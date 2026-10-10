@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · DNS — System Design Notes</title>
+<meta name="description" content="Resolution and caching, record types, TTL as a control knob, DNS as a load balancer and failover mechanism, anycast, and migration playbooks.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/notes.css">
+<style>
+  .steps{display:grid;gap:8px;margin:4px 0 12px}
+  .step{display:grid;grid-template-columns:26px 1fr auto;gap:11px;align-items:start;padding:10px 12px;
+    border:1px solid var(--rule-2);border-radius:4px;background:var(--paper);opacity:.4;transition:opacity .2s}
+  .step.on{opacity:1;border-color:var(--line);background:var(--line-soft)}
+  .step.done{opacity:.85;border-color:var(--rule)}
+  .step .i{width:26px;height:26px;border-radius:50%;background:var(--card);border:2px solid var(--rule);
+    display:flex;align-items:center;justify-content:center;font-size:11.5px;font-weight:700;color:var(--text-2)}
+  .step.on .i{border-color:var(--line);color:var(--line)}
+  .step .t{font-size:13.5px;font-weight:600;line-height:1.35}
+  .step .d{font-size:12.5px;color:var(--text-2);margin-top:3px;line-height:1.45}
+  .step .ms{font-size:12px;font-weight:600;color:var(--text-3);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .step code{font-size:11.8px}
+</style>
+</head>
+<body>
+<div class="readbar"></div>
+
+<header class="top">
+  <div class="top-inner">
+    <a class="home" href="../../index.html"><span class="mark"></span>All roadmaps</a>
+    <span class="top-sep">/</span>
+    <a class="home" href="index.html" style="color:var(--band-text)">System Design</a>
+    <span class="top-spacer"></span>
+    <button class="rail-toggle" aria-expanded="false">Contents</button>
+    <nav class="top-nav" aria-label="Chapter navigation"></nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail" id="rail" aria-label="Chapter and section navigation"></aside>
+
+  <article>
+    <p class="crumb">Part 3 · The path of a request &nbsp;·&nbsp; <b>Chapter 08</b></p>
+    <h1>DNS</h1>
+    <p class="standfirst">DNS is the first thing that happens and the last thing anyone thinks about. It is also the largest distributed cache on earth, a load balancer with a very slow control loop, and the single most common cause of "the whole company is offline". This chapter covers how resolution works, why TTL is the only real control you have, and what DNS can and cannot do for traffic management.</p>
+    <div class="meta">
+      <span>~28 min read</span>
+      <span>Resolution · TTL · failover · anycast</span>
+      <span>2 interactive panels</span>
+      <span>Prerequisite: none</span>
+    </div>
+
+    <div class="body">
+
+      <h2><span class="h2n">8.1</span>What DNS is really for</h2>
+
+      <p>The obvious answer is that it turns <code>api.example.com</code> into <code>203.0.113.7</code>. The useful answer is that it is a <b>layer of indirection between a name that people and code hold onto and an address that you need to be able to change</b>. Servers get replaced, regions get added, providers get swapped; the name must survive all of it. Every property of DNS follows from that job plus one constraint: it must answer billions of queries per second worldwide, which forces aggressive caching, which is the source of every DNS problem you will ever have.</p>
+
+      <h2><span class="h2n">8.2</span>The hierarchy and the players</h2>
+
+      <p>The namespace is a tree, read right to left: <code>api.example.com.</code> is the <code>api</code> node inside <code>example</code> inside <code>com</code> inside the unnamed root. Four kinds of server participate:</p>
+
+      <dl>
+        <dt>Stub resolver</dt>
+        <dd>The tiny client in your operating system or browser. It does not resolve anything; it asks a recursive resolver and caches the answer.</dd>
+        <dt>Recursive resolver</dt>
+        <dd>Your ISP's, your company's, or a public one (<code>8.8.8.8</code>, <code>1.1.1.1</code>). It does the actual walking of the tree and holds the cache that matters most — one resolver serves millions of users, so one cached answer suppresses millions of queries.</dd>
+        <dt>Root and TLD servers</dt>
+        <dd>Thirteen root server <em>addresses</em> (served by hundreds of physical machines via anycast) that know where <code>.com</code> lives; TLD servers that know which nameservers are authoritative for <code>example.com</code>.</dd>
+        <dt>Authoritative nameserver</dt>
+        <dd>Yours, or your provider's. It holds the actual records and is the only thing that knows the truth. Everything else is a cache of what it said.</dd>
+      </dl>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Resolving a name, step by step</h4>
+          <p>A cold cache, then a warm one. Notice which steps disappear the second time.</p>
+        </div>
+        <div class="demo-body">
+          <div class="btnrow">
+            <button class="btn primary" id="d-next">Next step</button>
+            <button class="btn" id="d-warm">Show a warm-cache lookup</button>
+            <button class="btn" id="d-reset">Start over</button>
+          </div>
+          <div class="steps" id="d-steps"></div>
+          <div class="out">
+            <div class="stats" id="d-stats"></div>
+            <p id="d-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <figure class="diagram">
+        <div class="mermaid">
+sequenceDiagram
+  participant B as Browser stub
+  participant R as Recursive resolver
+  participant Ro as Root server
+  participant T as .com TLD server
+  participant A as Authoritative NS
+  B->>R: A? api.example.com
+  R->>Ro: A? api.example.com
+  Ro-->>R: referral: ask the .com servers
+  R->>T: A? api.example.com
+  T-->>R: referral: ask ns1.example-dns.net
+  R->>A: A? api.example.com
+  A-->>R: 203.0.113.7, TTL 60
+  R-->>B: 203.0.113.7
+  Note over R: cached for 60 s — the next million<br/>users behind this resolver skip every hop above
+        </div>
+        <figcaption>Only the resolver recurses. The browser asks one question and gets one answer, which is why a slow authoritative server shows up as a slow page load with no obvious cause.</figcaption>
+      </figure>
+
+      <h2><span class="h2n">8.3</span>Caching and TTL</h2>
+
+      <p>Every record carries a time-to-live in seconds. Anyone who receives it may cache it for that long, and — this is the part that catches people — <b>you cannot revoke it early</b>. There is no invalidation, no purge, no push. Once an answer is out there with a TTL of 86 400, some resolver somewhere will keep using it for the next day, and some client will keep using it for longer because plenty of software ignores TTL entirely.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Choosing a TTL</caption>
+          <thead><tr><th>TTL</th><th>Query load on your authoritative servers</th><th>Time to change something</th><th>Use for</th></tr></thead>
+          <tbody>
+            <tr><td>30–60 s</td><td class="no">High — resolvers re-ask constantly</td><td class="yes">About a minute</td><td>Records used for failover, or during a migration window</td></tr>
+            <tr><td>300 s (5 min)</td><td class="mid">Moderate</td><td class="mid">Minutes</td><td>A good default for application endpoints</td></tr>
+            <tr><td>3 600 s (1 h)</td><td class="yes">Low</td><td class="no">An hour, plus stragglers</td><td>Stable records: MX, verification TXT</td></tr>
+            <tr><td>86 400 s (1 d)</td><td class="yes">Minimal</td><td class="no">A day, plus stragglers for much longer</td><td>NS records, things that genuinely never move</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <span class="lab">Lower the TTL before you need it, not when</span>
+        <p>The migration playbook every operations team learns once, painfully: at least <b>2× the current TTL before</b> the change, drop the TTL to 60 seconds. Wait for the old, longer TTL to expire everywhere. Make the change. Verify. Then raise the TTL back up. If you only lower the TTL at the moment you make the change, the low TTL is itself sitting behind the old high TTL and does nothing for you — you still wait out the original day.</p>
+      </div>
+
+      <p>Two caching details that cause real incidents. <b>Negative caching</b> means an NXDOMAIN answer is cached too, for a duration set by the minimum field of the zone's SOA record — so if you query a name a moment before you create it, some resolvers will insist it does not exist for the next hour. And <b>every layer caches independently</b>: the browser (Chrome keeps its own DNS cache for about a minute), the OS, the resolver, and often a corporate forwarder in between. Your effective propagation time is the sum of the worst behaviour at each layer, not the TTL you set.</p>
+
+      <h2><span class="h2n">8.4</span>Record types worth knowing</h2>
+
+      <div class="tw">
+        <table>
+          <caption>The records that appear in system designs</caption>
+          <thead><tr><th>Type</th><th>Holds</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td><b>A</b></td><td>An IPv4 address</td><td>Multiple A records for one name is the simplest form of load balancing</td></tr>
+            <tr><td><b>AAAA</b></td><td>An IPv6 address</td><td>Clients try both; "happy eyeballs" races them and takes whichever connects first</td></tr>
+            <tr><td><b>CNAME</b></td><td>An alias to another name</td><td>Cannot coexist with any other record at the same name, and therefore <b>cannot be used at the zone apex</b></td></tr>
+            <tr><td><b>ALIAS / ANAME</b></td><td>Apex-safe alias</td><td>Not a real DNS type — the provider resolves the target and returns A records. Provider-specific</td></tr>
+            <tr><td><b>NS</b></td><td>Which nameservers are authoritative</td><td>The delegation itself. Long TTLs; changes are slow and dangerous</td></tr>
+            <tr><td><b>SOA</b></td><td>Zone metadata</td><td>Its minimum field controls negative caching duration</td></tr>
+            <tr><td><b>MX</b></td><td>Mail servers, with priorities</td><td>Lower number wins; equal numbers share load</td></tr>
+            <tr><td><b>TXT</b></td><td>Arbitrary text</td><td>SPF, DKIM, DMARC, and every SaaS domain-verification token you will ever paste</td></tr>
+            <tr><td><b>SRV</b></td><td>Service, port, priority, weight, target</td><td>The one record designed for service discovery. Used by Kubernetes, SIP, XMPP</td></tr>
+            <tr><td><b>CAA</b></td><td>Which certificate authorities may issue for this domain</td><td>Cheap protection against mis-issuance</td></tr>
+            <tr><td><b>PTR</b></td><td>Address → name (reverse)</td><td>Mail servers check it; almost nothing else does</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <span class="lab">The CNAME-at-apex problem</span>
+        <p>You want <code>example.com</code> (no <code>www</code>) to point at a load balancer whose address changes. A CNAME would be perfect — and is forbidden, because the apex must also carry NS and SOA records and a CNAME may not coexist with anything. The workarounds are all imperfect: your DNS provider's ALIAS/ANAME pseudo-record (which ties you to that provider), an HTTP redirect from apex to <code>www</code>, or a static anycast IP in front of the changing infrastructure. Worth knowing because it constrains real architectures, and it is a favourite interview detail.</p>
+      </div>
+
+      <h2><span class="h2n">8.5</span>DNS as a traffic manager</h2>
+
+      <p>Because you control the answer, you control where clients go. This makes DNS the coarsest and most global load-balancing tool you have.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Routing policies offered by managed DNS providers</caption>
+          <thead><tr><th>Policy</th><th>Mechanism</th><th>Good for</th></tr></thead>
+          <tbody>
+            <tr><td><b>Round robin</b></td><td>Several A records; resolvers rotate the order</td><td>Crude spreading. No health awareness at all</td></tr>
+            <tr><td><b>Weighted</b></td><td>Answers returned in proportion to weights</td><td>Canary releases, gradual migration between providers</td></tr>
+            <tr><td><b>Geolocation</b></td><td>Answer depends on the resolver's location</td><td>Data residency, language, regulatory routing</td></tr>
+            <tr><td><b>Latency-based</b></td><td>Answer is the region measured fastest for that client</td><td>Multi-region applications where you want the nearest healthy stack</td></tr>
+            <tr><td><b>Failover</b></td><td>Health checks; the record changes when the primary fails</td><td>Disaster recovery between regions</td></tr>
+            <tr><td><b>Multi-value with health</b></td><td>Several answers, unhealthy ones withdrawn</td><td>A middle ground between round robin and real load balancing</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>All of them share the same four limitations, and understanding these is what separates "use Route 53 for failover" from a design that actually recovers:</p>
+
+      <ol>
+        <li><b>The control loop is minutes, not milliseconds.</b> Detection (health check interval × failure threshold) plus TTL plus client cache behaviour. Even a well-tuned setup is 60–120 seconds; DNS is a disaster-recovery mechanism, not a request-level one.</li>
+        <li><b>You cannot balance per request.</b> A resolver caches one answer and hands it to everyone behind it for the whole TTL, so load lands in lumps proportional to resolver population, not to your weights.</li>
+        <li><b>You are routing resolvers, not users.</b> Geolocation sees the resolver's address, and a user on a public resolver may appear to be somewhere else entirely. EDNS Client Subnet passes a truncated client address to fix this, and not everyone supports it.</li>
+        <li><b>Clients ignore you.</b> Java historically cached DNS forever by default; connection pools resolve once at startup and hold the address for weeks; some libraries never re-resolve. A long-lived process is the most common reason a "completed" DNS failover leaves traffic hitting a dead address.</li>
+      </ol>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>How long does DNS failover actually take?</h4>
+          <p>Detection plus propagation plus the clients who are not listening.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="f-ttl">Record TTL <b><span id="f-ttlv">300</span> s</b></label>
+              <input type="range" id="f-ttl" min="30" max="3600" step="30" value="300">
+            </div>
+            <div class="ctrl">
+              <label for="f-int">Health check interval <b><span id="f-intv">30</span> s</b></label>
+              <input type="range" id="f-int" min="10" max="120" step="5" value="30">
+            </div>
+            <div class="ctrl">
+              <label for="f-thr">Failures before switching <b><span id="f-thrv">3</span></b></label>
+              <input type="range" id="f-thr" min="1" max="5" step="1" value="3">
+            </div>
+            <div class="ctrl">
+              <label for="f-bad">Clients that ignore TTL <b><span id="f-badv">5</span>%</b></label>
+              <input type="range" id="f-bad" min="0" max="30" step="1" value="5">
+            </div>
+            <div class="ctrl">
+              <label for="f-qps">Lookups per second (global) <b><span id="f-qpsv">2000</span></b></label>
+              <input type="range" id="f-qps" min="100" max="50000" step="100" value="2000">
+            </div>
+          </div>
+          <div class="bars" id="f-bars"></div>
+          <div class="out">
+            <div class="stats" id="f-stats"></div>
+            <p id="f-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">8.6</span>Anycast</h2>
+
+      <p>The same IP address announced from many locations at once, with the internet's routing protocol (BGP) delivering each packet to the topologically nearest announcement. It is how the root servers, every large DNS provider and every CDN work.</p>
+
+      <p>What it buys: latency, because the nearest site answers; capacity, because load spreads geographically for free; and DDoS resilience, because an attack is absorbed by whichever site is nearest to each attacker rather than concentrating on one. What it costs: you need your own address space and BGP relationships, so in practice you rent it from a provider. And it is unreliable for long-lived connections — a routing change mid-session can send your packets to a different site that knows nothing about your TCP state, which is why anycast is mostly used for short, stateless request-response traffic like DNS, and why anycast HTTP relies on the edge site terminating the connection immediately.</p>
+
+      <h2><span class="h2n">8.7</span>DNS on the latency budget</h2>
+
+      <p>A cold lookup can cost 20–120 ms before a single byte of your application is requested, and it happens before TCP, before TLS, before anything. Then the same page needs lookups for every additional hostname it references. Four mitigations, all cheap:</p>
+
+      <ul class="tight">
+        <li><b>Fewer hostnames.</b> Every distinct domain on a page is a fresh resolution plus a fresh connection. Domain sharding was a useful HTTP/1.1 trick and is actively harmful under HTTP/2.</li>
+        <li><b><code>dns-prefetch</code> and <code>preconnect</code>.</b> Tell the browser about a hostname you will need shortly, and the lookup happens in parallel with parsing rather than on the critical path.</li>
+        <li><b>Connection reuse.</b> Keep-alive means one resolution serves many requests. This is also why HTTP/2 and HTTP/3, which multiplex over one connection, remove most repeat DNS cost.</li>
+        <li><b>Sensible TTLs on hot names.</b> A 60-second TTL on your busiest hostname means every resolver re-resolves every minute; 300 seconds is usually a better trade unless you are actively failing over.</li>
+      </ul>
+
+      <h2><span class="h2n">8.8</span>How DNS takes companies offline</h2>
+
+      <div class="tw">
+        <table>
+          <caption>The recurring failure modes</caption>
+          <thead><tr><th>Failure</th><th>What happens</th><th>Defence</th></tr></thead>
+          <tbody>
+            <tr><td>Single DNS provider outage</td><td>Every name you own becomes unresolvable. Not degraded — gone</td><td>Two providers serving the same zone, NS records listing both, zone changes applied to both</td></tr>
+            <tr><td>Expired domain registration</td><td>The delegation vanishes. Recovery takes hours to days</td><td>Auto-renew plus a calendar reminder plus registrar lock</td></tr>
+            <tr><td>TTL too high during an incident</td><td>You fix the problem and traffic keeps going to the broken address</td><td>Keep failover-relevant records at 60 s permanently; accept the query load</td></tr>
+            <tr><td>Negative caching after a typo</td><td>You create the record but resolvers insist it does not exist</td><td>Keep the SOA minimum low (300 s); never query a name before creating it</td></tr>
+            <tr><td>Health check false positive</td><td>DNS fails over to a standby that is not ready, or flaps between regions</td><td>Multiple check locations, a failure threshold, and hysteresis before failing back</td></tr>
+            <tr><td>Client-side caching</td><td>Long-lived services keep the old address for hours or forever</td><td>Bounded connection lifetime, periodic re-resolution, or a proxy that handles it for them</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Two protocol-level items to be able to name. <b>DNSSEC</b> signs records so a resolver can verify they came from the real zone owner, defending against cache poisoning; it does not encrypt anything, and misconfigured or expired signatures have themselves caused large outages. <b>DoH and DoT</b> (DNS over HTTPS/TLS) encrypt the query between client and resolver for privacy; they change nothing about how caching or authority works, but they do move resolution out of the network operator's control, which occasionally breaks corporate split-horizon setups where internal names resolve differently inside the network.</p>
+
+      <details class="check">
+        <summary>You need to move a service to a new region with under a minute of disruption. Walk through the DNS plan.</summary>
+        <div class="ans">
+          <p>Days before: confirm the current TTL, then lower it to 60 seconds and <em>wait longer than the old TTL</em> so every cached copy has expired and resolvers are now honouring 60. Before the cutover: bring the new region up, warm its caches, and verify it directly by address or via a test hostname. Cutover: change the record; monitor traffic shifting to the new region and error rates on both. Keep the old region running for at least an hour — probably a day — because long-lived clients will still be connecting to it. Then raise the TTL back to 300. And if the requirement were genuinely sub-second, DNS would be the wrong tool entirely: put an anycast address or a load balancer in front and shift traffic there, where the control loop is a health check rather than a cache expiry.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Round-robin DNS returns three A records with equal weight, but one server gets 60% of the traffic. Why?</summary>
+        <div class="ans">
+          <p>Because DNS distributes across <em>resolvers</em>, not users. A single large ISP resolver caches one ordering and hands it to millions of subscribers for the whole TTL, so the split follows the size of the resolver populations, not your record weights. On top of that, some resolvers re-sort answers, some clients always take the first address, happy-eyeballs may prefer whichever answers fastest, and there is no health awareness at all — a dead server keeps receiving its share until you notice. Round-robin DNS is a spreading mechanism, not a balancer; put a real load balancer behind one name and let DNS just find it.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Why would you pay for two DNS providers?</summary>
+        <div class="ans">
+          <p>Because DNS failure is total rather than partial. If your only provider has an outage, no name you own resolves — not the website, not the API, not the mail, not the status page if it is on the same domain. The 2016 Dyn attack took a large fraction of well-known internet services offline for exactly this reason. Serving the same zone from two independent providers, with NS records listing both sets of nameservers, means resolvers simply use whichever answers. The cost is that every zone change must be applied to both, which is a solvable automation problem, and it is cheap insurance against the one dependency whose failure has no workaround.</p>
+        </div>
+      </details>
+
+      <div class="recap">
+        <h2>Recap</h2>
+        <ol>
+          <li><b>DNS is indirection plus the world's largest cache.</b> Every quirk follows from that caching.</li>
+          <li><b>Only recursive resolvers recurse;</b> your authoritative server sees a tiny fraction of real query volume, which is also why it is easy to under-provision.</li>
+          <li><b>TTL is the only control you have and it cannot be revoked.</b> Lower it well before a change, and wait out the old value first.</li>
+          <li><b>CNAME cannot live at the apex.</b> Use a provider ALIAS record, a redirect, or a stable anycast address.</li>
+          <li><b>DNS traffic management is coarse:</b> minutes of control loop, per-resolver granularity, and clients that ignore TTL. Use it for regional failover, not request balancing.</li>
+          <li><b>Anycast gives latency, capacity and DDoS absorption</b> for short stateless exchanges.</li>
+          <li><b>A cold lookup costs tens of milliseconds</b> before anything else happens. Reduce hostnames, preconnect, and reuse connections.</li>
+          <li><b>Use two DNS providers.</b> There is no partial failure and no workaround.</li>
+        </ol>
+      </div>
+
+      <nav class="pn" aria-label="Previous and next chapter"></nav>
+    </div>
+  </article>
+</div>
+
+<script src="assets/notes.js"></script>
+<script>
+function st8(k, v, tone) {
+  var d = document.createElement("div"); d.className = "stat";
+  var a = document.createElement("div"); a.className = "k"; a.textContent = k;
+  var b = document.createElement("div"); b.className = "v"; b.textContent = v;
+  if (tone) b.style.color = tone;
+  d.append(a, b); return d;
+}
+function bar8(label, pct, value, colour) {
+  var row = document.createElement("div"); row.className = "bar";
+  var k = document.createElement("span"); k.textContent = label;
+  var t = document.createElement("span"); t.className = "track";
+  var f = document.createElement("span"); f.className = "fill";
+  f.style.width = Math.max(0.5, Math.min(100, pct)) + "%";
+  if (colour) f.style.background = colour;
+  t.appendChild(f);
+  var v = document.createElement("span"); v.className = "val"; v.textContent = value;
+  row.append(k, t, v); return row;
+}
+
+/* ---------- resolution walkthrough ---------- */
+(function () {
+  var COLD = [
+    { t: "Browser and OS cache", d: "Chrome keeps its own short-lived cache; the OS keeps another. Both miss.", ms: 0 },
+    { t: "Ask the recursive resolver", d: "The stub sends one UDP query to <code>1.1.1.1</code> and waits. Everything below happens without the browser knowing.", ms: 2 },
+    { t: "Root server", d: "Resolver asks a root server, which does not know the answer but knows who runs <code>.com</code>. Reply is a referral, not an address.", ms: 12 },
+    { t: ".com TLD server", d: "Another referral: the nameservers delegated for <code>example.com</code>.", ms: 18 },
+    { t: "Authoritative nameserver", d: "Finally the real answer: <code>A 203.0.113.7</code> with <code>TTL 60</code>.", ms: 22 },
+    { t: "Answer returned and cached", d: "The resolver caches it for 60 s and answers the stub. The OS and browser cache it too.", ms: 3 }
+  ];
+  var WARM = [
+    { t: "Browser cache", d: "Hit. The address was resolved 12 seconds ago and the TTL has not expired.", ms: 0 }
+  ];
+  var steps = COLD, idx = 0, warm = false;
+  var wrap = document.getElementById("d-steps"), stats = document.getElementById("d-stats"), note = document.getElementById("d-note");
+
+  function draw() {
+    wrap.innerHTML = "";
+    steps.forEach(function (s, i) {
+      var d = document.createElement("div");
+      d.className = "step" + (i === idx ? " on" : i < idx ? " done" : "");
+      var n = document.createElement("div"); n.className = "i"; n.textContent = i + 1;
+      var mid = document.createElement("div");
+      var t = document.createElement("div"); t.className = "t"; t.textContent = s.t;
+      var dd = document.createElement("div"); dd.className = "d"; dd.innerHTML = s.d;
+      mid.append(t, dd);
+      var ms = document.createElement("div"); ms.className = "ms"; ms.textContent = i <= idx ? "+" + s.ms + " ms" : "";
+      d.append(n, mid, ms);
+      wrap.appendChild(d);
+    });
+    var total = steps.slice(0, idx + 1).reduce(function (a, s) { return a + s.ms; }, 0);
+    var full = steps.reduce(function (a, s) { return a + s.ms; }, 0);
+    stats.innerHTML = "";
+    stats.appendChild(st8("Elapsed", total + " ms"));
+    stats.appendChild(st8("Total for this lookup", full + " ms", full > 40 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st8("Network round trips", warm ? 0 : Math.min(idx, 4)));
+    stats.appendChild(st8("Cached for", warm ? "in cache" : "60 s"));
+    note.textContent = warm
+      ? "One cache hit, zero packets. Across a busy resolver this is what happens to the overwhelming majority of queries — which is why the whole hierarchy above survives on a tiny fraction of real traffic, and why an authoritative server outage takes minutes to become visible."
+      : idx >= steps.length - 1
+        ? "Four round trips, most of them to servers you do not control, before your application receives a single byte. This is the cost paid by the first user in each resolver's population every time the TTL expires."
+        : "Each step is a full network round trip. The resolver walks the tree from the root downwards; nobody above the authoritative server actually knows your address.";
+  }
+  document.getElementById("d-next").addEventListener("click", function () {
+    if (idx < steps.length - 1) idx++;
+    draw();
+  });
+  document.getElementById("d-warm").addEventListener("click", function () {
+    warm = true; steps = WARM; idx = 0; draw();
+  });
+  document.getElementById("d-reset").addEventListener("click", function () {
+    warm = false; steps = COLD; idx = 0; draw();
+  });
+  draw();
+})();
+
+/* ---------- failover timing ---------- */
+(function () {
+  var ttl = document.getElementById("f-ttl"), intv = document.getElementById("f-int"),
+      thr = document.getElementById("f-thr"), bad = document.getElementById("f-bad"),
+      qps = document.getElementById("f-qps"),
+      bars = document.getElementById("f-bars"), stats = document.getElementById("f-stats"),
+      note = document.getElementById("f-note");
+
+  function draw() {
+    var T = +ttl.value, I = +intv.value, N = +thr.value, B = +bad.value / 100, Q = +qps.value;
+    document.getElementById("f-ttlv").textContent = T;
+    document.getElementById("f-intv").textContent = I;
+    document.getElementById("f-thrv").textContent = N;
+    document.getElementById("f-badv").textContent = +bad.value;
+    document.getElementById("f-qpsv").textContent = Q;
+
+    var detect = I * N;
+    var publish = 5;
+    var propAvg = T / 2, propWorst = T;
+    var typical = detect + publish + propAvg;
+    var worst = detect + publish + propWorst;
+    var authQps = Q; /* cache-miss driven: shorter TTL, more upstream queries */
+    var missRatio = Math.min(1, 60 / T);
+    var authLoad = Q * missRatio;
+
+    bars.innerHTML = "";
+    var scale = worst || 1;
+    bars.appendChild(bar8("Detection", detect / scale * 100, detect + " s", "#B87A17"));
+    bars.appendChild(bar8("Publish", publish / scale * 100, publish + " s", "var(--text-3)"));
+    bars.appendChild(bar8("Cache expiry", propWorst / scale * 100, "0–" + propWorst + " s", "var(--line)"));
+
+    stats.innerHTML = "";
+    stats.appendChild(st8("Typical user recovers in", Math.round(typical) + " s", typical > 180 ? "var(--line)" : typical < 90 ? "var(--ok)" : ""));
+    stats.appendChild(st8("Worst case", Math.round(worst) + " s", worst > 300 ? "var(--line)" : ""));
+    stats.appendChild(st8("Never recovers without a restart", (B * 100).toFixed(0) + "% of clients", B > 0 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st8("Authoritative query load", Math.round(authLoad) + "/s", authLoad > 10000 ? "var(--line)" : ""));
+
+    note.textContent = typical > 240
+      ? "Over four minutes of downtime for a typical user, most of it spent waiting for caches to expire. If the requirement is tighter than this, DNS is the wrong layer — move the failover decision into an anycast edge or a load balancer where it takes effect immediately."
+      : B > 0.1
+      ? "A large share of clients never re-resolve. Long-lived connection pools and libraries that cache forever mean part of your traffic keeps hitting the dead address until those processes restart. Bound connection lifetime, or front the service with something that re-resolves for them."
+      : "Reasonable for regional disaster recovery. Note the shape of the bars: detection and cache expiry dominate, and shortening the TTL is usually the cheaper of the two to improve — at the cost of proportionally more query load on your nameservers.";
+  }
+  [ttl, intv, thr, bad, qps].forEach(function (x) { x.addEventListener("input", draw); });
+  draw();
+})();
+</script>
+</body>
+</html>

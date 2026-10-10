@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Aggregations — Elasticsearch</title>
+<meta name="description" content="Buckets, metrics, nesting and pipelines — the analytics half of Elasticsearch, and where the numbers stop being exact.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 12 · Analytics</div>
+    <h1>Aggregations</h1>
+    <p class="standfirst">The half of Elasticsearch that has nothing to do with search, and arguably the reason it displaced dedicated analytics databases for log data. It also produces numbers that are approximate by design, in ways that are easy to miss and awkward to explain afterwards.</p>
+    <div class="chap-meta">
+      <span class="tagpill">terms</span>
+      <span class="tagpill">metrics</span>
+      <span class="tagpill">nesting</span>
+      <span class="tagpill">cardinality</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Buckets and metrics</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">two kinds, and they nest</span><button class="copy">Copy</button></div>
+<pre><code>GET /orders/_search
+{
+  "size": 0,                              # no documents, just the numbers
+  "query": { "range": { "placed_at": { "gte": "now-30d/d" } } },
+  "aggs": {
+
+    "by_country": {                       # BUCKET agg — splits documents up
+      "terms": { "field": "country", "size": 10 },
+
+      "aggs": {                           # nested inside each bucket
+        "revenue":  { "sum": { "field": "total" } },      # METRIC agg
+        "avg_order": { "avg": { "field": "total" } },
+        "customers": { "cardinality": { "field": "customer_id" } },
+
+        "by_month": {                     # buckets inside buckets
+          "date_histogram": { "field": "placed_at", "calendar_interval": "month" },
+          "aggs": { "revenue": { "sum": { "field": "total" } } }
+        }
+      }
+    }
+  }
+}
+
+# size: 0 is important. It says "return no hits", which makes the response
+# far smaller AND makes the request eligible for the shard request cache —
+# so a dashboard re-running the same aggregation over an unchanged index
+# gets the whole response back for free (chapter 7).
+
+# THE MENTAL MODEL: a bucket aggregation partitions documents into groups; a
+# metric aggregation computes a number over a group. Nesting a bucket inside
+# a bucket subdivides; nesting a metric inside a bucket computes per group.
+#
+# AGGREGATIONS RUN OVER DOC VALUES, the columnar structure from chapter 3 —
+# which is why text fields cannot be aggregated and .keyword sub-fields can.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Where the numbers go wrong</h2>
+
+<div class="demo" id="ag">
+  <div class="demo-head">
+    <b>Why a terms aggregation can return the wrong top N</b>
+    <span>Each shard sends its own top results. The coordinating node never sees the rest.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="g-size">Requested <code>size</code> — <span id="g-sizev">3</span></label>
+        <input type="range" id="g-size" min="1" max="6" step="1" value="3">
+      </div>
+      <div>
+        <label for="g-shardsize">
+          <code>shard_size</code> — <span id="g-shardsizev">auto</span></label>
+        <select id="g-shardsize">
+          <option value="0" selected>default (size × 1.5 + 10)</option>
+          <option value="3">3 — same as size</option>
+          <option value="10">10</option>
+          <option value="99">effectively unlimited</option>
+        </select>
+      </div>
+    </div>
+    <div id="g-shards"></div>
+    <div class="stat">
+      <div><b id="g-err">—</b><span>doc_count_error_upper_bound</span></div>
+      <div><b id="g-correct">—</b><span>top N correct?</span></div>
+      <div><b id="g-cost">—</b><span>memory cost</span></div>
+    </div>
+    <div class="out" id="g-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Three numbers in the response tell you whether to trust it</span>
+  <p><code>doc_count_error_upper_bound</code> is the maximum amount by which any returned bucket's count could be understated. <code>sum_other_doc_count</code> is how many documents fell outside the returned buckets — if that is large relative to your total, the buckets you are showing are a small slice. And on a <code>cardinality</code> aggregation, the value is a <b>HyperLogLog++ estimate</b>, exact only below <code>precision_threshold</code> (default 3000, maximum 40000) and typically within a few percent above it. <b>All three are in every response and almost universally ignored</b>, which is how approximate numbers end up in board reports. Read them, and if <code>doc_count_error_upper_bound</code> is non-zero on a number that matters, raise <code>shard_size</code> until it is not.</p>
+</div>
+
+<h2><span class="h-rule"></span>The aggregations worth knowing</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Bucket</th><th>Splits by</th></tr></thead>
+<tbody>
+<tr><td><code>terms</code></td><td>Distinct field values. The workhorse — and the approximate one</td></tr>
+<tr><td><code>date_histogram</code></td><td>Time intervals. Use <code>calendar_interval</code> for months, <code>fixed_interval</code> for exact spans</td></tr>
+<tr><td><code>histogram</code></td><td>Numeric intervals</td></tr>
+<tr><td><code>range</code> / <code>date_range</code></td><td>Explicit, possibly overlapping ranges you define</td></tr>
+<tr><td><code>filter</code> / <code>filters</code></td><td>One or several named conditions — the way to get several counts in one request</td></tr>
+<tr><td><code>nested</code> / <code>reverse_nested</code></td><td>Into and out of nested documents (chapter 5)</td></tr>
+<tr><td><code>composite</code></td><td>Paginable buckets. The only way to enumerate all of a high-cardinality field</td></tr>
+<tr><td><code>significant_terms</code></td><td>Terms unusually common in this result set versus the index. Genuinely clever, and slow</td></tr>
+<tr><td><code>multi_terms</code></td><td>Buckets keyed on several fields at once</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Metric</th><th>Computes</th></tr></thead>
+<tbody>
+<tr><td><code>sum</code>, <code>avg</code>, <code>min</code>, <code>max</code>, <code>value_count</code></td><td>Exact, cheap</td></tr>
+<tr><td><code>stats</code> / <code>extended_stats</code></td><td>All of the above in one pass, plus variance and standard deviation</td></tr>
+<tr><td><code>cardinality</code></td><td>Distinct count — <b>approximate</b>, HyperLogLog++</td></tr>
+<tr><td><code>percentiles</code></td><td>p50, p95, p99 — <b>approximate</b>, t-digest</td></tr>
+<tr><td><code>percentile_ranks</code></td><td>"What percentile is 500 ms?"</td></tr>
+<tr><td><code>top_hits</code></td><td>Actual documents per bucket. Expensive; <code>collapse</code> is usually better (chapter 9)</td></tr>
+<tr><td><code>top_metrics</code></td><td>The field values from the best-sorted document per bucket. Cheap version of <code>top_hits</code></td></tr>
+<tr><td><code>rate</code></td><td>Per-unit-time rate inside a date histogram</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">pipeline aggregations — computing on the results</span><button class="copy">Copy</button></div>
+<pre><code># Pipeline aggregations take the OUTPUT of other aggregations as input. They
+# are how you express "moving average", "difference from last month" and
+# "only buckets where X" — none of which the normal aggregations can do.
+
+{ "size": 0,
+  "aggs": {
+    "monthly": {
+      "date_histogram": { "field": "placed_at", "calendar_interval": "month" },
+      "aggs": {
+        "revenue": { "sum": { "field": "total" } },
+
+        "growth": { "derivative": { "buckets_path": "revenue" } },
+        "smoothed": { "moving_fn": {
+            "buckets_path": "revenue", "window": 3,
+            "script": "MovingFunctions.unweightedAvg(values)" } },
+        "cumulative": { "cumulative_sum": { "buckets_path": "revenue" } }
+      }
+    },
+
+    "best_month": { "max_bucket": { "buckets_path": "monthly>revenue" } },
+    "total":      { "sum_bucket": { "buckets_path": "monthly>revenue" } }
+  }
+}
+
+# THE ONE YOU WILL WANT MOST — bucket_selector, which is HAVING:
+{ "aggs": { "by_service": {
+    "terms": { "field": "service", "size": 100 },
+    "aggs": {
+      "errors": { "filter": { "term": { "level": "ERROR" } } },
+      "enough": { "bucket_selector": {
+          "buckets_path": { "n": "errors._count" },
+          "script": "params.n > 10" } }
+    }
+}}}
+
+# And bucket_sort, which sorts and paginates buckets AFTER computing them:
+{ "aggs": { "by_service": {
+    "terms": { "field": "service", "size": 100 },
+    "aggs": {
+      "p95": { "percentiles": { "field": "duration_ms", "percents": [95] } },
+      "worst": { "bucket_sort": {
+          "sort": [ { "p95.95": { "order": "desc" } } ], "size": 10 } }
+    }
+}}}
+# Note the two-step shape: ask terms for 100 buckets, compute p95 in each,
+# then sort by p95 and keep 10. You cannot sort a terms aggregation by a
+# metric it has not computed yet, so this is the pattern — and it is why
+# ES|QL's flat pipeline reads so much better for this kind of query
+# (chapter 11).</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Nesting multiplies, and there is a limit for a reason</span>
+  <p>A <code>terms</code> aggregation with <code>size: 1000</code> containing another with <code>size: 1000</code> asks for up to a million buckets, and every one is built in heap on the coordinating node before anything is returned. This is the classic way to make a node unresponsive with a single well-formed request, and it is why <code>search.max_buckets</code> exists — 65,536 by default, and a rejected request is very much better than an out-of-memory node. Two habits avoid the problem: <b>set <code>size</code> to what you will actually display</b>, since a chart showing ten bars does not need a thousand buckets, and reach for <code>composite</code> when you genuinely need to enumerate everything, because it paginates instead of materialising the whole set at once.</p>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">composite, for enumerating everything</span><button class="copy">Copy</button></div>
+<pre><code>GET /orders/_search
+{ "size": 0,
+  "aggs": { "all_customers": {
+      "composite": {
+        "size": 1000,
+        "sources": [
+          { "customer": { "terms": { "field": "customer_id" } } },
+          { "month":    { "date_histogram": { "field": "placed_at",
+                                              "calendar_interval": "month" } } }
+        ]
+      },
+      "aggs": { "spend": { "sum": { "field": "total" } } }
+  }}
+}
+
+# -> "after_key": { "customer": "c-4192", "month": 1740787200000 }
+
+# Pass it back to continue:
+{ "composite": { "size": 1000, "after": { "customer": "c-4192", "month": 1740787200000 },
+                 "sources": [ ... ] } }
+
+# THIS IS THE search_after OF AGGREGATIONS (chapter 9): a cursor rather than
+# an offset, so the cost per page is constant and memory is bounded.
+#
+# Use it for: export, reconciliation, feeding a downstream system, anything
+# that must see every bucket. Do NOT use it for a dashboard — it is slower
+# per bucket than terms and it cannot be sorted by a metric.
+
+# TRANSFORMS are the persistent version of this. Instead of computing the
+# pivot on every request, a transform materialises it into a real index,
+# either once or continuously:
+PUT /_transform/customer_summary
+{ "source": { "index": "orders" },
+  "dest":   { "index": "customer_summary" },
+  "pivot": {
+    "group_by": { "customer": { "terms": { "field": "customer_id" } } },
+    "aggregations": { "total_spend": { "sum": { "field": "total" } },
+                      "order_count": { "value_count": { "field": "order_id" } } }
+  },
+  "sync": { "time": { "field": "placed_at", "delay": "60s" } },
+  "frequency": "5m"
+}
+POST /_transform/customer_summary/_start
+
+# The destination is an ordinary index you can search, sort and paginate
+# normally — including by total_spend, which you cannot do to a terms
+# aggregation of a million customers. For "entity-centric" views this is
+# the right tool, and it is much less known than it should be.
+#   latest transforms keep only the most recent document per group, which
+#   is the other common shape: current state per device, per user, per host.</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Two smaller traps worth knowing</span>
+  <p><b><code>avg</code> of an <code>avg</code> is not the average.</b> Nesting an average inside buckets and then taking <code>avg_bucket</code> across them weights every bucket equally regardless of size, so a bucket with three documents counts as much as one with thirty thousand. Compute <code>sum</code> and <code>value_count</code> and divide, or use <code>weighted_avg</code>. <b>And <code>calendar_interval</code> is not <code>fixed_interval</code>.</b> A month is not 30 days, a day is not always 24 hours where daylight saving exists, and asking for <code>fixed_interval: "30d"</code> when you meant months produces buckets that drift out of alignment with the calendar — visible as a chart where the monthly peaks slowly slide. Pass <code>"time_zone"</code> too, or your daily buckets are split at UTC midnight rather than the user's.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Bucket aggregations partition, metric aggregations compute</b>, and they nest arbitrarily.</li>
+    <li><b>Always set <code>size: 0</code></b> when you only want numbers — smaller response, and eligible for the request cache.</li>
+    <li><b><code>terms</code> is approximate.</b> Each shard sends its own top results, so the global top N can be wrong.</li>
+    <li><b>Read <code>doc_count_error_upper_bound</code> and <code>sum_other_doc_count</code></b>. They are in every response and always ignored.</li>
+    <li><b><code>cardinality</code> and <code>percentiles</code> are estimates</b> — HyperLogLog++ and t-digest respectively.</li>
+    <li><b>Nesting multiplies buckets</b>, all built in heap. <code>search.max_buckets</code> is 65,536 for good reason.</li>
+    <li><b><code>composite</code> paginates</b> where <code>terms</code> materialises, and <code>bucket_selector</code> is <code>HAVING</code>.</li>
+    <li><b>Transforms materialise a pivot into a real index</b>, which you can then sort and paginate normally.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("12-aggregations.html");
+
+(function(){
+  const root = document.getElementById("ag");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  // three shards, term -> count per shard. Term E is the trap: spread evenly,
+  // globally 3rd, but never in any single shard's top 3.
+  const SHARDS = [
+    {A:100, B:5,  C:5,  D:2,  E:34, F:1},
+    {A:5,   B:95, C:5,  D:2,  E:34, F:1},
+    {A:5,   B:5,  C:90, D:2,  E:34, F:1}
+  ];
+  const TERMS = ["A","B","C","D","E","F"];
+
+  function render(){
+    const size = parseInt($("g-size").value, 10);
+    const ssSel = parseInt($("g-shardsize").value, 10);
+    const shardSize = ssSel === 0 ? Math.ceil(size * 1.5 + 10) : ssSel;
+    $("g-sizev").textContent = size;
+    $("g-shardsizev").textContent = shardSize >= 6 ? "all terms" : shardSize;
+
+    // global truth
+    const global = {};
+    TERMS.forEach(t => global[t] = SHARDS.reduce((a, s) => a + s[t], 0));
+    const trueTop = TERMS.slice().sort((a, b) => global[b] - global[a]).slice(0, size);
+
+    // what each shard sends
+    const sent = SHARDS.map(s =>
+      TERMS.slice().sort((a, b) => s[b] - s[a]).slice(0, shardSize));
+
+    // coordinator merges
+    const merged = {};
+    sent.forEach((list, i) => list.forEach(t => {
+      merged[t] = (merged[t] || 0) + SHARDS[i][t];
+    }));
+    const gotTop = Object.keys(merged).sort((a, b) => merged[b] - merged[a]).slice(0, size);
+
+    // doc_count_error_upper_bound: sum of the count of the last term each
+    // shard returned but did not include beyond
+    const err = SHARDS.reduce((a, s, i) => {
+      const list = sent[i];
+      if(list.length >= TERMS.length) return a;
+      return a + s[list[list.length - 1]];
+    }, 0);
+
+    const correct = trueTop.length === gotTop.length && trueTop.every((t, i) => t === gotTop[i]);
+
+    $("g-err").textContent     = err;
+    $("g-correct").textContent = correct ? "yes" : "NO";
+    $("g-correct").style.color = correct ? "#3FB984" : "#E2574C";
+    $("g-cost").textContent    = (shardSize * SHARDS.length) + " buckets held";
+
+    const chip = (t, n, on, missed) =>
+      '<span style="font-family:var(--mono);font-size:11px;padding:2px 7px;border-radius:3px;' +
+      'background:' + (missed ? "#FBEDEC" : on ? "#D6EFF3" : "#F1F4F6") +
+      ';color:' + (missed ? "#A8382F" : on ? "#0F7A85" : "#8FA0AF") +
+      ';border:1px solid ' + (missed ? "#E2574C" : on ? "#25B7C4" : "#E1E7EC") + '">' +
+      t + ':' + n + '</span>';
+
+    $("g-shards").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin:16px 0 8px">Each shard sends its top ' +
+      (shardSize >= 6 ? "(all)" : shardSize) + '</div>' +
+      SHARDS.map((s, i) =>
+        '<div style="background:#fff;border:1px solid #E1E7EC;border-radius:4px;padding:8px 11px;' +
+        'margin-bottom:4px"><div style="font-family:var(--mono);font-size:10.5px;color:#8FA0AF;' +
+        'margin-bottom:5px">shard ' + i + '</div><div style="display:flex;gap:4px;flex-wrap:wrap">' +
+        TERMS.map(t => chip(t, s[t], sent[i].includes(t), false)).join("") + '</div></div>').join("") +
+      '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;margin-top:14px">' +
+      '<div><div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin-bottom:7px">What the query returns</div>' +
+      '<div style="display:flex;gap:4px;flex-wrap:wrap">' +
+      gotTop.map(t => chip(t, merged[t], true, !trueTop.includes(t))).join("") + '</div></div>' +
+      '<div><div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin-bottom:7px">The true top ' + size + '</div>' +
+      '<div style="display:flex;gap:4px;flex-wrap:wrap">' +
+      trueTop.map(t => chip(t, global[t], true, !gotTop.includes(t))).join("") + '</div></div></div>';
+
+    const notes = [];
+
+    notes.push("Six terms across three shards. Terms A, B and C are each concentrated on one shard; term E has 34 documents on every shard, so globally it has " +
+      global.E + " — third overall — while never being any single shard's biggest.\n\nThat asymmetry is the whole mechanism. A shard cannot know what other shards hold, so it reports its own top " +
+      (shardSize >= 6 ? "(everything)" : shardSize) + " and nothing else.");
+
+    if(!correct){
+      const missing = trueTop.filter(t => !gotTop.includes(t));
+      const spurious = gotTop.filter(t => !trueTop.includes(t));
+      notes.push("The result is WRONG. " +
+        (missing.length ? "Term " + missing.join(", ") + " belongs in the top " + size +
+          " with " + missing.map(t => global[t]).join(", ") + " documents and is missing. " : "") +
+        (spurious.length ? "Term " + spurious.join(", ") + " is included and should not be. " : "") +
+        "\n\nNo error is returned. The response looks exactly like a correct one, and the only signal is doc_count_error_upper_bound sitting at " +
+        err + " — which is Elasticsearch telling you a returned count could be understated by up to that much.\n\nThis is how approximate numbers reach dashboards and reports. Raise shard_size above and watch it correct itself.");
+    } else if(shardSize >= 6){
+      notes.push("Correct, because every shard is now returning every term it holds. The coordinating node has complete information and doc_count_error_upper_bound is " +
+        err + ".\n\nThis is exact and it does not scale. On a field with a million distinct values, asking every shard for all of them means materialising a million buckets in heap on one node — which is what search.max_buckets exists to prevent.\n\nFor a genuinely high-cardinality field the answer is composite aggregation, which paginates, or a transform that materialises the pivot into a real index.");
+    } else {
+      notes.push("Correct at these settings. The default shard_size of size × 1.5 + 10 gives each shard enough headroom that the globally-ranked terms survive the merge.\n\nThat default is well chosen and it is a heuristic, not a guarantee. It fails on exactly the distribution shown here — a term spread evenly across many shards, never top on any of them — and the more shards you have, the more likely that shape becomes.");
+    }
+
+    if(ssSel === 3)
+      notes.push("With shard_size equal to size, each shard returns only as many terms as you asked for globally. That is the minimum possible information and the maximum possible error.\n\nElasticsearch does not default to this for good reason. If you ever find yourself setting shard_size down to size to save memory, you are trading correctness for a small amount of heap on the coordinating node — usually the wrong trade.");
+
+    if(err > 0)
+      notes.push("Two other numbers in every terms aggregation response deserve the same attention.\n\nsum_other_doc_count is how many documents fell outside the returned buckets. If it is large relative to your total, the buckets you are displaying are a small slice of the data and any percentage computed from them is meaningless.\n\nAnd on a cardinality aggregation the value is a HyperLogLog++ estimate — exact below precision_threshold (3000 by default, 40000 maximum) and typically within a few percent above it. Percentiles are t-digest estimates for the same reason. All of these are approximate BY DESIGN, because the exact versions do not distribute, and all of them are routinely reported as facts.");
+
+    $("g-note").textContent = notes.join("\n\n");
+  }
+
+  ["g-size","g-shardsize"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

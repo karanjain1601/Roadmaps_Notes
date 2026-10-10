@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Security — SQL</title>
+<meta name="description" content="Injection and why parameterisation is the only real fix, least privilege, row-level security, and handling sensitive columns.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 15 · In production</div>
+    <h1>Security</h1>
+    <p class="standfirst">Injection has a complete, well-understood fix that costs nothing, and it remains one of the most exploited vulnerabilities in software. This chapter is about applying it properly, and about the layers that limit the damage when something else goes wrong.</p>
+    <div class="chap-meta">
+      <span class="tagpill">parameterisation</span>
+      <span class="tagpill">least privilege</span>
+      <span class="tagpill">row-level security</span>
+      <span class="tagpill">sensitive data</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Why injection happens</h2>
+
+<p>The same reason as chapter 10 of the prompt-engineering world: <b>code and data share one channel</b>. When you build a query by concatenating strings, the database receives one blob of text and has no way to know which parts you intended as instructions and which as values.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">the mechanism, schematically</span><button class="copy">Copy</button></div>
+<pre><code># Vulnerable: the value becomes part of the query text.
+q = "SELECT * FROM users WHERE email = '" + user_input + "'"
+
+# The database parses one string. If user_input contains a quote character,
+# the value ends early and everything after it is parsed as SQL — a new
+# condition, a chained statement, whatever the attacker wrote. The engine is
+# behaving correctly; it was handed a different query from the one intended.
+
+# Safe: the value travels in a separate channel and is never parsed as SQL.
+cur.execute("SELECT * FROM users WHERE email = %s", (user_input,))
+
+# The driver sends the query text and the parameters separately. The database
+# plans the statement first, then binds the value into a placeholder. There is
+# no string in which a quote could terminate anything, so there is nothing to
+# escape and nothing to get wrong.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Parameterisation is a structural fix, not a filter</span>
+  <p>This is the distinction that matters. Escaping and input validation try to <em>detect</em> dangerous content — and detection can always be wrong, because the space of encodings, character sets and edge cases is unbounded. Parameterisation removes the possibility: the value is never part of the parsed statement, so there is nothing for it to break out of. <b>It is not a mitigation that reduces risk; it eliminates the class.</b> That is why "we sanitise inputs" is not an acceptable answer and "we use parameterised queries everywhere" is.</p>
+</div>
+
+<div class="demo" id="inj">
+  <div class="demo-head">
+    <b>Where the boundary is</b>
+    <span>Which parts of a query can be parameterised, which cannot, and what to do about the ones that cannot.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="q-part">User input controls the…</label>
+        <select id="q-part">
+          <option value="value" selected>value in a WHERE clause</option>
+          <option value="list">list of values for IN</option>
+          <option value="like">pattern for LIKE</option>
+          <option value="column">column to sort by</option>
+          <option value="dir">sort direction</option>
+          <option value="table">table or schema name</option>
+          <option value="limit">page size</option>
+        </select>
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="q-can">—</b><span>parameterisable?</span></div>
+      <div><b id="q-risk">—</b><span>risk if concatenated</span></div>
+    </div>
+    <div id="q-code"></div>
+    <div class="out" id="q-note"></div>
+  </div>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Identifiers cannot be parameters, and this is where injection survives</span>
+  <p>A placeholder stands in for a <em>value</em>. It cannot stand in for a table name, a column name, or the direction of a sort, because those are part of the query's structure and the statement must be parsed before values are bound. So dynamic sorting and dynamic table selection cannot be parameterised — and that is exactly where injection lives in codebases that otherwise use placeholders correctly. <b>The fix is an allowlist</b>: map the user's input to a fixed set of known-good identifiers in your code, and reject anything else. Never pass the string through, even quoted.</p>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">the allowlist pattern</span><button class="copy">Copy</button></div>
+<pre><code>SORTABLE = {
+    "date":     "o.placed_at",
+    "amount":   "o.amount",
+    "customer": "c.name",
+}
+DIRECTIONS = {"asc": "ASC", "desc": "DESC"}
+
+def list_orders(sort: str, direction: str, status: str, limit: int):
+    # Look up, never interpolate. An unknown key falls back to a default
+    # rather than reaching the database.
+    col = SORTABLE.get(sort, "o.placed_at")
+    dir_ = DIRECTIONS.get(direction, "DESC")
+    limit = min(max(int(limit), 1), 200)          # clamp, do not trust
+
+    sql = f"""
+        SELECT o.id, o.amount, c.name
+        FROM orders o JOIN customers c ON c.id = o.customer_id
+        WHERE o.status = %s
+        ORDER BY {col} {dir_}, o.id DESC
+        LIMIT {limit}
+    """
+    return cur.execute(sql, (status,))
+
+# The f-string is safe here ONLY because col, dir_ and limit can no longer be
+# arbitrary strings — they are dictionary values and a bounded integer. The
+# status value still goes through a placeholder, because it can be anything.
+#
+# Reviewing rule: an f-string in a query is not automatically wrong, but every
+# interpolated name must be traceable to a literal in your source.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Getting parameterisation right in practice</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Situation</th><th>Do</th></tr></thead>
+<tbody>
+<tr><td>A variable-length <code>IN</code> list</td><td><code>WHERE id = ANY(%s)</code> with an array parameter — one placeholder, any length</td></tr>
+<tr><td>A <code>LIKE</code> pattern</td><td>Parameterise the whole pattern: <code>LIKE %s</code> with <code>f"%{term}%"</code> built in code. Escape <code>%</code> and <code>_</code> in the term if they should be literal</td></tr>
+<tr><td>Optional filters</td><td>Build the <code>WHERE</code> from a list of clause fragments with their own placeholders — never by interpolating values</td></tr>
+<tr><td>Bulk insert</td><td><code>executemany</code>, or the driver's bulk helper. Still parameterised</td></tr>
+<tr><td>An ORM</td><td>Query builders parameterise by default. <b>Raw-SQL escape hatches do not</b> — audit every one</td></tr>
+<tr><td>Stored procedures</td><td>Not automatically safe. Dynamic SQL built inside one has the same problem</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">optional filters without string-building values</span><button class="copy">Copy</button></div>
+<pre><code>def search(status=None, min_amount=None, since=None):
+    clauses, params = ["1 = 1"], []
+
+    if status is not None:
+        clauses.append("status = %s");       params.append(status)
+    if min_amount is not None:
+        clauses.append("amount >= %s");      params.append(min_amount)
+    if since is not None:
+        clauses.append("placed_at >= %s");   params.append(since)
+
+    sql = "SELECT * FROM orders WHERE " + " AND ".join(clauses) + " ORDER BY id DESC"
+    return cur.execute(sql, params)
+
+# The query TEXT is assembled from literals in this file. Only values go into
+# params. That is the invariant to hold, and it is easy to check in review:
+# no variable ever appears inside the SQL string itself.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Least privilege</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the application should not own its schema</span><button class="copy">Copy</button></div>
+<pre><code>-- Most applications connect as the user that owns every table, which means a
+-- successful injection can DROP them. Separate the roles.
+
+CREATE ROLE app_owner NOLOGIN;                   -- owns the schema
+CREATE ROLE app_rw LOGIN PASSWORD '…';           -- what the application uses
+CREATE ROLE app_ro LOGIN PASSWORD '…';           -- reports, analytics, replicas
+
+ALTER SCHEMA public OWNER TO app_owner;
+
+GRANT USAGE ON SCHEMA public TO app_rw, app_ro;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_rw;
+GRANT SELECT                          ON ALL TABLES IN SCHEMA public TO app_ro;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO app_rw;
+
+-- Future tables too, or the next migration silently creates something the
+-- application cannot read.
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_rw;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public
+    GRANT SELECT ON TABLES TO app_ro;
+
+-- Revoke the default that surprises people: PUBLIC can create objects in the
+-- public schema on older Postgres versions.
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+
+-- Migrations run as app_owner, from CI, with credentials the application
+-- never has. Then no injection, however severe, can alter the schema.</code></pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Role</th><th>Gets</th><th>Used by</th></tr></thead>
+<tbody>
+<tr><td><b>Owner</b></td><td>DDL on its own objects</td><td>Migrations only, from CI</td></tr>
+<tr><td><b>Read-write</b></td><td>DML on specific tables</td><td>The application</td></tr>
+<tr><td><b>Read-only</b></td><td><code>SELECT</code></td><td>Reporting, BI tools, read replicas</td></tr>
+<tr><td><b>Restricted read</b></td><td><code>SELECT</code> on views that exclude sensitive columns</td><td>Analysts, third-party tools</td></tr>
+<tr><td><b>Superuser</b></td><td>Everything</td><td>Nobody, routinely. Break-glass with an audit trail</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>Row-level security</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">multi-tenancy the database enforces</span><button class="copy">Copy</button></div>
+<pre><code>-- The usual approach is "every query includes WHERE tenant_id = ?" — which
+-- holds until one query forgets, and then one customer sees another's data.
+-- RLS moves the rule below the application, where it cannot be forgotten.
+
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON orders
+    USING       (tenant_id = current_setting('app.tenant_id')::bigint)  -- reads
+    WITH CHECK  (tenant_id = current_setting('app.tenant_id')::bigint); -- writes
+
+-- Set the tenant per connection, per request, as a parameterised call:
+SET LOCAL app.tenant_id = '42';     -- LOCAL = resets at end of transaction
+
+-- Now every query on orders is filtered automatically. A query that forgets
+-- its tenant filter returns nothing rather than everything, which is the
+-- correct direction for that mistake to fail in.
+
+-- Two things to get right:
+--   * WITH CHECK as well as USING, or a tenant can INSERT rows attributed to
+--     another tenant even though they cannot read them
+--   * the table owner BYPASSES RLS by default. The application must connect
+--     as a role that is not the owner, or FORCE ROW LEVEL SECURITY
+ALTER TABLE orders FORCE ROW LEVEL SECURITY;</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">RLS with a connection pool needs care</span>
+  <p><code>SET LOCAL</code> is scoped to the transaction, which is what makes it safe with pooling — the setting cannot leak to the next request that borrows the connection. Plain <code>SET</code> persists for the session and <b>will</b> leak, giving one tenant another's context. If you use RLS behind PgBouncer in transaction mode, verify this explicitly with a test that runs two requests for different tenants through the same pooled connection. It is exactly the kind of bug that never appears in development, where the pool has one connection per request.</p>
+</div>
+
+<h2><span class="h-rule"></span>Sensitive data</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Data</th><th>Approach</th></tr></thead>
+<tbody>
+<tr><td><b>Passwords</b></td><td>Never stored. A slow one-way hash — argon2id, scrypt or bcrypt — computed in the application, never in SQL</td></tr>
+<tr><td><b>API keys and tokens</b></td><td>Store a hash; show the value once at creation. A stolen dump then yields nothing usable</td></tr>
+<tr><td><b>Card numbers</b></td><td>Do not store them. Use a payment provider's token</td></tr>
+<tr><td><b>Personal data</b></td><td>Column-level grants or a redacting view; encrypt at rest; know where it is</td></tr>
+<tr><td><b>Anything searchable but sensitive</b></td><td>A deterministic hash or a blind index for lookup, with the value encrypted alongside</td></tr>
+<tr><td><b>Audit logs</b></td><td>Append-only, on a separate schema, with no DELETE granted to the application</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">a redacting view, so analysts get data without identities</span><button class="copy">Copy</button></div>
+<pre><code>CREATE VIEW customers_safe
+WITH (security_barrier = true) AS      -- stops predicate pushdown leaking rows
+SELECT
+    id,
+    region,
+    created_at,
+    -- keep the shape, lose the identity
+    left(md5(email), 12)          AS email_hash,
+    substring(postcode from 1 for 3) AS postcode_area,
+    date_trunc('year', birth_date)   AS birth_year
+FROM customers;
+
+REVOKE ALL ON customers      FROM analyst;
+GRANT SELECT ON customers_safe TO analyst;
+
+-- The analyst can group, join and count. They cannot read an email address,
+-- and no query they write — however creative — can, because the grant does
+-- not exist. This is stronger than a policy document.
+--
+-- Postgres 15+ also has native dynamic masking via RLS column policies in
+-- some distributions; the view approach works everywhere.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Errors and logs leak too</span>
+  <p>A database error returned to the user reveals table names, column names and sometimes values — everything an attacker needs to make the next attempt more precise. Catch database exceptions at the boundary, log the detail with a correlation id, and return something generic. Separately: check that your query logs and your APM traces are not recording parameter values, or every password reset token and personal detail that passed through a query is now in a log aggregator with much weaker access control than the database.</p>
+</div>
+
+<h2><span class="h-rule"></span>The rest of the surface</h2>
+
+<ul class="check">
+  <li><b>TLS on every connection</b>, including inside the private network. <code>sslmode=verify-full</code>, not <code>require</code> — the weaker setting encrypts without authenticating the server.</li>
+  <li><b>No database on a public address.</b> Private networking or a bastion, and a firewall that defaults to deny.</li>
+  <li><b>Rotate credentials</b>, and prefer short-lived ones issued by a secrets manager or IAM.</li>
+  <li><b>Separate credentials per service</b>, so a compromise is scoped and an audit log identifies the source.</li>
+  <li><b>Encrypt backups</b>, and test restoring them. An untested backup is a hope.</li>
+  <li><b>Audit privileged access.</b> Who connected as an admin role, when, and what they ran.</li>
+  <li><b>Patch.</b> Database CVEs are less frequent than application ones and considerably more serious.</li>
+  <li><b>Statement timeouts</b> (chapter 10) also limit how much damage a hostile query can do.</li>
+</ul>
+
+<div class="note key">
+  <span class="note-t">Assume the application will be compromised</span>
+  <p>Every control after parameterisation exists for the case where something else failed — a dependency, a deserialisation bug, a leaked credential, an insider. The question to design against is not "can they inject SQL" but <b>"if they can run arbitrary queries as the application, what do they get?"</b> With an owner-level connection: everything, including the ability to destroy it. With a restricted role, RLS, hashed tokens and no card data, the same compromise yields a much smaller incident. That difference is the whole return on this chapter's second half.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Injection exists because <b>code and data share one channel</b>. Parameterisation separates them structurally.</li>
+    <li><b>Parameterisation eliminates the class; escaping only reduces it.</b> "We sanitise inputs" is not an answer.</li>
+    <li><b>Identifiers cannot be parameters</b> — sort columns, table names, directions. Use an allowlist that maps input to literals in your source.</li>
+    <li>The reviewable invariant: <b>no variable ever appears inside the SQL string itself</b>, only in the parameter list.</li>
+    <li><b>The application should not own its schema.</b> Migrations run as a separate role from CI.</li>
+    <li><b>RLS moves tenant isolation below the application</b>, so a forgotten filter returns nothing rather than everything. Use <code>SET LOCAL</code>, and <code>FORCE</code> it for the owner.</li>
+    <li>Hash tokens and passwords; <b>do not store card numbers</b>; give analysts a redacting view rather than a policy.</li>
+    <li>Design for the compromise: <b>"if they can run any query as the app, what do they get?"</b></li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("15-security.html");
+
+(function(){
+  const root = document.getElementById("inj");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const CASES = {
+    value: {
+      can: "yes", risk: "high",
+      code: 'cur.execute(\n    "SELECT * FROM users WHERE email = %s",\n    (user_input,)\n)',
+      note: "A value is exactly what a placeholder is for. The driver sends the statement and the parameter separately, so the input is never parsed as SQL — there is nothing to escape and nothing to get wrong.\n\nThis covers the large majority of user input in a typical application, which is why parameterisation gets you most of the way with almost no effort."
+    },
+    list: {
+      can: "yes", risk: "high",
+      code: '# One placeholder, any number of values.\ncur.execute(\n    "SELECT * FROM orders WHERE id = ANY(%s)",\n    (list_of_ids,)\n)\n\n# Avoid building "IN (" + ",".join(ids) + ")" — that is concatenation,\n# and it also produces a different query text for every list length,\n# so the plan cache never hits.',
+      note: "The variable-length IN list is where people reach for concatenation, because the number of placeholders seems to depend on the input. Passing an array to = ANY(%s) sidesteps that entirely: one placeholder regardless of length.\n\nThere is a performance argument too. Concatenating a list produces a distinct query string for each length, so the database re-plans every time and the prepared-statement cache is useless."
+    },
+    like: {
+      can: "yes", risk: "high",
+      code: '# Build the pattern in code, parameterise the whole thing.\npattern = f"%{term}%"\ncur.execute(\n    "SELECT * FROM products WHERE name ILIKE %s",\n    (pattern,)\n)\n\n# If % and _ in the user\'s term should be literal characters:\nterm = term.replace("\\\\", "\\\\\\\\").replace("%", "\\\\%").replace("_", "\\\\_")',
+      note: "The wildcards go in the Python string, not in the SQL. The whole pattern is then one parameter.\n\nThe second part is a different concern from injection: % and _ are LIKE metacharacters, so a user searching for \"50%\" gets a wildcard rather than a literal. Escaping them is about correct results, not security — but it is easy to conflate the two and skip both."
+    },
+    column: {
+      can: "NO", risk: "critical",
+      code: '# CANNOT be a parameter — the column name is part of the query structure.\nSORTABLE = {\n    "date":     "o.placed_at",\n    "amount":   "o.amount",\n    "customer": "c.name",\n}\ncol = SORTABLE.get(user_input, "o.placed_at")   # allowlist, with a default\nsql = f"SELECT … ORDER BY {col} DESC"',
+      note: "This is where injection survives in codebases that use placeholders everywhere else. A placeholder stands in for a value, and the statement must be parsed before values are bound — so a column name cannot be one.\n\nThe fix is a lookup table. Note what makes it safe: col is a value from a dictionary defined in your source, so after the .get() it can only be one of three literal strings. The f-string is fine because there is no longer any user-controlled text in it.\n\nQuoting the identifier instead is not a substitute. Reach for the allowlist every time."
+    },
+    dir: {
+      can: "NO", risk: "critical",
+      code: 'DIRECTIONS = {"asc": "ASC", "desc": "DESC"}\ndir_ = DIRECTIONS.get(user_input, "DESC")\nsql = f"SELECT … ORDER BY {col} {dir_}"',
+      note: "Same category as a column name, and even easier to get wrong because \"it's only asc or desc\" feels harmless. It is a fragment of query text, and anything appended after ORDER BY is parsed as SQL.\n\nA two-entry dictionary with a default settles it permanently."
+    },
+    table: {
+      can: "NO", risk: "critical",
+      code: '# Almost always a design smell. If you genuinely need it:\nALLOWED_TABLES = {"orders", "invoices", "shipments"}\nif user_input not in ALLOWED_TABLES:\n    raise ValueError("unknown table")\nsql = f"SELECT count(*) FROM {user_input}"',
+      note: "Also not parameterisable, and worth pausing on before you implement it at all. User-selectable table names usually indicate a modelling problem — several tables that should be one table with a type column, or an API that is exposing internals.\n\nWhere it is genuinely required, membership in a set defined in code is the only acceptable check. Never a regex, never quoting, never \"it looks like an identifier\"."
+    },
+    limit: {
+      can: "sometimes", risk: "medium",
+      code: '# Most drivers accept a parameter here:\ncur.execute("SELECT … LIMIT %s", (limit,))\n\n# Either way, clamp it. An unbounded LIMIT is a denial-of-service vector\n# even with no injection at all.\nlimit = min(max(int(user_input), 1), 200)',
+      note: "LIMIT can usually be parameterised, though support varies by driver and engine — this is one of the places where dialects differ.\n\nThe more interesting risk here is not injection. A user passing limit=10000000 makes the database produce ten million rows, and does so with a perfectly well-formed parameterised query. Clamping to a sane maximum is the actual control, and it belongs on every paginated endpoint whether or not the value is parameterised."
+    }
+  };
+
+  function render(){
+    const c = CASES[$("q-part").value];
+    $("q-can").textContent  = c.can;
+    $("q-risk").textContent = c.risk;
+
+    const esc = s => s.replace(/[<>&]/g, ch => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[ch]));
+    const col = c.can === "yes" ? "#3FB984" : c.can === "NO" ? "#E2574C" : "#F2A03D";
+    $("q-code").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid ' + col +
+      ';border-radius:5px;padding:11px 13px;margin:14px 0 12px;font-family:var(--mono);' +
+      'font-size:12px;line-height:1.6;overflow-x:auto">' + esc(c.code) + '</pre>';
+
+    $("q-note").textContent = c.note;
+  }
+
+  $("q-part").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

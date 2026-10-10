@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Vector and semantic search — Elasticsearch</title>
+<meta name="description" content="kNN, dense and sparse vectors, hybrid retrieval with RRF, and an honest assessment of when embeddings beat a well-tuned BM25.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 13 · Analytics</div>
+    <h1>Vector and semantic search</h1>
+    <p class="standfirst">BM25 matches words. Embeddings match meaning. Neither is strictly better, they fail in different directions, and the interesting result of the last few years is that combining them beats either — which is why hybrid retrieval, not vector search, is the thing to build.</p>
+    <div class="chap-meta">
+      <span class="tagpill">knn</span>
+      <span class="tagpill">hnsw</span>
+      <span class="tagpill">elser</span>
+      <span class="tagpill">hybrid</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Where each one fails</h2>
+
+<div class="demo" id="hy">
+  <div class="demo-head">
+    <b>Lexical, semantic, and both</b>
+    <span>Five queries against the same small corpus. The failures are the informative part.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="h-q">Query</label>
+        <select id="h-q">
+          <option value="0" selected>"laptop bag"</option>
+          <option value="1">"something to carry my computer"</option>
+          <option value="2">"WH-1000XM5"</option>
+          <option value="3">"noise cancelling"</option>
+          <option value="4">"gift for a runner"</option>
+        </select>
+      </div>
+      <div>
+        <label for="h-mode">Retrieval</label>
+        <select id="h-mode">
+          <option value="bm25" selected>BM25 only</option>
+          <option value="knn">kNN only</option>
+          <option value="rrf">Hybrid, RRF</option>
+        </select>
+      </div>
+    </div>
+    <div id="h-list"></div>
+    <div class="stat">
+      <div><b id="h-top">—</b><span>top result</span></div>
+      <div><b id="h-good">—</b><span>relevant in top 3</span></div>
+      <div><b id="h-verdict">—</b><span>verdict</span></div>
+    </div>
+    <div class="out" id="h-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">The two failure modes are complementary, which is the whole argument</span>
+  <p><b>BM25 fails on vocabulary mismatch.</b> A query using different words from the document finds nothing, because there is no shared term to match — "something to carry my computer" against a document that says "laptop bag" scores zero. <b>Embeddings fail on exact tokens.</b> A part number, a SKU, a proper noun or a rare technical term gets embedded into roughly the same region as similar-looking strings, so a search for <code>WH-1000XM5</code> returns plausible-looking wrong products. Since the failures do not overlap, combining the two rankings recovers most of both — and that is a stronger and more reliable result than either method tuned in isolation.</p>
+</div>
+
+<h2><span class="h-rule"></span>Dense vectors and kNN</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the mapping and the query</span><button class="copy">Copy</button></div>
+<pre><code>PUT /products
+{ "mappings": { "properties": {
+    "name": { "type": "text" },
+    "name_vector": {
+      "type": "dense_vector",
+      "dims": 384,                       # must match your model exactly
+      "index": true,                     # build an HNSW graph for fast ANN
+      "similarity": "cosine",            # cosine | dot_product | l2_norm |
+                                         # max_inner_product
+      "index_options": {
+        "type": "int8_hnsw",             # quantisation — see below
+        "m": 16,                         # graph connections per node
+        "ef_construction": 100           # build-time search breadth
+      }
+    }
+}}}
+
+# APPROXIMATE kNN — uses the HNSW graph. This is what you want.
+GET /products/_search
+{ "knn": {
+    "field": "name_vector",
+    "query_vector": [0.12, -0.03, ...],
+    "k": 10,                             # results to return
+    "num_candidates": 100,               # per shard. Higher = better recall,
+                                         # slower. 100 is a reasonable start
+    "filter": { "term": { "in_stock": true } }
+}}
+
+# EXACT kNN — brute force over every vector, via a script_score query
+{ "query": { "script_score": {
+    "query": { "term": { "category": "audio" } },
+    "script": { "source": "cosineSimilarity(params.qv, 'name_vector') + 1.0",
+                "params": { "qv": [ ... ] } } }}}
+# Exact and O(documents). Fine over a few thousand pre-filtered candidates,
+# hopeless over millions.
+
+# THE FILTER IS PRE-FILTERED, and this matters. Elasticsearch applies the
+# filter DURING the graph traversal rather than after it, so a restrictive
+# filter still returns k results. Systems that post-filter return fewer than
+# k — sometimes zero — when the filter is selective, which is a common and
+# nasty surprise in other vector stores.
+#
+# The caveat: a very restrictive filter degrades the graph search toward
+# brute force, because the traversal keeps hitting excluded nodes. Elastic-
+# search will fall back to exact search when the filtered set is small
+# enough, which is the right behaviour.</code></pre>
+</div>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">what HNSW costs, and quantisation</span><button class="copy">Copy</button></div>
+<pre><code>HNSW is a layered proximity graph. Search starts at a sparse top layer,
+descends greedily toward the query point, and refines at the bottom. That
+gives you logarithmic-ish search instead of linear — and it requires the
+graph to be resident in memory to be fast.
+
+  THE MEMORY ARITHMETIC, which is the thing to plan around:
+
+    raw float32 vectors:  dims × 4 bytes × documents
+    plus the graph:       roughly dims × 4 × m × 2 (small by comparison)
+
+    1 million docs × 384 dims × 4 bytes  ≈  1.5 GB
+    10 million   × 768 dims × 4 bytes    ≈  30 GB
+
+  And that wants to be in the page cache OR the JVM heap depending on
+  version and configuration — either way it is real memory that competes
+  with everything else on the node.
+
+QUANTISATION is the answer, and it is unusually effective:
+
+  int8_hnsw    4× smaller. Recall loss is typically small enough to be
+               invisible after rescoring. THE SENSIBLE DEFAULT, and it
+               became the default for float vectors in recent versions
+  int4_hnsw    8× smaller. More loss, still often acceptable
+  bbq_hnsw     Better Binary Quantisation — ~32× smaller. Available in
+               newer 8.x/9.x versions. Needs oversampling and rescoring to
+               recover recall, and the trade is often excellent
+  flat / *_flat  no graph. Exact brute force, for small collections
+
+  Quantised vectors are searched approximately and then RESCORED against
+  higher-fidelity values for the top candidates, which is how the recall
+  loss is largely recovered. Check the exact options and defaults for your
+  version — this area has moved quickly.
+
+TWO OTHER COSTS worth knowing:
+  * indexing is slower. Building graph connections is real work
+  * MERGING is much slower, because segments' graphs must be rebuilt rather
+    than concatenated. A vector index does noticeably more background I/O
+    than an equivalent text index (chapter 14)</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Hybrid retrieval</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">RRF, via the retrievers API</span><button class="copy">Copy</button></div>
+<pre><code>GET /products/_search
+{
+  "retriever": {
+    "rrf": {
+      "retrievers": [
+        { "standard": {                        # the lexical side
+            "query": { "multi_match": {
+                "query": "wireless noise cancelling",
+                "fields": [ "name^2", "description" ] } } } },
+        { "knn": {                             # the semantic side
+            "field": "description_vector",
+            "query_vector_builder": {
+              "text_embedding": {
+                "model_id": "sentence-transformers__all-minilm-l6-v2",
+                "model_text": "wireless noise cancelling" } },
+            "k": 50, "num_candidates": 200 } }
+      ],
+      "rank_window_size": 50,
+      "rank_constant": 20
+    }
+  },
+  "size": 10
+}
+
+# RECIPROCAL RANK FUSION combines rankings by POSITION, not by score:
+#
+#     rrf_score(d) = Σ over retrievers  1 / (rank_constant + rank(d))
+#
+# That is the key property. BM25 scores are unbounded and corpus-dependent;
+# cosine similarities live in [-1, 1]. There is no principled way to add
+# them, and normalising them requires knowing the distributions. RRF sidesteps
+# the problem entirely by throwing the scores away and keeping only the order.
+#
+# A document ranked 1st and 5th beats one ranked 3rd and 3rd — appearing
+# near the top of EITHER list counts for a lot, which is exactly the
+# behaviour you want given the complementary failure modes.
+#
+# rank_constant dampens the contribution of top ranks. Higher values flatten
+# the curve so lower-ranked results matter more. 20 is the usual default and
+# 60 appears in the original paper; it is worth trying both.
+
+# THE RETRIEVERS API also composes other stages:
+#   standard    a normal query
+#   knn         vector search
+#   rrf         fusion
+#   text_similarity_reranker   a cross-encoder or reranking service over the
+#                              top N — a second-stage reranker, which is
+#                              usually the largest single quality win after
+#                              hybrid itself
+#   rule        pinned or excluded documents, for merchandising
+
+# The retrievers API arrived in 8.14 and has been evolving since. Check what
+# your version supports before designing around a particular stage.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>The three ways to get embeddings</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Approach</th><th>How</th><th>Trade</th></tr></thead>
+<tbody>
+<tr><td><b><code>semantic_text</code></b></td><td>One field type. Chunking, inference and querying all handled</td><td>Least control, least work. <b>Start here</b></td></tr>
+<tr><td><b>ELSER / sparse vectors</b></td><td>Elastic's learned sparse model, expanded into weighted terms</td><td>No embedding model to run; strong out of the box; licence-gated</td></tr>
+<tr><td><b>Your own model</b></td><td>Embed externally or via an inference endpoint, write the vector</td><td>Full control, and you own the versioning problem</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">semantic_text, which removes most of the work</span><button class="copy">Copy</button></div>
+<pre><code># 1. An inference endpoint — Elastic's own model, or a third party
+PUT /_inference/sparse_embedding/my-elser
+{ "service": "elasticsearch",
+  "service_settings": { "num_allocations": 1, "num_threads": 1,
+                        "model_id": ".elser_model_2" } }
+
+# 2. A semantic_text field
+PUT /articles
+{ "mappings": { "properties": {
+    "body": { "type": "text" },
+    "body_semantic": { "type": "semantic_text", "inference_id": "my-elser" }
+}}}
+
+# 3. Index normally. Chunking and inference happen automatically.
+PUT /articles/_doc/1
+{ "body": "...", "body_semantic": "..." }
+
+# 4. Query with natural language
+GET /articles/_search
+{ "query": { "semantic": { "field": "body_semantic",
+                           "query": "how do distributed systems agree" } } }
+
+# WHAT IT HANDLES FOR YOU: chunking long text into passages, running
+# inference at index time and query time, storing the vectors, and matching
+# at the chunk level while returning whole documents.
+#
+# Chunking is the part people underestimate. An embedding of a 5,000-word
+# document is a vector representing the average of everything in it, which
+# is close to useless — the signal is diluted to nothing. Passage-level
+# chunking with overlap is what makes semantic search over long documents
+# work at all, and getting it right by hand is fiddly.
+
+# ELSER SPARSE VECTORS, if you want the model without semantic_text:
+PUT /articles { "mappings": { "properties": {
+    "body_expanded": { "type": "sparse_vector" } }}}
+# ELSER expands text into weighted TERMS rather than a dense vector, so
+# matching uses the inverted index. That means it works with the existing
+# machinery, it is interpretable — you can see which terms it added — and it
+# does not need an HNSW graph in memory. The cost is longer posting lists
+# and slower queries than dense kNN, plus the licence tier.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">The model is now part of your index format</span>
+  <p>An embedding is only comparable with embeddings from the same model. Change the model — a new version, a different provider, a switch from 384 to 768 dimensions — and <b>every vector in the index is invalid and must be regenerated</b>. That is a full reindex plus the inference cost of re-embedding your entire corpus, which for millions of documents is a real bill and a real amount of time. Two habits make it survivable: <b>record the model id and version in the index name or metadata</b>, so you always know what generated what, and <b>read and write through an alias</b> (chapter 4) so the swap to a re-embedded index is atomic. This is the operational cost that separates a semantic search demo from a semantic search system, and it is rarely mentioned in the demo.</p>
+</div>
+
+<h2><span class="h-rule"></span>Is it worth it</h2>
+
+<div class="cols">
+  <div class="col good">
+    <h4>Semantic earns its place</h4>
+    <ul>
+      <li><b>Question-shaped queries</b> — "how do I cancel my order" against documentation that never uses those words</li>
+      <li><b>RAG retrieval</b>, where the query is a user's sentence rather than keywords</li>
+      <li><b>Vocabulary gaps</b> between how you write and how users search</li>
+      <li><b>Multilingual</b>, with a multilingual model — genuinely hard to do lexically</li>
+      <li><b>Images, audio, recommendations</b> — anywhere there are no words to match</li>
+      <li><b>Long-tail queries</b> nobody wrote a synonym rule for</li>
+    </ul>
+  </div>
+  <div class="col bad">
+    <h4>BM25 is still better, or enough</h4>
+    <ul>
+      <li><b>Identifiers</b> — SKUs, part numbers, error codes, names</li>
+      <li><b>Keyword search</b> where users already type the domain's vocabulary</li>
+      <li><b>Filtered navigation</b>, which is filters and facets, not retrieval</li>
+      <li><b>When the corpus is small</b> — a good analyzer and synonyms will beat a mediocre embedding setup</li>
+      <li><b>When you have not tuned BM25 yet</b> — see below</li>
+      <li><b>When latency and memory are tight</b>; kNN costs both</li>
+    </ul>
+  </div>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Tune BM25 before you reach for vectors</span>
+  <p>The commonest sequence is: search quality is poor, vector search is the current answer to poor search quality, so vectors get added — and the result is a system that is more expensive, slower, harder to operate and only slightly better. Meanwhile the lexical side still has no synonyms, the wrong analyzer for the content's language, no field boosts, <code>minimum_should_match</code> untouched, and identifiers indexed as <code>text</code>. <b>Those fixes are hours of work with no ongoing cost, and they frequently close most of the gap</b> (chapters 3, 8 and 10). Build a <code>rank_eval</code> set first so you can measure what each change is worth. Then add hybrid retrieval, which is a genuine improvement — and you will be able to prove it rather than hope.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>BM25 fails on vocabulary mismatch; embeddings fail on exact tokens.</b> The failures are complementary, which is why hybrid works.</li>
+    <li><b>Approximate kNN over an HNSW graph</b> is the practical form. Exact kNN is for small pre-filtered candidate sets.</li>
+    <li><b>Filters are applied during traversal</b>, so you still get <code>k</code> results — unlike post-filtering systems.</li>
+    <li><b>Vectors are a memory-planning problem.</b> Quantisation is unusually effective; <code>int8</code> is the sensible default.</li>
+    <li><b>RRF fuses by rank, not score</b>, because BM25 scores and cosine similarities are not on comparable scales.</li>
+    <li><b><code>semantic_text</code> handles chunking</b>, which is the part people underestimate — embedding a whole long document dilutes the signal to nothing.</li>
+    <li><b>The model becomes part of your index format.</b> Changing it means re-embedding everything.</li>
+    <li><b>Tune BM25 first.</b> Synonyms, the right analyzer and field boosts are free and often close most of the gap.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("13-vector-search.html");
+
+(function(){
+  const root = document.getElementById("hy");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const DOCS = [
+    {id:"D1", t:"Leather laptop bag, 15 inch"},
+    {id:"D2", t:"Padded sleeve for notebooks and tablets"},
+    {id:"D3", t:"Sony WH-1000XM5 noise cancelling headphones"},
+    {id:"D4", t:"Bose QuietComfort over-ear headphones"},
+    {id:"D5", t:"Running shoes, road, neutral"},
+    {id:"D6", t:"Sports water bottle, 750ml"}
+  ];
+
+  // per query: bm25 ranking (by shared terms), knn ranking (by meaning), and truth
+  const QUERIES = [
+    { q:"laptop bag",
+      bm25:["D1","D2"], knn:["D1","D2","D6"], relevant:["D1","D2"],
+      lex:"strong", sem:"strong",
+      note:"Both work. The query uses the exact words the document uses, so BM25 finds D1 immediately, and the meaning is unambiguous so the embedding finds it too.\n\nThis is the majority of queries in most systems, and it is why the honest answer to \"do I need vector search\" is often \"not for most of your traffic\". The interesting cases are the other four." },
+    { q:"something to carry my computer",
+      bm25:[], knn:["D2","D1"], relevant:["D1","D2"],
+      lex:"fails", sem:"strong",
+      note:"BM25 returns NOTHING. Not a poor ranking — zero results.\n\nThe query shares no terms with either document: \"carry\" is not \"bag\" or \"sleeve\", and \"computer\" is not \"laptop\" or \"notebook\". With no shared term there is no posting list to intersect, so the inverted index has nothing to offer (chapter 1).\n\nThis is vocabulary mismatch, and it is the failure mode embeddings exist to solve. The vector for this sentence lands near the vectors for both products because they mean similar things, regardless of which words were used.\n\nThe lexical mitigations are real but partial: synonyms for computer/laptop/notebook, and stemming. They require you to have anticipated the vocabulary, which is exactly what you cannot do for the long tail." },
+    { q:"WH-1000XM5",
+      bm25:["D3"], knn:["D4","D3"], relevant:["D3"],
+      lex:"strong", sem:"fails",
+      note:"The mirror image, and the one people do not expect.\n\nBM25 nails it: the term WH-1000XM5 appears in exactly one document, so IDF is enormous and the match is decisive (chapter 10). This is what a rare exact token does in an inverted index.\n\nThe embedding gets it WRONG — it ranks the Bose above the Sony. A model has no reason to encode a specific alphanumeric part number distinctly; it embeds it as \"something like a headphone model number\", which puts it in the same region as every other headphone. So it returns plausible, similar, wrong products.\n\nThis is why a pure vector search over a product catalogue is a bad idea. Users paste part numbers, SKUs, error codes and ISBNs, and those are precisely the queries where BM25 is unbeatable and embeddings are actively misleading." },
+    { q:"noise cancelling",
+      bm25:["D3","D4"], knn:["D4","D3"], relevant:["D3","D4"],
+      lex:"strong", sem:"strong",
+      note:"Both find both relevant documents, in different orders.\n\nBM25 puts D3 first because it contains the literal phrase. The embedding puts D4 first because \"QuietComfort\" is semantically about noise cancellation even though it never says so — which is a genuinely impressive piece of matching that no synonym list would have covered.\n\nSo here the two methods are not competing, they are contributing different information. D4 deserves to be found for this query and only the semantic side knows why. That is the case for hybrid even when neither method outright fails." },
+    { q:"gift for a runner",
+      bm25:[], knn:["D5","D6"], relevant:["D5","D6"],
+      lex:"fails", sem:"strong",
+      note:"BM25 returns nothing again. \"Gift\" appears nowhere, and \"runner\" does not match \"running\" unless you have stemming configured — which is one of the free lexical fixes worth doing before anything else (chapter 3).\n\nEven with stemming it would find only the shoes. The water bottle is relevant to \"gift for a runner\" for reasons that exist entirely in the world rather than in the text, and no analyzer chain gets you there.\n\nThis is the strongest case for semantic retrieval: queries expressing intent rather than vocabulary. It is also the case where evaluating quality is hardest, because whether the water bottle SHOULD rank second is a product judgement, not a retrieval fact." }
+  ];
+
+  function rrf(a, b, k){
+    const s = {};
+    a.forEach((d, i) => s[d] = (s[d] || 0) + 1 / (k + i + 1));
+    b.forEach((d, i) => s[d] = (s[d] || 0) + 1 / (k + i + 1));
+    return Object.keys(s).sort((x, y) => s[y] - s[x]);
+  }
+
+  function render(){
+    const qi = parseInt($("h-q").value, 10);
+    const Q = QUERIES[qi];
+    const mode = $("h-mode").value;
+
+    let ranking;
+    if(mode === "bm25")      ranking = Q.bm25;
+    else if(mode === "knn")  ranking = Q.knn;
+    else                     ranking = rrf(Q.bm25, Q.knn, 20);
+
+    const top3 = ranking.slice(0, 3);
+    const good = top3.filter(d => Q.relevant.includes(d)).length;
+
+    $("h-top").textContent  = ranking.length ? ranking[0] : "no results";
+    $("h-good").textContent = good + " of " + Math.min(3, Q.relevant.length);
+
+    let verdict, vcol;
+    if(ranking.length === 0){ verdict = "total failure"; vcol = "#E2574C"; }
+    else if(!Q.relevant.includes(ranking[0])){ verdict = "wrong top hit"; vcol = "#E2574C"; }
+    else if(good === Math.min(3, Q.relevant.length)){ verdict = "good"; vcol = "#3FB984"; }
+    else { verdict = "partial"; vcol = "#F2A03D"; }
+    $("h-verdict").textContent = verdict;
+    $("h-verdict").style.color = vcol;
+
+    $("h-list").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin:16px 0 8px">' + mode.toUpperCase() +
+      ' results for &quot;' + Q.q + '&quot;</div>' +
+      (ranking.length === 0
+        ? '<div style="background:#FBEDEC;border:1px solid #E2574C;border-radius:5px;padding:14px;' +
+          'text-align:center;font-family:var(--mono);font-size:12px;color:#A8382F">' +
+          '"hits": { "total": { "value": 0 }, "hits": [] }</div>'
+        : ranking.map((id, i) => {
+            const d = DOCS.find(x => x.id === id);
+            const rel = Q.relevant.includes(id);
+            return '<div style="display:flex;gap:12px;align-items:center;background:' +
+              (rel ? "#E6F6F8" : "#FBEDEC") + ';border:1px solid ' + (rel ? "#25B7C4" : "#E2574C") +
+              ';border-radius:4px;padding:8px 12px;margin-bottom:4px">' +
+              '<span style="font-family:var(--mono);font-size:11px;font-weight:700;color:' +
+              (rel ? "#0F7A85" : "#A8382F") + ';min-width:18px">' + (i+1) + '</span>' +
+              '<span style="font-size:13px;color:#25323E">' + d.t + '</span>' +
+              '<span style="margin-left:auto;font-size:10.5px;font-weight:700;letter-spacing:.05em;' +
+              'text-transform:uppercase;color:' + (rel ? "#3FB984" : "#E2574C") + '">' +
+              (rel ? "relevant" : "not relevant") + '</span></div>';
+          }).join("")) +
+      '<div style="display:flex;gap:16px;margin-top:10px;font-size:11.5px;color:#54677A">' +
+      '<span>BM25: <b style="color:' + (Q.lex === "fails" ? "#E2574C" : "#3FB984") + '">' +
+      Q.lex + '</b></span>' +
+      '<span>semantic: <b style="color:' + (Q.sem === "fails" ? "#E2574C" : "#3FB984") + '">' +
+      Q.sem + '</b></span></div>';
+
+    const notes = [Q.note];
+
+    if(mode === "rrf"){
+      const parts = [];
+      if(Q.bm25.length) parts.push("BM25 contributed [" + Q.bm25.join(", ") + "]");
+      else parts.push("BM25 contributed nothing");
+      parts.push("kNN contributed [" + Q.knn.join(", ") + "]");
+      notes.push("RRF fused the two rankings by POSITION rather than by score. " + parts.join(" and ") +
+        ", giving [" + ranking.join(", ") + "].\n\nThe formula is 1/(k + rank) summed across retrievers, with k defaulting to 20. Note what that means: the scores are discarded entirely. BM25 scores are unbounded and corpus-dependent; cosine similarities sit in [-1, 1]. There is no principled way to add them and normalising requires knowing both distributions, so RRF sidesteps the problem by keeping only the order.\n\nThe practical consequence is that appearing near the top of EITHER list counts for a lot — which is exactly right when the two methods fail in different directions.");
+      if(Q.lex === "fails")
+        notes.push("Here the fusion is doing the whole job: the lexical retriever returned nothing, so the result is the semantic ranking. Hybrid degrades gracefully to whichever side has something to say, which is a useful property — you are not averaging in a zero, you are ignoring an empty list.");
+      else if(Q.sem === "fails")
+        notes.push("And here fusion rescues the semantic failure. The embedding ranked the wrong product first, but BM25 ranked the right one first with an enormous IDF, so the correct document appears in both lists — once at rank 1 — and wins the fusion.\n\nThat is the case worth remembering when someone proposes replacing lexical search with vectors rather than combining them.");
+      notes.push("The next improvement after hybrid, and usually the largest single one, is a second-stage RERANKER: take the top 50 fused candidates and score them with a cross-encoder that reads the query and document together rather than comparing two independently-computed vectors. The retrievers API exposes this as text_similarity_reranker.\n\nIt is expensive per document and cheap over 50, which is the same argument as rescore in chapter 10 — do the costly thing to a small candidate set rather than the whole index.");
+    }
+
+    if(mode === "bm25" && Q.lex === "fails")
+      notes.push("Before concluding that this requires embeddings, note the free fixes. Stemming would connect \"runner\" to \"running\". A synonym set would connect \"computer\" to \"laptop\" and \"notebook\". The right language analyzer matters if the content is not English (chapter 3).\n\nThose take hours, cost nothing at query time, and often close most of the gap. The reason they are not a complete answer is the long tail: you cannot write synonym rules for queries nobody has asked yet, and \"gift for a runner\" is not a vocabulary problem at all.\n\nSo the honest position is that lexical tuning is the first move and hybrid retrieval is the second — not that one replaces the other.");
+
+    if(mode === "knn" && Q.sem === "fails")
+      notes.push("This is the failure that gets underweighted in vector-search discussions, because demos use natural-language queries where embeddings shine.\n\nReal traffic contains part numbers, SKUs, error codes, ISBNs, invoice references and proper nouns — and for every one of those, an embedding is a liability rather than an asset. It returns confident, similar, wrong answers, which is worse than returning nothing because nobody notices.\n\nA product search that is pure kNN will fail its most commercially valuable queries, which are the ones where the user already knows exactly what they want.");
+
+    $("h-note").textContent = notes.join("\n\n");
+  }
+
+  ["h-q","h-mode"].forEach(id => $(id).addEventListener("change", render));
+  render();
+})();
+</script>
+</body>
+</html>

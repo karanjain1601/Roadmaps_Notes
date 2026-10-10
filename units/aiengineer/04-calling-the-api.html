@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Talking to a model in code — AI Engineer</title>
+<meta name="description" content="Message roles, the chat completions shape, streaming, retries, timeouts, conversation state and a provider-agnostic client worth keeping.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 04 · Working with models</div>
+    <h1>Talking to a model in code</h1>
+    <p class="standfirst">The request itself is ten lines. The other ninety are conversation state, streaming, timeouts, retries, finish reasons and the seam that stops you rewriting everything when you change provider. Those ninety are the chapter.</p>
+    <div class="chap-meta">
+      <span class="tagpill">message roles</span>
+      <span class="tagpill">streaming</span>
+      <span class="tagpill">retries</span>
+      <span class="tagpill">finish reasons</span>
+      <span class="tagpill">conversation state</span>
+      <span class="tagpill">provider seam</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The request shape</h2>
+
+<p>Every text model API is the same idea with different spelling: a list of messages, each with a role, plus generation settings. The provider returns a message from the assistant, a reason it stopped, and a token usage record.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">python — the whole idea, once</span><button class="copy">Copy</button></div>
+<pre><code>response = client.chat.completions.create(
+    model="provider/workhorse-v2-2026-05-20",
+    messages=[
+        {"role": "system", "content": "You classify support tickets. Reply with one word."},
+        {"role": "user",   "content": "My card was charged twice for the same order."},
+    ],
+    temperature=0,
+    max_tokens=8,
+)
+
+print(response.choices[0].message.content)   # "billing"
+print(response.choices[0].finish_reason)     # "stop"
+print(response.usage.prompt_tokens,          # 34
+      response.usage.completion_tokens)      # 2</code></pre>
+</div>
+
+<h3>The roles, and what each is for</h3>
+
+<div class="tw">
+<table>
+<thead><tr><th>Role</th><th>Contains</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><b>system</b> (sometimes <code>developer</code>)</td><td>Instructions, persona, rules, output contract, static reference material</td><td>Highest-priority text in the request. Anthropic passes it as a separate top-level parameter rather than a message. Keep it stable — a stable prefix is what prompt caching keys on.</td></tr>
+<tr><td><b>user</b></td><td>The end user's input, plus anything you retrieved on their behalf</td><td>Treat everything here as untrusted, including retrieved documents (chapter 17).</td></tr>
+<tr><td><b>assistant</b></td><td>What the model said previously, and any tool calls it requested</td><td>You can also write these yourself to prefill a response or to demonstrate desired behaviour.</td></tr>
+<tr><td><b>tool</b> (or <code>function</code>)</td><td>The result of a function the model asked you to run</td><td>Must reference the call id the model issued. Chapter 7.</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Modern APIs allow a message's content to be a list of typed blocks rather than a plain string — text, image, document, tool use, tool result, and sometimes a thinking block. This is how multimodal input arrives (chapter 16) and how tool calls come back (chapter 7).</p>
+
+<div class="code" data-lang="json">
+<div class="code-head"><span class="lang">a content-block message</span><button class="copy">Copy</button></div>
+<pre><code>{
+  "role": "user",
+  "content": [
+    { "type": "text",  "text": "Which line item is wrong on this invoice?" },
+    { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "iVBORw0..." } }
+  ]
+}</code></pre>
+</div>
+
+<h3>Where the providers differ</h3>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th>OpenAI-style</th><th>Anthropic</th><th>Google Gemini</th></tr></thead>
+<tbody>
+<tr><td>Endpoint concept</td><td><code>chat.completions</code> / responses API</td><td><code>messages</code></td><td><code>generateContent</code></td></tr>
+<tr><td>System prompt</td><td>A message with role <code>system</code></td><td>Top-level <code>system</code> parameter</td><td><code>systemInstruction</code> field</td></tr>
+<tr><td>Message list</td><td><code>messages</code></td><td><code>messages</code></td><td><code>contents</code>, with <code>parts</code></td></tr>
+<tr><td>Assistant role name</td><td><code>assistant</code></td><td><code>assistant</code></td><td><code>model</code></td></tr>
+<tr><td>Output limit</td><td><code>max_tokens</code> / <code>max_output_tokens</code></td><td><code>max_tokens</code> (required)</td><td><code>maxOutputTokens</code></td></tr>
+<tr><td>Stop reason field</td><td><code>finish_reason</code></td><td><code>stop_reason</code></td><td><code>finishReason</code></td></tr>
+<tr><td>Usage field</td><td><code>usage.prompt_tokens</code></td><td><code>usage.input_tokens</code></td><td><code>usageMetadata</code></td></tr>
+</tbody>
+</table>
+<caption>Many third-party hosts expose an OpenAI-compatible endpoint, which is why that shape has become the lingua franca. Compatibility is usually partial — check tools, streaming and structured output specifically.</caption>
+</div>
+
+<h2><span class="h-rule"></span>Conversation state is yours</h2>
+
+<p>The API is stateless. A conversation exists because you store the messages and re-send them. That means three decisions are yours: where history lives, what you trim, and what you never send again.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">conversation.py — history with a token budget</span><button class="copy">Copy</button></div>
+<pre><code>from dataclasses import dataclass, field
+
+@dataclass
+class Conversation:
+    system: str
+    messages: list = field(default_factory=list)
+    max_history_tokens: int = 12_000
+
+    def add(self, role: str, content: str):
+        self.messages.append({"role": role, "content": content})
+
+    def build(self, counter) -> list:
+        """Newest-first walk, keeping whole turns, until the budget is spent."""
+        kept, used = [], 0
+        for m in reversed(self.messages):
+            cost = counter(m["content"])
+            if used + cost > self.max_history_tokens:
+                break
+            kept.append(m)
+            used += cost
+        kept.reverse()
+
+        # Never drop the first user turn: it usually contains the actual task.
+        if self.messages and kept and kept[0] is not self.messages[0]:
+            first = self.messages[0]
+            if first["role"] == "user":
+                kept.insert(0, first)
+
+        return [{"role": "system", "content": self.system}] + kept</code></pre>
+</div>
+
+<p>Three strategies for long conversations, in increasing order of effort:</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Strategy</th><th>How</th><th>Cost</th><th>Loses</th></tr></thead>
+<tbody>
+<tr><td><b>Sliding window</b></td><td>Keep the last N turns</td><td>Free</td><td>Anything established early — the user's name, the constraint they gave in turn two</td></tr>
+<tr><td><b>Window plus pinned facts</b></td><td>Keep last N turns and a small structured summary you maintain (order id, chosen plan, language)</td><td>One cheap extraction call per few turns</td><td>Nuance, but rarely anything that matters</td></tr>
+<tr><td><b>Rolling summary</b></td><td>When history exceeds a threshold, summarise the oldest half into one assistant-visible note and drop it</td><td>One summarisation call occasionally</td><td>Detail, progressively — and summarisation errors compound over a very long session</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Store the raw exchange separately from the prompt</span>
+  <p>Keep an append-only log of exactly what the user said and what the model returned, including token counts, model version and latency. What you <em>send</em> is a derived, trimmed view. Conflating the two makes it impossible to replay an incident or build an eval set from real traffic.</p>
+</div>
+
+<h2><span class="h-rule"></span>Streaming</h2>
+
+<p>Streaming does not make the response faster. It makes the wait visible, which is a different and much larger UX win: a first token in 400ms with tokens arriving steadily feels dramatically better than silence for six seconds followed by everything at once.</p>
+
+<div class="demo" id="stream">
+  <div class="demo-head">
+    <b>Why streaming matters</b>
+    <span>Same model, same 320-token answer, same total time. Run both and watch the difference in how long the interface feels dead.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="ttft">Time to first token — <span id="ttftv">0.5</span>s</label>
+        <input type="range" id="ttft" min="0.2" max="4" step="0.1" value="0.5">
+      </div>
+      <div>
+        <label for="tps">Tokens per second — <span id="tpsv">70</span></label>
+        <input type="range" id="tps" min="10" max="200" step="5" value="70">
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;margin-bottom:12px">
+      <button class="btn" id="runboth">Run both</button>
+      <button class="btn ghost" id="stopboth">Reset</button>
+    </div>
+    <div class="cols" style="margin:0">
+      <div class="col">
+        <h4 style="margin-bottom:6px">Buffered (wait for the whole response)</h4>
+        <div class="out" id="bufout" style="min-height:104px;margin-top:0">idle</div>
+        <div style="font-size:12px;color:#54677A;margin-top:6px">Dead time: <b id="bufdead">—</b></div>
+      </div>
+      <div class="col">
+        <h4 style="margin-bottom:6px">Streamed</h4>
+        <div class="out" id="strout" style="min-height:104px;margin-top:0">idle</div>
+        <div style="font-size:12px;color:#54677A;margin-top:6px">Dead time: <b id="strdead">—</b></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">python — consuming a stream</span><button class="copy">Copy</button></div>
+<pre><code>full = []
+with client.chat.completions.stream(model=MODEL, messages=msgs, max_tokens=800) as stream:
+    for event in stream:
+        if event.type == "content.delta":
+            full.append(event.delta)
+            yield event.delta                 # push to the client immediately
+        elif event.type == "error":
+            raise RuntimeError(event.error)
+
+final = stream.get_final_completion()          # usage and finish_reason arrive at the end
+text = "".join(full)</code></pre>
+</div>
+
+<div class="code" data-lang="typescript">
+<div class="code-head"><span class="lang">typescript — server-sent events to the browser</span><button class="copy">Copy</button></div>
+<pre><code>// Server (any Node framework). Note: disable proxy buffering, or nothing arrives until the end.
+export async function GET(req: Request) {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream({
+    async start(controller) {
+      const stream = await llm.stream({ model: MODEL, messages });
+      try {
+        for await (const chunk of stream) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ t: chunk.text })}\n\n`));
+        }
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));
+      } catch (err) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: String(err) })}\n\n`));
+      } finally {
+        controller.close();
+      }
+    },
+    cancel() { /* user navigated away: abort upstream so you stop paying for tokens */ }
+  });
+
+  return new Response(body, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  });
+}</code></pre>
+</div>
+
+<h3>The four things that bite you when streaming</h3>
+
+<ul>
+  <li><b>Proxies buffer.</b> Nginx, some CDNs and some serverless platforms will hold your chunks until the response completes, which silently converts streaming back into buffering. Set <code>X-Accel-Buffering: no</code>, disable compression on the route, and test through your real edge, not localhost.</li>
+  <li><b>Partial JSON is not JSON.</b> If the model is emitting a structured object you cannot parse mid-stream with <code>JSON.parse</code>. Either buffer structured responses and stream only prose, or use a streaming-tolerant parser and render fields as they complete. Chapter 7.</li>
+  <li><b>Errors arrive mid-stream.</b> A 200 response can still fail halfway. You have already sent a partial answer to the user, so you need a UI state for "this got cut off" rather than an exception page.</li>
+  <li><b>Cancellation must propagate.</b> When the user closes the tab, abort the upstream request. Otherwise you keep generating and paying for tokens nobody will read. Wire an <code>AbortController</code> through every layer.</li>
+</ul>
+
+<h2><span class="h-rule"></span>Finish reasons: check them, always</h2>
+
+<p>The most common silent bug in LLM code is treating a truncated response as a complete one. The text looks fine. It just stops.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Reason</th><th>Means</th><th>Your code should</th></tr></thead>
+<tbody>
+<tr><td><code>stop</code> / <code>end_turn</code></td><td>The model finished naturally</td><td>Proceed</td></tr>
+<tr><td><code>length</code> / <code>max_tokens</code></td><td>It hit your output cap mid-sentence</td><td>Never parse the result as complete. Either raise, or continue generation, or re-run with a higher cap. Log it — a rising rate means your cap is wrong.</td></tr>
+<tr><td><code>tool_calls</code> / <code>tool_use</code></td><td>It wants you to run a function</td><td>Execute the tool and loop (chapter 7). This is not an answer.</td></tr>
+<tr><td><code>content_filter</code> / <code>refusal</code></td><td>Blocked by a safety system, yours or theirs</td><td>Show a specific message, do not retry identically, and log it for review</td></tr>
+<tr><td><code>pause_turn</code> and similar</td><td>A long server-side operation paused</td><td>Continue the request as documented rather than treating it as finished</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">python — a guard that has saved a lot of incidents</span><button class="copy">Copy</button></div>
+<pre><code>class Truncated(Exception): ...
+
+def text_of(response) -> str:
+    choice = response.choices[0]
+    reason = choice.finish_reason
+    if reason == "length":
+        raise Truncated(f"hit max_tokens ({response.usage.completion_tokens} generated)")
+    if reason == "content_filter":
+        raise Blocked(choice.message.content or "")
+    if reason == "tool_calls":
+        raise ToolRequested(choice.message.tool_calls)
+    return choice.message.content or ""</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Failure and retries</h2>
+
+<p>Model APIs fail more often than the databases you are used to, and in more interesting ways. Handle each class deliberately.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Status</th><th>Cause</th><th>Retry?</th><th>Handling</th></tr></thead>
+<tbody>
+<tr><td><code>400</code></td><td>Malformed request, or context length exceeded</td><td class="no">No</td><td>A bug or an oversized prompt. Count tokens before sending (chapter 5) and fail with a clear internal error.</td></tr>
+<tr><td><code>401</code> / <code>403</code></td><td>Bad key, no access to that model</td><td class="no">No</td><td>Configuration. Fail loudly at startup, not per request — validate model access on boot.</td></tr>
+<tr><td><code>408</code> / client timeout</td><td>Slow generation, long prompt</td><td class="mid">Careful</td><td>Retrying a slow request usually produces another slow request. Prefer a shorter prompt, a smaller model, or streaming.</td></tr>
+<tr><td><code>429</code></td><td>Rate limit — requests or tokens per minute</td><td class="yes">Yes</td><td>Honour <code>retry-after</code> if present, otherwise exponential backoff with jitter. Also queue and smooth your own traffic.</td></tr>
+<tr><td><code>500</code> / <code>503</code> / <code>529</code></td><td>Provider trouble or overload</td><td class="yes">Yes</td><td>Backoff, then fall back to a second model or provider (chapter 19).</td></tr>
+<tr><td>Empty or malformed output</td><td>The model did something unhelpful</td><td class="yes">Yes, once</td><td>Retry with the validation error appended to the messages. A second attempt fixes most format failures (chapter 7).</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">retry.py — backoff with jitter and a hard deadline</span><button class="copy">Copy</button></div>
+<pre><code>import random, time
+
+RETRYABLE = (RateLimited, Overloaded, ServerError, ConnectionError)
+
+def with_retries(fn, *, attempts=4, base=0.7, cap=12.0, deadline_s=45.0):
+    started = time.monotonic()
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except RETRYABLE as e:
+            last = e
+            retry_after = getattr(e, "retry_after", None)
+            wait = retry_after if retry_after else min(cap, base * (2 ** i))
+            wait *= 0.5 + random.random()               # full jitter: do not stampede
+            if time.monotonic() - started + wait > deadline_s:
+                break                                   # never blow the user's latency budget
+            time.sleep(wait)
+        except Exception:
+            raise                                       # non-retryable: fail fast
+    raise last</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Retries are not free</span>
+  <p>A retried request is charged again, and a naive retry loop across a whole fleet during a provider incident turns a partial outage into a self-inflicted one. Always set a total deadline, always use jitter, and put a circuit breaker in front of the provider so that when it is clearly down you fail fast to your fallback rather than queueing thousands of doomed calls.</p>
+</div>
+
+<h2><span class="h-rule"></span>Concurrency, timeouts and budgets</h2>
+
+<p>Model calls are slow I/O, so throughput comes from concurrency, and safety comes from bounding it.</p>
+
+<ul>
+  <li><b>Set an explicit timeout on every call.</b> SDK defaults are often a minute or more. Decide per call site: an interactive answer might get 20 seconds, a background enrichment job 120.</li>
+  <li><b>Bound your concurrency</b> with a semaphore sized to your rate limit, not to your CPU. Exceeding token-per-minute limits produces 429s that cost you latency and retries.</li>
+  <li><b>Give each user request a token budget</b> and a wall-clock budget that all its internal calls share. Agent loops without a budget are the classic way to discover a five-figure bill.</li>
+</ul>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">python — bounded fan-out over many documents</span><button class="copy">Copy</button></div>
+<pre><code>import asyncio
+
+async def classify_all(docs, concurrency=8):
+    sem = asyncio.Semaphore(concurrency)          # sized to your rate limit
+
+    async def one(doc):
+        async with sem:
+            try:
+                return await asyncio.wait_for(classify(doc), timeout=20)
+            except asyncio.TimeoutError:
+                return {"id": doc.id, "error": "timeout"}
+
+    return await asyncio.gather(*(one(d) for d in docs))</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>The seam</h2>
+
+<p>Put one interface between your application and any provider. Not a framework, not an abstraction over every feature — a narrow surface that covers what you actually use, with an adapter per provider behind it.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">llm.py — small enough to read, big enough to matter</span><button class="copy">Copy</button></div>
+<pre><code>from dataclasses import dataclass
+from typing import Protocol, Iterator, Any
+
+@dataclass
+class Completion:
+    text: str
+    tool_calls: list[dict]
+    finish_reason: str
+    input_tokens: int
+    output_tokens: int
+    cached_input_tokens: int
+    model: str
+    latency_ms: int
+
+class LLM(Protocol):
+    def complete(self, *, system: str, messages: list, model: str,
+                 temperature: float = 0.0, max_tokens: int = 1024,
+                 tools: list | None = None, schema: dict | None = None,
+                 timeout: float = 30.0) -> Completion: ...
+
+    def stream(self, **kwargs) -> Iterator[str]: ...
+
+
+class OpenAIAdapter:
+    def complete(self, *, system, messages, model, **kw) -> Completion:
+        t0 = time.perf_counter()
+        r = self._client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system}, *messages],
+            temperature=kw.get("temperature", 0),
+            max_tokens=kw.get("max_tokens", 1024),
+            tools=kw.get("tools"),
+            timeout=kw.get("timeout", 30.0),
+        )
+        c = r.choices[0]
+        return Completion(
+            text=c.message.content or "",
+            tool_calls=[t.model_dump() for t in (c.message.tool_calls or [])],
+            finish_reason=c.finish_reason,
+            input_tokens=r.usage.prompt_tokens,
+            output_tokens=r.usage.completion_tokens,
+            cached_input_tokens=getattr(r.usage, "prompt_tokens_details", {}).get("cached_tokens", 0),
+            model=r.model,
+            latency_ms=int((time.perf_counter() - t0) * 1000),
+        )
+
+
+class AnthropicAdapter:
+    def complete(self, *, system, messages, model, **kw) -> Completion:
+        r = self._client.messages.create(
+            model=model, system=system, messages=messages,           # system is separate here
+            max_tokens=kw.get("max_tokens", 1024),
+            temperature=kw.get("temperature", 0),
+            tools=kw.get("tools"),
+        )
+        text = "".join(b.text for b in r.content if b.type == "text")
+        return Completion(
+            text=text,
+            tool_calls=[b.model_dump() for b in r.content if b.type == "tool_use"],
+            finish_reason=r.stop_reason,
+            input_tokens=r.usage.input_tokens,
+            output_tokens=r.usage.output_tokens,
+            cached_input_tokens=getattr(r.usage, "cache_read_input_tokens", 0),
+            model=r.model,
+            latency_ms=...,
+        )</code></pre>
+</div>
+
+<p>What this buys you, concretely: one place to add retries, one place to log every call for tracing, one place to enforce timeouts and budgets, one place to swap a model, and a test double that makes your business logic testable without a network.</p>
+
+<div class="note trap">
+  <span class="note-t">Do not build a mega-abstraction</span>
+  <p>The failure mode at the other extreme is a framework-shaped layer that supports every provider's every option through a lowest-common-denominator interface. You lose prompt caching, structured-output guarantees and provider-specific tool features — precisely the things that make a system cheap and reliable. If a feature exists on one provider only and you need it, let that adapter expose it and branch at the call site.</p>
+</div>
+
+<h2><span class="h-rule"></span>Making it testable</h2>
+
+<p>Business logic that calls a model should be testable without a network, without cost and without flakiness. Two techniques cover almost everything.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">tests — a scripted fake and recorded fixtures</span><button class="copy">Copy</button></div>
+<pre><code>class ScriptedLLM:
+    """Deterministic double. Assert on what your code DOES with a response."""
+    def __init__(self, replies): self.replies, self.calls = list(replies), []
+
+    def complete(self, **kw):
+        self.calls.append(kw)
+        return self.replies.pop(0)
+
+def test_refund_requires_confirmation():
+    llm = ScriptedLLM([Completion(text="", tool_calls=[{"name": "refund",
+                                  "arguments": {"order_id": "A-1", "amount": 40.0}}],
+                                  finish_reason="tool_calls", **ZERO_USAGE)])
+    result = handle("refund my order A-1", llm=llm)
+
+    assert result.status == "awaiting_confirmation"     # policy, not model behaviour
+    assert result.pending.name == "refund"
+    assert "You are a support agent" in llm.calls[0]["system"]
+
+
+# For prompt-quality changes, record real responses once and replay them:
+#   pytest --record   -> hits the provider, writes tests/fixtures/*.json
+#   pytest            -> replays, so CI is fast, free and deterministic</code></pre>
+</div>
+
+<p>Note what the test asserts: that a refund goes to a confirmation state, not that the model produced particular words. Tests cover <em>your</em> logic. Model behaviour is covered by evals, which are a different mechanism with a pass rate rather than a boolean, and they live in chapter 18.</p>
+
+<h2><span class="h-rule"></span>A checklist for every call site</h2>
+
+<ul class="check">
+  <li>An explicit model version from your central model file, never a floating alias.</li>
+  <li>An explicit <code>max_tokens</code>, and a check of the finish reason before using the text.</li>
+  <li>An explicit timeout suited to this call, not the SDK default.</li>
+  <li>Retries with jitter and a total deadline, applied only to retryable errors.</li>
+  <li>Token counts, latency, model version and cost logged for every call.</li>
+  <li>A correlation id threaded through so one user request is one trace.</li>
+  <li>Cancellation propagated from the client all the way to the provider.</li>
+  <li>Temperature set deliberately — zero unless you have a reason.</li>
+</ul>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>The API is <b>stateless</b>. Conversation, trimming and summarisation are your code's job, and they are where token cost quietly grows.</li>
+    <li>Streaming does not reduce total time; it removes <b>dead air</b>. Watch for buffering proxies, mid-stream errors and partial JSON.</li>
+    <li><b>Always check the finish reason.</b> Treating a truncated answer as complete is the most common silent bug in this field.</li>
+    <li>Retry only what is retryable, with <b>jitter, a deadline and a circuit breaker</b>. Retries cost money and can amplify an outage.</li>
+    <li>Bound concurrency to your <b>rate limit</b>, and give every user request a token and time budget.</li>
+    <li>One <b>thin seam</b> per provider gives you logging, retries, testing and migration for almost no design cost.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("04-calling-the-api.html");
+
+(function(){
+  const root = document.getElementById("stream");
+  if(!root) return;
+
+  const WORDS = ("The deployment failed because the readiness probe timed out. The container started, " +
+    "but the database migration held a lock for longer than the probe's grace period, so Kubernetes " +
+    "restarted the pod before it ever reported healthy. Raise initialDelaySeconds above the migration's " +
+    "worst observed duration, or move migrations to a separate job that runs to completion first.").split(" ");
+
+  const ttft = document.getElementById("ttft");
+  const tps  = document.getElementById("tps");
+  const bufOut = document.getElementById("bufout");
+  const strOut = document.getElementById("strout");
+  const bufDead = document.getElementById("bufdead");
+  const strDead = document.getElementById("strdead");
+  let timers = [];
+
+  function clear(){
+    timers.forEach(t => clearTimeout(t));
+    timers = [];
+  }
+  function reset(){
+    clear();
+    bufOut.textContent = "idle"; strOut.textContent = "idle";
+    bufDead.textContent = "—";   strDead.textContent = "—";
+  }
+
+  ttft.addEventListener("input", () => document.getElementById("ttftv").textContent = parseFloat(ttft.value).toFixed(1));
+  tps .addEventListener("input", () => document.getElementById("tpsv").textContent  = tps.value);
+
+  document.getElementById("stopboth").addEventListener("click", reset);
+
+  document.getElementById("runboth").addEventListener("click", () => {
+    clear();
+    const first = parseFloat(ttft.value) * 1000;
+    const rate  = parseInt(tps.value, 10);
+    // ~1.35 tokens per word is a reasonable English approximation.
+    const perWord = (1000 / rate) * 1.35;
+    const total = first + perWord * WORDS.length;
+
+    bufOut.textContent = "waiting…";
+    strOut.textContent = "waiting…";
+    bufDead.textContent = "—";
+    strDead.textContent = "—";
+
+    // Buffered: nothing until the whole thing is done.
+    timers.push(setTimeout(() => {
+      bufOut.textContent = WORDS.join(" ");
+      bufDead.textContent = (total / 1000).toFixed(1) + "s of blank screen";
+    }, total));
+
+    // Streamed: first token at ttft, then a word at a time.
+    let shown = [];
+    WORDS.forEach((w, i) => {
+      timers.push(setTimeout(() => {
+        if(i === 0){
+          shown = [w];
+          strDead.textContent = (first / 1000).toFixed(1) + "s of blank screen";
+        } else {
+          shown.push(w);
+        }
+        strOut.textContent = shown.join(" ");
+      }, first + perWord * i));
+    });
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Performance — Redis</title>
+<meta name="description" content="One thread means one slow command blocks everything. Pipelining, latency measurement, the commands to ban, and where the time actually goes.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 14 · Making it work</div>
+    <h1>Performance</h1>
+    <p class="standfirst">Redis is fast enough that your own code is usually the bottleneck. When it is not, the cause is almost always one of three things: too many round trips, one command doing too much work, or something outside Redis entirely.</p>
+    <div class="chap-meta">
+      <span class="tagpill">pipelining</span>
+      <span class="tagpill">latency</span>
+      <span class="tagpill">slowlog</span>
+      <span class="tagpill">big keys</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Where the time goes</h2>
+
+<div class="demo" id="perf">
+  <div class="demo-head">
+    <b>The latency budget</b>
+    <span>A single Redis command spends almost none of its time inside Redis.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="w-ops">Commands per request — <span id="w-opsv">50</span></label>
+        <input type="range" id="w-ops" min="1" max="200" step="1" value="50">
+      </div>
+      <div>
+        <label for="w-rtt">Network round trip — <span id="w-rttv">0.5</span> ms</label>
+        <input type="range" id="w-rttv2" min="1" max="100" step="1" value="5">
+      </div>
+      <div>
+        <label for="w-mode">How they are sent</label>
+        <select id="w-mode">
+          <option value="serial" selected>One at a time</option>
+          <option value="pipeline">Pipelined</option>
+          <option value="mget">One multi-key command</option>
+          <option value="lua">One Lua script</option>
+        </select>
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="w-total">—</b><span>total latency</span></div>
+      <div><b id="w-net">—</b><span>on the network</span></div>
+      <div><b id="w-srv">—</b><span>inside Redis</span></div>
+      <div><b id="w-speedup">—</b><span>vs. one at a time</span></div>
+    </div>
+    <div id="w-bar"></div>
+    <div class="out" id="w-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Round trips, not command execution</span>
+  <p>A <code>GET</code> takes tens of microseconds inside Redis and half a millisecond on a local network — so <b>the network is 95% of the cost and the database is 5%</b>. That single ratio determines almost all Redis performance work: a hundred sequential commands is a hundred round trips, and turning them into one exchange is a 50–100× improvement that no amount of server tuning can approach. Before looking at anything in <code>INFO</code>, count the round trips per request. Most Redis "slowness" is an application issuing commands in a loop.</p>
+</div>
+
+<h2><span class="h-rule"></span>Pipelining</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">the highest-value change available</span><button class="copy">Copy</button></div>
+<pre><code># Sequential — 100 round trips
+for uid in user_ids:
+    r.hgetall(f"user:{uid}")
+
+# Pipelined — one round trip
+pipe = r.pipeline(transaction=False)      # transaction=False → no MULTI
+for uid in user_ids:
+    pipe.hgetall(f"user:{uid}")
+results = pipe.execute()
+
+# Send all the commands, then read all the replies. Nothing is atomic and
+# other clients' commands interleave freely — that is fine, and it is why
+# pipelining is simpler than MULTI (chapter 8).
+#
+# Note transaction=False in redis-py: the default wraps the pipeline in
+# MULTI/EXEC, which adds atomicity you probably did not want and does not
+# work across slots in cluster mode.
+
+# BATCH SIZE. The replies buffer in memory on both sides, so an unbounded
+# pipeline of a million commands allocates a million replies at once. A few
+# hundred to a few thousand per batch is the useful range:
+for chunk in chunks(user_ids, 500):
+    pipe = r.pipeline(transaction=False)
+    for uid in chunk: pipe.hgetall(f"user:{uid}")
+    yield from pipe.execute()
+
+# THE MULTI-KEY COMMANDS do the same job with no client-side machinery, and
+# are better where they apply:
+MGET  k1 k2 k3                      # instead of three GETs
+MSET  k1 v1 k2 v2
+HMGET user:41 name tier             # instead of three HGETs
+SADD  s a b c                       # variadic — nearly every write command is
+DEL   k1 k2 k3
+# In cluster mode these require all keys in one slot; a pipeline does not
+# (chapter 16).</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Big keys and slow commands</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">one thread, so one command's work is everyone's wait</span><button class="copy">Copy</button></div>
+<pre><code># THE COMMANDS TO TREAT AS BANNED IN PRODUCTION:
+KEYS pattern            # O(N) over the whole keyspace       -> SCAN
+FLUSHALL / FLUSHDB      # synchronous by default             -> add ASYNC
+DEBUG SLEEP             # blocks deliberately
+MONITOR                 # streams every command to a client — measurably
+                        # slows the server, and people leave it running
+
+# THE COMMANDS THAT ARE FINE UNTIL THE DATA GROWS:
+SMEMBERS  big:set       # O(N) -> SSCAN, or SISMEMBER for the actual question
+HGETALL   big:hash      # O(N) -> HMGET the fields you need
+LRANGE    big:list 0 -1 # O(N) -> bound the range
+ZRANGE    big:zset 0 -1 # O(N) -> ZRANGEBYSCORE with LIMIT
+DEL       big:key       # O(N) freeing -> UNLINK
+
+# These are the dangerous ones precisely because they are correct. Written
+# against a collection of fifty members they work for years, and there is no
+# moment at which anything breaks — the collection grows, the command gets
+# slower, and one day it is 400 ms and the server stalls.
+
+# FIND THEM:
+redis-cli --bigkeys          # largest key of each type, via SCAN
+redis-cli --memkeys          # memory by key
+MEMORY USAGE somekey
+OBJECT ENCODING somekey
+
+SLOWLOG GET 10               # commands over slowlog-log-slower-than µs
+SLOWLOG RESET
+CONFIG SET slowlog-log-slower-than 5000     # 5 ms. The default is 10 ms
+CONFIG SET slowlog-max-len 512
+
+# The slowlog records EXECUTION time only — not the time spent waiting behind
+# another command, and not network time. So a slowlog full of fast commands
+# with terrible client-side latency means something else is blocking the
+# thread: a fork (chapter 13), a slow Lua script, or a big key you have not
+# found yet.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Latency is measured at the client, and the cause is at the server</span>
+  <p>The most confusing Redis incident is uniform latency across every operation with nothing in the slowlog. That pattern means the thread was <em>occupied</em> — every command waited its turn and each one executed quickly, so none of them appears slow. The usual culprits are the fork during a background save, a Lua script looping over a collection, an <code>UNLINK</code> of a genuinely enormous key, or active defragmentation. <b><code>LATENCY DOCTOR</code> and <code>redis-cli --latency</code> measure what the slowlog cannot</b>: total delay including queueing, which is the number your application actually experiences.</p>
+</div>
+
+<h2><span class="h-rule"></span>Measuring</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the tools, in the order to use them</span><button class="copy">Copy</button></div>
+<pre><code># 1. WHAT IS THE BASELINE? Intrinsic latency of the machine itself, with no
+#    Redis involved — scheduler, virtualisation, noisy neighbours.
+redis-cli --intrinsic-latency 100
+#    "Max latency so far: 3 milliseconds"
+#    If the machine alone shows milliseconds, Redis cannot do better. This
+#    is common on oversubscribed cloud instances and it is the first thing
+#    to rule out.
+
+# 2. WHAT IS THE ROUND TRIP? Continuous ping from where your app runs.
+redis-cli --latency
+redis-cli --latency-history -i 5
+redis-cli --latency-dist               # a spectrum of samples
+
+# 3. WHAT SPIKED, AND WHY?
+LATENCY RESET
+LATENCY LATEST                         # event, last, max
+LATENCY HISTORY fork
+LATENCY DOCTOR                         # plain-English analysis
+CONFIG SET latency-monitor-threshold 100    # ms. Off by default — TURN IT ON
+#    Tracked events include: fork, aof-fsync-always, expire-cycle,
+#    eviction-cycle, active-defrag-cycle, command
+
+# 4. WHAT IS THE SERVER DOING?
+INFO commandstats      # calls, usec, usec_per_call, PER COMMAND
+INFO latencystats      # p50/p99/p99.9 per command (7.0+)
+INFO stats             # instantaneous_ops_per_sec, total_net_input_bytes
+CONFIG RESETSTAT
+
+# INFO commandstats is the most underused diagnostic here. Sort by total
+# usec rather than usec_per_call — the same argument as every other unit.
+# A 40 µs command called ten million times matters more than a 4 ms one
+# called twice.
+
+# 5. WHAT IS THE CEILING?
+redis-benchmark -t get,set,lpush -n 100000 -q
+redis-benchmark -t get -n 100000 -P 16 -q       # with pipelining
+#    The -P difference shows you exactly what pipelining is worth on your
+#    network. It is usually startling.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Connections and clients</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">frequently the actual problem</span><button class="copy">Copy</button></div>
+<pre><code># Connecting is expensive relative to a command: TCP handshake, TLS if
+# enabled, AUTH, SELECT. A client that connects per operation spends more
+# time on setup than on work.
+#
+# Use ONE connection pool per process, sized deliberately:
+#   pool size ≈ concurrent operations in flight, not request rate
+#   too small  -> requests queue in the client, invisible in Redis metrics
+#   too large  -> file descriptors and server memory for nothing
+
+INFO clients
+#   connected_clients
+#   blocked_clients          BLPOP/BRPOP/XREAD waiters. Normal, and worth
+#                            knowing about — they are not stuck
+#   client_recent_max_input_buffer / output_buffer
+
+CLIENT LIST                  # age, idle, cmd, omem per connection
+CLIENT KILL ID 42
+CLIENT NO-EVICT on           # protect an admin connection from eviction
+
+# TCP_NODELAY should be on — Nagle's algorithm batches small packets and
+# adds up to 40 ms of latency to a request/response protocol. Every decent
+# client library sets it; if you are seeing suspiciously round tens of
+# milliseconds, check.
+
+# TLS costs real CPU on the single thread. Measure it before assuming it is
+# free, and terminate it at a proxy if the numbers justify the complexity.
+
+# THE CLIENT-SIDE FAILURE THAT LOOKS LIKE A SERVER PROBLEM: an exhausted
+# connection pool. Every operation queues waiting for a connection, latency
+# climbs uniformly, and Redis itself shows low CPU, few connections and
+# nothing in the slowlog. Check the pool before the server.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Scaling beyond one thread</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Approach</th><th>Gets you</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><td><b>Pipelining</b></td><td>10–100× on batch work</td><td>None. Do this first</td></tr>
+<tr><td><b>Fewer, better commands</b></td><td>Removes work entirely</td><td>Schema thought (chapters 3–5)</td></tr>
+<tr><td><b>Read replicas</b></td><td>Read throughput</td><td>Stale reads (chapter 15)</td></tr>
+<tr><td><b>Several instances on one box</b></td><td>Uses your cores</td><td>Application-side sharding</td></tr>
+<tr><td><b><code>io-threads</code></b></td><td>Faster socket handling</td><td>Only helps when the network is the bottleneck</td></tr>
+<tr><td><b>Cluster</b></td><td>Horizontal everything</td><td>Real constraints (chapter 16)</td></tr>
+<tr><td><b>A client-side cache</b></td><td>Removes the round trip</td><td>Invalidation. Use <code>CLIENT TRACKING</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">io-threads, since it is widely misunderstood</span><button class="copy">Copy</button></div>
+<pre><code>io-threads 4                # 6.0+. Parallelise socket reads and writes
+io-threads-do-reads yes
+
+# This does NOT make command execution parallel. Commands still run one at a
+# time on the main thread; only the reading and writing of socket data is
+# spread across threads.
+#
+# So it helps when you are bottlenecked on syscalls and network I/O — many
+# connections, large values, high throughput of small commands. It does
+# nothing at all if the bottleneck is a slow command or a big key.
+#
+# Set it to roughly the number of cores minus one, and measure. More is not
+# better; above 4-8 the coordination overhead outweighs the gain on most
+# workloads.
+
+# THE ALTERNATIVE THAT ALWAYS WORKS: run several Redis processes. Four
+# instances on a four-core box genuinely use four cores, with no shared
+# state and no coordination — and it forces you to think about how the data
+# partitions, which is the same thinking cluster mode requires anyway.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Check whether it is Redis at all</span>
+  <p>Three things present as "Redis is slow" and are not. <b>An exhausted client connection pool</b>, where every operation queues in your application and Redis shows low CPU and an empty slowlog. <b>Serialisation cost</b>, where the JSON encode and decode around each value takes longer than the round trip — worth profiling before blaming the network. And <b>the machine itself</b>: <code>redis-cli --intrinsic-latency</code> on an oversubscribed cloud instance routinely reports milliseconds of scheduler jitter, which is a ceiling no configuration can improve. Rule out all three before tuning anything, because each of them produces metrics that look exactly like a database problem.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>The network is 95% of the cost.</b> Count round trips per request before looking at anything else.</li>
+    <li><b>Pipelining is the highest-value change available</b> — 10–100× on batch work, with no atomicity semantics to reason about.</li>
+    <li><b>Use the multi-key commands</b> — <code>MGET</code>, <code>HMGET</code>, variadic writes — where they apply.</li>
+    <li><b>Ban <code>KEYS</code>, <code>MONITOR</code> and synchronous <code>FLUSHALL</code></b>, and treat <code>SMEMBERS</code>/<code>HGETALL</code> as bombs on a timer.</li>
+    <li><b>The slowlog records execution, not queueing.</b> Uniform latency with an empty slowlog means the thread was occupied.</li>
+    <li><b>Turn on <code>latency-monitor-threshold</code></b> — it is off by default and it is what explains spikes.</li>
+    <li><b><code>io-threads</code> does not parallelise commands.</b> More processes is the way to use more cores.</li>
+    <li><b>Check the pool, the serialisation and the machine</b> before tuning Redis. All three look like a database problem.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("14-performance.html");
+
+(function(){
+  const root = document.getElementById("perf");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  function render(){
+    const ops  = parseInt($("w-ops").value, 10);
+    const rtt  = parseInt($("w-rttv2").value, 10) / 10;
+    const mode = $("w-mode").value;
+    $("w-opsv").textContent = ops;
+    $("w-rttv").textContent = rtt.toFixed(1);
+
+    const SRV = 0.03;   // ms per command inside Redis
+
+    let net, srv, label;
+    if(mode === "serial")        { net = ops * rtt;      srv = ops * SRV;        label = ops + " round trips"; }
+    else if(mode === "pipeline") { net = rtt;            srv = ops * SRV;        label = "1 round trip"; }
+    else if(mode === "mget")     { net = rtt;            srv = ops * SRV * 0.55; label = "1 round trip, 1 command"; }
+    else                         { net = rtt;            srv = ops * SRV * 0.75 + 0.05; label = "1 round trip, server-side"; }
+
+    const total = net + srv;
+    const serialTotal = ops * rtt + ops * SRV;
+    const speedup = serialTotal / total;
+
+    $("w-total").textContent   = total.toFixed(2) + " ms";
+    $("w-net").textContent     = (net/total*100).toFixed(0) + "%";
+    $("w-srv").textContent     = (srv/total*100).toFixed(0) + "%";
+    $("w-speedup").textContent = mode === "serial" ? "baseline" : speedup.toFixed(0) + "× faster";
+
+    const max = Math.max(total, serialTotal);
+    const bars = [
+      ["Network", net, "#E2574C"],
+      ["Inside Redis", srv, "#3FB984"]
+    ];
+    $("w-bar").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      ops + ' commands · ' + label + '</div>' +
+      '<div style="background:#fff;border:1px solid #E1E7EC;border-radius:5px;padding:12px">' +
+      '<div style="display:flex;height:28px;border-radius:4px;overflow:hidden;background:#EDF1F4">' +
+      bars.map(([lab, v, col]) =>
+        '<div style="width:' + (v/max*100).toFixed(2) + '%;background:' + col + ';height:100%"></div>').join("") +
+      '</div>' +
+      '<div style="display:flex;gap:16px;margin-top:8px;font-size:11.5px;color:#54677A">' +
+      bars.map(([lab, v, col]) =>
+        '<span style="display:flex;align-items:center;gap:5px"><span style="width:11px;height:11px;background:' +
+        col + ';border-radius:2px;display:inline-block"></span>' + lab + ' ' + v.toFixed(2) + ' ms</span>').join("") +
+      '</div>' +
+      (mode !== "serial"
+        ? '<div style="margin-top:10px"><div style="font-family:var(--mono);font-size:10.5px;color:#8FA0AF;margin-bottom:4px">' +
+          'one at a time, for comparison</div>' +
+          '<div style="height:14px;border-radius:3px;background:#CFD8E0;width:' +
+          (serialTotal/max*100).toFixed(1) + '%"></div>' +
+          '<div style="font-family:var(--mono);font-size:10.5px;color:#8FA0AF;margin-top:3px">' +
+          serialTotal.toFixed(2) + ' ms</div></div>'
+        : '') +
+      '</div>';
+
+    const notes = [];
+
+    if(mode === "serial"){
+      notes.push("Each command waits for the previous reply before the next is sent, so the cost is " + ops +
+                 " × " + rtt.toFixed(1) + " ms of network plus " + srv.toFixed(2) +
+                 " ms of actual work. The network is " + (net/total*100).toFixed(0) +
+                 "% of the total and Redis is " + (srv/total*100).toFixed(0) + "%.\n\nThat ratio is the whole of Redis performance work. The server is not the bottleneck; the number of times you cross the network is.");
+      if(ops > 20)
+        notes.push(ops + " commands in a loop is the single most common Redis performance problem, and it is invisible in server-side metrics — Redis reports low CPU, fast commands and an empty slowlog while your application waits " +
+                   total.toFixed(0) + " ms. Switch the dropdown to see what the alternatives cost.");
+    }
+
+    if(mode === "pipeline"){
+      notes.push("All " + ops + " commands go out in one write and all the replies come back in one read. One round trip instead of " +
+                 ops + ", so the network term collapses from " + (ops*rtt).toFixed(1) + " ms to " + rtt.toFixed(1) + " ms.\n\n" +
+                 speedup.toFixed(0) + "× faster, with no change to what the commands do. Nothing is atomic and other clients interleave freely — which is fine, and is why pipelining is simpler to reason about than MULTI (chapter 8).");
+      notes.push("Bound the batch size. The replies buffer in memory on both sides, so a pipeline of a million commands allocates a million replies at once. A few hundred to a few thousand per batch is the useful range, and beyond that you are trading memory for a diminishing return.");
+    }
+
+    if(mode === "mget"){
+      notes.push("A single multi-key command — MGET, HMGET, or a variadic write. One round trip AND one command, so Redis parses one request rather than " +
+                 ops + ", which is why the server-side time is lower than the pipelined version too.\n\nWhere a multi-key command applies it is better than a pipeline: less protocol overhead, simpler code, and no client-side batching logic.\n\nThe restriction is cluster mode, where every key in one command must live in the same hash slot. A pipeline has no such requirement, which is why both techniques stay useful (chapter 16).");
+    }
+
+    if(mode === "lua"){
+      notes.push("A Lua script does all " + ops + " operations server-side in one round trip, and unlike a pipeline it is atomic — nothing interleaves (chapter 8).\n\nThe reason to choose it over a pipeline is when the operations depend on each other: read a value, branch on it, write. A pipeline cannot do that because every command is sent before any reply comes back.\n\nThe reason NOT to: the script blocks the entire server for its whole duration, so " +
+                 srv.toFixed(2) + " ms here is " + srv.toFixed(2) + " ms during which no other client is served. Keep scripts bounded, and prefer a pipeline when you do not need atomicity.");
+    }
+
+    if(rtt >= 2)
+      notes.push("A " + rtt.toFixed(1) + " ms round trip is cross-availability-zone or worse. At that distance the network term dominates completely and batching stops being an optimisation and becomes the only thing that matters — every technique in this chapter is worth several times what it would be on a local network.\n\nIt is also worth asking whether Redis should be closer. A cache that is 2 ms away is competing with a well-indexed database query.");
+    else if(rtt <= 0.2)
+      notes.push("At " + rtt.toFixed(1) + " ms this is a local socket or a very close host. Even here the network is the larger term for a single command — Redis executes in tens of microseconds and the round trip is hundreds.");
+
+    $("w-note").textContent = notes.join("\n\n");
+  }
+
+  ["w-ops","w-rttv2","w-mode"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

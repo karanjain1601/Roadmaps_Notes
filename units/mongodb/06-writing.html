@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Writing data — MongoDB</title>
+<meta name="description" content="Update operators, upserts, atomicity at the document level, bulk writes, and findAndModify for read-modify-write.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 06 · Working with data</div>
+    <h1>Writing data</h1>
+    <p class="standfirst">Every write to a single document is atomic — that is the guarantee the whole model is built on. Using it well means expressing changes as operators the server applies, rather than reading a document into your application and writing it back.</p>
+    <div class="chap-meta">
+      <span class="tagpill">operators</span>
+      <span class="tagpill">atomicity</span>
+      <span class="tagpill">upsert</span>
+      <span class="tagpill">bulk</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Atomicity at the document</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">the guarantee, and what it does not cover</span><button class="copy">Copy</button></div>
+<pre><code>// This is ATOMIC. All four changes apply, or none do. No transaction needed,
+// no other reader ever sees a half-applied state.
+db.orders.updateOne(
+  { _id: id, status: "pending" },
+  { $set:  { status: "paid", paidAt: new Date() },
+    $inc:  { version: 1 },
+    $push: { events: { type: "payment", at: new Date() } } }
+);
+
+// This is NOT atomic — two documents, two operations.
+db.orders.updateOne({ _id: orderId }, { $set: { status: "paid" } });
+db.accounts.updateOne({ _id: accId }, { $inc: { balance: -100 } });
+// Between them, a crash leaves the order paid and the account unbilled.
+// That needs a transaction (chapter 12) — or a schema where both facts
+// live in one document (chapters 2 and 3).
+
+// The design consequence, stated once: the more your invariants fit inside a
+// single document, the less you need transactions. That is not a workaround;
+// it is the point of the document model, and it is why chapter 2 matters
+// more than this chapter does.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Update operators</h2>
+
+<div class="demo" id="upd">
+  <div class="demo-head">
+    <b>Operators against a document</b>
+    <span>Pick an operation and see the before and after. Several of these have no relational equivalent.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="u-op">Operation</label>
+        <select id="u-op">
+          <option value="set" selected>$set — change fields</option>
+          <option value="inc">$inc — increment atomically</option>
+          <option value="push">$push — append to an array</option>
+          <option value="slice">$push with $sort and $slice — bounded list</option>
+          <option value="addToSet">$addToSet — append if absent</option>
+          <option value="pull">$pull — remove matching elements</option>
+          <option value="positional">$ — update the matched array element</option>
+          <option value="filtered">$[&lt;id&gt;] — update elements matching a filter</option>
+          <option value="all">$[] — update every element</option>
+          <option value="unset">$unset — remove a field</option>
+          <option value="rename">$rename — rename a field</option>
+          <option value="replace">replaceOne — the dangerous one</option>
+        </select>
+      </div>
+    </div>
+    <div id="u-before"></div>
+    <div id="u-cmd"></div>
+    <div id="u-after"></div>
+    <div class="out" id="u-note"></div>
+  </div>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Operator</th><th>Does</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><code>$set</code> / <code>$unset</code></td><td>Set or remove fields</td><td>Dot notation reaches nested fields</td></tr>
+<tr><td><code>$inc</code> / <code>$mul</code></td><td>Arithmetic, atomically</td><td>No read needed. Negative <code>$inc</code> decrements</td></tr>
+<tr><td><code>$min</code> / <code>$max</code></td><td>Set only if smaller / larger</td><td>Excellent for running extremes</td></tr>
+<tr><td><code>$setOnInsert</code></td><td>Apply only when an upsert inserts</td><td>The <code>createdAt</code> field</td></tr>
+<tr><td><code>$currentDate</code></td><td>Set to the server's clock</td><td>Avoids client clock skew</td></tr>
+<tr><td><code>$push</code> / <code>$pop</code></td><td>Append / remove an end element</td><td><code>$each</code>, <code>$sort</code>, <code>$slice</code>, <code>$position</code> modifiers</td></tr>
+<tr><td><code>$addToSet</code></td><td>Append if not present</td><td>Set semantics; no duplicates</td></tr>
+<tr><td><code>$pull</code> / <code>$pullAll</code></td><td>Remove elements by condition</td><td>Removes all matches, not just the first</td></tr>
+<tr><td><code>$</code></td><td>The first array element matched by the filter</td><td>Requires the array in the query</td></tr>
+<tr><td><code>$[]</code></td><td>Every array element</td><td></td></tr>
+<tr><td><code>$[&lt;id&gt;]</code></td><td>Elements matching an <code>arrayFilters</code> condition</td><td>3.6+. The one that made array updates usable</td></tr>
+<tr><td><code>$rename</code></td><td>Rename a field</td><td>Useful in migrations (chapter 17)</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">Never read-modify-write</span>
+  <p>Fetching a document, changing a value in your application and writing the whole thing back is the pattern to eliminate. Between the read and the write, another process can change the same document — and your write silently overwrites their change with a value computed from stale data. It is the lost update from the SQL unit's chapter 10, in a system where you may not have a transaction to fall back on. <b>Express the change as an operator</b> and the server applies it atomically to whatever the current state is: <code>$inc</code> rather than read-add-write, <code>$push</code> rather than read-append-write, <code>$min</code> rather than read-compare-write.</p>
+</div>
+
+<h2><span class="h-rule"></span>Upserts</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">insert or update, atomically</span><button class="copy">Copy</button></div>
+<pre><code>db.counters.updateOne(
+  { device: "d-41", hour: hourStart },      // the filter identifies it
+  { $inc: { count: 1, sum: value },
+    $setOnInsert: { createdAt: new Date() } },
+  { upsert: true }
+);
+
+// If nothing matches, MongoDB builds a document from the FILTER's equality
+// fields plus the update operators, and inserts it. So the document above
+// gets device and hour from the filter — you do not repeat them.
+//
+// $setOnInsert applies only on the insert path, which is how createdAt gets
+// set once and never touched again.
+
+// THE THING THAT MATTERS: an upsert is only race-free if a UNIQUE INDEX
+// covers the filter fields. Without one, two concurrent upserts can both
+// find nothing and both insert, and you get duplicates.
+db.counters.createIndex({ device: 1, hour: 1 }, { unique: true });
+
+// With the unique index, one of the two racing inserts fails with a
+// duplicate key error (code 11000) — RETRY it and the second attempt
+// updates the row the first one created. That retry is not optional; it is
+// part of the pattern.
+try {
+  await coll.updateOne(filter, update, { upsert: true });
+} catch (e) {
+  if (e.code === 11000) await coll.updateOne(filter, update, { upsert: true });
+  else throw e;
+}
+
+// This is exactly the SQL unit's chapter 9 argument about ON CONFLICT: an
+// upsert without the unique index is a race condition wearing a costume.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>findAndModify</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">when you need the document back</span><button class="copy">Copy</button></div>
+<pre><code>// Atomically update AND return the document — before or after the change.
+const claimed = await db.jobs.findOneAndUpdate(
+  { status: "pending", runAfter: { $lte: new Date() } },
+  { $set: { status: "running", claimedAt: new Date(), worker: workerId } },
+  { sort: { runAfter: 1 }, returnDocument: "after" }
+);
+
+// This is a WORK QUEUE, and it is correct: the find and the update are one
+// atomic operation, so two workers cannot claim the same job. The document
+// model gives you this without SELECT ... FOR UPDATE SKIP LOCKED — the
+// atomicity is already at the right granularity.
+
+// OPTIMISTIC CONCURRENCY, when the change genuinely must be computed in the
+// application — a state machine, a complex validation:
+const doc = await coll.findOne({ _id: id });
+const next = computeNextState(doc);
+const res = await coll.updateOne(
+  { _id: id, version: doc.version },              // the guard
+  { $set: { ...next, version: doc.version + 1 } }
+);
+if (res.matchedCount === 0) {
+  // someone else changed it — re-read and retry, do not overwrite
+}
+
+// The version field turns a read-modify-write into a safe operation: the
+// update applies only if nothing changed underneath. Check matchedCount, and
+// retry rather than ignoring it. Ignoring it is the lost update again.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Bulk writes</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">one round trip instead of a thousand</span><button class="copy">Copy</button></div>
+<pre><code>await db.orders.bulkWrite([
+  { insertOne: { document: { … } } },
+  { updateOne: { filter: { _id: a }, update: { $set: { status: "shipped" } } } },
+  { updateMany: { filter: { batch: 7 }, update: { $inc: { attempts: 1 } } } },
+  { deleteOne: { filter: { _id: b } } },
+  { replaceOne: { filter: { _id: c }, replacement: { … }, upsert: true } }
+], { ordered: false });
+
+//   ordered: true  (default) — sequential; STOPS at the first error
+//   ordered: false           — may run in parallel; continues past errors
+//                              and reports them all at the end
+//
+// Use ordered: false for independent operations — it is substantially faster
+// and one bad document does not abandon the rest of the batch. Use the
+// default when later operations depend on earlier ones.
+
+// A bulk write is NOT a transaction. Individual operations are each atomic;
+// the batch as a whole is not, and a failure halfway leaves earlier
+// operations applied.
+
+// Batch size: a few hundred to a few thousand. The wire limit is 100,000
+// operations or 16 MB per batch, and much smaller batches are usually better
+// for memory and for not holding up replication.
+for (const chunk of chunks(items, 1000)) {
+  await coll.bulkWrite(chunk.map(toOperation), { ordered: false });
+}
+
+// A thousand individual updateOne calls is a thousand network round trips.
+// The same work as bulkWrite is typically 10-50x faster, and this is the
+// single most common easy performance win in a MongoDB application.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Update pipelines</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">since 4.2, an update can be an aggregation</span><button class="copy">Copy</button></div>
+<pre><code>// Set a field from OTHER fields of the same document — impossible with
+// plain operators, and previously required reading the document first.
+db.orders.updateMany({}, [
+  { $set: {
+      total: { $sum: { $map: {
+        input: "$items", as: "i",
+        in: { $multiply: ["$$i.qty", "$$i.price"] }
+      } } },
+      updatedAt: "$$NOW"
+  } }
+]);
+
+// Conditional logic in a single atomic write:
+db.accounts.updateOne({ _id: id }, [
+  { $set: {
+      tier: { $switch: { branches: [
+        { case: { $gte: ["$spend", 10000] }, then: "gold"   },
+        { case: { $gte: ["$spend", 1000]  }, then: "silver" }
+      ], default: "bronze" } }
+  } }
+]);
+
+// Only $addFields/$set, $project/$unset, $replaceRoot/$replaceWith are
+// allowed — no $lookup, no $group. Still, this removes most of the remaining
+// reasons to read a document before writing it, which is the point.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">replaceOne and a document without operators are the same trap</span>
+  <p><code>updateOne(filter, {status: "paid"})</code> — with no <code>$set</code> — does not set the status. It <b>replaces the entire document</b> with <code>{_id, status: "paid"}</code>, discarding every other field. Modern drivers reject an update document with no operators, which is a relief, but <code>replaceOne</code> does exactly this by design and is occasionally reached for by mistake. The same hazard appears in ORMs that read a document, mutate the object and call <code>replaceOne</code> to save it: any field added by another process between the read and the write is silently destroyed. Use operators.</p>
+</div>
+
+<h2><span class="h-rule"></span>What a write returns</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">check it, because silence is not success</span><button class="copy">Copy</button></div>
+<pre><code>const res = await db.orders.updateOne(
+  { _id: id, status: "pending" },
+  { $set: { status: "paid" } }
+);
+
+res.matchedCount    // 0 means the FILTER matched nothing — the document does
+                    // not exist, or its status was not "pending". This is
+                    // usually the interesting case and it is not an error
+res.modifiedCount   // 0 with matchedCount 1 means it matched and the values
+                    // were already what you set. Also not an error
+res.upsertedId      // present if an upsert inserted
+
+// A conditional update that matches nothing is how you detect a state
+// transition that was not valid — and it is silent unless you check.
+if (res.matchedCount === 0) {
+  throw new ConflictError("order was not pending");
+}
+
+// deleteMany and updateMany with a filter that matches nothing also succeed
+// quietly. A migration that "ran fine" and changed nothing is the classic
+// version of this (chapter 17) — always assert the count.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Deleting</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">and why it does not free space</span><button class="copy">Copy</button></div>
+<pre><code>db.orders.deleteOne({ _id: id });
+db.orders.deleteMany({ status: "cancelled", placedAt: { $lt: cutoff } });
+
+// deleteMany over millions of documents is slow, generates a lot of oplog,
+// and does NOT return space to the filesystem — WiredTiger marks the space
+// reusable within its files, exactly like the PostgreSQL unit's chapter 3.
+// The collection on disk stays the same size.
+//
+// db.runCommand({ compact: "orders" });   // reclaims it. Blocks writes on
+//                                         // that collection. Consider
+//                                         // resyncing a secondary instead.
+
+// TTL INDEXES — the right answer for anything with a retention policy.
+// A background thread deletes expired documents automatically.
+db.sessions.createIndex({ lastSeen: 1 }, { expireAfterSeconds: 3600 });
+db.events.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+//   the second form uses the DATE IN THE FIELD as the expiry time
+
+// The TTL thread runs every 60 seconds, so deletion is approximate — a
+// document may survive up to a minute past its expiry, more under load.
+// Fine for sessions and caches; not a security control.
+
+// And for genuine time-series or high-volume append data, chapter 3's
+// bucketing plus dropping whole collections beats deleting documents
+// entirely — the same argument as partitioning in the PostgreSQL unit.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Idempotency, since retries are inevitable</span>
+  <p>A network failure between the server applying a write and your driver receiving the acknowledgement is indistinguishable from the write never happening. The driver retries — MongoDB's retryable writes do this automatically for single-document operations — and your write may therefore apply twice. Operators differ: <code>$set</code> is naturally idempotent, <code>$inc</code> and <code>$push</code> are not. Where it matters, make the operation idempotent by construction: a conditional filter that only matches once (<code>{status: "pending"}</code>), a unique index on a client-supplied key, or <code>$addToSet</code> instead of <code>$push</code>. This is the SQL unit's chapter 9 argument, and it applies with more force here because the retry is automatic.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>A write to one document is atomic</b>, however many fields it changes. Across documents it is not.</li>
+    <li><b>Never read-modify-write.</b> Express the change as an operator the server applies to current state.</li>
+    <li><b>An upsert without a unique index on the filter fields is a race condition.</b> Add the index and retry on error 11000.</li>
+    <li><code>findOneAndUpdate</code> gives you an atomic claim — a correct work queue with no extra machinery.</li>
+    <li>When the change must be computed in the application, use a <b>version guard and check <code>matchedCount</code></b>.</li>
+    <li><b><code>bulkWrite</code> with <code>ordered: false</code></b> is the easiest large performance win in most MongoDB applications.</li>
+    <li><b><code>replaceOne</code> discards every field you did not include.</b> Use operators.</li>
+    <li><b>Deletes do not return space</b>, and retries are automatic — so make writes idempotent by construction.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("06-writing.html");
+
+(function(){
+  const root = document.getElementById("upd");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const BEFORE = {
+    _id: 'ObjectId("A")', reference: '"NW-8842"', status: '"pending"',
+    views: 41,
+    tags: '["gift", "urgent"]',
+    items: '[ { sku: "TSH", qty: 2, done: false },\n           { sku: "MUG", qty: 1, done: false } ]',
+    recent: '[ { t: 3 }, { t: 2 }, { t: 1 } ]',
+    legacyRef: '"old-8842"'
+  };
+
+  const OPS = {
+    set: {cmd:'{ $set: { status: "paid", "customer.tier": "gold" } }',
+      after:{status:'"paid"', customer:'{ tier: "gold" }'},
+      note:"The workhorse. Dot notation reaches into nested objects and CREATES the intermediate objects if they do not exist — so \"customer.tier\" works even when there is no customer field yet.\n\nUnlike replaceOne it leaves every other field alone, which is what you almost always want."},
+    inc: {cmd:'{ $inc: { views: 1 } }',
+      after:{views:42},
+      note:"Atomic arithmetic performed by the server. No read, no race — a thousand concurrent $inc operations produce exactly a thousand increments.\n\nCompare with the alternative: read views, add one, write 42 back. Two processes doing that concurrently both read 41, both write 42, and one increment is lost. That is the SQL unit's chapter 10 lost update, and $inc makes it impossible rather than merely unlikely.\n\nAlso works with a negative value to decrement, and $mul multiplies. Note $inc is not idempotent, so an automatic retry after a network failure can apply it twice."},
+    push: {cmd:'{ $push: { tags: "fragile" } }',
+      after:{tags:'["gift", "urgent", "fragile"]'},
+      note:"Appends to the end of an array. If the field does not exist it is created as a single-element array.\n\nThe caution from chapter 2 applies: WiredTiger rewrites the whole document when it grows, so pushing to an array that never stops growing costs more with every push and ends at the 16 MB limit. An unbounded $push is a modelling bug — bucket it, or bound it with the next option."},
+    slice: {cmd:'{ $push: { recent: {\n    $each: [ { t: 4 } ],\n    $sort: { t: -1 },\n    $slice: 3\n} } }',
+      after:{recent:'[ { t: 4 }, { t: 3 }, { t: 2 } ]'},
+      note:"$each, $sort and $slice together maintain a bounded, sorted list in ONE atomic operation. The new element is added, everything is re-sorted, and only the top three are kept.\n\nThis is what makes chapter 3's subset pattern practical: the five most helpful reviews, the twenty most recent activity items, the top ten scores. The array can never grow past the slice, so the document stays bounded by construction.\n\nA negative $slice keeps elements from the end instead, which is the usual form for \"the most recent N\" when sorting ascending."},
+    addToSet: {cmd:'{ $addToSet: { tags: "gift" } }',
+      after:{tags:'["gift", "urgent"]  // unchanged'},
+      note:"Appends only if the value is not already present — set semantics. Here \"gift\" is already there, so nothing changes.\n\nUnlike $push, this IS idempotent, which makes it the right choice whenever a retry might reapply the operation. If an automatic retryable write fires twice, $addToSet gives the same result and $push gives you a duplicate.\n\nComparison uses full BSON equality, so for arrays of objects every field must match — which is usually not what you want. For those, a conditional update or arrayFilters is a better fit."},
+    pull: {cmd:'{ $pull: { tags: "urgent" } }',
+      after:{tags:'["gift"]'},
+      note:"Removes every element matching the value or condition — not just the first. $pull accepts a query, so you can remove by condition:\n\n    { $pull: { items: { qty: { $lt: 1 } } } }\n\n$pullAll removes several exact values at once. $pop removes from one end: -1 for the first element, 1 for the last."},
+    positional: {cmd:'// note the array field IS in the filter\nupdateOne(\n  { _id: id, "items.sku": "MUG" },\n  { $set: { "items.$.done": true } }\n)',
+      after:{items:'[ { sku: "TSH", qty: 2, done: false },\n           { sku: "MUG", qty: 1, done: true } ]'},
+      note:"The positional $ refers to the FIRST array element matched by the query, so the filter must include a condition on that array — without it, MongoDB has no idea which element you mean and errors.\n\nTwo limits worth knowing. It only ever updates the first match, even if several elements qualify. And it cannot reach into nested arrays — \"a.$.b.$.c\" is not valid.\n\nFor anything beyond \"the one element I just matched\", use arrayFilters instead."},
+    filtered: {cmd:'updateOne({ _id: id },\n  { $set: { "items.$[e].done": true } },\n  { arrayFilters: [ { "e.qty": { $gte: 2 } } ] }\n)',
+      after:{items:'[ { sku: "TSH", qty: 2, done: true },\n           { sku: "MUG", qty: 1, done: false } ]'},
+      note:"arrayFilters updates every element matching a named condition, and it is the operator that made array updates genuinely usable when it arrived in 3.6.\n\nThe identifier in $[e] is bound by the arrayFilters entry, so you can name several and use them independently — including for nested arrays, which the positional $ cannot reach.\n\nBefore this existed, updating specific array elements meant reading the document, finding the indices, and writing back positional paths like \"items.3.done\" — a read-modify-write with all the race conditions that implies. If you see that pattern in old code, this is what replaces it."},
+    all: {cmd:'{ $set: { "items.$[].done": true } }',
+      after:{items:'[ { sku: "TSH", qty: 2, done: true },\n           { sku: "MUG", qty: 1, done: true } ]'},
+      note:"$[] with no identifier applies to every element of the array, unconditionally.\n\nSimple and occasionally exactly right — marking everything as processed, stamping every element with a timestamp. Be deliberate about it, since it is the array equivalent of an UPDATE with no WHERE clause: correct when intended and destructive when not."},
+    unset: {cmd:'{ $unset: { legacyRef: "" } }',
+      after:{legacyRef:'// field removed entirely'},
+      note:"Removes the field completely — not setting it to null, which is a different state (chapter 1).\n\nThe value passed is ignored; the empty string is convention. Useful in migrations to drop a deprecated field once nothing reads it (chapter 17).\n\nRemember the three states: has a value, is null, does not exist. { legacyRef: null } as a query matches both of the last two, which is why being deliberate about which one you produce matters."},
+    rename: {cmd:'{ $rename: { legacyRef: "externalRef" } }',
+      after:{externalRef:'"old-8842"  // legacyRef gone'},
+      note:"Renames a field in place, atomically per document. The primary tool for a field-rename migration.\n\nTwo notes. If the target name already exists it is overwritten. And $rename cannot move a field into or out of an array — for that you need an update pipeline.\n\nIn practice a rename across a live collection is done gradually: write both names for a period, backfill with $rename, then stop writing the old one and $unset it. Chapter 17 covers the full sequence."},
+    replace: {cmd:'replaceOne({ _id: id }, { status: "paid" })',
+      after:{"⚠":'{ _id: ObjectId("A"), status: "paid" }\n// EVERY other field is gone'},
+      note:"This replaces the entire document. reference, views, tags, items, recent — all destroyed. Only _id survives, because it cannot be changed.\n\nIt is occasionally what you want, and it is far more often reached for by accident. The classic route is an ORM that reads a document into an object, mutates one property and calls replaceOne to save it: any field another process added between the read and the write is silently gone.\n\nModern drivers reject an update document with no operators — updateOne(filter, {status: \"paid\"}) errors rather than replacing — which removed the worst version of this trap. replaceOne still does exactly what it says.\n\nUse operators."}
+  };
+
+  function esc(s){ return String(s).replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])); }
+
+  function docBlock(obj, title, colour, changed){
+    return '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      title + '</div>' +
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid ' + colour +
+      ';border-radius:5px;padding:11px 13px;margin:0;font-family:var(--mono);font-size:11.5px;' +
+      'line-height:1.65;overflow-x:auto">{\n' +
+      Object.entries(obj).map(([k, v]) =>
+        '  ' + (changed && changed.includes(k)
+          ? '<b style="color:#0F7A85">' + esc(k) + ': ' + esc(v) + '</b>'
+          : '<span style="color:#54677A">' + esc(k) + ': ' + esc(v) + '</span>')).join(",\n") +
+      '\n}</pre>';
+  }
+
+  function render(){
+    const k = $("u-op").value, o = OPS[k];
+    const isReplace = k === "replace";
+
+    $("u-before").innerHTML = docBlock(BEFORE, "Before", "#CFD8E0");
+
+    $("u-cmd").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      'The update</div>' +
+      '<pre style="background:#0C1D30;color:#CFE0EC;border-radius:5px;padding:11px 13px;margin:0;' +
+      'font-family:var(--mono);font-size:12px;line-height:1.6;overflow-x:auto">' + esc(o.cmd) + '</pre>';
+
+    const after = isReplace ? o.after : { ...BEFORE, ...o.after };
+    if(!isReplace) Object.keys(o.after).forEach(kk => { after[kk] = o.after[kk]; });
+    $("u-after").innerHTML = docBlock(after, "After", isReplace ? "#E2574C" : "#3FB984",
+                                      Object.keys(o.after));
+
+    $("u-note").textContent = o.note;
+  }
+
+  $("u-op").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

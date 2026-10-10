@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>22 · Automating GitHub: CLI, APIs and webhooks — Git &amp; GitHub</title>
+<meta name="description" content="The gh CLI, the REST and GraphQL APIs compared, pagination and rate limits, token and app types, and webhooks with signature verification.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M8 24V11a3 3 0 013-3h10' stroke='%237C8CF8' stroke-width='2.5' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='8' cy='24' r='3' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='23' cy='8' r='3' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch22">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Git &amp; GitHub
+    </a>
+    <div class="chno"><b>Chapter 22</b><span>GitHub the platform</span></div>
+    <h1>Automating GitHub</h1>
+    <p class="lede">Everything the web interface does is an API call, and most of what a team does repeatedly should be a script. <b>The interesting decisions are which API, which token, and push or pull</b> — and each has a wrong answer that works fine until you have a hundred repositories or a rate limit.</p>
+    <div class="meta"><span>28 min</span><span>2 demos</span><span>7 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="gh">
+      <h2 data-nav="The gh CLI">The <code>gh</code> CLI</h2>
+      <p class="sub">Start here. It handles auth, pagination and JSON, and most scripts never need more.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">the high-level commands</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ gh auth login &amp;&amp; gh auth status
+$ gh repo clone acme/api &amp;&amp; gh repo view --web
+$ gh pr create --fill --draft &amp;&amp; gh pr checks &amp;&amp; gh pr merge --squash --delete-branch
+$ gh issue list --label "prio:p1" --json number,title,assignees
+$ gh run watch &amp;&amp; gh run view --log-failed
+$ gh release create v2.5.0 --generate-notes
+$ gh workflow run deploy.yml -f environment=staging</pre>
+      </div>
+      <p>The part worth learning properly is <code>gh api</code>, which is a thin authenticated HTTP client with pagination and <code>jq</code> built in:</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">gh api</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ gh api repos/acme/api --jq '.default_branch, .open_issues_count'
+
+$ gh api --paginate 'repos/acme/api/pulls?state=open&amp;per_page=100' \
+    --jq '.[] | [.number, .user.login, .title] | @tsv'
+
+$ gh api --method POST repos/acme/api/issues \
+    -f title='Flaky auth test' -f body='Fails about 1 run in 20' \
+    -f 'labels[]=type:bug'
+
+$ gh api graphql -f query='
+  query($owner:String!, $name:String!) {
+    repository(owner:$owner, name:$name) {
+      pullRequests(states:OPEN, first:20) { nodes { number title author { login } } }
+    }
+  }' -f owner=acme -f name=api
+
+$ gh api rate_limit --jq '.resources.core'      # never counts against the limit</pre>
+      </div>
+      <div class="tip">
+        <span class="lbl">Two flags that change how you script</span>
+        <p><code>--paginate</code> follows <code>Link</code> headers until there are no more pages, so you never write a pagination loop. <code>--jq</code> applies a filter in-process, which means no <code>jq</code> dependency and no shell quoting fight. Together they turn a twenty-line Python script into one line — and in Actions, <code>gh</code> is preinstalled and picks up <code>GH_TOKEN</code> from the environment.</p>
+      </div>
+    </section>
+
+    <section id="rest">
+      <h2 data-nav="REST">The REST API</h2>
+      <p class="sub">Predictable, complete, and chatty.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">the shape of a raw call</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ curl -sS https://api.github.com/repos/acme/api/pulls?per_page=100 \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" -D headers.txt
+
+$ grep -i '^link:' headers.txt
+link: &lt;https://api.github.com/repositories/1300192/pulls?per_page=100&amp;page=2&gt;; rel="next", …
+
+$ grep -i '^x-ratelimit' headers.txt
+x-ratelimit-limit: 5000
+x-ratelimit-remaining: 4987
+x-ratelimit-reset: 1756742400</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Mechanic</th><th>Detail</th></tr></thead>
+          <tbody>
+            <tr><td>Pagination</td><td><code>per_page</code> up to 100; follow the <code>Link</code> header's <code>rel="next"</code> rather than incrementing <code>page</code></td></tr>
+            <tr><td>Versioning</td><td><code>X-GitHub-Api-Version</code>. Pin it, or a future change is your problem</td></tr>
+            <tr><td>Rate limit</td><td>5,000 requests per hour authenticated; 60 unauthenticated; <b>1,000 per hour per repository</b> for <code>GITHUB_TOKEN</code> inside Actions</td></tr>
+            <tr><td>Conditional requests</td><td>Send <code>If-None-Match</code> with a stored <code>ETag</code>; a <code>304 Not Modified</code> does not count against the primary limit</td></tr>
+            <tr><td>Secondary limits</td><td>Separate, undocumented-in-detail throttles on concurrency and content creation. Respect <code>Retry-After</code></td></tr>
+            <tr><td>Search</td><td>Its own much lower limit, and a 1,000-result cap. Not a database</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>The failure mode of REST is the <strong>N+1 problem</strong>: listing 200 pull requests is two calls, and getting each one's reviews is another 200. That is what GraphQL is for.</p>
+    </section>
+
+    <section id="graphql">
+      <h2 data-nav="GraphQL">GraphQL, and when it wins</h2>
+      <p class="sub">One request, exactly the fields you asked for, priced by how much you asked for.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">nested data in one round trip</span><button class="copy">Copy</button></div>
+<pre data-lang="text">query($owner:String!, $name:String!, $cursor:String) {
+  repository(owner:$owner, name:$name) {
+    pullRequests(states:OPEN, first:50, after:$cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number title
+        author { login }
+        labels(first:10) { nodes { name } }
+        reviews(first:10) { nodes { state author { login } } }
+        commits(last:1) { nodes { commit { statusCheckRollup { state } } } }
+      }
+    }
+  }
+  rateLimit { cost remaining resetAt }
+}</pre>
+      </div>
+      <p>Include the <code>rateLimit</code> field and the response tells you what the query cost — the only reliable way to tune a large query.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>REST versus GraphQL request planner</h3>
+          <span class="hint">Calls, points and share of the hourly budget for the same job</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <label for="g-items" style="min-width:136px">primary items <b id="g-itemsv">200</b></label>
+            <input type="range" id="g-items" min="10" max="5000" step="10" value="200" style="width:140px">
+          </div>
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:136px">also need, per item</span>
+            <span id="g-subs" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:136px">running as</span>
+            <span id="g-token" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div id="g-table" style="overflow-x:auto"></div>
+          <div class="rgrid" id="g-out"></div>
+          <p class="readout" id="g-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Choose REST when</th><th>Choose GraphQL when</th></tr></thead>
+          <tbody>
+            <tr><td>You need one or two objects</td><td>You need nested data across many objects</td></tr>
+            <tr><td>The endpoint has no GraphQL equivalent — Actions, some admin APIs</td><td>You want to avoid N+1 entirely</td></tr>
+            <tr><td>You want <code>curl</code>-level simplicity</td><td>Response size matters, or you are on a mobile link</td></tr>
+            <tr><td>You are uploading a release asset or a file</td><td>You need Projects v2, which is GraphQL-only</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="auth">
+      <h2 data-nav="Tokens">Tokens, and which one to use</h2>
+      <p class="sub">Four kinds, with genuinely different security properties.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Credential</th><th>Scope</th><th>Lifetime</th><th>Use for</th></tr></thead>
+          <tbody>
+            <tr><td>Classic PAT</td><td>Coarse scopes, every repository you can reach</td><td>Optional expiry</td><td>Nothing new. It is the credential most often over-privileged</td></tr>
+            <tr><td>Fine-grained PAT</td><td>Chosen repositories, per-permission read or write</td><td>Mandatory expiry; org approval possible</td><td>Personal scripts and one-off automation</td></tr>
+            <tr><td><code>GITHUB_TOKEN</code></td><td>The one repository, permissions you declare</td><td>The job</td><td>Anything inside Actions (ch. 21)</td></tr>
+            <tr><td>GitHub App installation token</td><td>Installed repositories, per-permission</td><td>One hour, minted on demand</td><td>Real automation: bots, org-wide tooling, anything shared</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">the app flow, which is the one worth learning</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># 1. sign a short JWT with the app's private key  (10 minutes max)
+# 2. exchange it for an installation token
+$ curl -sS -X POST \
+    -H "Authorization: Bearer $APP_JWT" \
+    -H "Accept: application/vnd.github+json" \
+    https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens
+
+# in Actions, an action does both steps for you
+- uses: actions/create-github-app-token@v1
+  id: app-token
+  with:
+    app-id: ${{ vars.APP_ID }}
+    private-key: ${{ secrets.APP_PRIVATE_KEY }}
+- run: gh pr create --fill
+  env:
+    GH_TOKEN: ${{ steps.app-token.outputs.token }}</pre>
+      </div>
+      <p>Three reasons apps beat a shared PAT for anything more than a personal script: the token expires in an hour so a leak has a short blast radius; the rate limit scales with the number of repositories the app is installed on rather than being one shared 5,000; and actions appear as the app rather than as whichever employee's account happened to own the token — which still works after they leave.</p>
+    </section>
+
+    <section id="webhooks">
+      <h2 data-nav="Webhooks">Webhooks</h2>
+      <p class="sub">Push instead of poll — and the one thing you must get right.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Header</th><th>Is</th></tr></thead>
+          <tbody>
+            <tr><td><code>X-GitHub-Event</code></td><td>The event name: <code>push</code>, <code>pull_request</code>, <code>issue_comment</code></td></tr>
+            <tr><td><code>X-GitHub-Delivery</code></td><td>A unique delivery id — your idempotency key, because retries happen</td></tr>
+            <tr><td><code>X-Hub-Signature-256</code></td><td><code>sha256=</code> plus the HMAC of the <b>raw request body</b> using your webhook secret</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Anyone who learns your endpoint URL can post to it. The signature is the only thing that distinguishes a real delivery from a forgery, so verifying it is not optional — and it must be computed over the <strong>exact bytes received</strong>.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Webhook signature verifier</h3>
+          <span class="hint">Real HMAC-SHA256, computed in the page — it matches what GitHub would send</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <label for="w-secret" style="min-width:70px">secret</label>
+            <input type="text" id="w-secret" spellcheck="false" style="flex:1 1 220px;font-family:var(--mono);font-size:12.5px" value="It's a Secret to Everybody">
+          </div>
+          <div class="ctrl">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:70px">in transit</span>
+            <span id="w-mode" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(238px,1fr));gap:11px">
+            <div>
+              <div style="font-size:12px;color:var(--text-2);margin-bottom:5px">the body GitHub signed</div>
+              <div class="term" id="w-sent" style="min-height:auto"></div>
+            </div>
+            <div>
+              <div style="font-size:12px;color:var(--text-2);margin-bottom:5px">the body your server received</div>
+              <div class="term" id="w-recv" style="min-height:auto"></div>
+            </div>
+          </div>
+          <div class="term" id="w-term" style="margin-top:11px"></div>
+          <div class="rgrid" id="w-out"></div>
+          <p class="readout" id="w-note"></p>
+        </div>
+      </div>
+
+      <div class="code">
+        <div class="code-top"><span class="tag">verification, done correctly</span><button class="copy">Copy</button></div>
+<pre data-lang="text">import crypto from "node:crypto"
+
+// the raw body, NOT the parsed object re-serialised
+app.post("/hook", express.raw({ type: "application/json" }), (req, res) =&gt; {
+  const sent = req.get("X-Hub-Signature-256") || ""
+  const mine = "sha256=" + crypto
+    .createHmac("sha256", process.env.WEBHOOK_SECRET)
+    .update(req.body)                       // a Buffer of the exact bytes
+    .digest("hex")
+
+  const a = Buffer.from(sent), b = Buffer.from(mine)
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(401).send("bad signature")
+  }
+
+  const id = req.get("X-GitHub-Delivery")   // idempotency: retries reuse this
+  enqueue(id, req.get("X-GitHub-Event"), JSON.parse(req.body))
+  res.status(202).end()                      // ack fast, work later
+})</pre>
+      </div>
+      <div class="trap">
+        <span class="lbl">Three ways this goes wrong</span>
+        <p><strong>Re-serialising the body.</strong> Frameworks that parse JSON automatically hand you an object; <code>JSON.stringify</code> of it is not the bytes that were signed, and every signature fails. Capture the raw body. <strong>Comparing with <code>==</code>.</strong> A non-constant-time comparison leaks the correct signature a byte at a time; use <code>timingSafeEqual</code>. <strong>Doing the work before responding.</strong> GitHub expects a fast acknowledgement and retries on timeout, so a slow handler turns one event into several — which is what the delivery id is for.</p>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">developing against webhooks</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ gh extension install cli/gh-webhook
+$ gh webhook forward --repo=acme/api --events=push,pull_request \
+    --url=http://localhost:3000/hook
+
+$ gh api repos/acme/api/hooks/12345/deliveries --jq '.[0]'
+$ gh api --method POST repos/acme/api/hooks/12345/deliveries/98765/attempts   # redeliver</pre>
+      </div>
+      <p>Redelivery from the API or the settings UI is the thing that makes webhook development bearable: fix the handler, replay the exact delivery, no need to reproduce the event.</p>
+    </section>
+
+    <section id="patterns">
+      <h2 data-nav="Patterns">Automation patterns</h2>
+      <p class="sub">Which mechanism for which shape of problem.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>You want</th><th>Use</th></tr></thead>
+          <tbody>
+            <tr><td>React to repository activity, with repository context</td><td>An Actions workflow on that event</td></tr>
+            <tr><td>React across many repositories, or keep state</td><td>A GitHub App receiving webhooks</td></tr>
+            <tr><td>A scheduled report or cleanup</td><td><code>on: schedule</code> plus <code>gh api</code></td></tr>
+            <tr><td>Trigger CI from an external system</td><td><code>repository_dispatch</code>, or <code>workflow_dispatch</code> via the API</td></tr>
+            <tr><td>Run something after another workflow finishes</td><td><code>on: workflow_run</code></td></tr>
+            <tr><td>A label or comment to start a job</td><td><code>issue_comment</code> or <code>pull_request</code> <code>labeled</code>, guarded by an <code>if:</code> on the actor's permission</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="trap">
+        <span class="lbl">The loop-prevention rule that looks like a bug</span>
+        <p>Events caused by <code>GITHUB_TOKEN</code> do not trigger new workflow runs. A workflow that commits with the default token will not cause your <code>on: push</code> CI to run, and a PR it opens will not trigger <code>on: pull_request</code>. This is deliberate — it stops infinite loops — and it is the usual explanation for "my bot's PR has no checks". To trigger downstream workflows you need a different identity: a GitHub App token or a PAT. Which also means you have re-enabled the loop, so add a guard such as <code>if: github.actor != 'my-bot[bot]'</code>.</p>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">a scheduled report, end to end</span><button class="copy">Copy</button></div>
+<pre data-lang="yaml">on:
+  schedule: [{ cron: '0 8 * * 1' }]
+permissions:
+  issues: write
+  pull-requests: read
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Stale pull requests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --paginate 'repos/${{ github.repository }}/pulls?state=open&amp;per_page=100' \
+            --jq '.[] | select(.updated_at &lt; "'"$(date -u -d '14 days ago' +%Y-%m-%d)"'")
+                  | "- #\(.number) \(.title) — \(.user.login)"' &gt; body.md
+          gh issue create --title "Stale PRs, week of $(date -u +%F)" --body-file body.md</pre>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 22 in seven lines</h2>
+        <ul>
+          <li><code>gh api</code> with <code>--paginate</code> and <code>--jq</code> replaces most scripts; <code>gh</code> is preinstalled in Actions and reads <code>GH_TOKEN</code>.</li>
+          <li>REST: follow the <code>Link</code> header, pin <code>X-GitHub-Api-Version</code>, 5,000 requests an hour — but only <b>1,000 per repository per hour</b> for <code>GITHUB_TOKEN</code> in Actions.</li>
+          <li>REST's failure mode is <b>N+1</b>; GraphQL exists for nested data, is priced in points, and will tell you the cost if you ask for <code>rateLimit</code>.</li>
+          <li>Credentials in order of preference: <code>GITHUB_TOKEN</code> inside Actions, a <b>GitHub App</b> for shared automation, a fine-grained PAT for personal scripts, a classic PAT for nothing.</li>
+          <li>App tokens expire in an hour, scale their rate limit with installations, and survive the departure of whoever set them up.</li>
+          <li>Verify <code>X-Hub-Signature-256</code> over the <b>raw body</b> with a constant-time comparison, use <code>X-GitHub-Delivery</code> for idempotency, and acknowledge before doing the work.</li>
+          <li>Events caused by <code>GITHUB_TOKEN</code> do not trigger workflows — deliberate loop prevention, and the reason a bot's PR appears to have no CI.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary>Your webhook handler rejects every delivery as having a bad signature, and the secret is definitely correct. What is the most likely cause?</summary>
+        <div class="ans"><p>The framework parsed the JSON body and you are computing the HMAC over a re-serialised version of it. Key order, whitespace and unicode escaping all differ from what GitHub actually sent, so the digest cannot match even though the data is identical. Capture the raw bytes — <code>express.raw()</code>, <code>request.data</code> in Flask, <code>ctx.request.rawBody</code> — and verify those, parsing only afterwards. The demo above reproduces this exactly with the "reformatted" option: the data is unchanged and the signature still fails.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A nightly job needs each of 400 open PRs with its reviews. Estimate the REST cost and say what you would do instead.</summary>
+        <div class="ans"><p>REST: four list calls at <code>per_page=100</code>, plus one <code>/pulls/{n}/reviews</code> call per PR — about 404 requests. That is 8% of a personal hourly limit, or <b>over 40% of the 1,000-per-repository budget a <code>GITHUB_TOKEN</code> gets in Actions</b>, before anything else in the job. GraphQL does it in roughly four paginated queries with <code>reviews(first:10)</code> nested inside <code>pullRequests(first:100)</code>, costing a handful of points. The planner above prices both.</p></div>
+      </details>
+      <details class="chk">
+        <summary>An Actions workflow uses <code>GITHUB_TOKEN</code> to open a pull request, and the PR shows no status checks. Why, and what are the fixes?</summary>
+        <div class="ans"><p>Events created with <code>GITHUB_TOKEN</code> deliberately do not trigger further workflow runs, so no <code>pull_request</code> event fires. Fixes, roughly best first: mint a GitHub App installation token and open the PR with that; use a fine-grained PAT stored as a secret; or restructure so the check runs in the same workflow that created the branch. If you do switch identity you have re-enabled the loop risk, so guard the triggered workflow with a condition on the actor.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Why prefer a GitHub App over a shared classic PAT for org-wide automation, beyond "it is more secure"?</summary>
+        <div class="ans"><p>Three concrete reasons. Rate limits: a PAT gives you one shared 5,000 per hour across every script using it, while an app's limit scales with how many repositories it is installed on. Lifetime: installation tokens last an hour and are minted on demand, so a leaked token is briefly useful rather than indefinitely. Ownership: a PAT belongs to a person, so it dies with their offboarding and its actions appear under their name in every audit log — an app acts as itself, with per-permission scopes you can narrow per repository.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Part 5 is complete. Chapter 23 opens the last part with repository archaeology and surgery: bisect, filter-repo, packfiles, fsck and hooks.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li><code>gh api rate_limit --jq '.resources'</code> — it is free.</li>
+        <li><code>gh api --paginate repos/:owner/:repo/pulls --jq 'length'</code>.</li>
+        <li>Compute an HMAC of a sample payload and compare it with the demo above.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>GitHub REST and GraphQL API documentation (pagination, rate limits, conditional requests), webhook delivery and validation docs, the apps documentation, and <code>gh help api</code>.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — REST versus GraphQL request planner
+   ============================================================ */
+(function () {
+  var SUBS = [
+    { id: "reviews", label: "reviews", on: true, nodes: 10 },
+    { id: "checks", label: "check status", on: true, nodes: 1 },
+    { id: "comments", label: "comments", on: false, nodes: 10 },
+    { id: "files", label: "changed files", on: false, nodes: 30 }
+  ];
+  /* labels and author arrive inside the primary object on both APIs */
+  var TOKENS = [
+    { id: "pat", label: "a personal token", limit: 5000 },
+    { id: "actions", label: "GITHUB_TOKEN in Actions", limit: 1000 }
+  ];
+  var token = "actions";
+
+  var subsHost = document.getElementById("g-subs");
+  var tokenHost = document.getElementById("g-token");
+  var table = document.getElementById("g-table");
+  var out = document.getElementById("g-out");
+  var note = document.getElementById("g-note");
+
+  SUBS.forEach(function (s) {
+    var b = document.createElement("button");
+    b.className = "btn" + (s.on ? " on" : "");
+    b.textContent = s.label;
+    b.addEventListener("click", function () { s.on = !s.on; b.classList.toggle("on", s.on); render(); });
+    subsHost.appendChild(b);
+  });
+  TOKENS.forEach(function (t) {
+    var b = document.createElement("button");
+    b.className = "btn" + (t.id === token ? " on" : "");
+    b.textContent = t.label;
+    b.addEventListener("click", function () {
+      token = t.id;
+      Array.prototype.forEach.call(tokenHost.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      render();
+    });
+    tokenHost.appendChild(b);
+  });
+
+  function limit() { return TOKENS.filter(function (t) { return t.id === token; })[0].limit; }
+
+  function model() {
+    var items = parseInt(document.getElementById("g-items").value, 10);
+    var active = SUBS.filter(function (s) { return s.on; });
+    var pages = Math.ceil(items / 100);
+
+    /* REST: one list per page, then one call per item per sub-resource */
+    var restCalls = pages + items * active.length;
+
+    /* GraphQL: one query per page of primary items, with sub-resources nested.
+       Cost is approximated the documented way: the number of nodes a query can
+       return, divided by 100, at least 1 point per connection. */
+    var gqlQueries = pages;
+    var nodesPerItem = 1 + active.reduce(function (a, s) { return a + s.nodes; }, 0);
+    var costPerQuery = Math.max(1, Math.ceil((Math.min(items, 100) * nodesPerItem) / 100));
+    var gqlPoints = gqlQueries * costPerQuery;
+
+    return {
+      items: items, pages: pages, active: active,
+      restCalls: restCalls, gqlQueries: gqlQueries, gqlPoints: gqlPoints,
+      restShare: restCalls / limit(), gqlShare: gqlPoints / 5000,
+      nodesPerItem: nodesPerItem
+    };
+  }
+
+  function render() {
+    document.getElementById("g-itemsv").textContent = document.getElementById("g-items").value;
+    var m = model();
+
+    var rows = [
+      ["REST", m.restCalls + " requests", m.pages + " list + " + (m.items * m.active.length) + " per-item",
+        (m.restShare * 100).toFixed(1) + "% of " + limit() + "/hr", m.restShare > 1],
+      ["GraphQL", m.gqlQueries + " requests", m.gqlPoints + " points, " + m.nodesPerItem + " nodes per item",
+        (m.gqlShare * 100).toFixed(1) + "% of 5000 points/hr", m.gqlShare > 1]
+    ];
+    table.innerHTML = '<table class="tbl"><thead><tr><th>API</th><th>calls</th><th>breakdown</th><th>hourly budget</th></tr></thead><tbody>' +
+      rows.map(function (r) {
+        return "<tr><td><b>" + r[0] + "</b></td><td>" + r[1] + "</td><td style='color:var(--text-2)'>" + r[2] +
+          "</td><td" + (r[4] ? " style='color:var(--bad);font-weight:600'" : "") + ">" + r[3] +
+          (r[4] ? " — over budget" : "") + "</td></tr>";
+      }).join("") + "</tbody></table>";
+
+    out.innerHTML = "";
+    tile("REST requests", String(m.restCalls), "for one run", m.restShare > 1);
+    tile("GraphQL requests", String(m.gqlQueries), m.gqlPoints + " points", true);
+    tile("Ratio", (m.restCalls / Math.max(1, m.gqlQueries)).toFixed(0) + "×", "more round trips");
+    tile("REST budget used", (m.restShare * 100).toFixed(0) + "%", "per run", m.restShare > 0.5);
+
+    var msgs = [];
+    if (!m.active.length) {
+      msgs.push("With no sub-resources, both APIs need one request per page and the choice is a matter of taste — REST is simpler, GraphQL returns less data. <b>Turn on 'reviews'</b> and watch REST acquire one request per item.");
+    } else {
+      msgs.push("Each selected sub-resource costs REST <b>one request per item</b> — that is the N+1 problem, and it is why the REST column scales with the item count while the GraphQL column scales with <i>pages</i>.");
+    }
+    if (m.restShare > 1) {
+      msgs.push("<b>This job cannot complete in one hour on REST</b> at " + limit() +
+        " requests. Inside Actions the per-repository limit is 1,000, which a few hundred items exhausts on its own.");
+    } else if (token === "actions" && m.restShare > 0.4) {
+      msgs.push("It fits, but it consumes " + (m.restShare * 100).toFixed(0) +
+        "% of the repository's hourly Actions budget — leaving little for anything else the workflow does.");
+    }
+    msgs.push("<b>Assumptions:</b> 100 items per page, one REST endpoint per sub-resource, and GraphQL cost approximated as requested nodes ÷ 100 with a one-point floor. Real GraphQL cost depends on the connections you actually request, which is why you should include the <code>rateLimit</code> field and measure rather than trusting this.");
+    note.innerHTML = msgs.join(" ");
+  }
+
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 9 ? "13px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+  document.getElementById("g-items").addEventListener("input", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — webhook signature verifier (hmacSha256 lives in unit.js)
+   ============================================================ */
+(function () {
+  var PAYLOAD = '{"action":"opened","number":42,"pull_request":{"title":"Return 401 for expired tokens","user":{"login":"priya"}}}';
+  var MODES = [
+    { id: "clean", label: "delivered unchanged" },
+    { id: "reformat", label: "re-serialised by the framework" },
+    { id: "tamper", label: "one value altered" },
+    { id: "nosig", label: "no signature header" }
+  ];
+  var mode = "clean";
+
+  var secretIn = document.getElementById("w-secret");
+  var modeHost = document.getElementById("w-mode");
+  var sentEl = document.getElementById("w-sent");
+  var recvEl = document.getElementById("w-recv");
+  var term = document.getElementById("w-term");
+  var out = document.getElementById("w-out");
+  var note = document.getElementById("w-note");
+
+  MODES.forEach(function (m) {
+    var b = document.createElement("button");
+    b.className = "btn" + (m.id === mode ? " on" : "");
+    b.textContent = m.label;
+    b.addEventListener("click", function () {
+      mode = m.id;
+      Array.prototype.forEach.call(modeHost.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      render();
+    });
+    modeHost.appendChild(b);
+  });
+
+  function received() {
+    if (mode === "reformat") return JSON.stringify(JSON.parse(PAYLOAD), null, 2);
+    if (mode === "tamper") return PAYLOAD.replace('"login":"priya"', '"login":"attacker"');
+    return PAYLOAD;
+  }
+
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+
+  function wrap(s, n) {
+    var out2 = [];
+    for (var i = 0; i < s.length; i += n) out2.push(s.slice(i, i + n));
+    return out2.join("\n");
+  }
+
+  function render() {
+    var secret = secretIn.value;
+    var recv = received();
+    var sentSig = "sha256=" + hmacSha256(secret, PAYLOAD);
+    var mineSig = "sha256=" + hmacSha256(secret, recv);
+    var header = mode === "nosig" ? "" : sentSig;
+    var match = header !== "" && header === mineSig;
+
+    sentEl.innerHTML = wrap(esc(PAYLOAD), 34) + '\n\n<span class="d">' + PAYLOAD.length + " bytes</span>";
+    recvEl.innerHTML = wrap(esc(recv), 34) + '\n\n<span class="d">' + recv.length + " bytes" +
+      (recv === PAYLOAD ? "" : " — differs from what was signed") + "</span>";
+
+    term.innerHTML =
+      '<span class="d">X-GitHub-Event:    pull_request</span>\n' +
+      '<span class="d">X-GitHub-Delivery: 8f3d2a19-c1b0-4e4f-8a7d-6c5b4a392817</span>\n' +
+      "X-Hub-Signature-256: " + (header ? '<span class="y">' + header.slice(0, 27) + "…</span>" : '<span class="r">(absent)</span>') + "\n\n" +
+      '<span class="p">$</span> hmac_sha256(secret, raw_body)\n' +
+      '<span class="' + (match ? "g" : "r") + '">' + mineSig.slice(0, 27) + "…</span>\n\n" +
+      (match
+        ? '<span class="g">202 Accepted — signature verified</span>'
+        : '<span class="r">401 Unauthorized — ' + (header ? "signature mismatch" : "missing X-Hub-Signature-256") + "</span>");
+
+    out.innerHTML = "";
+    tile("Verified", match ? "yes" : "no", "", match);
+    tile("Signed bytes", String(PAYLOAD.length), "as sent");
+    tile("Hashed bytes", String(recv.length), "as received", recv.length === PAYLOAD.length);
+    tile("Digest", mineSig.slice(7, 15) + "…", "sha256");
+
+    var msgs = [];
+    if (mode === "clean") {
+      msgs.push("The digests agree, so this delivery genuinely came from someone holding the secret. Note that the signature covers the body only — headers are not signed, so never trust <code>X-GitHub-Event</code> without having verified the body first. Change one character of the secret and watch it fail.");
+    }
+    if (mode === "reformat") {
+      msgs.push("<b>The data is identical and verification still fails.</b> The framework parsed the JSON and re-serialised it with different whitespace, so the bytes differ from what was signed — " +
+        recv.length + " instead of " + PAYLOAD.length + ". This is the most common webhook bug there is, and the reason every framework has a way to reach the raw body.");
+    }
+    if (mode === "tamper") {
+      msgs.push("A single value was altered in transit and the digest changes completely — the avalanche property of a cryptographic hash. Without the signature check, your handler would have acted on an attacker-supplied login.");
+    }
+    if (mode === "nosig") {
+      msgs.push("No signature at all. Reject rather than falling back to \"process it anyway\": an unsigned request is an anonymous internet POST to a public URL, and treating it as a GitHub event is how endpoints get abused.");
+    }
+    msgs.push("This is real HMAC-SHA256 computed in the page, and it matches what <code>openssl dgst -sha256 -hmac</code> produces for the same inputs.");
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  secretIn.addEventListener("input", render);
+  render();
+})();
+</script>
+</body>
+</html>

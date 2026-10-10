@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Memory and resource configuration — PostgreSQL</title>
+<meta name="description" content="shared_buffers, work_mem, maintenance_work_mem and effective_cache_size — what each does and how to size them.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 08 · Configuring</div>
+    <h1>Memory and resource configuration</h1>
+    <p class="standfirst">There are about fifteen settings worth changing from their defaults, and roughly two hundred that are not. This chapter is the fifteen, with the reasoning attached — because a number you cannot justify is a number you cannot adjust when the workload changes.</p>
+    <div class="chap-meta">
+      <span class="tagpill">shared_buffers</span>
+      <span class="tagpill">work_mem</span>
+      <span class="tagpill">timeouts</span>
+      <span class="tagpill">defaults</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Why the defaults are what they are</h2>
+
+<p>PostgreSQL ships with settings that will start on almost any machine, including a small container or an old laptop. <b>They are startup-safe, not sensible</b>, and a freshly installed cluster on a 128 GB server is using 128 MB of shared buffers and assuming 4 GB of cache exists. Every managed service overrides them; a self-managed cluster frequently does not, because nobody chose either way.</p>
+
+<div class="demo" id="conf">
+  <div class="demo-head">
+    <b>A configuration, generated with reasons</b>
+    <span>Describe the machine and the workload. The output is real config, and each line says why.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="f-ram">RAM — <span id="f-ramv">32 GB</span></label>
+        <input type="range" id="f-ram" min="1" max="8" step="1" value="4">
+      </div>
+      <div>
+        <label for="f-cpu">CPU cores — <span id="f-cpuv">8</span></label>
+        <input type="range" id="f-cpu" min="1" max="8" step="1" value="4">
+      </div>
+      <div>
+        <label for="f-load">Workload</label>
+        <select id="f-load">
+          <option value="oltp" selected>OLTP — many short transactions</option>
+          <option value="olap">Analytics — few large queries</option>
+          <option value="mixed">Mixed</option>
+          <option value="web">Web app with a connection pooler</option>
+        </select>
+      </div>
+      <div>
+        <label for="f-disk">Storage</label>
+        <select id="f-disk">
+          <option value="ssd" selected>SSD or cloud block storage</option>
+          <option value="hdd">Spinning disk</option>
+        </select>
+      </div>
+    </div>
+    <div id="f-out"></div>
+    <div class="out" id="f-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>shared_buffers</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">25%, and when it is wrong</span><button class="copy">Copy</button></div>
+<pre><code>shared_buffers = '8GB'      -- 25% of 32GB. Requires a restart.
+
+-- Why not more? Postgres reads through the OS page cache as well, so a hot
+-- page is often cached twice. Beyond about 25-40% you are mostly buying
+-- duplication, and you make checkpoints write more dirty pages at once.
+--
+-- Reasons to go HIGHER (40%+):
+--   * write-heavy workload — keeping pages dirty in shared_buffers longer
+--     means fewer writes overall, because repeated modifications coalesce
+--   * a dedicated machine where nothing else wants the memory
+--   * the working set is just above 25% and just below 40%
+--
+-- Reasons to go LOWER:
+--   * the application runs on the same box
+--   * many connections each needing work_mem
+--   * a small container where the OS cache matters proportionally more
+
+-- Is it big enough? Measure the hit ratio rather than guessing:
+SELECT sum(heap_blks_hit) AS hits, sum(heap_blks_read) AS reads,
+       round(100.0 * sum(heap_blks_hit) /
+             nullif(sum(heap_blks_hit) + sum(heap_blks_read), 0), 2) AS hit_pct
+FROM pg_statio_user_tables;
+-- Above 99% on an OLTP system is normal. Sustained below ~95% means the
+-- working set does not fit — though note "read" counts include pages served
+-- from the OS cache, so this understates the true hit rate.
+
+CREATE EXTENSION pg_buffercache;   -- what is actually IN the cache right now</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Huge pages are the free win nobody enables</span>
+  <p>With 8 GB of shared buffers and 4 KB pages, the kernel manages two million page-table entries <em>per backend</em>. Huge pages (2 MB each) cut that by a factor of 512, reducing TLB misses and page-table memory measurably — typically a few percent of throughput on a large instance, for no downside. Set <code>huge_pages = try</code> and configure <code>vm.nr_hugepages</code> in the kernel to cover <code>shared_buffers</code> plus a margin. Use <code>try</code> rather than <code>on</code> so the server still starts if the reservation fails, and check <code>SHOW huge_pages_status</code> afterwards to confirm it actually got them.</p>
+</div>
+
+<h2><span class="h-rule"></span>work_mem</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the setting that is per node, not per query</span><button class="copy">Copy</button></div>
+<pre><code>-- Chapter 1 and chapter 7 both flagged this; here is the sizing.
+-- Worst case ≈ max_connections × nodes_per_query × parallel_workers × work_mem
+
+work_mem = '16MB'                 -- modest global default
+maintenance_work_mem = '2GB'      -- vacuum, CREATE INDEX, ALTER TABLE
+autovacuum_work_mem = '1GB'       -- separate, so autovacuum workers do not
+                                  -- each grab maintenance_work_mem
+
+-- Per role is nearly always better than one global compromise:
+ALTER ROLE reporting SET work_mem = '512MB';
+ALTER ROLE app       SET work_mem = '8MB';
+
+-- Or per transaction, for a specific known-heavy statement:
+BEGIN; SET LOCAL work_mem = '1GB'; SELECT … ; COMMIT;
+
+-- Is it big enough? Sorts that spill to disk are the symptom:
+SELECT temp_files, pg_size_pretty(temp_bytes) AS temp
+FROM pg_stat_database WHERE datname = current_database();
+
+-- And find WHICH queries, so you can raise it for those rather than globally:
+--   log_temp_files = '10MB'   -- log any temp file over this size
+-- Then look for "temporary file: path ... size ..." in the log.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">A hash join spilling is worse than a sort spilling</span>
+  <p>When a sort exceeds <code>work_mem</code> it switches to an external merge, which is slower but degrades gracefully. When a <em>hash join</em> exceeds it, Postgres splits into batches and may have to re-read both inputs several times — a much sharper cliff. So if <code>EXPLAIN ANALYZE</code> shows <code>Batches: 17</code> on a Hash node, that one query is worth a session-level <code>work_mem</code> increase far more than a sort showing <code>external merge Disk: 40MB</code>. Look at the batch count first.</p>
+</div>
+
+<h2><span class="h-rule"></span>The settings worth changing</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Setting</th><th>Default</th><th>Set to</th><th>Restart?</th></tr></thead>
+<tbody>
+<tr><td><code>shared_buffers</code></td><td>128MB</td><td>25% of RAM</td><td><b>Yes</b></td></tr>
+<tr><td><code>effective_cache_size</code></td><td>4GB</td><td>50–75% of RAM</td><td>No</td></tr>
+<tr><td><code>work_mem</code></td><td>4MB</td><td>16–64MB, per role above that</td><td>No</td></tr>
+<tr><td><code>maintenance_work_mem</code></td><td>64MB</td><td>1–2GB</td><td>No</td></tr>
+<tr><td><code>random_page_cost</code></td><td>4.0</td><td><b>1.1</b> on SSD</td><td>No</td></tr>
+<tr><td><code>max_connections</code></td><td>100</td><td>Keep low; pool instead (chapter 9)</td><td><b>Yes</b></td></tr>
+<tr><td><code>checkpoint_timeout</code></td><td>5min</td><td>15–30min</td><td>No</td></tr>
+<tr><td><code>max_wal_size</code></td><td>1GB</td><td>8–32GB</td><td>No</td></tr>
+<tr><td><code>wal_compression</code></td><td>off</td><td><code>lz4</code></td><td>No</td></tr>
+<tr><td><code>autovacuum_vacuum_cost_limit</code></td><td>200</td><td>1000–4000</td><td>No</td></tr>
+<tr><td><code>autovacuum_max_workers</code></td><td>3</td><td>4–8</td><td><b>Yes</b></td></tr>
+<tr><td><code>default_statistics_target</code></td><td>100</td><td>100, raise per column</td><td>No</td></tr>
+<tr><td><code>max_parallel_workers_per_gather</code></td><td>2</td><td>0 for OLTP, 4 for analytics</td><td>No</td></tr>
+<tr><td><code>huge_pages</code></td><td>try</td><td><code>try</code>, plus kernel config</td><td><b>Yes</b></td></tr>
+<tr><td><code>wal_level</code></td><td>replica</td><td><code>logical</code> if you might ever need it</td><td><b>Yes</b></td></tr>
+</tbody>
+</table>
+<caption>Fifteen settings. Decide <code>max_connections</code>, <code>shared_buffers</code>, <code>wal_level</code> and <code>huge_pages</code> before the cluster goes live, because changing them later means scheduling a restart.</caption>
+</div>
+
+<h2><span class="h-rule"></span>Timeouts</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the four that prevent incidents</span><button class="copy">Copy</button></div>
+<pre><code>-- 1. Stop one runaway query taking the system with it. Set per role, not
+--    globally — a nightly report legitimately runs for an hour.
+ALTER ROLE app SET statement_timeout = '30s';
+ALTER ROLE reporting SET statement_timeout = '30min';
+
+-- 2. THE MOST IMPORTANT ONE. Kill sessions that opened a transaction and
+--    went away — a crashed worker, an abandoned psql window. These hold
+--    locks and block vacuum indefinitely (chapters 2 and 3).
+ALTER SYSTEM SET idle_in_transaction_session_timeout = '5min';
+
+-- 3. Fail fast on DDL rather than queueing behind a long query and blocking
+--    everything after it (SQL chapter 16). Set it in your migration runner.
+SET lock_timeout = '3s';
+
+-- 4. Reap connections a pooler or a crashed client left behind (PG14+).
+ALTER SYSTEM SET idle_session_timeout = '1h';
+-- Careful with this one if clients rely on long-lived idle connections;
+-- most poolers handle reconnection fine.
+
+-- Also worth setting, and easy to forget:
+ALTER SYSTEM SET tcp_keepalives_idle = 60;   -- detect dead peers, so a
+ALTER SYSTEM SET tcp_keepalives_interval = 10; -- network partition does not
+ALTER SYSTEM SET tcp_keepalives_count = 6;   -- leave backends hanging forever</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Set idle_in_transaction_session_timeout today</span>
+  <p>If you take one action from this chapter, this is it. A session sitting idle inside a transaction holds its snapshot, which holds back vacuum for <em>every table in the cluster</em> (chapter 2), and holds any locks it acquired. The causes are mundane — a worker that crashed after <code>BEGIN</code>, a developer's terminal, an ORM that opened a transaction and then made a slow HTTP call. Five minutes is generous for almost every legitimate workload, and it converts a class of silent cluster-wide degradation into a clear error in one application.</p>
+</div>
+
+<h2><span class="h-rule"></span>Disk and the kernel</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">the settings outside postgresql.conf</span><button class="copy">Copy</button></div>
+<pre><code># /etc/sysctl.d/30-postgresql.conf
+
+# Do not overcommit. The OOM killer choosing the postmaster takes the whole
+# cluster down and forces crash recovery; better to fail an allocation.
+vm.overcommit_memory = 2
+vm.overcommit_ratio  = 80
+
+# Make the kernel flush dirty pages earlier and in smaller batches, so a
+# checkpoint does not collide with a huge accumulated writeback.
+vm.dirty_background_bytes = 67108864      # 64 MB
+vm.dirty_bytes            = 536870912     # 512 MB
+
+# Do not swap out a database. Reclaim cache instead.
+vm.swappiness = 1
+
+# Huge pages: enough to cover shared_buffers, in 2 MB units.
+vm.nr_hugepages = 4500                    # ≈ 8.8 GB
+
+# Transparent huge pages: turn them OFF. The defragmentation stalls they
+# cause show up as unexplained latency spikes, and they are not the same
+# thing as the explicit huge pages above.
+#   echo never > /sys/kernel/mm/transparent_hugepage/enabled
+
+# Filesystem: mount with noatime. ext4 or xfs are both fine and both are
+# used at scale; the choice matters far less than the mount options.</code></pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Also worth checking</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Separate volume for <code>pg_wal</code></td><td>Sequential WAL writes stop competing with random data I/O. Meaningful on spinning disks, less so on NVMe</td></tr>
+<tr><td>No RAID 5 or 6</td><td>The read-modify-write penalty on small random writes is severe. RAID 10 or nothing</td></tr>
+<tr><td>Write cache with a battery</td><td>A volatile write cache that lies about fsync will corrupt your database on a power loss</td></tr>
+<tr><td>ulimits for the postgres user</td><td><code>nofile</code> and <code>nproc</code> high enough for <code>max_connections</code> plus background workers</td></tr>
+<tr><td>CPU governor</td><td><code>performance</code>, not <code>powersave</code> — the latter adds latency to bursty OLTP work</td></tr>
+<tr><td>NUMA</td><td>On a large multi-socket machine, check that memory is interleaved rather than pinned to one node</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>Logging</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">what to log, and what to leave off</span><button class="copy">Copy</button></div>
+<pre><code>-- A prefix that makes every line attributable. Without this, log analysis is
+-- guesswork, and pgBadger cannot parse timings at all.
+log_line_prefix = '%m [%p] %q%u@%d %a %h '
+--   %m timestamp  %p pid  %u user  %d database  %a application_name  %h host
+
+log_min_duration_statement = '1s'   -- log slow queries. Start here
+log_checkpoints = on                -- PG15+ default; keep it
+log_autovacuum_min_duration = '1s'  -- chapter 3
+log_lock_waits = on                 -- log anything waiting past deadlock_timeout
+log_temp_files = '10MB'             -- work_mem is too small for these queries
+log_connections = off               -- noisy behind a pooler
+log_disconnections = off
+
+-- Leave OFF unless you are actively debugging:
+--   log_statement = 'all'      logs every statement including parameters,
+--                              which is a volume problem AND a data-protection
+--                              problem — passwords and personal data end up in
+--                              a log aggregator with weaker access control
+--                              than the database (SQL chapter 15)
+
+-- Set application_name from every service. It costs nothing and it is the
+-- difference between "some backend is doing this" and knowing which
+-- deployment to roll back.
+--   PGAPPNAME=orders-api, or SET application_name = 'orders-api';</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>How to change a setting safely</h2>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Measure first</b><span>Know the number you expect to move, and its current value</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Change one thing</b><span>Two at once and you learn nothing from the result</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Prefer the narrowest scope</b><span>Session, then role, then database, then cluster</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Reload rather than restart where possible</b><span><code>pg_settings.context</code> tells you which is needed</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Wait a full cycle</b><span>A day, including the nightly jobs. Some effects only appear under the weekly peak</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>6 · Write down why</b><span>The next person needs the reasoning, not the number</span></div>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Configuration generators are a starting point, not an answer</span>
+  <p>Tools like PGTune and the demo above produce a reasonable baseline from RAM, cores and a workload label — and they cannot know your working-set size, your query shapes, your connection pattern or your write rate. Use one to escape the defaults, then measure and adjust. The failure mode is treating the generated file as finished: a cluster configured for "OLTP, 32 GB" two years ago is now running a workload nobody re-examined, with a <code>work_mem</code> that made sense at the time.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>The defaults are <b>startup-safe, not sensible</b>. A fresh cluster on a large server is using 128 MB of buffers.</li>
+    <li><b><code>shared_buffers</code> at 25%</b> of RAM, higher for write-heavy, lower if the app shares the box.</li>
+    <li><b><code>work_mem</code> is per node per worker.</b> Keep the global modest and raise it per role.</li>
+    <li>A <b>hash join spilling to batches is worse than a sort spilling</b> — check the batch count first.</li>
+    <li><b>Huge pages</b> are a free few percent that almost nobody enables. Transparent huge pages should be <em>off</em>.</li>
+    <li><b>Set <code>idle_in_transaction_session_timeout</code> today.</b> It is the highest-value single change in this chapter.</li>
+    <li>Set <code>vm.overcommit_memory = 2</code> so the OOM killer never chooses the postmaster.</li>
+    <li>Decide <b><code>max_connections</code>, <code>shared_buffers</code>, <code>wal_level</code> and <code>huge_pages</code> before going live</b> — changing them later needs a restart.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("08-memory.html");
+
+(function(){
+  const root = document.getElementById("conf");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const RAM = [2, 4, 8, 16, 32, 64, 128, 256];
+  const CPU = [1, 2, 4, 8, 16, 32, 64, 96];
+
+  function mb(v){ return v >= 1024 ? Math.round(v/1024) + "GB" : Math.round(v) + "MB"; }
+
+  function render(){
+    const ram  = RAM[parseInt($("f-ram").value,10)-1];
+    const cpu  = CPU[parseInt($("f-cpu").value,10)-1];
+    const load = $("f-load").value;
+    const ssd  = $("f-disk").value === "ssd";
+    $("f-ramv").textContent = ram + " GB";
+    $("f-cpuv").textContent = cpu;
+
+    const ramMB = ram * 1024;
+    const sharedPct = load === "olap" ? 0.30 : load === "oltp" ? 0.25 : 0.25;
+    const shared = ramMB * sharedPct;
+    const eff    = ramMB * 0.70;
+
+    const conns = load === "web" ? Math.max(50, Math.min(200, cpu * 6))
+                : load === "olap" ? Math.max(20, cpu * 2)
+                : Math.max(50, Math.min(300, cpu * 10));
+
+    const workBase = load === "olap" ? ramMB * 0.02
+                   : load === "oltp" ? Math.min(64, ramMB * 0.0015)
+                   : Math.min(128, ramMB * 0.004);
+    const work = Math.max(4, Math.round(workBase / 4) * 4);
+
+    const maint = Math.min(4096, Math.max(64, ramMB * 0.06));
+    const parallel = load === "oltp" ? 0 : Math.min(8, Math.max(2, Math.floor(cpu / 2)));
+    const maxWal = Math.min(32768, Math.max(1024, ramMB * 0.5));
+
+    const lines = [
+      ["shared_buffers", mb(shared), "restart",
+        (sharedPct*100).toFixed(0) + "% of RAM. The rest is left to the OS page cache, which Postgres reads through as well." +
+        (load === "olap" ? " Slightly higher for analytics, where large scans benefit from holding more pages." : "")],
+      ["effective_cache_size", mb(eff), "reload",
+        "A planner hint only — it allocates nothing. It tells the cost model how much total cache to assume, including the kernel's, which keeps index scans competitive. The 4GB default makes the planner pessimistic on any large machine."],
+      ["work_mem", mb(work), "reload",
+        "Per sort or hash node, multiplied again by parallel workers. Deliberately conservative here; raise it per role for reporting rather than globally."],
+      ["maintenance_work_mem", mb(maint), "reload",
+        "Used by vacuum and index builds. Larger means vacuum tracks more dead tuples per pass and makes fewer index passes — directly faster vacuum (chapter 3)."],
+      ["max_connections", String(conns), "restart",
+        load === "web"
+          ? "Kept low deliberately because a pooler sits in front. The pooler multiplexes hundreds of client connections onto these few backends (chapter 9)."
+          : "Each connection is an OS process costing several megabytes. This is not a throughput knob — raising it past roughly 4× cores makes things slower, not faster."],
+      ["random_page_cost", ssd ? "1.1" : "4.0", "reload",
+        ssd
+          ? "SSD and cloud block storage have near-equal random and sequential read cost. The 4.0 default encodes spinning-disk seek time and systematically biases the planner away from indexes."
+          : "The default, which is correct for spinning disks: a random read genuinely costs about four times a sequential one."],
+      ["checkpoint_timeout", load === "oltp" ? "15min" : "30min", "reload",
+        "Longer intervals mean fewer full-page writes and therefore less total WAL, at the cost of longer crash recovery (chapter 4)."],
+      ["max_wal_size", mb(maxWal), "reload",
+        "Large enough that checkpoints are triggered by the timer rather than by volume. Watch checkpoints_req in pg_stat_bgwriter — if it is rising, raise this."],
+      ["wal_compression", "lz4", "reload",
+        "Compresses the full-page images that dominate WAL volume after each checkpoint. CPU for I/O, and usually a clear win."],
+      ["max_worker_processes", String(Math.max(8, cpu)), "restart",
+        "The overall ceiling for parallel workers, autovacuum, logical replication and extension background workers combined."],
+      ["max_parallel_workers", String(Math.max(2, Math.floor(cpu * 0.75))), "reload",
+        "The pool available for parallel query across the whole cluster."],
+      ["max_parallel_workers_per_gather", String(parallel), "reload",
+        parallel === 0
+          ? "Zero for OLTP. Parallelism adds setup cost and multiplies work_mem, and short transactions gain nothing from it."
+          : "Per gather node. Remember this multiplies work_mem — a query with two hash joins and " + parallel + " workers can allocate several times the configured value."],
+      ["autovacuum_max_workers", String(Math.min(8, Math.max(3, Math.floor(cpu / 2)))), "restart",
+        "Workers share one cost budget, so raise the cost limit alongside this or each worker simply runs slower."],
+      ["autovacuum_vacuum_cost_limit", ssd ? "3000" : "600", "reload",
+        ssd
+          ? "The 200 default is calibrated for spinning disks and throttles vacuum far below what modern storage can sustain. This is the main reason autovacuum falls behind."
+          : "Raised from the default, but modestly — spinning disks genuinely need the throttle to avoid starving user queries."],
+      ["idle_in_transaction_session_timeout", "5min", "reload",
+        "The highest-value setting in this chapter. A session idle inside a transaction holds its snapshot and blocks vacuum for the entire cluster."],
+      ["huge_pages", "try", "restart",
+        "Cuts page-table overhead substantially at this buffer size. Use 'try' so the server still starts if the kernel reservation is unavailable, and turn transparent huge pages OFF separately."]
+    ];
+
+    $("f-out").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:16px 0 8px">' +
+      'postgresql.conf</div>' +
+      lines.map(([k, v, ctx, why]) =>
+        '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid ' +
+        (ctx === "restart" ? "#F2A03D" : "#25B7C4") + ';border-radius:4px;padding:9px 12px;margin-bottom:6px">' +
+        '<div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">' +
+        '<span style="font-family:var(--mono);font-size:12.5px;font-weight:600;color:#0F7A85">' + k + '</span>' +
+        '<span style="font-family:var(--mono);font-size:12.5px">= ' + v + '</span>' +
+        '<span style="margin-left:auto;font-size:10.5px;letter-spacing:.04em;text-transform:uppercase;font-weight:700;color:' +
+        (ctx === "restart" ? "#B0762A" : "#8FA0AF") + '">' + ctx + '</span></div>' +
+        '<div style="font-size:13px;line-height:1.5;color:#54677A;margin-top:4px">' + why + '</div></div>').join("");
+
+    const notes = [];
+    const worst = conns * 2 * work;
+    notes.push("Worst-case work_mem exposure: " + conns + " connections × 2 nodes × " + mb(work) + " = " + mb(worst) +
+               ", against " + ram + " GB of RAM. Not every connection runs a memory-hungry query at once, but the number is worth knowing before a traffic spike finds it for you.");
+
+    if(load === "oltp" && parallel === 0)
+      notes.push("Parallel query is disabled. Short OLTP transactions do not benefit — parallel_setup_cost is 1000, which is more than the whole query — and it removes a source of unpredictable work_mem multiplication. Enable it per role if you also run reports on this cluster.");
+    if(load === "olap")
+      notes.push("Analytics settings: more shared_buffers, much more work_mem, parallelism on. Consider also raising default_statistics_target on your large fact-table join keys, since good estimates matter more when a bad plan costs minutes rather than milliseconds (chapter 7).");
+    if(load === "web")
+      notes.push("max_connections is deliberately low because a pooler sits in front. If you have no pooler yet, that is chapter 9 and it is more important than any setting here — raising max_connections instead is the wrong direction.");
+    if(ram <= 4)
+      notes.push("At " + ram + " GB, memory is the binding constraint on everything. Keep work_mem small, expect the OS cache to do most of the work, and be especially careful about connection count.");
+    if(ram >= 128)
+      notes.push("At " + ram + " GB, check NUMA topology and confirm huge pages were actually granted with SHOW huge_pages_status. On a machine this size the page-table overhead without them is substantial.");
+
+    notes.push("This is a baseline to escape the defaults with, not a finished configuration. Measure the cache hit ratio, the temp file volume and the checkpoint trigger mix, then adjust one thing at a time.");
+    $("f-note").textContent = notes.join("\n\n");
+  }
+
+  ["f-ram","f-cpu","f-load","f-disk"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

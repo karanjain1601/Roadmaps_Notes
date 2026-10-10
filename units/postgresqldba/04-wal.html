@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · The write path — PostgreSQL</title>
+<meta name="description" content="Write-ahead logging, checkpoints, fsync and the durability knobs — what happens between COMMIT and the data reaching disk.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 04 · The engine</div>
+    <h1>The write path</h1>
+    <p class="standfirst">One mechanism — the write-ahead log — provides crash recovery, replication and point-in-time recovery all at once. It also explains why a commit is fast, why checkpoints cause I/O spikes, and why your disk filled up.</p>
+    <div class="chap-meta">
+      <span class="tagpill">wal</span>
+      <span class="tagpill">checkpoints</span>
+      <span class="tagpill">fsync</span>
+      <span class="tagpill">durability</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Write to the log, not to the table</h2>
+
+<p>The rule is in the name: <b>a change is recorded in the WAL and flushed to disk before the modified data page is</b>. The data page can then be written whenever convenient, because if the server crashes the log has enough information to redo the change.</p>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Modify the page in shared_buffers</b><span>In memory. The page is now "dirty"</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Append a WAL record to the WAL buffer</b><span>Sequential, tiny, cheap</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · On COMMIT, flush the WAL to disk and fsync</b><span>This is the only synchronous disk wait in the whole path</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Tell the client it committed</b><span>The data page is still dirty in memory and that is fine</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Later: the checkpointer writes dirty pages to disk</b><span>Batched, spread out, asynchronous to any client</span></div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Why this is fast</span>
+  <p>A commit writes a small record to the <em>end</em> of one file — sequential I/O, which even on spinning disks is orders of magnitude faster than random writes. Without WAL, committing would mean fsyncing every modified page to its scattered location. Instead, one sequential flush covers arbitrarily many page changes, and the random writes happen later in bulk when the checkpointer can order them sensibly. <b>WAL turns many random synchronous writes into one sequential one.</b></p>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">where the log is, and how to read its position</span><button class="copy">Copy</button></div>
+<pre><code>-- WAL lives in $PGDATA/pg_wal as 16 MB segment files with hex names.
+-- A position — an LSN, log sequence number — is a byte offset into that stream.
+SELECT pg_current_wal_lsn();              -- 3/A82C4F18
+SELECT pg_walfile_name(pg_current_wal_lsn());
+
+-- LSNs subtract, which is how every lag and volume metric in this unit works:
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), '3/A0000000'));
+
+-- How much WAL a workload generates, measured directly:
+SELECT pg_size_pretty(
+    pg_wal_lsn_diff(pg_current_wal_lsn(), :start_lsn)) AS wal_written;
+-- Capture :start_lsn before a batch job and compare. Useful when a nightly
+-- job is quietly producing 200 GB of WAL and filling the archive.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Checkpoints</h2>
+
+<p>A checkpoint writes every dirty buffer to disk and records a position in the WAL, saying: everything before here is safely in the data files. Recovery then only needs to replay from the last checkpoint, which bounds how long a crash restart takes.</p>
+
+<div class="demo" id="ckpt">
+  <div class="demo-head">
+    <b>Checkpoint tuning</b>
+    <span>The trade is between recovery time and how much I/O the checkpointer inflicts. Both ends are unpleasant.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="c-timeout">checkpoint_timeout — <span id="c-timeoutv">5 min</span></label>
+        <input type="range" id="c-timeout" min="1" max="8" step="1" value="2">
+      </div>
+      <div>
+        <label for="c-maxwal">max_wal_size — <span id="c-maxwalv">1 GB</span></label>
+        <input type="range" id="c-maxwal" min="1" max="8" step="1" value="2">
+      </div>
+      <div>
+        <label for="c-rate">Write rate — <span id="c-ratev">20 MB/s</span> of WAL</label>
+        <input type="range" id="c-rate" min="1" max="8" step="1" value="4">
+      </div>
+      <div>
+        <label for="c-target">checkpoint_completion_target — <span id="c-targetv">0.9</span></label>
+        <input type="range" id="c-target" min="10" max="95" step="5" value="90">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="c-every">—</b><span>checkpoint every</span></div>
+      <div><b id="c-trigger">—</b><span>triggered by</span></div>
+      <div><b id="c-io">—</b><span>write I/O during spread</span></div>
+      <div><b id="c-recover">—</b><span>worst-case recovery</span></div>
+    </div>
+    <div id="c-bars"></div>
+    <div class="out" id="c-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the settings, and what each actually controls</span><button class="copy">Copy</button></div>
+<pre><code>checkpoint_timeout = '15min'            -- default 5min; 15-30min is common
+max_wal_size = '8GB'                    -- default 1GB; the soft ceiling that
+                                        -- triggers a checkpoint when exceeded
+min_wal_size = '2GB'                    -- keep this many segments for reuse
+checkpoint_completion_target = 0.9      -- default since PG14; spread writes
+                                        -- over 90% of the interval
+checkpoint_warning = '30s'              -- log if checkpoints come closer
+
+-- The two triggers:
+--   TIME     checkpoint_timeout elapsed
+--   VOLUME   WAL since the last checkpoint exceeded max_wal_size
+--
+-- Volume-triggered checkpoints are the ones to avoid. They arrive whenever
+-- the write rate says so, they are not spread over a predictable interval,
+-- and they mean the settings are fighting the workload.
+
+-- Which trigger is firing:
+SELECT checkpoints_timed, checkpoints_req,
+       round(100.0 * checkpoints_req /
+             nullif(checkpoints_timed + checkpoints_req, 0), 1) AS pct_forced,
+       buffers_checkpoint, buffers_clean, buffers_backend,
+       checkpoint_write_time, checkpoint_sync_time
+FROM pg_stat_bgwriter;
+-- (PG17 splits this into pg_stat_checkpointer and pg_stat_bgwriter.)
+--
+-- pct_forced above ~10% means raise max_wal_size.
+-- buffers_backend high means backends are flushing their own pages because
+-- the background writer cannot keep up — that cost lands on user queries.</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Full-page writes make the first write after a checkpoint expensive</span>
+  <p>The first time a page is modified after a checkpoint, Postgres writes the <b>entire 8 KB page</b> into the WAL, not just the change. This protects against torn pages — a partial page write during a crash, which the WAL delta alone could not repair. The consequence is that WAL volume spikes immediately after every checkpoint, and frequent checkpoints multiply the effect. It is also why <b>lengthening <code>checkpoint_timeout</code> often reduces total WAL volume substantially</b>, which surprises people who expect the opposite. Do not turn <code>full_page_writes</code> off unless your storage genuinely guarantees atomic 8 KB writes; almost none do.</p>
+</div>
+
+<h2><span class="h-rule"></span>Durability settings</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Setting</th><th>Default</th><th>If changed</th><th>Risk</th></tr></thead>
+<tbody>
+<tr><td><code>fsync</code></td><td>on</td><td>off skips flushing entirely</td><td><b>Data corruption on crash.</b> Never off in production</td></tr>
+<tr><td><code>synchronous_commit</code></td><td>on</td><td>off returns before the WAL flush</td><td>Lose the last ~<code>wal_writer_delay</code> × 3 of commits. <b>No corruption</b></td></tr>
+<tr><td><code>full_page_writes</code></td><td>on</td><td>off skips torn-page protection</td><td>Corruption on a partial page write</td></tr>
+<tr><td><code>wal_compression</code></td><td>off (on for some builds)</td><td>on compresses full-page images</td><td>CPU for less WAL. Usually a good trade</td></tr>
+<tr><td><code>wal_level</code></td><td>replica</td><td><code>logical</code> for logical replication</td><td>More WAL volume. Needs a restart</td></tr>
+<tr><td><code>commit_delay</code></td><td>0</td><td>Group commits together</td><td>Latency for throughput, on very busy systems</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">synchronous_commit off is the one safe speed knob</span>
+  <p>It is the only durability setting where the failure mode is <b>losing recent commits rather than corrupting the database</b>. On a crash you lose up to a few hundred milliseconds of transactions; everything that survives is consistent. That is an entirely reasonable trade for analytics loads, bulk imports, session tables and audit trails — and it can be set per transaction, so the payment write stays durable while the page-view insert does not. <code>fsync = off</code> is a different category and belongs only in throwaway test environments.</p>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">per-transaction durability</span><button class="copy">Copy</button></div>
+<pre><code>-- Global default stays safe.
+-- Relax it only where losing a few hundred ms of writes is acceptable.
+BEGIN;
+SET LOCAL synchronous_commit = off;
+INSERT INTO page_views (…) SELECT … FROM staging;   -- 50k rows
+COMMIT;   -- returns without waiting for the WAL flush
+
+-- Or per role, which is usually cleaner:
+ALTER ROLE etl SET synchronous_commit = off;
+
+-- With synchronous replication configured (chapter 13) there are more levels:
+--   off          do not wait for the local flush
+--   local        wait for the local flush only
+--   remote_write wait for a standby to receive it
+--   on           wait for a standby to flush it
+--   remote_apply wait for a standby to APPLY it — read-your-writes on replicas,
+--                and the slowest by a wide margin</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Crash recovery</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">what happens when it starts after a crash</span><button class="copy">Copy</button></div>
+<pre><code>LOG:  database system was not properly shut down; automatic recovery in progress
+LOG:  redo starts at 3/A82C4F18
+LOG:  invalid record length at 3/AB19C220: wanted 24, got 0
+LOG:  redo done at 3/AB19C1F8 system usage: CPU 4.12s elapsed 38.44s
+LOG:  database system is ready to accept connections
+
+-- What it did:
+--   1. read the last checkpoint record to find the redo start position
+--   2. replayed every WAL record from there forward, reapplying changes to
+--      pages whose on-disk version is older than the record
+--   3. stopped at the first invalid record — that is the crash point, and the
+--      "invalid record length" line is expected, not an error
+--   4. rolled back anything left uncommitted, lazily, via MVCC (chapter 2):
+--      those tuples are simply never visible and vacuum removes them later
+--
+-- "elapsed 38.44s" is your recovery time, and it is bounded by how much WAL
+-- accumulated since the last checkpoint. That is the whole reason
+-- checkpoint_timeout is a trade rather than a free knob.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>WAL retention: the thing that fills your disk</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">four reasons WAL is not being removed</span><button class="copy">Copy</button></div>
+<pre><code>-- Normally WAL older than the last checkpoint is recycled. It is retained if:
+
+-- 1. A REPLICATION SLOT is holding it. The single most common cause, because
+--    an inactive slot retains WAL forever and nothing complains until the
+--    disk is full.
+SELECT slot_name, active, wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
+FROM pg_replication_slots
+ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC;
+-- active = false with gigabytes retained: a replica that was decommissioned
+-- and whose slot nobody dropped. Set max_slot_wal_keep_size (PG13+) so the
+-- slot is invalidated instead of taking the primary down.
+
+-- 2. archive_command is FAILING. Postgres will not recycle unarchived WAL.
+SELECT archived_count, last_archived_wal, last_archived_time,
+       failed_count, last_failed_wal, last_failed_time
+FROM pg_stat_archiver;
+-- A rising failed_count with a stale last_archived_time is a ticking clock.
+
+-- 3. wal_keep_size is set high (or wal_keep_segments on old versions).
+
+-- 4. A checkpoint has not happened yet — rare, and self-resolving.
+
+-- Alert on pg_wal size as a percentage of the filesystem. A full pg_wal
+-- stops all writes, and recovering from it is unpleasant precisely because
+-- you cannot write.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">An abandoned replication slot is the classic 3am page</span>
+  <p>A standby is removed, or a logical subscriber stops consuming, and its slot stays behind. The primary keeps every WAL segment since that slot's position — forever — because as far as it knows a consumer will return. Disk usage climbs steadily for days with no other symptom, then the filesystem fills and the database stops accepting writes. <b>Put <code>pg_replication_slots</code> on your dashboard</b>, alert on any slot with <code>active = false</code>, and set <code>max_slot_wal_keep_size</code> so Postgres invalidates a runaway slot rather than sacrificing the primary for it.</p>
+</div>
+
+<h2><span class="h-rule"></span>What generates WAL, and reducing it</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Source</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>Every insert, update and delete</td><td>An update writes a whole new tuple (chapter 2), so it is as expensive as an insert</td></tr>
+<tr><td>Full-page images after a checkpoint</td><td>Often the largest single contributor on a write-heavy system</td></tr>
+<tr><td>Index maintenance</td><td>Every index on the table adds its own WAL per row change</td></tr>
+<tr><td>Vacuum</td><td>Freezing and cleanup are logged like any other change</td></tr>
+<tr><td><code>SELECT … FOR UPDATE</code></td><td>Sets a hint in the tuple, so a "read" writes WAL</td></tr>
+<tr><td>Hint-bit setting on first read after commit</td><td>Why the first <code>SELECT</code> after a bulk load is slower and dirties pages</td></tr>
+<tr><td>Temporary and unlogged tables</td><td><b>Generate none.</b> Unlogged tables are truncated on crash — good for scratch data</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">reducing WAL volume, in order of effect</span><button class="copy">Copy</button></div>
+<pre><code>-- 1. Longer checkpoint interval  -> far fewer full-page images
+checkpoint_timeout = '30min';  max_wal_size = '16GB';
+
+-- 2. Compress the full-page images that remain
+wal_compression = 'lz4';       -- or 'pglz'; lz4 is faster, PG15+
+
+-- 3. Drop indexes you do not use (SQL chapter 12). Each one is WAL per write.
+
+-- 4. Unlogged tables for genuinely disposable data
+CREATE UNLOGGED TABLE import_staging (…);
+-- No WAL, so no replication and no crash survival — the table is TRUNCATED
+-- after an unclean shutdown. Correct for staging and scratch; never for
+-- anything you would miss.
+
+-- 5. Update fewer columns and fewer rows. The cheapest WAL is the record you
+--    never wrote, and chapter 5's HOT updates make some updates much cheaper.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">The same WAL powers three features</span>
+  <p>Crash recovery replays it locally. <b>Streaming replication</b> ships it to a standby that replays it continuously (chapter 13). <b>Point-in-time recovery</b> archives it alongside a base backup so you can replay to any moment (chapter 12). This is why the WAL settings appear in all three chapters, and why <code>wal_level</code> is a restart-only setting you want right from the beginning — discovering you need <code>logical</code> after the cluster is in production means a restart you have to schedule.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>WAL turns <b>many random synchronous writes into one sequential flush</b>. That is why commits are fast.</li>
+    <li>A commit's only disk wait is the <b>WAL fsync</b>; data pages are written later by the checkpointer.</li>
+    <li>Checkpoints trade <b>recovery time against I/O spikes</b>. Volume-triggered checkpoints mean <code>max_wal_size</code> is too small.</li>
+    <li><b>Full-page writes</b> mean WAL spikes after every checkpoint — so a longer interval often reduces total WAL.</li>
+    <li><b><code>synchronous_commit = off</code> loses commits, not consistency</b>, and can be set per transaction or per role. <code>fsync = off</code> corrupts.</li>
+    <li>Recovery replays from the last checkpoint; <b>uncommitted work is discarded lazily via MVCC</b>.</li>
+    <li>WAL not being recycled means a <b>replication slot, a failing archive command, or <code>wal_keep_size</code></b>.</li>
+    <li><b>An inactive replication slot will fill your disk</b> and stop all writes. Alert on it and set <code>max_slot_wal_keep_size</code>.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("04-wal.html");
+
+(function(){
+  const root = document.getElementById("ckpt");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const TIMEOUT = [1, 5, 10, 15, 20, 30, 45, 60];        // minutes
+  const MAXWAL  = [0.5, 1, 2, 4, 8, 16, 32, 64];         // GB
+  const RATE    = [0.5, 2, 5, 20, 50, 100, 250, 500];    // MB/s
+
+  function dur(s){
+    if(s < 90) return s.toFixed(0) + "s";
+    if(s < 5400) return (s/60).toFixed(1) + " min";
+    return (s/3600).toFixed(1) + " hr";
+  }
+
+  function render(){
+    const timeout = TIMEOUT[parseInt($("c-timeout").value,10)-1] * 60;   // s
+    const maxwal  = MAXWAL[parseInt($("c-maxwal").value,10)-1] * 1024;   // MB
+    const rate    = RATE[parseInt($("c-rate").value,10)-1];              // MB/s
+    const target  = parseInt($("c-target").value,10) / 100;
+    $("c-timeoutv").textContent = TIMEOUT[parseInt($("c-timeout").value,10)-1] + " min";
+    $("c-maxwalv").textContent  = MAXWAL[parseInt($("c-maxwal").value,10)-1] + " GB";
+    $("c-ratev").textContent    = rate + " MB/s";
+    $("c-targetv").textContent  = target.toFixed(2);
+
+    const volumeInterval = maxwal / rate;                 // s to fill max_wal_size
+    const interval = Math.min(timeout, volumeInterval);
+    const forced = volumeInterval < timeout;
+
+    // dirty data to write ≈ WAL produced, discounted for repeated page writes
+    const dirty = rate * interval * 0.45;                 // MB
+    const spread = interval * target;
+    const io = dirty / spread;                            // MB/s during the spread
+
+    // recovery: replay WAL since the last checkpoint, ~35 MB/s replay rate
+    const recovery = (rate * interval) / 35;
+
+    $("c-every").textContent   = dur(interval);
+    $("c-trigger").textContent = forced ? "max_wal_size" : "timeout";
+    $("c-io").textContent      = io.toFixed(1) + " MB/s";
+    $("c-recover").textContent = dur(recovery);
+
+    const rows = [
+      ["Checkpoint interval", interval, dur(interval)],
+      ["Write spread over", spread, dur(spread)],
+      ["Worst-case recovery", recovery, dur(recovery)]
+    ];
+    const max = Math.max.apply(null, rows.map(r => r[1]));
+    $("c-bars").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">Timings</div>' +
+      rows.map(([lab, v, txt], i) =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px">' +
+        '<span style="min-width:170px;font-size:13px">' + lab + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + Math.max(1, v/max*100).toFixed(0) +
+        '%' + (i === 2 && recovery > 300 ? ';background:#E2574C' : i === 1 ? ';background:#3FB984' : '') + '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:64px;text-align:right">' +
+        txt + '</span></div>').join("");
+
+    const notes = [];
+    if(forced)
+      notes.push("Checkpoints are being triggered by max_wal_size, not by the timer — the write rate fills " +
+                 MAXWAL[parseInt($("c-maxwal").value,10)-1] + " GB of WAL in " + dur(volumeInterval) +
+                 ", well before the " + (timeout/60) + "-minute timeout. That is the state to avoid: checkpoints arrive whenever traffic says so rather than on a predictable schedule, " +
+                 "and each one triggers a fresh round of full-page writes, which produces more WAL, which triggers the next one sooner. Raise max_wal_size.");
+    else
+      notes.push("Checkpoints are timer-driven every " + dur(interval) + ", which is the healthy state — predictable, and max_wal_size has room to absorb write spikes without forcing an early one.");
+
+    notes.push("Immediately after each checkpoint, the first write to any page logs the ENTIRE 8 KB page rather than just the change. So shorter intervals mean more full-page images and more total WAL — " +
+               "which is why lengthening checkpoint_timeout usually reduces WAL volume rather than increasing it.");
+
+    if(recovery > 600)
+      notes.push("Worst-case crash recovery is " + dur(recovery) + " of WAL replay before the database accepts connections. If that exceeds your availability target, shorten checkpoint_timeout — " +
+                 "accepting more I/O and more WAL in exchange. This is the actual trade the setting controls, and it is worth deciding deliberately rather than inheriting the default.");
+    else if(recovery < 30)
+      notes.push("Recovery would take about " + dur(recovery) + ", which is comfortable. There is room to lengthen the interval further and reduce WAL volume if that is the constraint.");
+
+    if(target < 0.6)
+      notes.push("A completion target of " + target.toFixed(2) + " compresses the writes into " + dur(spread) +
+                 ", producing a burst of " + io.toFixed(1) + " MB/s. Query latency spikes during that window because the checkpointer is competing with user I/O. " +
+                 "The default of 0.9 spreads it out and is right for almost everyone.");
+    else
+      notes.push("Spreading writes over " + (target*100).toFixed(0) + "% of the interval keeps checkpoint I/O at about " + io.toFixed(1) +
+                 " MB/s — a steady trickle rather than a spike, which is what you want.");
+
+    notes.push("Model: dirty data ≈ 45% of WAL volume (pages are modified repeatedly between checkpoints), replay at ~35 MB/s. Check yours in pg_stat_bgwriter: checkpoints_req rising against checkpoints_timed is the signal to raise max_wal_size.");
+    $("c-note").textContent = notes.join("\n\n");
+  }
+
+  ["c-timeout","c-maxwal","c-rate","c-target"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

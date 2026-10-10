@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Storage: volumes, binds and tmpfs — Docker</title>
+<meta name="description" content="The ephemeral container layer, named volumes versus bind mounts versus tmpfs, the mount syntax traps, the UID mismatch that makes a directory unwritable, read-only root filesystems and running databases.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Crect x='6' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='19' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='10' width='5' height='5' fill='%23fff'/%3E%3Cpath d='M4 22h22a5 5 0 004-4' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch11">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Docker
+    </a>
+    <div class="chno"><b>Chapter 11</b><span>Running containers</span></div>
+    <h1>Storage: volumes, binds and tmpfs</h1>
+    <p class="lede">Everything a container writes goes into a scratch layer that is deleted with it. <b>Mounts are how you opt out of that</b> — and the three kinds behave differently enough that choosing wrongly produces either data loss, a directory your process cannot write to, or a development setup that is mysteriously slow on one colleague's laptop.</p>
+    <div class="meta"><span>26 min</span><span>2 demos</span><span>8 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="ephemeral">
+      <h2 data-nav="The ephemeral layer">The ephemeral writable layer</h2>
+      <p class="sub">Chapter 3 built it. Here is what it costs you.</p>
+      <p>Writes from a running container land in its upper overlay directory. That layer has three properties worth stating plainly: it is <strong>deleted with the container</strong>, it is <strong>not shared</strong> with any other container, and it is <strong>slow for rewrites</strong> because of copy-up.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">seeing it</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run -d --name t alpine sh -c 'dd if=/dev/zero of=/data.bin bs=1M count=200; sleep 999'
+$ docker diff t
+A /data.bin
+$ docker ps -s --filter name=t
+CONTAINER   SIZE
+t           210MB (virtual 217MB)      # 210MB of writable layer
+
+$ docker rm -f t          # and it is gone, with no warning</pre>
+      </div>
+      <div class="key">
+        <span class="lbl">Copy-up makes the container layer wrong for write-heavy work</span>
+        <p>Modifying a file that came from an image layer copies the whole file up first (chapter 3), so a database rewriting pages inside its image directory pays a duplication cost on the first write to every file, then loses everything on <code>docker rm</code>. <strong>A volume bypasses the overlay entirely</strong> — writes go straight to the host filesystem — which is why the official database images declare their data directory as a mount point and why you should give them a real one.</p>
+      </div>
+    </section>
+
+    <section id="types">
+      <h2 data-nav="The three types">The three mount types</h2>
+      <p class="sub">One decision, and it is mostly about who owns the data.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th></th><th>Named volume</th><th>Bind mount</th><th>tmpfs</th></tr></thead>
+          <tbody>
+            <tr><td>Stored</td><td>Docker's area, managed for you</td><td>A path you choose on the host</td><td>RAM only</td></tr>
+            <tr><td>Survives <code>docker rm</code></td><td class="yes">yes</td><td class="yes">yes</td><td class="no">no</td></tr>
+            <tr><td>Portable across hosts</td><td>With a driver</td><td class="no">no — the path must exist</td><td>n/a</td></tr>
+            <tr><td>Populated from the image</td><td class="yes">yes, when empty</td><td class="no">no — it shadows</td><td class="no">no</td></tr>
+            <tr><td>Performance on Docker Desktop</td><td>Native</td><td>Crosses a VM boundary</td><td>Native</td></tr>
+            <tr><td>Right for</td><td>Databases, uploads, anything the app owns</td><td>Source code in development, config files</td><td>Secrets, scratch, a writable path under <code>--read-only</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Mount spec resolver</h3>
+          <span class="hint">What Docker infers from your flag, and what it does with the path</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight" id="v-presets"></div>
+          <div class="ctrl">
+            <label for="v-in" style="min-width:40px">flag</label>
+            <input type="text" id="v-in" spellcheck="false" style="flex:1 1 300px;font-family:var(--mono);font-size:12.5px" value="-v /srv/data:/var/lib/postgresql/data">
+            <span class="sep"></span>
+            <button class="btn mono" id="v-exists">host path exists</button>
+          </div>
+          <div id="v-cards"></div>
+          <div class="rgrid" id="v-out"></div>
+          <p class="readout" id="v-note"></p>
+        </div>
+      </div>
+
+      <div class="code">
+        <div class="code-top"><span class="tag">the two syntaxes</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># short form: compact, and the type is inferred from the source
+$ docker run -v pgdata:/var/lib/postgresql/data postgres:16
+$ docker run -v /srv/conf:/etc/nginx/conf.d:ro nginx
+$ docker run -v /var/cache nginx                       # anonymous volume
+
+# long form: explicit, validates, and the only way to set some options
+$ docker run --mount type=volume,source=pgdata,target=/var/lib/postgresql/data postgres:16
+$ docker run --mount type=bind,source=/srv/conf,target=/etc/nginx/conf.d,readonly nginx
+$ docker run --mount type=tmpfs,target=/tmp,tmpfs-size=64m app</pre>
+      </div>
+      <div class="trap">
+        <span class="lbl">The difference that matters: a missing host path</span>
+        <p>With <code>-v /srv/typo:/data</code>, Docker <strong>creates <code>/srv/typo</code> as an empty directory owned by root</strong> and mounts it — so the container starts, finds no data, and initialises an empty database while your real data sits untouched one typo away. With <code>--mount type=bind,source=/srv/typo,target=/data</code>, Docker <strong>refuses to start</strong>. That single behavioural difference is the strongest argument for <code>--mount</code> in anything automated.</p>
+      </div>
+    </section>
+
+    <section id="volumes">
+      <h2 data-nav="Named volumes">Named volumes</h2>
+      <p class="sub">Docker manages the location so you do not have to.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">managing them</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker volume create pgdata
+$ docker volume ls
+$ docker volume inspect pgdata -f '{{.Mountpoint}}'
+/var/lib/docker/volumes/pgdata/_data
+
+$ docker volume ls -f dangling=true          # attached to nothing
+$ docker volume prune                         # remove those. Reads: deletes data
+$ docker run --rm -v pgdata:/d alpine du -sh /d      # how big is it?</pre>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">backup and restore, the portable way</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># back up: mount the volume plus a host directory, tar between them
+$ docker run --rm -v pgdata:/from:ro -v "$PWD:/to" alpine \
+    tar czf /to/pgdata-$(date +%F).tgz -C /from .
+
+# restore into a fresh volume
+$ docker volume create pgdata-restored
+$ docker run --rm -v pgdata-restored:/to -v "$PWD:/from:ro" alpine \
+    tar xzf /from/pgdata-2026-09-03.tgz -C /to</pre>
+      </div>
+      <p>For a database, prefer its own dump tool — <code>pg_dump</code>, <code>mysqldump</code> — over a filesystem tar of a running data directory, which can capture a torn state. Stop the container first if you must copy the files.</p>
+      <div class="note">
+        <span class="lbl"><code>VOLUME</code> in a Dockerfile is usually a mistake</span>
+        <p>It forces an <strong>anonymous</strong> volume at that path on every run, whether or not the user wanted one. Those volumes are invisible in <code>docker volume ls</code> until you look for dangling ones, they accumulate silently, and they cannot be overridden away — a later <code>RUN</code> writing to that path in a derived image has its writes discarded. Declare nothing, document the path, and let the operator mount what they choose. The official database images use it, which is why <code>docker volume ls</code> on a development machine is full of unnamed volumes containing old databases.</p>
+      </div>
+    </section>
+
+    <section id="binds">
+      <h2 data-nav="Bind mounts">Bind mounts</h2>
+      <p class="sub">A host path, straight through — with two platform caveats.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">the forms and the flags</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run -v "$PWD:/app" -w /app node:22-alpine npm run dev   # absolute paths only
+$ docker run -v /srv/conf:/etc/app:ro app                          # read-only
+$ docker run -v /srv/data:/data:z app                               # SELinux: shared label
+$ docker run -v /srv/data:/data:Z app                               # SELinux: private label
+
+# mount a single file — the container sees exactly that file
+$ docker run -v /etc/localtime:/etc/localtime:ro app</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Caveat</th><th>Where</th><th>Effect</th></tr></thead>
+          <tbody>
+            <tr><td>Crosses a VM boundary</td><td>Docker Desktop on macOS and Windows</td><td>File operations are much slower than native; <code>node_modules</code> and large repositories feel it most</td></tr>
+            <tr><td>File watching is unreliable</td><td>Same</td><td>Inotify events may not propagate; hot reload needs polling</td></tr>
+            <tr><td>SELinux denies access</td><td>Fedora, RHEL, CentOS</td><td>Permission denied despite correct modes — needs <code>:z</code> or <code>:Z</code></td></tr>
+            <tr><td>Single-file mounts do not survive replacement</td><td>Everywhere</td><td>An editor that writes a new file and renames breaks the mount; mount the directory</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="tip">
+        <span class="lbl">The development pattern that avoids the slow case</span>
+        <p>Bind-mount the source but keep the dependency directory inside the container, by layering an anonymous volume over it: <code>-v "$PWD:/app" -v /app/node_modules</code>. Your edits appear instantly, while the thousands of small dependency files stay on the container's own filesystem where access is native. It also stops a host <code>node_modules</code> built for macOS from shadowing the Linux one built inside the image.</p>
+      </div>
+    </section>
+
+    <section id="permissions">
+      <h2 data-nav="Permissions">The UID mismatch</h2>
+      <p class="sub">The single most common storage failure, and it is pure arithmetic.</p>
+      <p>There is no user namespace by default (chapter 2), so the UID inside the container <em>is</em> a UID on the host. A container running as UID 10001 writing to a directory owned by host UID 1000 gets whatever the <strong>other</strong> permission bits allow — usually nothing.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Permission resolver</h3>
+          <span class="hint">Real POSIX bit checking, plus what a created file ends up owned by</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:104px">mount</span>
+            <span id="p-kind" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:104px">host dir owner</span>
+            <span id="p-owner" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:104px">mode</span>
+            <span id="p-mode" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:104px">container runs as</span>
+            <span id="p-user" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="term" id="p-term"></div>
+          <div class="rgrid" id="p-out"></div>
+          <p class="readout" id="p-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Fix</th><th>How</th><th>Suits</th></tr></thead>
+          <tbody>
+            <tr><td>Run as your own UID</td><td><code>--user "$(id -u):$(id -g)"</code></td><td>Development bind mounts. The image needs no matching passwd entry for numeric IDs</td></tr>
+            <tr><td>Use a named volume</td><td><code>-v appdata:/data</code></td><td>Anything the application owns — Docker copies the image's ownership in</td></tr>
+            <tr><td>Fix ownership on the host</td><td><code>sudo chown -R 10001:10001 /srv/data</code></td><td>A dedicated data directory on a server</td></tr>
+            <tr><td>Fix it at startup</td><td><code>chown</code> in an entrypoint running as root, then <code>exec su-exec app "$@"</code></td><td>Images that must accept any host directory</td></tr>
+            <tr><td>Make the group work</td><td>Group-own the directory and add <code>--group-add</code></td><td>Several containers sharing one directory</td></tr>
+            <tr><td>Remap UIDs</td><td>userns-remap or rootless (chapter 18)</td><td>Multi-user hosts, and the real fix</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="warn">
+        <span class="lbl"><code>chmod 777</code> is not a fix</span>
+        <p>It works, and it makes the directory writable by every user and every container on the host, permanently, including anything that later escapes a neighbouring container. It is also how a data directory ends up with a mix of files owned by three different UIDs, which makes the next fix harder. Match the UID instead — the demo above shows which of the options actually resolves your case.</p>
+      </div>
+    </section>
+
+    <section id="readonly">
+      <h2 data-nav="Read-only roots">Read-only root filesystems</h2>
+      <p class="sub">Cheap hardening, once you know which paths need to be writable.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">the pattern</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run --read-only \
+    --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+    --tmpfs /run:rw,noexec,nosuid,size=8m \
+    -v appdata:/var/lib/app \
+    app</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Commonly needs writing</th><th>Give it</th></tr></thead>
+          <tbody>
+            <tr><td><code>/tmp</code></td><td>tmpfs — almost every runtime needs it</td></tr>
+            <tr><td><code>/run</code>, <code>/var/run</code></td><td>tmpfs, for PID and socket files</td></tr>
+            <tr><td>nginx cache and temp paths</td><td>tmpfs at <code>/var/cache/nginx</code></td></tr>
+            <tr><td>The application's data</td><td>A named volume</td></tr>
+            <tr><td>Language caches (<code>~/.npm</code>, <code>__pycache__</code>)</td><td>tmpfs, or set the cache path to <code>/tmp</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Finding the list is empirical: run with <code>--read-only</code>, watch it fail, add a tmpfs, repeat. Two or three iterations usually suffice, and the result is a container that cannot be modified at runtime — which removes a large class of persistence techniques an attacker would otherwise use (chapter 18).</p>
+    </section>
+
+    <section id="databases">
+      <h2 data-nav="Databases">Databases in containers</h2>
+      <p class="sub">Fine, with three rules.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">the shape that works</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker volume create pgdata
+$ docker run -d --name db \
+    -v pgdata:/var/lib/postgresql/data \
+    -e POSTGRES_PASSWORD_FILE=/run/secrets/pg \
+    -v /srv/secrets/pg:/run/secrets/pg:ro \
+    --shm-size 256m \
+    --stop-timeout 60 \
+    -m 2g --cpus 2 \
+    postgres:16</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Rule</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Named volume, never the container layer</strong></td><td>Copy-up cost, and total loss on <code>docker rm</code></td></tr>
+            <tr><td><strong>Never a bind mount on Docker Desktop</strong></td><td>The VM boundary breaks the durability and locking assumptions a database makes, and it is very slow</td></tr>
+            <tr><td><strong>A generous stop timeout</strong></td><td>A database killed mid-checkpoint recovers on restart — usually. Chapter 9's ten-second default is not enough</td></tr>
+            <tr><td>Raise <code>--shm-size</code></td><td>Postgres parallel workers use shared memory; 64&nbsp;MB is too small (chapter 10)</td></tr>
+            <tr><td>Pin the major version by digest</td><td>An accidental major upgrade will refuse to start on an old data directory, at best</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note">
+        <span class="lbl">When not to</span>
+        <p>A production database on a single Docker host gives you containerisation's packaging benefits and none of its scheduling benefits, while adding a storage layer between the process and the disk. That is a reasonable trade for a small deployment and a poor one at scale, where a managed service or a dedicated host usually wins. In development, containerised databases are unambiguously correct — a disposable, version-pinned Postgres per project is one of the best things containers do.</p>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 11 in eight lines</h2>
+        <ul>
+          <li>The writable layer is deleted with the container, shared with nothing, and slow to rewrite because of copy-up.</li>
+          <li><b>Named volume</b> for data the app owns, <b>bind mount</b> for source and config you own, <b>tmpfs</b> for scratch and secrets.</li>
+          <li>A named volume that is empty is <b>populated from the image</b>, ownership included. A bind mount <b>shadows</b> whatever was there.</li>
+          <li><code>-v</code> with a missing host path <b>creates it as root-owned</b>; <code>--mount</code> refuses to start. Prefer <code>--mount</code> in automation.</li>
+          <li><code>VOLUME</code> in a Dockerfile forces an anonymous volume on every run and cannot be overridden away.</li>
+          <li>There is no user namespace by default, so container UID <b>is</b> host UID — and permission is decided by ordinary POSIX bits.</li>
+          <li>Fix the mismatch with <code>--user</code>, a named volume, or matching ownership. <code>chmod 777</code> is not a fix.</li>
+          <li><code>--read-only</code> plus tmpfs for <code>/tmp</code> and <code>/run</code> costs two iterations and removes a whole class of persistence.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary>You mount <code>-v /srv/pgdata:/var/lib/postgresql/data</code> and Postgres initialises an empty database. The data is definitely at <code>/srv/pg-data</code>. What happened?</summary>
+        <div class="ans"><p>The hyphen. <code>-v</code> silently <b>created</b> <code>/srv/pgdata</code> as an empty root-owned directory and mounted it, so Postgres saw an empty data directory and did what it does with one: initialised a fresh cluster. Your real data is untouched at <code>/srv/pg-data</code>. Two defences: use <code>--mount type=bind,source=…</code>, which errors on a missing source instead of inventing it, and prefer named volumes for database data so there is no host path to mistype.</p></div>
+      </details>
+      <details class="chk">
+        <summary>An image runs as UID 10001. A bind-mounted host directory owned by <code>1000:1000</code> with mode 755 gives "permission denied" on write. Give three fixes and say which you would pick.</summary>
+        <div class="ans"><p>The container's UID matches neither owner nor group, so it falls to the <b>other</b> bits — <code>r-x</code>, no write. Fixes: <code>chown -R 10001:10001</code> the host directory; run with <code>--user "$(id -u):$(id -g)"</code> so the process is the directory's owner; or replace the bind mount with a named volume, which is populated with the image's own ownership and therefore writable. On a server I would chown the directory, since it has one purpose; in development I would use <code>--user</code>; for anything the application alone owns I would use a volume. Not <code>chmod 777</code>.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Why does a named volume "just work" for Postgres while a bind mount to an empty directory often does not?</summary>
+        <div class="ans"><p>Because an empty <b>named volume is populated from the image</b> at that path on first use, including ownership — so the directory arrives owned by the <code>postgres</code> user the image expects. A bind mount does the opposite: it shadows whatever the image had there, so the container sees a host directory with host ownership and no initialisation. That single asymmetry explains most of the difference in how the two feel. Note it only applies while the volume is empty; once it has content, nothing is copied.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A colleague's <code>npm run dev</code> in a bind-mounted container is ten times slower on their MacBook than on your Linux box, and hot reload does not fire. Explain both.</summary>
+        <div class="ans"><p>Docker Desktop runs a Linux VM, so a bind mount crosses a boundary between the host filesystem and the VM. Every file operation pays that crossing, which is why a directory of thousands of small dependency files is dramatically slower — and why inotify events from the host may not reach the container, so watchers see nothing. Fixes: keep <code>node_modules</code> inside the container with an anonymous volume layered over the bind mount, and configure the watcher to poll. Neither is needed on Linux, where a bind mount is just a mount.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Chapter 12 finishes Part 3 with networking: bridge, host and overlay, DNS between containers, and why publishing a port can quietly bypass your firewall.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li><code>docker volume ls -f dangling=true</code> — how many old databases?</li>
+        <li><code>docker run --rm -v /tmp/nope:/d alpine ls -la /d</code> then look at <code>/tmp/nope</code>.</li>
+        <li><code>docker run --rm --read-only alpine touch /x</code>.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>Docker's storage documentation on volumes, bind mounts and tmpfs, the <code>--mount</code> versus <code>-v</code> reference, and the overlayfs notes on copy-up.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — mount spec resolver
+   ============================================================ */
+(function () {
+  var exists = true;
+  var input = document.getElementById("v-in");
+  var cards = document.getElementById("v-cards");
+  var out = document.getElementById("v-out");
+  var note = document.getElementById("v-note");
+  var exBtn = document.getElementById("v-exists");
+
+  exBtn.classList.add("on");
+  exBtn.addEventListener("click", function () {
+    exists = !exists;
+    exBtn.classList.toggle("on", exists);
+    exBtn.textContent = exists ? "host path exists" : "host path missing";
+    render();
+  });
+
+  [
+    "-v /srv/data:/var/lib/postgresql/data",
+    "-v pgdata:/var/lib/postgresql/data",
+    "-v /var/cache",
+    "-v ./conf:/etc/nginx/conf.d:ro",
+    "--mount type=bind,source=/srv/data,target=/data",
+    "--mount type=volume,source=pgdata,target=/data",
+    "--mount type=tmpfs,target=/tmp,tmpfs-size=64m",
+    "--mount type=volume,source=v,target=/app,volume-nocopy"
+  ].forEach(function (p) {
+    var b = document.createElement("button");
+    b.className = "btn mono";
+    b.textContent = p.length > 30 ? p.slice(0, 29) + "…" : p;
+    b.title = p;
+    b.addEventListener("click", function () { input.value = p; render(); });
+    document.getElementById("v-presets").appendChild(b);
+  });
+
+  function parse(spec) {
+    spec = spec.trim();
+    var m;
+    if ((m = /^--mount\s+(.+)$/.exec(spec))) {
+      var opts = {};
+      m[1].split(",").forEach(function (kv) {
+        var i = kv.indexOf("=");
+        if (i === -1) opts[kv.trim()] = true;
+        else opts[kv.slice(0, i).trim()] = kv.slice(i + 1).trim();
+      });
+      var type = opts.type || "volume";
+      if (!opts.target && !opts.destination && !opts.dst) return { err: "--mount requires target=" };
+      return {
+        long: true, type: type,
+        source: opts.source || opts.src || null,
+        target: opts.target || opts.destination || opts.dst,
+        ro: opts.readonly === true || opts.readonly === "true" || opts.ro === true,
+        nocopy: opts["volume-nocopy"] === true || opts["volume-nocopy"] === "true",
+        size: opts["tmpfs-size"] || null
+      };
+    }
+    if ((m = /^-v\s+(.+)$/.exec(spec))) {
+      var parts = m[1].split(":");
+      var src = null, tgt = null, flags = "";
+      if (parts.length === 1) { tgt = parts[0]; }
+      else if (parts.length === 2) { src = parts[0]; tgt = parts[1]; }
+      else { src = parts[0]; tgt = parts[1]; flags = parts[2] || ""; }
+      if (!tgt) return { err: "no target path" };
+      var type;
+      if (src === null) type = "anonymous";
+      else if (/^[./~]/.test(src)) type = "bind";
+      else type = "volume";
+      return { long: false, type: type, source: src, target: tgt,
+               ro: /(^|,)ro(,|$)/.test(flags), selinux: /[zZ]/.test(flags), nocopy: false };
+    }
+    return { err: "not a -v or --mount flag" };
+  }
+
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+
+  function analyse(p) {
+    var rows = [], warns = [];
+    var isBind = p.type === "bind";
+    var isVol = p.type === "volume" || p.type === "anonymous";
+
+    rows.push(["Type", p.type === "anonymous" ? "anonymous volume" : p.type]);
+    rows.push(["Source", p.source || (p.type === "anonymous" ? "(generated name)" : p.type === "tmpfs" ? "(memory)" : "—")]);
+    rows.push(["Target", p.target]);
+    rows.push(["Read-only", p.ro ? "yes" : "no"]);
+
+    if (isBind) {
+      if (!exists) {
+        if (p.long) {
+          rows.push(["Missing source", "the container REFUSES to start"]);
+          warns.push("<code>--mount</code> validates the source: the run fails with <code>bind source path does not exist</code>. That is the behaviour you want in automation.");
+        } else {
+          rows.push(["Missing source", "Docker CREATES it, owned by root"]);
+          warns.push("<b><code>-v</code> silently creates the missing host directory as root</b> and mounts it empty — so an application expecting data finds none and may initialise fresh state over nothing. A single typo in the path does this.");
+        }
+      } else {
+        rows.push(["Missing source", "n/a — it exists"]);
+      }
+      rows.push(["Image content at the target", "hidden (shadowed)"]);
+      rows.push(["Survives docker rm", "yes — it is your directory"]);
+      warns.push("A bind mount <b>shadows</b> whatever the image had at <code>" + esc(p.target) +
+        "</code>. Nothing is merged and nothing is copied.");
+    } else if (isVol) {
+      rows.push(["Image content at the target", p.nocopy ? "NOT copied (volume-nocopy)" : "copied in when the volume is empty"]);
+      rows.push(["Survives docker rm", p.type === "anonymous" ? "yes, but unnamed and easily orphaned" : "yes"]);
+      if (!p.nocopy) {
+        warns.push("Because the volume starts empty, Docker copies the image's content <b>and its ownership</b> into it — which is why volumes usually avoid the permission problem that bind mounts hit.");
+      } else {
+        warns.push("<code>volume-nocopy</code> disables the initial copy, so the container sees an empty directory even though the image had content there.");
+      }
+      if (p.type === "anonymous") {
+        warns.push("An anonymous volume gets a random name and is not removed by <code>docker rm</code> unless you pass <code>-v</code>. These are what fill <code>docker volume ls -f dangling=true</code>.");
+      }
+    } else if (p.type === "tmpfs") {
+      rows.push(["Backed by", "RAM — counts toward --memory (chapter 10)"]);
+      rows.push(["Size", p.size || "half of host RAM by default"]);
+      rows.push(["Survives docker rm", "no, and not a restart either"]);
+      if (!p.size) warns.push("No <code>tmpfs-size</code>: the default cap is half the host's memory, which the memory limit will stop long before — set a size.");
+    }
+    return { rows: rows, warns: warns };
+  }
+
+  function render() {
+    var p = parse(input.value);
+    if (p.err) {
+      cards.innerHTML = '<div class="trap" style="margin:10px 0 0"><span class="lbl">Cannot parse</span><p>' + esc(p.err) + "</p></div>";
+      out.innerHTML = ""; note.innerHTML = "Docker rejects malformed mount flags before the container is created.";
+      return;
+    }
+    var a = analyse(p);
+    cards.innerHTML = '<div class="term" style="margin:10px 0 0;min-height:auto">' +
+      a.rows.map(function (r) {
+        return '<span class="d">' + r[0].padEnd(28, "\u00a0") + "</span>" +
+          (/REFUSES|CREATES|hidden|NOT copied/.test(r[1]) ? '<span class="r">' : '<span class="g">') + esc(r[1]) + "</span>";
+      }).join("\n") + "</div>";
+
+    out.innerHTML = "";
+    tile("Type", p.type === "anonymous" ? "anon vol" : p.type, p.long ? "--mount" : "-v", true);
+    tile("Persists", p.type === "tmpfs" ? "no" : "yes", "past docker rm", p.type !== "tmpfs");
+    tile("Image content", p.type === "bind" ? "shadowed" : p.type === "tmpfs" ? "shadowed" : p.nocopy ? "skipped" : "copied in", "");
+    tile("Warnings", String(a.warns.length), "", a.warns.length === 0);
+
+    note.innerHTML = a.warns.join(" ") ||
+      "Nothing surprising about this one. Try the missing-host-path toggle with <code>-v</code> and then with <code>--mount</code> — that difference is the reason to prefer the long form in scripts.";
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  input.addEventListener("input", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — UID / permission resolver (real POSIX bit checking)
+   ============================================================ */
+(function () {
+  var KINDS = [{ id: "bind", label: "bind mount" }, { id: "volume", label: "named volume" }];
+  var OWNERS = [
+    { id: "1000", label: "1000:1000 (you)", uid: 1000, gid: 1000 },
+    { id: "0", label: "0:0 (root)", uid: 0, gid: 0 },
+    { id: "10001", label: "10001:10001 (app)", uid: 10001, gid: 10001 }
+  ];
+  var MODES = [
+    { id: "755", label: "755  rwxr-xr-x", v: 0o755 },
+    { id: "775", label: "775  rwxrwxr-x", v: 0o775 },
+    { id: "700", label: "700  rwx------", v: 0o700 },
+    { id: "777", label: "777  rwxrwxrwx", v: 0o777 }
+  ];
+  var USERS = [
+    { id: "root", label: "root (0)", uid: 0, gid: 0 },
+    { id: "app", label: "app (10001)", uid: 10001, gid: 10001 },
+    { id: "node", label: "node (1000)", uid: 1000, gid: 1000 }
+  ];
+  var kind = "bind", owner = "1000", mode = "755", user = "app";
+
+  var term = document.getElementById("p-term");
+  var out = document.getElementById("p-out");
+  var note = document.getElementById("p-note");
+
+  function group(hostId, list, get, set) {
+    var host = document.getElementById(hostId);
+    list.forEach(function (item) {
+      var b = document.createElement("button");
+      b.className = "btn mono" + (get() === item.id ? " on" : "");
+      b.textContent = item.label;
+      b.addEventListener("click", function () {
+        set(item.id);
+        Array.prototype.forEach.call(host.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+        b.classList.add("on");
+        render();
+      });
+      host.appendChild(b);
+    });
+  }
+  group("p-kind", KINDS, function () { return kind; }, function (v) { kind = v; });
+  group("p-owner", OWNERS, function () { return owner; }, function (v) { owner = v; });
+  group("p-mode", MODES, function () { return mode; }, function (v) { mode = v; });
+  group("p-user", USERS, function () { return user; }, function (v) { user = v; });
+
+  function check(dirUid, dirGid, modeV, uid, gid) {
+    /* root bypasses the checks entirely */
+    if (uid === 0) return { r: true, w: true, x: true, via: "root — permission checks bypassed" };
+    var bits, via;
+    if (uid === dirUid) { bits = (modeV >> 6) & 7; via = "owner bits"; }
+    else if (gid === dirGid) { bits = (modeV >> 3) & 7; via = "group bits"; }
+    else { bits = modeV & 7; via = "other bits"; }
+    return { r: !!(bits & 4), w: !!(bits & 2), x: !!(bits & 1), via: via, bits: bits };
+  }
+
+  function render() {
+    var O = OWNERS.filter(function (x) { return x.id === owner; })[0];
+    var M = MODES.filter(function (x) { return x.id === mode; })[0];
+    var U = USERS.filter(function (x) { return x.id === user; })[0];
+
+    /* a fresh named volume is populated from the image, ownership included,
+       so the directory ends up owned by whoever the image expects */
+    var effUid = kind === "volume" ? U.uid : O.uid;
+    var effGid = kind === "volume" ? U.gid : O.gid;
+    var effMode = kind === "volume" ? 0o755 : M.v;
+
+    var a = check(effUid, effGid, effMode, U.uid, U.gid);
+    var ok = a.r && a.w && a.x;
+
+    var lines = [];
+    if (kind === "bind") {
+      lines.push('<span class="p">$</span> ls -ld /srv/data');
+      lines.push("drwx" + ((M.v >> 3) & 4 ? "r" : "-") + ((M.v >> 3) & 2 ? "w" : "-") + ((M.v >> 3) & 1 ? "x" : "-") +
+        (M.v & 4 ? "r" : "-") + (M.v & 2 ? "w" : "-") + (M.v & 1 ? "x" : "-") +
+        "  " + O.uid + " " + O.gid + "  /srv/data");
+      lines.push('<span class="p">$</span> docker run -v /srv/data:/data --user ' + U.uid + ":" + U.gid + " app");
+    } else {
+      lines.push('<span class="p">$</span> docker volume create appdata');
+      lines.push('<span class="d">the volume is empty, so the image content at /data is copied in,</span>');
+      lines.push('<span class="d">ownership included — it arrives owned by ' + U.uid + ":" + U.gid + "</span>");
+      lines.push('<span class="p">$</span> docker run -v appdata:/data --user ' + U.uid + ":" + U.gid + " app");
+    }
+    lines.push("");
+    lines.push('<span class="p">/ $</span> id');
+    lines.push("uid=" + U.uid + " gid=" + U.gid);
+    lines.push('<span class="p">/ $</span> touch /data/test');
+    if (ok) {
+      lines.push('<span class="g">(created)</span>');
+      lines.push('<span class="p">/ $</span> ls -l /data/test');
+      lines.push("-rw-r--r--  " + U.uid + " " + U.gid + "  /data/test");
+      lines.push('<span class="d">on the host that file is owned by UID ' + U.uid +
+        (U.uid === 0 ? " — that is host root" : "") + ", because there is no user namespace</span>");
+    } else {
+      lines.push('<span class="r">touch: /data/test: Permission denied</span>');
+      lines.push('<span class="d">uid ' + U.uid + " matched neither owner (" + effUid + ") nor group (" + effGid +
+        "), so the kernel applied the " + a.via + "</span>");
+    }
+    term.innerHTML = lines.join("\n");
+
+    out.innerHTML = "";
+    tile("Matched", a.via.split(" ")[0], "in the mode", ok);
+    tile("Read", a.r ? "yes" : "no", "", a.r);
+    tile("Write", a.w ? "yes" : "no", "", a.w);
+    tile("New files owned by", ok ? String(U.uid) : "—", ok ? "on the host too" : "nothing created", ok);
+
+    var msgs = [];
+    if (kind === "volume") {
+      msgs.push("<b>A named volume sidesteps the problem.</b> Because it starts empty, Docker copies the image's content and ownership into it, so the directory is owned by exactly the user the image runs as. This is why <code>docker run -v pgdata:/var/lib/postgresql/data postgres</code> works with no thought at all, while the bind-mount equivalent often does not.");
+    } else if (U.uid === 0) {
+      msgs.push("<b>Running as root works, and that is the problem.</b> Root bypasses the permission check entirely, so this succeeds regardless of the mode — and the file it creates on the host is owned by <b>host root</b>, which your normal user then cannot delete without <code>sudo</code>. It is the reason a directory bind-mounted into a root container fills up with files you cannot remove.");
+    } else if (ok && U.uid === O.uid) {
+      msgs.push("The container's UID equals the directory's owner, so the owner bits apply and everything works. This is what <code>--user \"$(id -u):$(id -g)\"</code> arranges deliberately, and it is the right answer for a development bind mount.");
+    } else if (ok && U.gid === O.gid) {
+      msgs.push("The UIDs differ but the <b>group</b> matches, and the group bits allow writing. This is the multi-container case: group-own the directory and give each container the same supplementary group with <code>--group-add</code>.");
+    } else if (ok && M.v === 0o777) {
+      msgs.push("It works because the directory is world-writable — and so is every other process on the host, container or not, now and permanently. Match the UID instead.");
+    } else {
+      msgs.push("<b>Permission denied, and the arithmetic is unremarkable:</b> UID " + U.uid +
+        " is not the owner (" + effUid + ") and GID " + U.gid + " is not the group (" + effGid +
+        "), so the kernel used the <b>other</b> bits — " + ((M.v & 4) ? "r" : "-") + ((M.v & 2) ? "w" : "-") + ((M.v & 1) ? "x" : "-") +
+        ". Fix it by making one of the three match: chown the directory to " + U.uid +
+        ", run with <code>--user " + O.uid + ":" + O.gid + "</code>, or use a named volume.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

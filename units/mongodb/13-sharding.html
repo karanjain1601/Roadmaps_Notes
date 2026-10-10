@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Sharding — MongoDB</title>
+<meta name="description" content="Choosing a shard key, chunks and balancing, targeted against scatter-gather queries, and why the key is nearly irreversible.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 13 · At scale</div>
+    <h1>Sharding</h1>
+    <p class="standfirst">Splitting a collection across several replica sets, coordinated so it still behaves like one collection. The mechanism is sound and largely automatic. The shard key is a single decision that determines whether the result works, and it is the hardest thing to change afterwards in this unit.</p>
+    <div class="chap-meta">
+      <span class="tagpill">shard key</span>
+      <span class="tagpill">chunks</span>
+      <span class="tagpill">targeting</span>
+      <span class="tagpill">irreversible</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Do not shard yet</h2>
+
+<div class="note key">
+  <span class="note-t">Sharding is the last option, not the next one</span>
+  <p>It adds config servers, routers, a balancer, cross-shard query semantics, slower transactions, restricted unique indexes and an operational surface several times larger. Before reaching for it, exhaust the cheaper answers: <b>a bigger machine</b> (a single replica set on modern hardware handles a great deal), <b>a smaller working set</b> (chapter 9), <b>archiving cold data</b>, <b>fixing the schema</b> (chapters 2 and 3), and <b>secondary reads</b> for genuinely read-heavy analytics. Shard when you have a specific number saying you must — write throughput exceeding one primary, or a working set that cannot fit in the largest machine available — and not because the collection is large.</p>
+</div>
+
+<h2><span class="h-rule"></span>The pieces</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">what a sharded cluster is made of</span><button class="copy">Copy</button></div>
+<pre><code>//   mongos          the router. Stateless. Clients connect here.
+//                   Run several, close to the application
+//   config servers  a replica set holding the chunk map and metadata.
+//                   Three members. Losing it is losing the cluster
+//   shards          each one a full replica set holding a subset of the data
+
+sh.enableSharding("shop");
+sh.shardCollection("shop.orders", { customerId: 1, _id: 1 });
+sh.status();
+
+// A CHUNK is a contiguous range of shard key values. The balancer moves
+// chunks between shards to keep them evenly distributed — automatically,
+// in the background, one at a time.
+//
+// Since MongoDB 6.0 the balancer works on DATA SIZE rather than chunk
+// COUNT, which is a meaningful improvement: it no longer treats a chunk
+// holding 10 documents as equivalent to one holding a million. Advice
+// written before 6.0 talks a lot about chunk splitting and jumbo chunks;
+// most of that is now handled for you.
+
+sh.getBalancerState();
+sh.disableBalancing("shop.orders");    // during a bulk load, then re-enable
+sh.startBalancer();</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Choosing the key</h2>
+
+<div class="demo" id="shk">
+  <div class="demo-head">
+    <b>Evaluate a shard key</b>
+    <span>Four properties decide whether a key works. All four have to hold.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="s-key">Candidate key</label>
+        <select id="s-key">
+          <option value="_id">{ _id: 1 }</option>
+          <option value="hashedid">{ _id: "hashed" }</option>
+          <option value="date">{ createdAt: 1 }</option>
+          <option value="customer" selected>{ customerId: 1 }</option>
+          <option value="compound">{ customerId: 1, createdAt: 1 }</option>
+          <option value="status">{ status: 1 }</option>
+          <option value="country">{ country: 1, customerId: 1 }</option>
+          <option value="hashedcust">{ customerId: "hashed" }</option>
+        </select>
+      </div>
+      <div>
+        <label for="s-query">The dominant query filters on</label>
+        <select id="s-query">
+          <option value="customer" selected>customerId</option>
+          <option value="id">_id</option>
+          <option value="daterange">a date range</option>
+          <option value="status">status</option>
+        </select>
+      </div>
+    </div>
+    <div id="s-props"></div>
+    <div class="stat">
+      <div><b id="s-verdict">—</b><span>verdict</span></div>
+      <div><b id="s-target">—</b><span>this query is</span></div>
+      <div><b id="s-shards">—</b><span>shards touched</span></div>
+    </div>
+    <div id="s-dist"></div>
+    <div class="out" id="s-note"></div>
+  </div>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Property</th><th>Means</th><th>Failure if missing</th></tr></thead>
+<tbody>
+<tr><td><b>High cardinality</b></td><td>Many distinct values</td><td>Chunks cannot split. A value larger than a chunk is stuck on one shard</td></tr>
+<tr><td><b>Low frequency</b></td><td>No value dominates</td><td>One shard holds a disproportionate share</td></tr>
+<tr><td><b>Non-monotonic</b></td><td>Not always increasing</td><td>Every insert lands on the same shard — a hot shard</td></tr>
+<tr><td><b>Query-aligned</b></td><td>Your common queries filter on it</td><td>Every query is scatter-gather across all shards</td></tr>
+</tbody>
+</table>
+<caption>All four must hold. A key with three of them will produce a cluster that works badly in a way that is expensive to fix.</caption>
+</div>
+
+<div class="note warn">
+  <span class="note-t">A monotonically increasing key gives you one hot shard</span>
+  <p><code>_id</code> as an <code>ObjectId</code>, a timestamp, an auto-incrementing counter — all increase over time, so every new document has a key higher than the last, so every insert lands in the highest chunk, which lives on one shard. That shard takes 100% of the write load while the others idle, and the balancer spends its time migrating chunks away from it. You have added machines and made writes slower. Either hash the key, or lead the compound key with something that distributes — which is the single most common shard-key mistake and it is not visible until you are under load.</p>
+</div>
+
+<h2><span class="h-rule"></span>Targeted and scatter-gather</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">the distinction that decides everything</span><button class="copy">Copy</button></div>
+<pre><code>// Shard key: { customerId: 1, createdAt: 1 }
+
+// TARGETED — mongos knows the shard key, so it routes to one shard.
+db.orders.find({ customerId: 4821 });
+db.orders.find({ customerId: 4821, createdAt: { $gte: d } });
+
+// SCATTER-GATHER — no shard key in the filter, so every shard is queried
+// and mongos merges the results.
+db.orders.find({ status: "paid" });
+
+// Scatter-gather is not automatically wrong. It is proportionally more
+// expensive: latency becomes the SLOWEST shard's response, not the average,
+// and total work is multiplied by the shard count. Occasional is fine; on
+// the hot path it means the cluster does N times the work to serve the same
+// query, which is the opposite of why you sharded.
+
+db.orders.find({ … }).explain();
+//   "shards": which were consulted
+//   look for SHARD_MERGE and SINGLE_SHARD in the winning plan
+
+// UPDATES AND DELETES are stricter. updateOne, deleteOne and findAndModify
+// need either the shard key or _id in the filter — otherwise MongoDB cannot
+// know which shard holds the single document to change. (Since 7.0 they can
+// broadcast, and it is slower and worth avoiding.)
+db.orders.updateOne({ _id: id }, { … });                    // fine
+db.orders.updateOne({ customerId: 4821, _id: id }, { … });  // better
+
+// SORTING across shards works — mongos merges sorted streams — but a sort
+// on a field that is not the shard key requires every shard to sort its
+// portion first.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Hashed sharding</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">even distribution, at a price</span><button class="copy">Copy</button></div>
+<pre><code>sh.shardCollection("shop.events", { deviceId: "hashed" });
+
+// MongoDB hashes the value and shards on the hash, so distribution is even
+// regardless of the underlying values. This solves the monotonic problem
+// completely — sequential ids scatter perfectly.
+
+// WHAT YOU LOSE:
+//   * RANGE QUERIES on the shard key become scatter-gather. Adjacent values
+//     hash to unrelated shards, so { createdAt: { $gte: d } } on a hashed
+//     createdAt touches every shard
+//   * zone sharding by value is not possible
+//   * you cannot control locality at all
+
+// So: hashed for point lookups on a high-cardinality field where you never
+// range-query it. Ranged when locality matters and you can find a
+// non-monotonic leading field.
+
+// The compound middle ground, often the best answer:
+sh.shardCollection("shop.orders", { customerId: 1, createdAt: 1 });
+//   customerId distributes (many customers, no one dominant, not monotonic)
+//   createdAt gives locality WITHIN a customer, so "this customer's recent
+//   orders" is a targeted range read on one shard
+//
+// This is the shape to reach for first: a distributing field, then a
+// locality field.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>What sharding constrains</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Constraint</th><th>Consequence</th></tr></thead>
+<tbody>
+<tr><td>Unique indexes must contain the shard key</td><td>Uniqueness cannot be enforced across shards otherwise. <b>Check this before choosing the key</b></td></tr>
+<tr><td><code>_id</code> is only unique per shard</td><td>Unless <code>_id</code> is the shard key. Application-generated ids should be globally unique anyway</td></tr>
+<tr><td>Transactions across shards use two-phase commit</td><td>Materially slower than single-shard (chapter 12)</td></tr>
+<tr><td><code>$lookup</code> has restrictions</td><td>The foreign collection can be sharded since 5.1, and performance is worse</td></tr>
+<tr><td>Every document needs the shard key</td><td>It is immutable in older versions; updatable since 4.2 if it moves the document</td></tr>
+<tr><td>Change streams are cluster-wide</td><td>They work, and ordering across shards costs coordination (chapter 14)</td></tr>
+<tr><td>Backups need coordination</td><td>A consistent snapshot across shards is not just N snapshots</td></tr>
+<tr><td>Orphaned documents</td><td>Left after migrations. <code>readConcern: "available"</code> can return them (chapter 11)</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Changing the shard key</span>
+  <p>Since MongoDB 5.0 you can <b>reshard</b> a collection — <code>sh.reshardCollection()</code> — which rewrites the entire collection under a new key while it stays online. This is a genuine improvement over the previous answer, which was "dump, drop, recreate, restore". It is still a heavy operation: it needs disk for a second copy of the collection, takes hours to days at scale, and puts sustained load on every shard for the duration. From 8.0 there is also <code>moveCollection</code> and unsharding for collections that should never have been sharded. Treat all of these as recovery from a bad decision rather than as a reason to be casual about the original one.</p>
+</div>
+
+<h2><span class="h-rule"></span>Zones</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">pinning ranges to specific shards</span><button class="copy">Copy</button></div>
+<pre><code>// Data residency — EU customer data stays on EU hardware:
+sh.addShardToZone("shard-eu-1", "EU");
+sh.addShardToZone("shard-us-1", "US");
+sh.updateZoneKeyRange("shop.orders",
+  { country: "AT", customerId: MinKey },
+  { country: "DE", customerId: MaxKey }, "EU");
+
+// Requires the zone field to be the LEADING part of the shard key, which
+// means this has to be designed in from the start.
+
+// Tiered storage — recent data on fast shards, old data on cheap ones:
+sh.updateZoneKeyRange("shop.events",
+  { createdAt: ISODate("2020-01-01") },
+  { createdAt: ISODate("2025-01-01") }, "archive");
+
+// The obvious risk: a zone whose range receives most of the writes is a hot
+// shard by design. Zones override the balancer, so it cannot fix an
+// imbalance you have configured. Check that the ranges are roughly even in
+// traffic and not just in value span.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Operating it</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">what to watch</span><button class="copy">Copy</button></div>
+<pre><code>sh.status();                                   // shards, chunks, zones
+db.adminCommand({ balancerStatus: 1 });
+
+// Distribution — the number that says whether the key is working:
+db.orders.getShardDistribution();
+//   per shard: document count, data size, average object size
+//   a shard holding 60% of the data means the key is not distributing
+
+// Are queries targeted?
+db.adminCommand({ serverStatus: 1 }).shardingStatistics;
+db.serverStatus().metrics.query;
+//   compare targeted against scatter-gather rates over time
+
+// Chunk migrations in progress:
+use config;
+db.changelog.find({ what: /moveChunk/ }).sort({ time: -1 }).limit(10);
+
+// FOUR THINGS TO ALERT ON:
+//   1. distribution skew  — one shard well above the average
+//   2. scatter-gather rate rising  — a new query pattern with no shard key
+//   3. balancer not running, or migrations constantly failing
+//   4. config server replica set health — this is the single point whose
+//      loss takes down the entire cluster, and it is easy to under-resource
+
+// mongos is stateless, so run several and put them close to the application.
+// A mongos restart is harmless; a config server outage is not.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>A decision procedure</h2>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Confirm you need it</b><span>A specific number: write throughput past one primary, or a working set past the biggest machine</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · List the queries, with frequency</b><span>Chapter 3's workload table. The shard key must serve the top ones</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Find a field the hot queries filter on</b><span>If none exists, everything will be scatter-gather and sharding will not help</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Check all four properties</b><span>Cardinality, frequency, monotonicity, alignment</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Add a locality field if useful</b><span>Distributing field first, then the range field</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>6 · Check every unique index</b><span>Each must contain the shard key. This has killed candidate keys late</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>7 · Test with real data volumes</b><span>Distribution skew and hot shards are invisible at small scale</span></div>
+</div>
+
+<div class="note key">
+  <span class="note-t">If no field serves the hot queries, sharding will not help</span>
+  <p>This is the finding worth reaching before the migration rather than after. Sharding improves throughput by letting queries hit one shard instead of all of them; if your access patterns have no common field to route on, every query becomes scatter-gather and the cluster does N times the work for the same result — with more latency, because you now wait for the slowest shard. Adding machines makes it worse. The honest conclusion in that case is that the workload needs a different data model, a different partitioning strategy, or a different database (chapter 18).</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Shard last.</b> A bigger machine, a smaller working set and a better schema are all cheaper.</li>
+    <li>The shard key needs <b>all four properties</b>: high cardinality, low frequency, non-monotonic, query-aligned.</li>
+    <li><b>A monotonic key gives you one hot shard</b> taking every write. The commonest mistake, invisible until load.</li>
+    <li><b>Targeted queries include the shard key</b>; everything else is scatter-gather across every shard.</li>
+    <li><b>Hashed distributes perfectly and destroys range queries.</b> A compound key — distributing field, then locality field — is usually better.</li>
+    <li><b>Every unique index must contain the shard key.</b> Check this before committing.</li>
+    <li><b>Resharding exists since 5.0</b> and is a heavy recovery operation, not a licence to be casual.</li>
+    <li><b>If no field serves the hot queries, sharding will not help</b> — it will make things worse.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("13-sharding.html");
+
+(function(){
+  const root = document.getElementById("shk");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const K = {
+    _id:        {card:"high", freq:"even", mono:"MONOTONIC", fields:["_id"], hashed:false,
+      note:"ObjectId is generated from a timestamp in its high bits, so it increases over time. Every insert therefore has a key higher than the last, lands in the highest chunk, and goes to whichever shard holds that chunk.\n\nOne shard takes 100% of the write load while the others idle, and the balancer spends its time migrating chunks away from it — adding load to the shard that is already saturated.\n\nYou have bought machines and made writes slower. This is the single most common shard key mistake, and it is invisible until you are under real write volume."},
+    hashedid:   {card:"high", freq:"even", mono:"no", fields:["_id"], hashed:true,
+      note:"Hashing removes the monotonic problem completely — sequential ObjectIds scatter evenly across every shard.\n\nDistribution is excellent and _id lookups are perfectly targeted, since a point query on _id hashes to exactly one shard.\n\nWhat you lose is every range query on _id, including the implicit \"documents created around this time\" that ObjectId ordering gives you. And if your hot queries filter on something other than _id — which they usually do — they are all scatter-gather. Good distribution is necessary and not sufficient."},
+    date:       {card:"high", freq:"even", mono:"MONOTONIC", fields:["createdAt"], hashed:false,
+      note:"The same monotonic failure as _id, and worse in one respect: it is more tempting, because time-range queries are usually a real access pattern and this key appears to serve them.\n\nIt does serve them. It also sends every single insert to one shard, which for an append-heavy collection — the kind you are most likely to shard — means the write load is entirely unsharded.\n\nIf time-range queries matter, put the date SECOND in a compound key behind something that distributes. You then get locality within each leading value, which is usually what the query actually wants anyway."},
+    customer:   {card:"high", freq:"even", mono:"no", fields:["customerId"], hashed:false,
+      note:"A reasonable key. Many customers, no single one dominant, and customer ids are not monotonic in a way that matters for distribution.\n\nQueries filtering on customerId are perfectly targeted, which for a customer-facing application is most of them.\n\nTwo things to check. Cardinality must genuinely be high — this fails if you have 40 enterprise customers rather than 400,000 consumers. And a single very large customer becomes a chunk that cannot split, since all documents share one key value; that is the jumbo chunk problem, and the compound version below solves it."},
+    compound:   {card:"high", freq:"even", mono:"no", fields:["customerId","createdAt"], hashed:false,
+      note:"The shape to reach for first: a distributing field, then a locality field.\n\ncustomerId spreads documents across shards. createdAt orders them within each customer, so \"this customer's orders from last month\" is a targeted RANGE read on a single shard — the index scan and the shard routing both work.\n\nIt also fixes the jumbo chunk problem: a customer with a million orders can be split across chunks by date, where a single-field customerId key could not split them at all.\n\nThis is the answer for most customer-scoped workloads, and it is worth trying to force your access patterns into this shape before considering anything more exotic."},
+    status:     {card:"LOW", freq:"SKEWED", mono:"no", fields:["status"], hashed:false,
+      note:"Four or five distinct values, so at most four or five chunks — the collection cannot be split further than the number of distinct keys, no matter how much data it holds.\n\nWorse, the values are not evenly distributed: \"paid\" is probably 90% of the collection, so one shard holds nearly everything while the others hold almost nothing. The balancer cannot fix this, because there is nothing to move — the chunk cannot split.\n\nLow cardinality is disqualifying on its own. A shard key must have far more distinct values than you have shards, by orders of magnitude."},
+    country:    {card:"medium", freq:"SKEWED", mono:"no", fields:["country","customerId"], hashed:false,
+      note:"The compound structure is right and the leading field is the problem. Country distributions in real applications are heavily skewed — one or two countries typically account for most of the data — so the shards holding those ranges get most of the traffic.\n\ncustomerId as the second field does allow chunks to split within a country, which prevents jumbo chunks. But the balancer will keep trying to even out shards whose ranges are inherently unequal in traffic, and it cannot succeed.\n\nWhere this key IS correct is when you need data residency: zone sharding requires the zone field to lead the shard key, so if EU data must stay on EU hardware, you accept the skew deliberately and provision those shards larger."},
+    hashedcust: {card:"high", freq:"even", mono:"no", fields:["customerId"], hashed:true,
+      note:"Perfect distribution, and targeted point lookups on customerId.\n\nCompare it with the ranged compound version: this hashes, so all of one customer's documents land on one shard but adjacent customer ids do not, and you cannot range-query within a customer efficiently by any other shard key field.\n\nHashing customerId is worth it when the id values themselves are skewed or clustered in a way that ranged sharding handles badly. If they are reasonably distributed already, { customerId: 1, createdAt: 1 } gives you the same targeting plus intra-customer locality, which is strictly more useful."}
+  };
+
+  const QF = {customer:"customerId", id:"_id", daterange:"createdAt", status:"status"};
+
+  function render(){
+    const kk = $("s-key").value, k = K[kk];
+    const qf = QF[$("s-query").value];
+
+    const leads = k.fields[0];
+    const inKey = k.fields.includes(qf);
+    const rangeQuery = $("s-query").value === "daterange";
+    const targeted = inKey && !(k.hashed && rangeQuery) &&
+                     (k.fields.indexOf(qf) === 0 || k.fields[0] === qf);
+
+    const props = [
+      ["High cardinality", k.card, k.card === "high"],
+      ["Low frequency (no dominant value)", k.freq, k.freq === "even"],
+      ["Non-monotonic", k.mono === "no" ? "yes" : "NO", k.mono === "no"],
+      ["Query-aligned", targeted ? "yes" : "no", targeted]
+    ];
+    const passes = props.filter(p => p[2]).length;
+
+    $("s-props").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:16px 0 8px">' +
+      'The four properties</div>' +
+      props.map(([lab, val, ok]) =>
+        '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid ' +
+        (ok ? "#3FB984" : "#E2574C") + ';border-radius:4px;padding:7px 12px;margin-bottom:4px;' +
+        'display:flex;gap:10px;align-items:baseline">' +
+        '<span style="flex:1;font-size:13.5px">' + lab + '</span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;font-weight:700;color:' +
+        (ok ? "#166B47" : "#B0453B") + '">' + val + '</span></div>').join("");
+
+    $("s-verdict").textContent = passes === 4 ? "good" : passes === 3 ? "flawed" : "do not use";
+    $("s-target").textContent  = targeted ? "targeted" : "scatter-gather";
+    $("s-shards").textContent  = targeted ? "1 of 4" : "4 of 4";
+
+    // distribution bars
+    let dist;
+    if(k.mono !== "no") dist = [4, 4, 4, 88];
+    else if(k.freq === "SKEWED") dist = [62, 21, 11, 6];
+    else if(k.card === "LOW") dist = [90, 7, 2, 1];
+    else dist = [26, 24, 25, 25];
+
+    $("s-dist").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      (k.mono !== "no" ? "Write distribution" : "Data distribution") + ' across four shards</div>' +
+      dist.map((v, i) =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px">' +
+        '<span style="min-width:74px;font-family:var(--mono);font-size:12px">shard-' + (i+1) + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + v + '%;background:' +
+        (v > 50 ? "#E2574C" : v > 35 ? "#F2A03D" : "#3FB984") + '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:38px;text-align:right">' +
+        v + '%</span></div>').join("");
+
+    const notes = [k.note];
+
+    if(!targeted && inKey && k.hashed && rangeQuery)
+      notes.push("The query field IS in the shard key, and the key is hashed — so a RANGE on it is still scatter-gather. Adjacent values hash to unrelated shards, so there is no contiguous range to route to. Hashing buys distribution at exactly this cost.");
+    else if(!targeted && !inKey)
+      notes.push("The dominant query filters on " + qf + ", which is not in the shard key, so mongos has to ask every shard and merge the results. Latency becomes the SLOWEST shard's response rather than the average, and total work is multiplied by the shard count.\n\nOccasional scatter-gather is fine. If your highest-frequency query is scatter-gather, the cluster is doing four times the work to serve it — which is the opposite of the reason you sharded.");
+    else if(targeted)
+      notes.push("This query is targeted: mongos reads the shard key from the filter, consults the chunk map, and routes to exactly one shard. That is what sharding is for, and it is the property to protect as new query patterns are added.");
+
+    if(passes < 4)
+      notes.push("This key fails " + (4 - passes) + " of the four properties. All four have to hold — a key with three produces a cluster that works badly in a way that is expensive to fix, and the fix is resharding: a rewrite of the entire collection taking hours to days under sustained load on every shard.");
+
+    notes.push("One more check before committing to any key: every UNIQUE index on the collection must contain the shard key, because uniqueness cannot be enforced across shards otherwise. That requirement has disqualified otherwise-good candidate keys late in the process, so verify it early.");
+    $("s-note").textContent = notes.join("\n\n");
+  }
+
+  ["s-key","s-query"].forEach(id => $(id).addEventListener("change", render));
+  render();
+})();
+</script>
+</body>
+</html>

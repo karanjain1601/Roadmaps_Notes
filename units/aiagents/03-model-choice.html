@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Choosing a model for agentic work — AI Agents</title>
+<meta name="description" content="Tool-calling reliability, reasoning models, instruction adherence over long runs, cost per step and the arithmetic of a twelve-step task.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 03 · Foundations</div>
+    <h1>Choosing a model for agentic work</h1>
+    <p class="standfirst">The model that writes the best prose is not necessarily the one that reliably picks the right tool on step nine of eleven. Agentic selection turns on a different set of properties from single-call selection, and almost none of them appear on a leaderboard.</p>
+    <div class="chap-meta">
+      <span class="tagpill">tool calling</span>
+      <span class="tagpill">adherence</span>
+      <span class="tagpill">reasoning models</span>
+      <span class="tagpill">cost per step</span>
+      <span class="tagpill">routing</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>What actually matters</h2>
+
+<p>The AI Engineer unit covers general model selection. For agents, reweight it heavily toward these seven properties, in roughly this order.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Property</th><th>Why it dominates in a loop</th><th>How to test it</th></tr></thead>
+<tbody>
+<tr><td><b>Tool-call validity</b></td><td>Malformed arguments, invented tool names or broken JSON cost a step every time. At 3% invalid, a 12-step run wastes a step on average</td><td>Run 200 tasks, count calls that fail schema validation before execution</td></tr>
+<tr><td><b>Tool selection accuracy</b></td><td>Choosing the wrong tool is pure waste: tokens, latency and budget spent learning nothing</td><td>Golden tasks with a known-correct first tool; measure top-1 accuracy</td></tr>
+<tr><td><b>Instruction adherence at depth</b></td><td>Rules obeyed at step 1 get forgotten by step 10 as the context fills with tool output</td><td>Plant a rule in the system prompt ("never call X twice") and measure violations by step index</td></tr>
+<tr><td><b>Error recovery</b></td><td>Reading an error and changing approach, versus retrying identically. This is the recovery rate from chapter 1</td><td>Inject deliberate tool failures; measure how often the next call differs meaningfully</td></tr>
+<tr><td><b>Knowing when to stop</b></td><td>Both failure directions are expensive: stopping early with a half-answer, or looping past the point of usefulness</td><td>Include tasks that are complete after 2 steps and tasks that are genuinely impossible</td></tr>
+<tr><td><b>Parallel call quality</b></td><td>Good models batch independent lookups. Poor ones either never parallelise or parallelise dependent calls</td><td>Give a task with three independent lookups; count round trips</td></tr>
+<tr><td><b>Long-context stability</b></td><td>A run's context grows to tens of thousands of tokens. Performance at 60k is what matters, not at 2k</td><td>Measure the metrics above at step 2 and again at step 10</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">Benchmarks measure the wrong thing for this</span>
+  <p>Public leaderboards mostly test single-turn reasoning and knowledge. A model can be excellent at those and mediocre at maintaining a tool-calling contract over eleven turns with 40k tokens of accumulated observations. Agentic benchmarks exist and are better, but they use <em>their</em> tools, not yours — and tool-calling accuracy is strongly sensitive to how tools are described. <b>The only measurement that predicts your production behaviour is your own tools on your own tasks.</b> Chapter 13 builds that harness; it takes a day and it is the highest-value day in the project.</p>
+</div>
+
+<h2><span class="h-rule"></span>Reasoning models in a loop</h2>
+
+<p>Models that think before answering behave differently inside an agent, and the trade is not obvious.</p>
+
+<div class="cols">
+  <div class="col good">
+    <h4>Where they win</h4>
+    <ul>
+      <li>Planning the overall approach at step 1</li>
+      <li>Deciding what to do after a surprising observation</li>
+      <li>Tasks where a wrong turn is expensive to unwind</li>
+      <li>Knowing that the task is actually complete</li>
+      <li>Recognising an impossible request instead of flailing</li>
+    </ul>
+  </div>
+  <div class="col bad">
+    <h4>Where they cost you</h4>
+    <ul>
+      <li>Mechanical steps — "now read the file I just found"</li>
+      <li>Latency: seconds of thinking per step, multiplied by steps</li>
+      <li>Reasoning tokens are billed and often invisible</li>
+      <li>Some over-deliberate and take more steps, not fewer</li>
+      <li>Reasoning traces bloat the context you resend</li>
+    </ul>
+  </div>
+</div>
+
+<p>The pattern that works in practice is <b>asymmetric</b>: a reasoning model for the first step and for any step following an error or an unexpected result; a fast standard model for the mechanical majority. Most agent steps are mechanical.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">step_model.py — choose per step, not per agent</span><button class="copy">Copy</button></div>
+<pre><code>def model_for_step(n: int, steps: list[Step], budget: Budget) -> str:
+    if n == 1:
+        return "reasoning"                       # plan the approach properly
+    last = steps[-1] if steps else None
+    if last and not last.ok:
+        return "reasoning"                       # something failed: think about why
+    if last and looks_surprising(last.observation):
+        return "reasoning"                       # empty result, conflict, unexpected shape
+    if budget.cost > budget.max_cost_usd * 0.7:
+        return "small"                           # running low: finish cheaply
+    return "standard"
+
+# Roughly 70-80% of steps in a typical investigative run are mechanical.
+# Routing those to a cheaper, faster model usually halves cost and cuts
+# wall-clock time by more, with no measurable drop in completion rate.
+# Measure that claim on your own tasks before believing it.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>The cost curve is quadratic</h2>
+
+<p>Chapter 2 showed why: the whole message array is resent on every step. A run of <i>n</i> steps does not cost <i>n</i> times one call — it costs roughly the sum of a growing array, which is proportional to <i>n</i>².</p>
+
+<div class="demo" id="cost">
+  <div class="demo-head">
+    <b>What a run costs</b>
+    <span>Twelve steps, one task. Adjust the model mix and prompt caching, and watch the two curves separate.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="c-steps">Steps in the run — <span id="c-stepsv">12</span></label>
+        <input type="range" id="c-steps" min="2" max="30" step="1" value="12">
+      </div>
+      <div>
+        <label for="c-obs">Avg tokens per observation — <span id="c-obsv">600</span></label>
+        <input type="range" id="c-obs" min="100" max="3000" step="100" value="600">
+      </div>
+      <div>
+        <label for="c-cache">Prompt cache hit — <span id="c-cachev">0</span>%</label>
+        <input type="range" id="c-cache" min="0" max="95" step="5" value="0">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="c-tier">Model for every step</label>
+        <select id="c-tier">
+          <option value="small">Small — $0.40/M in, $1.60/M out</option>
+          <option value="mid" selected>Workhorse — $3/M in, $15/M out</option>
+          <option value="large">Frontier — $15/M in, $75/M out</option>
+          <option value="reason">Reasoning — $15/M in, $75/M out + 800 thinking tokens/step</option>
+        </select>
+      </div>
+      <div>
+        <label><input type="checkbox" id="c-route"> Route mechanical steps to the small model</label>
+      </div>
+      <div>
+        <label for="c-runs">Runs per day — <span id="c-runsv">2,000</span></label>
+        <input type="range" id="c-runs" min="0" max="6" step="1" value="3">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="c-run">—</b><span>cost / run</span></div>
+      <div><b id="c-lin">—</b><span>if it were linear</span></div>
+      <div><b id="c-final">—</b><span>final context size</span></div>
+      <div><b id="c-month">—</b><span>cost / month</span></div>
+    </div>
+    <div id="c-bars"></div>
+    <div class="out" id="c-note"></div>
+  </div>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Prompt caching matters more for agents than for anything else</span>
+  <p>In a chat application the cacheable prefix is the system prompt. In an agent, everything before the current step — the system prompt, the tool definitions, and every previous message — is a stable prefix that will be resent unchanged. That is exactly what prefix caching is designed for, and it turns the quadratic term into a much smaller one. To get it: keep the system prompt and tool schemas byte-identical between steps, and never insert anything at the front of the array mid-run. Rewriting the system prompt on step 5 to "remind" the model of a rule invalidates the entire cache for the rest of the run.</p>
+</div>
+
+<h2><span class="h-rule"></span>Latency</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Contributor</th><th>Typical</th><th>Lever</th></tr></thead>
+<tbody>
+<tr><td>Prefill, growing each step</td><td>200ms → 900ms as context grows</td><td>Prompt caching; compaction (chapter 7)</td></tr>
+<tr><td>Reasoning, if enabled</td><td>1–8s per step</td><td>Reserve it for steps that need it</td></tr>
+<tr><td>Decode of the tool call</td><td>200–600ms</td><td>Smaller model; shorter tool schemas</td></tr>
+<tr><td>Tool execution</td><td>50ms–5s, entirely yours</td><td>Parallelise independent calls; cache; add timeouts</td></tr>
+<tr><td>Final answer generation</td><td>1–4s</td><td>Stream it</td></tr>
+</tbody>
+</table>
+<caption>A 10-step run at 3s per step is 30 seconds. That is acceptable if the user can see progress and unacceptable if they cannot — which is a UX decision, not a model one (chapter 16).</caption>
+</div>
+
+<h2><span class="h-rule"></span>Open-weight models as agents</h2>
+
+<p>The gap between hosted frontier models and open weights has narrowed considerably for generation quality. It has narrowed less for <em>agentic reliability</em>, because tool calling is a specifically trained behaviour and the long tail of getting it right — nested schemas, parallel calls, recovering from a validation error, refusing to invent a tool — is where the difference still shows.</p>
+
+<ul class="check">
+  <li><b>Check the tool-calling format explicitly.</b> Some open models emit a provider-compatible structure; others need a special template, and a serving stack that supports it. Verify end to end before designing around it.</li>
+  <li><b>Prefer constrained decoding</b> where your server supports it. Forcing the output to match the tool schema eliminates malformed-argument failures entirely, which is the single biggest reliability gap.</li>
+  <li><b>Test at depth, not at step one.</b> Smaller models degrade faster as the context fills — the metric to watch is adherence at step 10, not step 2.</li>
+  <li><b>Consider a hybrid.</b> A hosted model for planning and a local model for the mechanical steps captures most of the cost saving with much less risk.</li>
+  <li><b>Weigh the operational cost honestly.</b> Agents are bursty and long-running; the utilisation maths differs from single-call serving. The AI Engineer unit has the break-even model.</li>
+</ul>
+
+<h2><span class="h-rule"></span>Measuring it yourself</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">bakeoff.py — the harness that decides the question</span><button class="copy">Copy</button></div>
+<pre><code>import asyncio, statistics
+from collections import Counter
+
+CANDIDATES = ["provider-a:mid", "provider-b:mid", "provider-b:reasoning", "local:open-32b"]
+
+async def evaluate(model_id: str, tasks: list[Task]) -> dict:
+    runs = await asyncio.gather(*[run_agent(t.goal, ctx_for(t), TOOLS,
+                                            budget=Budget(max_steps=12),
+                                            model=model_id) for t in tasks])
+
+    invalid = wrong_first = repeats = 0
+    for task, run in zip(tasks, runs):
+        for s in run.steps:
+            if s.tool and not s.ok and "invalid arguments" in (s.observation or ""):
+                invalid += 1
+        first = next((s.tool for s in run.steps if s.tool), None)
+        if task.expected_first_tool and first != task.expected_first_tool:
+            wrong_first += 1
+        sigs = Counter((s.tool, json_key(s.args)) for s in run.steps if s.tool)
+        repeats += sum(c - 1 for c in sigs.values() if c > 1)
+
+    completed = [r for r in runs if r.status == "completed"]
+    correct = [r for r, t in zip(runs, tasks) if t.check(r)]
+
+    return {
+        "model": model_id,
+        "task_success":       len(correct) / len(tasks),
+        "completed":          len(completed) / len(tasks),
+        "invalid_call_rate":  invalid / sum(len(r.steps) for r in runs),
+        "wrong_first_tool":   wrong_first / len(tasks),
+        "repeat_calls":       repeats / len(runs),
+        "median_steps":       statistics.median(len(r.steps) for r in completed) if completed else None,
+        "p95_seconds":        pct([r.seconds for r in runs], 95),
+        "cost_per_success":   sum(r.cost for r in runs) / max(1, len(correct)),
+    }
+
+# cost_per_success is the number to decide on. A cheap model that completes 60%
+# of tasks can easily cost more per finished job than an expensive one at 90%,
+# once you count the retries and the human who cleans up after the failures.</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Pin the version, and re-run when it moves</span>
+  <p>Point production at a specific model version, never a floating alias. Agentic behaviour is unusually sensitive to model updates: a change that improves general quality can alter how eagerly a model calls tools, how many steps it takes, or when it decides it is finished — none of which appear in release notes. Your bake-off harness is also your upgrade harness. Run it against the new version, compare on completion rate, step count and cost per success, then switch deliberately.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Agentic selection weights differently: <b>tool-call validity, selection accuracy and adherence at depth</b> beat prose quality.</li>
+    <li>Leaderboards do not predict this. <b>Measure with your own tools on your own tasks</b> — it takes a day.</li>
+    <li>Reasoning models earn their cost <b>at step one and after surprises</b>, not on mechanical steps.</li>
+    <li>Cost is <b>quadratic in run length</b> because the array is resent each step. Prompt caching is the main defence and agents benefit from it more than anything else.</li>
+    <li>Never rewrite the system prompt mid-run — it <b>invalidates the cache for the rest of the run</b>.</li>
+    <li>Open weights have closed the quality gap faster than the <b>tool-calling reliability gap</b>. Use constrained decoding and test at step 10.</li>
+    <li>Decide on <b>cost per success</b>, not cost per call.</li>
+    <li><b>Pin the version</b>, and re-run the bake-off on every upgrade.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("03-model-choice.html");
+
+(function(){
+  const root = document.getElementById("cost");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const RUNS = [50, 200, 500, 2000, 10000, 50000, 200000];
+  const TIERS = {
+    small:  {in:0.40, out:1.60,  think:0},
+    mid:    {in:3,    out:15,    think:0},
+    large:  {in:15,   out:75,    think:0},
+    reason: {in:15,   out:75,    think:800}
+  };
+  const SMALL = TIERS.small;
+
+  function render(){
+    const n     = parseInt($("c-steps").value, 10);
+    const obs   = parseInt($("c-obs").value, 10);
+    const cache = parseInt($("c-cache").value, 10) / 100;
+    const tier  = TIERS[$("c-tier").value];
+    const route = $("c-route").checked;
+    const ri    = parseInt($("c-runs").value, 10);
+    const runs  = RUNS[ri];
+
+    $("c-stepsv").textContent = n;
+    $("c-obsv").textContent   = obs;
+    $("c-cachev").textContent = Math.round(cache * 100);
+    $("c-runsv").textContent  = runs.toLocaleString();
+
+    const BASE = 1400;          // system prompt + tool schemas
+    const ASSISTANT = 180;      // tokens the model emits per step
+
+    let ctxTokens = BASE + 120; // + goal
+    let cost = 0, linear = 0;
+    const perStep = [];
+
+    for(let i = 1; i <= n; i++){
+      // Mechanical steps: not the first, and not immediately after an "error".
+      const mechanical = route && i > 1 && i % 4 !== 0;
+      const m = mechanical ? SMALL : tier;
+
+      // Cached portion: everything except this step's newly added tokens.
+      const fresh = i === 1 ? ctxTokens : (ASSISTANT + obs);
+      const cached = Math.max(0, ctxTokens - fresh);
+      const billedIn = fresh + cached * (1 - cache) + cached * cache * 0.1;
+
+      const thinking = m.think;
+      const stepCost = billedIn / 1e6 * m.in
+                     + (ASSISTANT + thinking) / 1e6 * m.out;
+      cost += stepCost;
+      perStep.push([i, stepCost, mechanical]);
+
+      // The linear counterfactual: as if only the new content were sent.
+      linear += (fresh / 1e6 * m.in) + ((ASSISTANT + thinking) / 1e6 * m.out);
+
+      ctxTokens += ASSISTANT + obs;
+    }
+
+    $("c-run").textContent   = "$" + cost.toFixed(4);
+    $("c-lin").textContent   = "$" + linear.toFixed(4);
+    $("c-final").textContent = (ctxTokens / 1000).toFixed(0) + "k";
+    $("c-month").textContent = "$" + Math.round(cost * runs * 30).toLocaleString();
+
+    const max = Math.max.apply(null, perStep.map(p => p[1]));
+    $("c-bars").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">Cost per step</div>' +
+      perStep.map(([i, c, mech]) =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">' +
+        '<span style="min-width:58px;font-size:12.5px;color:#54677A">step ' + i + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + Math.max(1, c/max*100).toFixed(0) +
+        '%' + (mech ? ';background:#25B7C4' : '') + '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:60px;text-align:right">$' +
+        c.toFixed(4) + '</span></div>').join("");
+
+    const notes = [];
+    const ratio = cost / linear;
+    notes.push("Step " + n + " costs " + (perStep[n-1][1] / perStep[0][1]).toFixed(1) +
+               "× what step 1 cost, because the array has grown to " + (ctxTokens/1000).toFixed(0) +
+               "k tokens and all of it is resent. Total is " + ratio.toFixed(1) +
+               "× the naive 'sum of the new content' estimate — this gap is the single most common budgeting error with agents.");
+
+    if(cache < 0.3)
+      notes.push("Prompt caching is at " + Math.round(cache*100) + "%. In an agent, everything before the current step is an unchanged prefix, " +
+                 "so this should be high. Raise the slider: it attacks the quadratic term directly and is close to free to adopt.");
+    else if(cache >= 0.7)
+      notes.push("With " + Math.round(cache*100) + "% cache hits the growth is much flatter. Keep the system prompt and tool schemas byte-identical across steps to hold this — " +
+                 "any mid-run edit to the prefix invalidates it for every remaining step.");
+
+    if(route)
+      notes.push("Mechanical steps (teal) are routed to the small model. That is " +
+                 perStep.filter(p => p[2]).length + " of " + n + " steps at roughly a tenth of the price, " +
+                 "for work that is mostly 'read the thing you just found'.");
+    else if($("c-tier").value !== "small")
+      notes.push("Every step uses the same model, including the mechanical ones. Tick the routing box to see what sending those to a small model saves.");
+
+    if($("c-tier").value === "reason")
+      notes.push("Reasoning on every step adds 800 billed thinking tokens per step and several seconds of latency each time. " +
+                 "Most steps in an investigative run do not need it — reserve it for step one and for steps following an error.");
+
+    if(obs > 1500)
+      notes.push("Observations averaging " + obs + " tokens dominate the growth. Truncating tool results to what the next decision actually needs " +
+                 "(chapter 5) is often a bigger lever than changing model.");
+
+    $("c-note").textContent = notes.join("\n\n");
+  }
+
+  ["c-steps","c-obs","c-cache","c-tier","c-route","c-runs"].forEach(id =>
+    $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

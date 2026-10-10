@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Partitioning — PostgreSQL</title>
+<meta name="description" content="Declarative partitioning, pruning, choosing a key, the operations it makes cheap, and the ones it makes worse.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 15 · At scale</div>
+    <h1>Partitioning</h1>
+    <p class="standfirst">Splitting one logical table into many physical ones. It is frequently proposed as a fix for "the table is large", which is the wrong reason — the right reasons are retention and pruning, and getting the key wrong makes everything slower.</p>
+    <div class="chap-meta">
+      <span class="tagpill">declarative</span>
+      <span class="tagpill">pruning</span>
+      <span class="tagpill">retention</span>
+      <span class="tagpill">choosing a key</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>What it actually buys</h2>
+
+<div class="cols">
+  <div class="col good">
+    <h4>Genuine wins</h4>
+    <ul>
+      <li><b>Instant retention</b> — <code>DROP TABLE</code> on an old partition, no <code>DELETE</code>, no bloat, no vacuum</li>
+      <li><b>Pruning</b> — a query filtered on the key reads only the relevant partitions</li>
+      <li><b>Per-partition maintenance</b> — vacuum, reindex and analyse one at a time</li>
+      <li><b>Bulk load and detach</b> — build a partition offline, attach it in one operation</li>
+      <li><b>Smaller indexes</b> — one B-tree per partition rather than one enormous one</li>
+    </ul>
+  </div>
+  <div class="col bad">
+    <h4>Not wins</h4>
+    <ul>
+      <li>Lookups by primary key. A B-tree on 1 billion rows is barely deeper than on 100 million</li>
+      <li>Queries that do not filter on the partition key — now they scan <em>every</em> partition</li>
+      <li>Anything requiring uniqueness across partitions on a different column</li>
+      <li>Write throughput, in itself</li>
+      <li>"The table is too big" as a general complaint</li>
+    </ul>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Partition for retention and pruning, not for size</span>
+  <p>The test: <b>does nearly every query filter on the same column, and do you delete old data by that column?</b> If yes — events, logs, metrics, orders by date, anything with a time dimension — partitioning is excellent and you should do it early. If no, it will make most queries slower by turning one index lookup into a lookup per partition, and add operational work for nothing. A large table is not by itself a reason.</p>
+</div>
+
+<h2><span class="h-rule"></span>Pruning</h2>
+
+<div class="demo" id="part">
+  <div class="demo-head">
+    <b>How much does the query read?</b>
+    <span>Twelve monthly partitions. Whether the query mentions the partition key decides everything.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="t-query">Query</label>
+        <select id="t-query">
+          <option value="month" selected>WHERE occurred_at &gt;= '2026-03-01' AND &lt; '2026-04-01'</option>
+          <option value="quarter">WHERE occurred_at &gt;= '2026-01-01'</option>
+          <option value="nokey">WHERE device_id = 4821</option>
+          <option value="both">WHERE device_id = 4821 AND occurred_at &gt;= '2026-03-01'</option>
+          <option value="func">WHERE date_trunc('month', occurred_at) = '2026-03-01'</option>
+          <option value="param">WHERE occurred_at &gt;= $1 (a parameter)</option>
+          <option value="join">JOIN dates d ON d.day = occurred_at::date</option>
+        </select>
+      </div>
+      <div>
+        <label for="t-parts">Partitions — <span id="t-partsv">12</span></label>
+        <input type="range" id="t-parts" min="4" max="200" step="4" value="12">
+      </div>
+    </div>
+    <div id="t-grid"></div>
+    <div class="stat">
+      <div><b id="t-scanned">—</b><span>partitions scanned</span></div>
+      <div><b id="t-when">—</b><span>pruned at</span></div>
+      <div><b id="t-lock">—</b><span>locks taken</span></div>
+      <div><b id="t-plan">—</b><span>planning cost</span></div>
+    </div>
+    <div class="out" id="t-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Setting it up</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">declarative partitioning</span><button class="copy">Copy</button></div>
+<pre><code>CREATE TABLE events (
+    id          bigint GENERATED ALWAYS AS IDENTITY,
+    occurred_at timestamptz NOT NULL,
+    device_id   bigint      NOT NULL,
+    payload     jsonb,
+    PRIMARY KEY (id, occurred_at)      -- the key MUST include the
+) PARTITION BY RANGE (occurred_at);    -- partition column
+
+CREATE TABLE events_2026_03 PARTITION OF events
+    FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+CREATE TABLE events_2026_04 PARTITION OF events
+    FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+
+-- A catch-all, so an out-of-range insert does not error. Mixed blessing:
+-- it prevents errors and it hides the fact that you stopped creating
+-- partitions. Monitor its row count if you use one.
+CREATE TABLE events_default PARTITION OF events DEFAULT;
+
+-- Indexes created on the parent are created on every partition automatically
+-- and on every new one:
+CREATE INDEX ON events (device_id, occurred_at DESC);
+CREATE INDEX ON events USING brin (occurred_at);   -- tiny (chapter 6)
+
+-- Three strategies:
+--   RANGE  time, id ranges — by far the most common
+--   LIST   discrete values: region, tenant, status
+--   HASH   even distribution when there is no natural grouping.
+--          Note HASH gives you NO pruning benefit for range queries and no
+--          cheap retention — it mostly just spreads writes</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Every unique constraint must contain the partition key</span>
+  <p>This is the constraint that most often makes partitioning impossible, and it is worth checking before you commit. Postgres cannot enforce uniqueness across partitions without a global index, which it does not have — so a primary key on <code>id</code> alone is rejected and you need <code>(id, occurred_at)</code>. That is fine until something references the table by <code>id</code> alone: <b>foreign keys pointing at a partitioned table need the full key</b>, so a child table must carry the partition column too. Work through your foreign keys before partitioning, not after.</p>
+</div>
+
+<h2><span class="h-rule"></span>Automating partition management</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">pg_partman, because doing this by hand fails eventually</span><button class="copy">Copy</button></div>
+<pre><code>CREATE EXTENSION pg_partman;
+
+SELECT partman.create_parent(
+    p_parent_table => 'public.events',
+    p_control      => 'occurred_at',
+    p_interval     => '1 month',
+    p_premake      => 4                  -- keep 4 future partitions ready
+);
+
+UPDATE partman.part_config
+SET retention = '12 months',
+    retention_keep_table = false,        -- actually drop them
+    infinite_time_partitions = true
+WHERE parent_table = 'public.events';
+
+-- Run maintenance on a schedule — pg_cron, or an external scheduler
+SELECT partman.run_maintenance('public.events');
+
+-- Doing it manually is a cron job that creates next month's partition. It
+-- works for a year and then fails at 2am on the first of the month because
+-- the disk was full or the job host was rebuilt — and every insert starts
+-- landing in the default partition or erroring outright.
+--
+-- Monitor either way:
+SELECT count(*) FROM events_default;      -- should be 0
+SELECT max(relname) FROM pg_class
+WHERE relname LIKE 'events_2%';           -- should be several months ahead</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Retention, which is the main reason</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">instant, versus hours of damage</span><button class="copy">Copy</button></div>
+<pre><code>-- Unpartitioned: deleting 100 million rows.
+DELETE FROM events WHERE occurred_at < now() - interval '12 months';
+--   * hours of work, generating WAL for every row
+--   * 100 million dead tuples for vacuum to process (chapter 3)
+--   * every index rewritten
+--   * the table does not shrink; the space is only marked reusable
+--   * replicas replay all of it
+
+-- Partitioned: the same outcome.
+DROP TABLE events_2025_03;
+--   * instant. A catalogue change and an unlink
+--   * no dead tuples, no WAL for rows, no vacuum work
+--   * the space is returned to the filesystem immediately
+
+-- Or keep the data and take it out of the live table:
+ALTER TABLE events DETACH PARTITION events_2025_03 CONCURRENTLY;
+-- Now an ordinary standalone table: archive it, move it to cheap storage,
+-- or attach it again later. CONCURRENTLY avoids the exclusive lock (PG14+).
+
+-- Attaching validates that every row satisfies the bound, which means a scan.
+-- Add a matching CHECK constraint first and the scan is skipped:
+ALTER TABLE events_2026_05 ADD CONSTRAINT ck
+    CHECK (occurred_at >= '2026-05-01' AND occurred_at < '2026-06-01');
+ALTER TABLE events ATTACH PARTITION events_2026_05
+    FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');   -- no scan</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">If a table has a retention policy, it probably wants partitioning</span>
+  <p>The strongest single signal. Any table where you periodically delete old rows — events, logs, metrics, sessions, audit trails, notifications — is paying an enormous recurring cost for a job that partitioning makes free. And it compounds: the mass <code>DELETE</code> creates bloat, the bloat needs vacuum, the vacuum competes with your workload, and the table never actually shrinks. <b>Set this up before the table is large</b>, because converting a big table to partitioned is real work (below).</p>
+</div>
+
+<h2><span class="h-rule"></span>Choosing the key</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Question</th><th>Why it decides things</th></tr></thead>
+<tbody>
+<tr><td><b>Do nearly all queries filter on it?</b></td><td>Without this, pruning never happens and every query touches every partition</td></tr>
+<tr><td><b>Does retention follow it?</b></td><td>The main operational win</td></tr>
+<tr><td><b>Is it immutable?</b></td><td>Updating the key moves the row between partitions — allowed since PG11 and expensive</td></tr>
+<tr><td><b>Does it appear in every unique constraint?</b></td><td>It must. Check your foreign keys first</td></tr>
+<tr><td><b>Are the partitions evenly sized?</b></td><td>One partition holding 90% of the data gives you the costs without the benefits</td></tr>
+<tr><td><b>How many will there be?</b></td><td>Aim for tens to low hundreds, not thousands</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Do not create thousands of partitions</span>
+  <p>Planning has to consider each one, and every partition a query touches takes a lock — so a query against a table with 5,000 partitions can exhaust <code>max_locks_per_transaction</code> and fail with "out of shared memory". Even with pruning, planning time grows and <code>pg_class</code> becomes large enough to slow catalogue lookups. Postgres 12 improved this enormously and it is not free even now. <b>Tens to low hundreds is the comfortable range</b>: monthly partitions with a few years of retention, or daily for a few months. Daily partitions kept for five years is 1,800 tables and a bad time.</p>
+</div>
+
+<h2><span class="h-rule"></span>Pruning in detail</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">two stages, and what defeats each</span><button class="copy">Copy</button></div>
+<pre><code>-- PLAN-TIME pruning: the planner excludes partitions using constant values in
+-- the query. The excluded ones never appear in the plan at all.
+EXPLAIN SELECT * FROM events WHERE occurred_at >= '2026-03-01';
+
+-- RUN-TIME pruning: for parameters and subquery results, values are not known
+-- until execution. The plan shows all partitions, and the executor skips them.
+EXPLAIN (ANALYZE) SELECT * FROM events WHERE occurred_at >= $1;
+--   Append  (actual rows=…)
+--     Subplans Removed: 9        <- run-time pruning worked
+SET enable_partition_pruning = on;   -- default; only turn off to diagnose
+
+-- What defeats pruning:
+--   a function on the column      date_trunc('month', occurred_at) = …
+--   a cast                        occurred_at::date = '2026-03-14'
+--   a join to the key             ON d.day = events.occurred_at::date
+--   no predicate at all           the commonest reason by far
+--
+-- The fix is almost always to write a plain range on the bare column:
+WHERE occurred_at >= '2026-03-14' AND occurred_at < '2026-03-15'
+-- rather than a function that computes the same thing. This is the SARGability
+-- argument from the SQL unit, with partitions as the stake instead of an index.
+
+-- Partitionwise operations — off by default because planning gets expensive:
+SET enable_partitionwise_join = on;      -- join partition to partition
+SET enable_partitionwise_aggregate = on; -- aggregate per partition, then combine
+-- Worth enabling for analytics workloads on partitioned tables; leave off
+-- for OLTP.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Converting an existing table</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">without a long outage</span><button class="copy">Copy</button></div>
+<pre><code>-- There is no ALTER TABLE ... PARTITION BY. You build a new structure and
+-- move the data, which is why doing this early is much cheaper.
+
+-- 1. New partitioned table, same columns.
+CREATE TABLE events_new (LIKE events INCLUDING ALL)
+    PARTITION BY RANGE (occurred_at);
+-- (adjust the primary key to include occurred_at)
+
+-- 2. Create partitions covering all existing data plus the near future.
+
+-- 3. Attach the OLD table as one partition covering everything historical.
+--    Add the CHECK first so the attach does not scan it.
+ALTER TABLE events ADD CONSTRAINT ck_hist
+    CHECK (occurred_at < '2026-04-01');
+ALTER TABLE events_new ATTACH PARTITION events
+    FOR VALUES FROM (MINVALUE) TO ('2026-04-01');
+
+-- 4. Swap the names in one transaction.
+BEGIN;
+ALTER TABLE events     RENAME TO events_hist;
+ALTER TABLE events_new RENAME TO events;
+COMMIT;
+
+-- 5. New rows now land in proper partitions. Migrate the history in batches
+--    at your leisure, or leave it as one large partition and let retention
+--    eventually drop it.
+
+-- The alternative — copy every row into the new structure, then swap — is
+-- simpler and needs double the disk plus a way to catch up the writes that
+-- arrived during the copy. Logical replication to a partitioned subscriber
+-- is the clean version of that, and it works across the swap.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Operating a partitioned table</h2>
+
+<ul class="check">
+  <li><b>Monitor the default partition.</b> Rows landing there mean partition creation has stopped. It should always be empty.</li>
+  <li><b>Keep several future partitions ready.</b> <code>p_premake = 4</code> or equivalent, so one failed maintenance run is not an incident.</li>
+  <li><b>Autovacuum works per partition</b>, which is good — but per-table settings must be applied to the partitions, not only the parent.</li>
+  <li><b>Statistics are per partition</b>, plus optional parent-level ones. Run <code>ANALYZE</code> on the parent after big changes.</li>
+  <li><b>Watch <code>max_locks_per_transaction</code></b> if partition counts grow.</li>
+  <li><b>Indexes created on the parent propagate</b> to new partitions automatically. Ones created directly on a partition do not.</li>
+  <li><b>Check pruning is happening</b> with <code>EXPLAIN</code> after any query change — losing it is silent and expensive.</li>
+</ul>
+
+<div class="note tip">
+  <span class="note-t">Partitioning and BRIN together</span>
+  <p>On an append-only time-series table these compose unusually well. Partitioning restricts the query to the relevant months; within a partition, a BRIN index on the timestamp narrows it to the right block ranges — and the BRIN index is a few kilobytes rather than gigabytes (chapter 6). Correlation stays near perfect because each partition is written in time order. The result is a table that scales to billions of rows with tiny indexes, instant retention and no vacuum crisis. It is the standard shape for this workload and worth reaching for deliberately.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Partition for <b>retention and pruning</b>, not because a table is large.</li>
+    <li>The test: <b>do nearly all queries filter on the same column, and does deletion follow it?</b></li>
+    <li><b>Every unique constraint must include the partition key</b> — check your foreign keys before committing to this.</li>
+    <li><code>DROP TABLE</code> on a partition is <b>instant</b>; the equivalent <code>DELETE</code> is hours of work and bloat.</li>
+    <li><b>Tens to low hundreds of partitions.</b> Thousands means lock exhaustion and slow planning.</li>
+    <li>A function or cast on the key <b>defeats pruning</b>, and losing it is silent.</li>
+    <li>Monitor the <b>default partition</b> — rows in it mean partition creation has stopped.</li>
+    <li><b>Set it up before the table is large.</b> Converting later is real work.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("15-partitioning.html");
+
+(function(){
+  const root = document.getElementById("part");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const Q = {
+    month: {frac: n => 1/n, when:"plan time",
+      note:"A plain range on the bare partition key, with constant bounds. The planner excludes every other partition before execution — they do not appear in the plan at all, and no lock is taken on them.\n\nThis is the ideal case and the one partitioning exists for."},
+    quarter:{frac: n => Math.min(1, 3/n), when:"plan time",
+      note:"An open-ended range from a constant. The planner keeps every partition whose bounds could contain matching rows and prunes the rest.\n\nStill plan-time pruning, just covering more partitions. Note that an unbounded upper end means every future partition is included too — worth remembering on a table with many months ahead pre-created."},
+    nokey: {frac: () => 1, when:"not pruned",
+      note:"No predicate on the partition key at all, so nothing can be pruned. Every partition is scanned and every one is locked.\n\nThis is strictly WORSE than an unpartitioned table: the same rows are read, plus per-partition planning, plus an index lookup in each partition instead of one. If a meaningful share of your queries look like this, partitioning on this key is the wrong choice.\n\nAn index on device_id exists in every partition, so it is index lookups rather than scans — but it is N lookups where an unpartitioned table would do one."},
+    both:  {frac: n => 1/n, when:"plan time",
+      note:"The best of both. The partition key prunes down to one partition, and the index on device_id finds the rows within it.\n\nThis is what you want your access patterns to look like: the partition key narrows the physical search space and an ordinary index does the rest. Notice the index is also much smaller here — one B-tree per partition rather than one covering the whole table."},
+    func:  {frac: () => 1, when:"not pruned",
+      note:"date_trunc() on the partition column defeats pruning entirely. The planner cannot reason about what the function's output implies for the raw column's bounds, so it keeps everything.\n\nThe query is logically identical to the plain range version and reads the entire table instead of one partition. Rewrite it as a bare range:\n\n    WHERE occurred_at >= '2026-03-01'\n      AND occurred_at <  '2026-04-01'\n\nThis is the SARGability rule from the SQL unit, with a much higher stake — losing an index costs you a scan of one table, losing pruning costs you a scan of all of them. It is also completely silent: the query still returns the right answer."},
+    param: {frac: n => 1/n, when:"run time",
+      note:"With a parameter the value is unknown at planning time, so the plan includes every partition. Pruning still happens — at execution, once the value is bound.\n\nEXPLAIN alone looks alarming here. EXPLAIN ANALYZE shows the truth:\n\n    Append  (actual rows=…)\n      Subplans Removed: 11\n\nThat line is run-time pruning working. The costs you do still pay are planning across all partitions and locking them, which is why partition count matters even when pruning is effective."},
+    join:  {frac: () => 1, when:"not pruned",
+      note:"Joining on the partition key with a cast prevents pruning: the values come from another table and the cast blocks the planner's reasoning about bounds even for run-time pruning.\n\nTwo ways out. Add an explicit range predicate on the bare column alongside the join, so the planner has something constant to prune with — often you know the range even when the join expresses the real condition. Or enable enable_partitionwise_join, which lets Postgres join partition-to-partition when both sides are partitioned compatibly.\n\nThe first is usually simpler and always available."}
+  };
+
+  function render(){
+    const k = $("t-query").value;
+    const q = Q[k];
+    const n = parseInt($("t-parts").value, 10);
+    $("t-partsv").textContent = n;
+
+    const scanned = Math.max(1, Math.round(q.frac(n) * n));
+    const planTime = q.when === "plan time";
+
+    $("t-scanned").textContent = scanned + " of " + n;
+    $("t-when").textContent    = q.when;
+    $("t-lock").textContent    = (planTime ? scanned : n) + " partitions";
+    $("t-plan").textContent    = n > 500 ? "high" : n > 100 ? "moderate" : "low";
+
+    const cols = Math.min(24, n);
+    $("t-grid").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:16px 0 8px">' +
+      'Partitions (' + (n > 24 ? "first 24 of " + n : n) + ')</div>' +
+      '<div style="display:grid;grid-template-columns:repeat(' + Math.min(12, cols) +
+      ',1fr);gap:4px">' +
+      Array.from({length: cols}, (_, i) => {
+        const hit = q.frac(n) === 1 ? true
+                  : k === "quarter" ? i < Math.min(3, scanned)
+                  : i === 2;
+        return '<div style="aspect-ratio:1.6;border:2px solid ' + (hit ? "#E2574C" : "#CFD8E0") +
+          ';border-radius:4px;background:' + (hit ? "#FDECEA" : "#F4F7F9") +
+          ';display:flex;align-items:center;justify-content:center;font-family:var(--mono);' +
+          'font-size:10px;color:' + (hit ? "#B0453B" : "#B4C0CA") + ';font-weight:' + (hit ? "700" : "400") + '">' +
+          (i+1) + '</div>';
+      }).join("") + '</div>';
+
+    const notes = [q.note];
+
+    if(!planTime && q.frac(n) === 1)
+      notes.push("Every partition is scanned AND locked. With " + n + " partitions that is " + n +
+                 " lock entries for one query — and at a few thousand partitions that exhausts max_locks_per_transaction and the query fails outright with \"out of shared memory\".");
+
+    if(n > 150)
+      notes.push("At " + n + " partitions, planning cost is becoming significant even when pruning works: the planner considers each one before excluding it. PostgreSQL 12 improved this a great deal and it is still not free. " +
+                 "Tens to low hundreds is the comfortable range — daily partitions retained for five years is 1,800 tables and a bad time.");
+
+    if(planTime && scanned === 1)
+      notes.push("One partition out of " + n + ". Everything downstream benefits: a smaller index to search, a smaller working set in cache, and vacuum and analyse on this partition alone rather than the whole table.");
+
+    notes.push("Verify pruning with EXPLAIN after any query change. Losing it produces no error and no warning — just a query that reads " + n + "× more data than it used to.");
+    $("t-note").textContent = notes.join("\n\n");
+  }
+
+  ["t-query","t-parts"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

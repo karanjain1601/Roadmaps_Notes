@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Load balancers and reverse proxies — System Design Notes</title>
+<meta name="description" content="L4 vs L7, balancing algorithms compared by simulation, health checks and outlier ejection, sticky sessions, draining, and load balancer high availability.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/notes.css">
+</head>
+<body>
+<div class="readbar"></div>
+
+<header class="top">
+  <div class="top-inner">
+    <a class="home" href="../../index.html"><span class="mark"></span>All roadmaps</a>
+    <span class="top-sep">/</span>
+    <a class="home" href="index.html" style="color:var(--band-text)">System Design</a>
+    <span class="top-spacer"></span>
+    <button class="rail-toggle" aria-expanded="false">Contents</button>
+    <nav class="top-nav" aria-label="Chapter navigation"></nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail" id="rail" aria-label="Chapter and section navigation"></aside>
+
+  <article>
+    <p class="crumb">Part 3 · The path of a request &nbsp;·&nbsp; <b>Chapter 10</b></p>
+    <h1>Load balancers and reverse proxies</h1>
+    <p class="standfirst">The box that decides which of your servers handles a request, and therefore the box that decides how badly one slow server ruins everyone's day. This chapter covers the L4/L7 split, the balancing algorithms with a simulation showing why the obvious one is the worst, health checking that catches half-dead nodes, and how the load balancer itself avoids being the single point of failure.</p>
+    <div class="meta">
+      <span>~35 min read</span>
+      <span>L4/L7 · algorithms · health checks · HA</span>
+      <span>2 interactive panels</span>
+      <span>Prerequisite: chapters 3, 4</span>
+    </div>
+
+    <div class="body">
+
+      <h2><span class="h2n">10.1</span>Four boxes that all sit in the same place</h2>
+
+      <p>The vocabulary overlaps confusingly because the products overlap. What distinguishes them is <em>whose interests they serve</em>.</p>
+
+      <dl>
+        <dt>Forward proxy</dt>
+        <dd>Sits in front of <em>clients</em>, on their behalf. Corporate egress filtering, caching for a network, hiding client addresses. Not part of your service.</dd>
+        <dt>Reverse proxy</dt>
+        <dd>Sits in front of <em>servers</em>, on their behalf. Terminates TLS, serves cached content, rewrites requests, hides the topology behind it. nginx, HAProxy, Envoy, Caddy.</dd>
+        <dt>Load balancer</dt>
+        <dd>A reverse proxy whose defining job is choosing among several equivalent backends and removing unhealthy ones. Every load balancer is a reverse proxy; not every reverse proxy balances.</dd>
+        <dt>API gateway</dt>
+        <dd>A load balancer that also knows about your API: authentication, rate limiting per key, request validation, response aggregation, protocol translation. Discussed in <a href="11-app-layer.html">Chapter 11</a>.</dd>
+      </dl>
+
+      <h2><span class="h2n">10.2</span>Layer 4 versus Layer 7</h2>
+
+      <div class="tw">
+        <table>
+          <caption>Where the balancing decision is made</caption>
+          <thead><tr><th></th><th>Layer 4 (transport)</th><th>Layer 7 (application)</th></tr></thead>
+          <tbody>
+            <tr><td>Sees</td><td>IP addresses, ports, TCP/UDP flags</td><td>The full request: method, path, headers, cookies, body</td></tr>
+            <tr><td>Decision unit</td><td>A whole connection</td><td>Each request — so an HTTP/2 connection's streams can go to different backends</td></tr>
+            <tr><td>Throughput</td><td class="yes">Very high; can operate without touching payload at all</td><td class="mid">Lower — it parses, buffers and often re-encrypts</td></tr>
+            <tr><td>Latency added</td><td class="yes">Microseconds</td><td class="mid">Sub-millisecond to a few ms</td></tr>
+            <tr><td>TLS</td><td>Passes through encrypted (or uses SNI to route)</td><td>Terminates it, so it can read and act on content</td></tr>
+            <tr><td>Can do</td><td>Fast failover, any protocol, connection-level balancing</td><td>Path routing, header rewriting, retries, caching, canary by cookie, rate limiting, compression</td></tr>
+            <tr><td>Typical</td><td>AWS NLB, IPVS, Maglev, F5 in L4 mode</td><td>nginx, Envoy, HAProxy, AWS ALB, Traefik</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The practical arrangement in most large systems is <b>both</b>: an L4 layer at the edge that is stateless, absurdly fast, and spreads connections across a fleet of L7 proxies, which then make the intelligent per-request decisions. The L4 tier survives at network speed and needs almost no configuration; the L7 tier holds the logic that changes weekly.</p>
+
+      <div class="note trap">
+        <span class="lab">L4 balancing plus long-lived connections is a load imbalance generator</span>
+        <p>An L4 balancer assigns a whole connection to a backend. With HTTP/1.1 keep-alive, gRPC, or HTTP/2, a client opens one connection and sends thousands of requests down it — so the balancing decision was made once, for what turned out to be an enormous amount of work. Add a backend and it gets zero traffic, because no new connections are being made. The standard fixes are an L7 proxy that balances per request, a maximum connection lifetime that forces periodic rebalancing, or client-side load balancing that is aware of the backend set.</p>
+      </div>
+
+      <h2><span class="h2n">10.3</span>The algorithms</h2>
+
+      <div class="tw">
+        <table>
+          <caption>How a backend gets chosen</caption>
+          <thead><tr><th>Algorithm</th><th>Rule</th><th>Strength</th><th>Weakness</th></tr></thead>
+          <tbody>
+            <tr><td><b>Round robin</b></td><td>Next in the list, in turn</td><td>Trivial, perfectly even <em>counts</em></td><td>Even counts are not even <em>work</em>. A slow or overloaded server keeps receiving its share</td></tr>
+            <tr><td><b>Weighted round robin</b></td><td>In proportion to static weights</td><td>Handles known heterogeneous hardware; used for canaries</td><td>Weights are static and reality is not</td></tr>
+            <tr><td><b>Random</b></td><td>Uniformly at random</td><td>Stateless, no coordination, no synchronisation effects</td><td>Random clumping means some server is always unlucky</td></tr>
+            <tr><td><b>Least connections</b></td><td>Fewest in-flight requests</td><td>Naturally adapts to slow backends — a stuck server accumulates connections and stops being chosen</td><td>Needs shared state; with many independent balancers each sees only its own view</td></tr>
+            <tr><td><b>Least response time / EWMA</b></td><td>Lowest moving average of latency, often × in-flight</td><td>Reacts to grey failure and to genuinely slower machines</td><td>Can oscillate; a briefly fast server gets swamped, becomes slow, gets abandoned</td></tr>
+            <tr><td><b>Power of two choices</b></td><td>Pick two at random, send to the less loaded</td><td>Almost all the benefit of least-connections with none of the coordination. The default worth choosing</td><td>Slightly worse than perfect least-connections; still needs a load signal</td></tr>
+            <tr><td><b>Hashing (source IP, header, URL)</b></td><td>Deterministic mapping from a key to a backend</td><td>Session affinity and cache locality without shared state</td><td>Uneven if the key distribution is skewed; a NAT'd office is one source address</td></tr>
+            <tr><td><b>Consistent / Maglev hashing</b></td><td>Ring or lookup table (see <a href="07-sharding.html">Chapter 7</a>)</td><td>Backend changes disturb minimal traffic — vital for cache affinity</td><td>More machinery than plain hashing</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <span class="lab">Why "power of two choices" is the quiet winner</span>
+        <p>Choosing the least loaded of two randomly picked servers reduces the maximum load from O(log n / log log n) — the result for pure random — to O(log log n). That is an exponential improvement for one extra comparison, and it needs no global state, which matters because in a real deployment there are many load balancers and none of them knows the others' decisions. Perfect least-connections across a fleet of balancers is not achievable anyway; P2C gets most of the benefit while being honest about that. It is the default in Envoy for good reason.</p>
+      </div>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Algorithm simulator</h4>
+          <p>Five thousand requests, the same arrival and service sequence fed to every algorithm, so the comparison is fair.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="l-n">Backends <b><span id="l-nv">8</span></b></label>
+              <input type="range" id="l-n" min="2" max="20" step="1" value="8">
+            </div>
+            <div class="ctrl">
+              <label for="l-util">Target utilisation <b><span id="l-utilv">75</span>%</b></label>
+              <input type="range" id="l-util" min="30" max="95" step="1" value="75">
+            </div>
+            <div class="ctrl">
+              <label for="l-var">Request cost variability</label>
+              <select id="l-var">
+                <option value="0.3">Uniform work</option>
+                <option value="1" selected>Typical (exponential)</option>
+                <option value="3">Mixed fast and slow</option>
+              </select>
+            </div>
+            <div class="ctrl">
+              <label for="l-sick">One backend is <b><span id="l-sickv">1</span>×</b> slower</label>
+              <input type="range" id="l-sick" min="1" max="10" step="0.5" value="1">
+            </div>
+          </div>
+          <div class="bars" id="l-bars"></div>
+          <div class="legend"><span>Bars show p99 latency. Lower is better.</span></div>
+          <div class="out">
+            <div class="stats" id="l-stats"></div>
+            <p id="l-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">10.4</span>Health checking</h2>
+
+      <p>Choosing well among healthy backends matters less than not choosing dead ones. Two mechanisms, and you want both.</p>
+
+      <dl>
+        <dt>Active health checks</dt>
+        <dd>The balancer polls each backend on a schedule — <code>GET /healthz</code> every few seconds, N consecutive failures to eject, M consecutive successes to restore. Simple and predictable. Its weakness is that it tests a synthetic request, so a backend that answers <code>/healthz</code> instantly while failing every real request stays in the pool.</dd>
+        <dt>Passive health checks / outlier ejection</dt>
+        <dd>The balancer watches the real traffic it is already sending and ejects backends whose error rate or latency is a statistical outlier <em>relative to their peers</em>. This is what catches grey failure, and the relative comparison matters: if every backend is at 5% errors, that is a dependency problem and ejecting hosts makes it worse.</dd>
+      </dl>
+
+      <p>Three parameters govern the behaviour and all three are worth setting deliberately:</p>
+
+      <ul class="tight">
+        <li><b>Interval × threshold = detection time.</b> Two seconds by three failures is six seconds of users hitting a dead backend. Faster detection means more false positives from GC pauses and brief spikes.</li>
+        <li><b>Ejection duration with backoff.</b> Eject for 30 seconds, then let a probe through; if it fails again, eject for longer. This prevents flapping without permanently losing capacity.</li>
+        <li><b>Panic threshold.</b> Never eject more than a set fraction — typically 50%. If the majority of backends look unhealthy, the health check or a shared dependency is far more likely to be the problem than every server dying at once, so send traffic to possibly-broken hosts rather than to none.</li>
+      </ul>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>How many users hit the broken backend?</h4>
+          <p>Detection settings versus the number of failed requests before the pool is corrected.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="e-rps">Requests/s across the pool <b><span id="e-rpsv">4000</span></b></label>
+              <input type="range" id="e-rps" min="100" max="50000" step="100" value="4000">
+            </div>
+            <div class="ctrl">
+              <label for="e-n">Backends <b><span id="e-nv">10</span></b></label>
+              <input type="range" id="e-n" min="2" max="50" step="1" value="10">
+            </div>
+            <div class="ctrl">
+              <label for="e-int">Check interval <b><span id="e-intv">2</span> s</b></label>
+              <input type="range" id="e-int" min="0.5" max="30" step="0.5" value="2">
+            </div>
+            <div class="ctrl">
+              <label for="e-thr">Failures before ejection <b><span id="e-thrv">3</span></b></label>
+              <input type="range" id="e-thr" min="1" max="6" step="1" value="3">
+            </div>
+            <div class="ctrl">
+              <label for="e-mode">Failure mode</label>
+              <select id="e-mode">
+                <option value="hard" selected>Connection refused — fails every check</option>
+                <option value="grey">Grey: fails 60% of real requests, passes /healthz</option>
+              </select>
+            </div>
+            <div class="ctrl">
+              <label for="e-retry">Client retries once on failure</label>
+              <select id="e-retry">
+                <option value="0">No retry</option>
+                <option value="1" selected>Yes, to a different backend</option>
+              </select>
+            </div>
+          </div>
+          <div class="out">
+            <div class="stats" id="e-stats"></div>
+            <p id="e-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">10.5</span>Session persistence, and why to avoid it</h2>
+
+      <p>Sticky sessions pin a client to a backend, usually with a cookie the balancer sets, sometimes by hashing the source address. It exists because some application keeps state in local memory.</p>
+
+      <p>The costs are steep. Load becomes uneven, because sessions are long-lived and unevenly active. Deploys become disruptive, because restarting a backend logs out everyone pinned to it. Autoscaling barely works, because new instances receive only new sessions. And source-IP hashing is actively unreliable — an entire office behind one NAT address is one "client", and a mobile client's address changes as it moves.</p>
+
+      <div class="note good">
+        <span class="lab">Where the state should go instead</span>
+        <ol class="tight">
+          <li><b>In a signed token held by the client</b> (a JWT or a signed cookie) for small, non-secret, non-revokable-in-a-hurry state. No server storage at all.</li>
+          <li><b>In a shared store</b> — Redis or a database — keyed by session id. One extra sub-millisecond lookup per request, and every backend becomes interchangeable.</li>
+          <li><b>Nowhere:</b> re-derive it from the request. Most "session state" is a user id and a set of preferences that could be loaded on demand.</li>
+        </ol>
+        <p>Affinity is still legitimate as a <em>performance</em> optimisation — consistent hashing on a cache key so a backend's local cache stays warm — but then it must be advisory. If the preferred backend is unavailable, the request goes elsewhere and still works.</p>
+      </div>
+
+      <h2><span class="h2n">10.6</span>Connections, TLS and the details that leak</h2>
+
+      <dl>
+        <dt>Keep-alive on both sides</dt>
+        <dd>The balancer should reuse connections to backends, or you pay a TCP handshake per request and burn ports. Watch for the classic mismatch: the backend's idle timeout shorter than the balancer's, so the backend closes a connection at the moment the balancer sends a request down it, producing intermittent 502s that are maddening to trace. Make the balancer's idle timeout shorter than the backend's.</dd>
+        <dt>Connection draining</dt>
+        <dd>When removing a backend for a deploy, stop sending it new requests but let in-flight ones finish, with a deadline. Without draining, every deploy kills a burst of live requests. The full sequence is: mark unready → wait for the balancer to notice → drain → then terminate. Applications must handle <code>SIGTERM</code> by failing readiness first and exiting only after in-flight work is done.</dd>
+        <dt>Slow start</dt>
+        <dd>A freshly started backend has cold caches, an unwarmed JIT and empty connection pools. Least-connections sees an empty server and floods it, so its first thousand requests are slow and it may fall over. Slow start ramps its weight over 30–60 seconds.</dd>
+        <dt>TLS termination vs passthrough</dt>
+        <dd>Terminating at the balancer lets it read requests (needed for L7 anything) and centralises certificate management. Passthrough keeps traffic encrypted end to end, which some compliance regimes require, at the cost of L4-only behaviour. The common middle ground is terminate at the edge and re-encrypt to the backend.</dd>
+        <dt>Losing the client's identity</dt>
+        <dd>Once a proxy is in the path, the backend sees the proxy's address. <code>X-Forwarded-For</code> and <code>Forwarded</code> carry the original for HTTP; the PROXY protocol does it for L4. Two hazards: these headers are client-supplied unless the proxy overwrites them, so trusting them naively lets anyone spoof an address past your rate limiter or IP allow-list; and if you forget them entirely, every log line and every rate limit sees one address for the whole internet.</dd>
+      </dl>
+
+      <h2><span class="h2n">10.7</span>Who balances the balancer?</h2>
+
+      <figure class="diagram">
+        <div class="mermaid">
+flowchart TB
+  C["Clients"] --> DNS["DNS · anycast address"]
+  DNS --> E1["L4 edge<br/>region A"]
+  DNS --> E2["L4 edge<br/>region B"]
+  E1 --> P1["L7 proxy"]
+  E1 --> P2["L7 proxy"]
+  E2 --> P3["L7 proxy"]
+  P1 --> S1["App"]
+  P1 --> S2["App"]
+  P2 --> S1
+  P2 --> S2
+  P3 --> S3["App"]
+  E1 -. "ECMP: many machines<br/>share one address" .- E1
+        </div>
+        <figcaption>Redundancy at every layer, using a different mechanism at each: DNS or anycast chooses a region, ECMP spreads across L4 machines sharing one address, and the L4 tier spreads across L7 proxies which spread across applications.</figcaption>
+      </figure>
+
+      <p>Four mechanisms, used in combination:</p>
+
+      <ul class="tight">
+        <li><b>Anycast + ECMP.</b> Many machines announce the same address; routers hash each flow onto one of them. Adding capacity is announcing the address from another machine. This is how large-scale L4 tiers work.</li>
+        <li><b>Floating / virtual IP.</b> A pair of balancers share an address; a protocol like VRRP moves it to the survivor within seconds. Simple, common in self-hosted setups, and limited to a pair.</li>
+        <li><b>DNS across balancers.</b> Multiple A records, health-checked. Slow (see <a href="08-dns.html">Chapter 8</a>) but it is the only mechanism that works across regions.</li>
+        <li><b>Client-side load balancing.</b> The client gets the backend list from a discovery service and balances itself, removing the middle box from the data path entirely. Lowest latency, no shared bottleneck; costs you a smart client library in every language and a rollout problem when the policy changes. This is what a service mesh automates by putting that smart client in a sidecar.</li>
+      </ul>
+
+      <h2><span class="h2n">10.8</span>How load balancers cause outages</h2>
+
+      <div class="tw">
+        <table>
+          <caption>Failure modes that originate at this layer</caption>
+          <thead><tr><th>Failure</th><th>Mechanism</th><th>Defence</th></tr></thead>
+          <tbody>
+            <tr><td>Retry amplification</td><td>The balancer retries failed requests; under overload every request is retried, tripling the load on an already-failing fleet</td><td>Retry budgets — cap retries at a small percentage of total traffic — plus circuit breaking. See <a href="20-resilience.html">Chapter 20</a></td></tr>
+            <tr><td>Health-check cascade</td><td>A shared dependency slows down, every backend fails its deep health check, the balancer ejects everything</td><td>Shallow liveness checks and a panic threshold that stops ejecting past 50%</td></tr>
+            <tr><td>Thundering herd on deploy</td><td>All backends restart near-simultaneously; caches and pools are cold; the fleet cannot serve peak</td><td>Slow start, small rolling batches, surge capacity during deploys</td></tr>
+            <tr><td>Imbalance under HTTP/2</td><td>One connection carries all a client's requests; L4 balancing pins it to one backend</td><td>Balance per request at L7, or cap connection lifetime and max streams</td></tr>
+            <tr><td>Connection exhaustion</td><td>Idle keep-alive connections × clients × balancers exceed the backend's file descriptor limit</td><td>Pool limits, sensible idle timeouts, raised limits, and monitoring of open connections</td></tr>
+            <tr><td>Timeout mismatch</td><td>Balancer timeout is longer than the client's, so work continues on requests nobody is waiting for</td><td>Timeout budgets that shrink at each hop, and cancellation propagation</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <details class="check">
+        <summary>You add four new servers to a pool of eight. Traffic to them stays near zero. What is going on?</summary>
+        <div class="ans">
+          <p>Almost certainly long-lived connections plus connection-level balancing. Existing clients already hold established connections to the original eight and keep reusing them, so the new servers only receive traffic when a new connection is made — which, with keep-alive or HTTP/2, is rarely. Confirm by looking at established connections per backend rather than requests per second. Fixes: balance per request at L7; set a maximum connection lifetime or maximum requests per connection so clients periodically reconnect and get rebalanced; or, if clients are internal, use client-side balancing that watches the backend set. A related variant with the same symptom is sticky sessions, where existing sessions never migrate.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Round robin and least connections both look fine in your load test. In production, one backend's p99 is ten times the others. Why might least connections be the better choice?</summary>
+        <div class="ans">
+          <p>Because the load test almost certainly used homogeneous machines and uniform request costs, which is the one case where round robin is optimal. In production, machines differ (noisy neighbours, older hardware, a node running a background compaction) and request costs vary by orders of magnitude. Round robin keeps sending a fixed share to the struggling server regardless, so its queue grows without bound while others idle. Least connections — or power of two choices — notices the growing in-flight count and routes around it automatically, which is a form of automatic grey-failure mitigation you get for free. Run the simulator above with one backend slowed down and the difference is immediate.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Why is a deep health check that queries the database a risky thing to put in a load balancer's config?</summary>
+        <div class="ans">
+          <p>Because it converts a partial dependency problem into a total outage. Every backend shares the database, so when the database has a brief hiccup every backend fails its health check at the same moment and the balancer removes the entire pool — turning "some requests are slow" into "the service does not exist". It also creates a feedback loop, because health checks themselves add database load. The right structure is a shallow liveness check for the balancer's remove-from-pool decision, a readiness check that covers only local startup concerns, and deep dependency checks exported as <em>metrics</em> for alerting and for outlier ejection that compares backends to each other rather than to an absolute standard. Plus a panic threshold so that mass unhealthiness is treated as a measurement problem rather than obeyed.</p>
+        </div>
+      </details>
+
+      <div class="recap">
+        <h2>Recap</h2>
+        <ol>
+          <li><b>L4 is fast and connection-scoped; L7 is per request and can act on content.</b> Large systems use L4 at the edge feeding an L7 tier.</li>
+          <li><b>Round robin balances counts, not work.</b> Least connections and power-of-two-choices adapt to slow backends automatically.</li>
+          <li><b>Power of two choices is the default worth picking:</b> near-least-connections behaviour with no shared state, which matters because balancers do not see each other's decisions.</li>
+          <li><b>Use active checks for dead backends and outlier ejection for half-dead ones,</b> with a panic threshold that refuses to eject more than half the fleet.</li>
+          <li><b>Avoid sticky sessions.</b> Put state in a token or a shared store; keep affinity only as an advisory cache optimisation.</li>
+          <li><b>Draining, slow start and timeout ordering</b> are where deploys quietly break — and where intermittent 502s come from.</li>
+          <li><b>Preserve the client address deliberately</b> with <code>X-Forwarded-For</code> or PROXY protocol, and overwrite it at the trusted edge so it cannot be spoofed.</li>
+          <li><b>Long-lived connections defeat connection-level balancing.</b> Bound connection lifetime or balance per request.</li>
+          <li><b>Retries at the balancer amplify overload.</b> Use retry budgets, not unlimited retries.</li>
+        </ol>
+      </div>
+
+      <nav class="pn" aria-label="Previous and next chapter"></nav>
+    </div>
+  </article>
+</div>
+
+<script src="assets/notes.js"></script>
+<script>
+function st10(k, v, tone) {
+  var d = document.createElement("div"); d.className = "stat";
+  var a = document.createElement("div"); a.className = "k"; a.textContent = k;
+  var b = document.createElement("div"); b.className = "v"; b.textContent = v;
+  if (tone) b.style.color = tone;
+  d.append(a, b); return d;
+}
+function bar10(label, pct, value, colour) {
+  var row = document.createElement("div"); row.className = "bar";
+  var k = document.createElement("span"); k.textContent = label;
+  var t = document.createElement("span"); t.className = "track";
+  var f = document.createElement("span"); f.className = "fill";
+  f.style.width = Math.max(0.5, Math.min(100, pct)) + "%";
+  if (colour) f.style.background = colour;
+  t.appendChild(f);
+  var v = document.createElement("span"); v.className = "val"; v.textContent = value;
+  row.append(k, t, v); return row;
+}
+
+/* ---------- load balancing algorithm simulator ---------- */
+(function () {
+  var nIn = document.getElementById("l-n"), uIn = document.getElementById("l-util"),
+      vIn = document.getElementById("l-var"), sIn = document.getElementById("l-sick"),
+      bars = document.getElementById("l-bars"), stats = document.getElementById("l-stats"),
+      note = document.getElementById("l-note");
+  var REQ = 5000;
+
+  function rng(seed) { var s = seed >>> 0; return function () { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 4294967296; }; }
+
+  function build(N, util, cv, sick) {
+    var r = rng(20260901);
+    var speed = [];
+    for (var i = 0; i < N; i++) speed.push(i === 0 ? 1 / sick : 1);
+    var capacity = speed.reduce(function (a, b) { return a + b; }, 0); /* requests per unit service time */
+    var base = 20;                       /* ms of work per request on a nominal server */
+    var lambda = capacity * util / base; /* arrivals per ms */
+    var arrivals = [], demand = [], t = 0;
+    for (var k = 0; k < REQ; k++) {
+      t += -Math.log(1 - r()) / lambda;
+      arrivals.push(t);
+      var x;
+      if (cv <= 0.4) x = base * (0.75 + 0.5 * r());
+      else if (cv <= 1.2) x = -Math.log(1 - r()) * base;
+      else x = r() < 0.9 ? -Math.log(1 - r()) * base * 0.4 : -Math.log(1 - r()) * base * 6;
+      demand.push(Math.max(1, x));
+    }
+    return { arrivals: arrivals, demand: demand, speed: speed };
+  }
+
+  function run(algo, w) {
+    var N = w.speed.length, free = new Array(N).fill(0), lat = [], count = new Array(N).fill(0);
+    var rr = 0, r = rng(777);
+    for (var i = 0; i < REQ; i++) {
+      var t = w.arrivals[i], pick = 0;
+      if (algo === "rr") { pick = rr % N; rr++; }
+      else if (algo === "rand") pick = Math.floor(r() * N);
+      else if (algo === "lc") {
+        var best = 0, bl = Infinity;
+        for (var j = 0; j < N; j++) { var b = Math.max(0, free[j] - t); if (b < bl) { bl = b; best = j; } }
+        pick = best;
+      } else if (algo === "p2c") {
+        var a = Math.floor(r() * N), b2 = Math.floor(r() * N);
+        pick = Math.max(0, free[a] - t) <= Math.max(0, free[b2] - t) ? a : b2;
+      } else if (algo === "hash") {
+        pick = (i * 2654435761 % N + N) % N;
+        pick = Math.floor((((i * 1103515245 + 12345) >>> 0) % 1000) / 1000 * N) % N;
+      }
+      var start = Math.max(t, free[pick]);
+      var svc = w.demand[i] / w.speed[pick];
+      free[pick] = start + svc;
+      lat.push(start + svc - t);
+      count[pick]++;
+    }
+    lat.sort(function (x, y) { return x - y; });
+    return {
+      p50: lat[Math.floor(REQ * 0.5)],
+      p99: lat[Math.floor(REQ * 0.99)],
+      max: lat[REQ - 1],
+      count: count
+    };
+  }
+
+  var ALGOS = [
+    { id: "rr", n: "Round robin" },
+    { id: "rand", n: "Random" },
+    { id: "hash", n: "Hash on key" },
+    { id: "lc", n: "Least connections" },
+    { id: "p2c", n: "Power of two choices" }
+  ];
+
+  function draw() {
+    var N = +nIn.value, util = +uIn.value / 100, cv = +vIn.value, sick = +sIn.value;
+    document.getElementById("l-nv").textContent = N;
+    document.getElementById("l-utilv").textContent = +uIn.value;
+    document.getElementById("l-sickv").textContent = sick;
+
+    var w = build(N, util, cv, sick);
+    var res = ALGOS.map(function (a) { return { a: a, r: run(a.id, w) }; });
+    var worst = Math.max.apply(null, res.map(function (x) { return x.r.p99; }));
+    var best = res.reduce(function (m, x) { return x.r.p99 < m.r.p99 ? x : m; });
+
+    var ms = function (v) { return v >= 2000 ? (v / 1000).toFixed(1) + " s" : Math.round(v) + " ms"; };
+    bars.innerHTML = "";
+    res.forEach(function (x) {
+      /* square-root scale so a collapsed algorithm does not flatten the rest */
+      bars.appendChild(bar10(x.a.n, Math.sqrt(x.r.p99 / worst) * 100, ms(x.r.p99),
+        x.a.id === best.a.id ? "var(--ok)" : x.r.p99 > best.r.p99 * 2 ? "var(--line)" : "#B87A17"));
+    });
+
+    var rrR = res[0].r, p2cR = res[4].r;
+    stats.innerHTML = "";
+    stats.appendChild(st10("Best p99", ms(best.r.p99) + " · " + best.a.n, "var(--ok)"));
+    stats.appendChild(st10("Round robin p99", ms(rrR.p99), rrR.p99 > best.r.p99 * 1.5 ? "var(--line)" : ""));
+    stats.appendChild(st10("P2C vs round robin", (rrR.p99 / p2cR.p99).toFixed(2) + "× better"));
+    stats.appendChild(st10("Worst p99 of any algorithm", ms(worst)));
+    stats.appendChild(st10("Slow backend's share (RR)", ((rrR.count[0] / REQ) * 100).toFixed(1) + "%",
+      sick > 1 ? "var(--line)" : ""));
+    stats.appendChild(st10("Slow backend's share (P2C)", ((p2cR.count[0] / REQ) * 100).toFixed(1) + "%",
+      sick > 1 ? "var(--ok)" : ""));
+
+    note.textContent = sick > 2
+      ? "With one backend " + sick + "× slower, round robin keeps handing it an equal share and its queue grows without bound — that queue is your p99. Least connections and P2C notice the backlog and route around it, which is grey-failure mitigation you get for free from the algorithm."
+      : util > 0.88
+      ? "Near saturation every algorithm suffers, because the problem is capacity rather than distribution. Note that the gap between algorithms widens as utilisation rises: good balancing buys you headroom, it does not create capacity."
+      : cv > 2
+      ? "With highly variable request costs, round robin's even counts produce very uneven work. This is the common real-world case, and the reason count-based balancing disappoints in production after looking fine in a load test."
+      : "With homogeneous backends and uniform work, round robin is close to optimal — which is exactly the situation your load test creates and production never reproduces.";
+  }
+  [nIn, uIn, vIn, sIn].forEach(function (x) { x.addEventListener("input", draw); x.addEventListener("change", draw); });
+  draw();
+})();
+
+/* ---------- ejection timing ---------- */
+(function () {
+  var rps = document.getElementById("e-rps"), n = document.getElementById("e-n"),
+      intv = document.getElementById("e-int"), thr = document.getElementById("e-thr"),
+      mode = document.getElementById("e-mode"), retry = document.getElementById("e-retry"),
+      stats = document.getElementById("e-stats"), note = document.getElementById("e-note");
+
+  function draw() {
+    var R = +rps.value, N = +n.value, I = +intv.value, T = +thr.value,
+        grey = mode.value === "grey", hasRetry = retry.value === "1";
+    document.getElementById("e-rpsv").textContent = R;
+    document.getElementById("e-nv").textContent = N;
+    document.getElementById("e-intv").textContent = I;
+    document.getElementById("e-thrv").textContent = T;
+
+    var share = R / N;
+    var activeDetect = I * T + I / 2;              /* checks plus average offset */
+    var passiveDetect = grey ? 5 : 2;              /* outlier ejection reacts to real traffic */
+    var detect = grey ? passiveDetect : Math.min(activeDetect, passiveDetect + 1);
+    var failRate = grey ? 0.6 : 1;
+    var affected = share * detect * failRate;
+    var userVisible = hasRetry ? affected * 0.02 : affected;
+    var pctOfAll = (share * failRate / R) * 100;
+
+    stats.innerHTML = "";
+    stats.appendChild(st10("Requests to the bad node/s", Math.round(share)));
+    stats.appendChild(st10("Detection time", detect.toFixed(1) + " s", detect > 8 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st10("Failed requests before ejection", Math.round(affected), affected > 1000 ? "var(--line)" : ""));
+    stats.appendChild(st10("Users who see an error", Math.round(userVisible), userVisible > 100 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st10("Error rate while it lasts", pctOfAll.toFixed(1) + "%"));
+    stats.appendChild(st10("Active check would take", activeDetect.toFixed(1) + " s", grey ? "var(--line)" : ""));
+
+    note.textContent = grey
+      ? "The node passes /healthz and fails real work, so active checking never ejects it — it would stay in the pool indefinitely. Only outlier ejection, which compares real error rates between peers, catches this. Grey failure is why passive checking is not optional."
+      : hasRetry
+      ? "A single retry to a different backend hides nearly all of these failures from users, which is why retries are worth having — and also why they must have a budget, since under a real overload the same mechanism triples your load."
+      : "Without retries, every request that lands on the dead node during the detection window is a user-visible error. Shortening the interval or the threshold reduces that count, at the cost of ejecting healthy nodes that pause for garbage collection.";
+  }
+  [rps, n, intv, thr, mode, retry].forEach(function (x) { x.addEventListener("input", draw); x.addEventListener("change", draw); });
+  draw();
+})();
+</script>
+</body>
+</html>

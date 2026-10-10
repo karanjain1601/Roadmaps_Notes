@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>20 · Production on one host — Docker</title>
+<meta name="description" content="When a single host is the right answer, host setup, deploying without downtime, reverse proxies and TLS, live-restore, backup and restore, and a single-host runbook.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Crect x='6' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='19' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='10' width='5' height='5' fill='%23fff'/%3E%3Cpath d='M4 22h22a5 5 0 004-4' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch20">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Docker
+    </a>
+    <div class="chno"><b>Chapter 20</b><span>Security and operations</span></div>
+    <h1>Production on one host</h1>
+    <p class="lede">A single machine running Compose serves a great many real businesses, and does it with a fraction of the operational surface of a cluster. <b>What it does not give you for free is a deploy without downtime, or a restore you can rely on</b> — and both are achievable on one host if you build them deliberately.</p>
+    <div class="meta"><span>28 min</span><span>2 demos</span><span>8 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="honest">
+      <h2 data-nav="When one host">When one host is the right answer</h2>
+      <p class="sub">And the specific things that end that.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>One host is fine when</th><th>You need more when</th></tr></thead>
+          <tbody>
+            <tr><td>The load fits comfortably in one machine, with headroom</td><td>You have outgrown the largest sensible instance</td></tr>
+            <tr><td>A few minutes of downtime for host maintenance is tolerable</td><td>An availability target rules that out</td></tr>
+            <tr><td>One or two people operate it</td><td>Many teams deploy independently and need isolation</td></tr>
+            <tr><td>Services are stable in number — tens, not hundreds</td><td>Services and their dependencies change constantly</td></tr>
+            <tr><td>Traffic is predictable, or absorbed by headroom</td><td>Load varies enough to need autoscaling</td></tr>
+            <tr><td>You can restore from backup within your recovery target</td><td>Losing the host must not lose the service</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Modern hardware is the reason this remains reasonable: a single machine with 64 cores and 256&nbsp;GB is unremarkable, and it will run a workload that would have needed a rack a decade ago. <strong>The honest limit is not throughput — it is that the host is a single point of failure</strong>, and no amount of configuration on that host changes it. Everything below is about making the failure modes you <em>can</em> control behave well.</p>
+      <div class="note">
+        <span class="lbl">The intermediate step people skip</span>
+        <p>The gap between one host and an orchestrator is usually filled by <strong>two hosts and a load balancer</strong> — the same Compose files deployed to both, with the database on one and a replica on the other. That removes the single point of failure for the stateless tier at a fraction of the complexity of a cluster, and it is where most "we need Kubernetes" conversations should actually start (chapter 22 covers when they should not).</p>
+      </div>
+    </section>
+
+    <section id="host">
+      <h2 data-nav="Host setup">What a host needs</h2>
+      <p class="sub">Nine things, most of them once.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">/etc/docker/daemon.json</span><button class="copy">Copy</button></div>
+<pre data-lang="text">{
+  "log-driver": "local",
+  "log-opts": { "max-size": "20m", "max-file": "5", "compress": "true" },
+  "live-restore": true,
+  "default-address-pools": [ { "base": "10.201.0.0/16", "size": 24 } ],
+  "default-ulimits": { "nofile": { "Name": "nofile", "Soft": 65536, "Hard": 65536 } },
+  "features": { "containerd-snapshotter": true }
+}</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>#</th><th>Do</th><th>Because</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td><code>/var/lib/docker</code> on its own filesystem</td><td>A runaway log or image pull fills that volume, not the root one (chapter 19)</td></tr>
+            <tr><td>2</td><td>Set the log driver and rotation</td><td>The default has no size limit at all</td></tr>
+            <tr><td>3</td><td>Firewall rules in <code>DOCKER-USER</code></td><td>Published ports bypass <code>ufw</code> (chapter 12)</td></tr>
+            <tr><td>4</td><td>Address pools that avoid your VPN ranges</td><td>Docker's defaults collide with common corporate networks</td></tr>
+            <tr><td>5</td><td><code>restart: unless-stopped</code> on everything</td><td>Containers come back after a reboot (chapter 9)</td></tr>
+            <tr><td>6</td><td>Unattended security upgrades, with a reboot window</td><td>The host kernel is your last isolation boundary (chapter 18)</td></tr>
+            <tr><td>7</td><td>Time synchronisation</td><td>TLS validation and log correlation both depend on it</td></tr>
+            <tr><td>8</td><td>Disk, memory and restart-count alerts</td><td>The three things that actually take a single host down</td></tr>
+            <tr><td>9</td><td>A tested restore procedure</td><td>See the model below</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">a weekly maintenance unit</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># /etc/systemd/system/docker-prune.service — reclaim without touching volumes
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker container prune -f
+ExecStart=/usr/bin/docker image prune -af --filter until=336h
+ExecStart=/usr/bin/docker builder prune -f --filter until=168h
+
+# note: no `volume prune`. That deletes data, and it belongs in a human decision.</pre>
+      </div>
+    </section>
+
+    <section id="deploy">
+      <h2 data-nav="Deploying">Deploying without downtime</h2>
+      <p class="sub">The default has downtime. Here is what each alternative costs.</p>
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Deployment strategy timeline</h3>
+          <span class="hint">Downtime, dropped requests, peak resources and rollback</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:74px">strategy</span>
+            <span id="s-strat" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl tight">
+            <label for="s-boot" style="min-width:158px">boot to healthy <b id="s-bootv">14</b>s</label>
+            <input type="range" id="s-boot" min="1" max="90" value="14" style="width:130px">
+          </div>
+          <div class="ctrl tight">
+            <label for="s-drain" style="min-width:158px">drain time <b id="s-drainv">6</b>s</label>
+            <input type="range" id="s-drain" min="0" max="60" value="6" style="width:130px">
+            <span class="sep"></span>
+            <label for="s-timeout" style="min-width:104px">stop -t <b id="s-timeoutv">10</b></label>
+            <input type="range" id="s-timeout" min="1" max="60" value="10" style="width:110px">
+          </div>
+          <div class="ctrl">
+            <label for="s-rps" style="min-width:158px">traffic <b id="s-rpsv">80</b> req/s</label>
+            <input type="range" id="s-rps" min="1" max="500" value="80" style="width:130px">
+          </div>
+          <div id="s-chart" style="margin:6px 0 10px"></div>
+          <div class="term" id="s-term"></div>
+          <div class="rgrid" id="s-out"></div>
+          <p class="readout" id="s-note"></p>
+        </div>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">what the default actually does</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker compose up -d
+ ⠿ Container acme-api-1  Recreate      # stop the old one…
+ ⠿ Container acme-api-1  Started       # …then start the new one. That gap is downtime.
+
+# a blue-green switch behind a proxy, by hand
+$ docker compose up -d --scale api=2 --no-recreate       # new alongside old
+$ docker compose ps --format json | jq -r 'select(.Health=="healthy")'
+$ docker compose stop --timeout 30 api-old               # drain and remove the old one</pre>
+      </div>
+      <div class="key">
+        <span class="lbl">"Zero downtime" still drops requests if the drain is wrong</span>
+        <p>A proxy that switches instantly to a healthy new container gives zero <em>downtime</em>, and the old container is still holding in-flight requests when it is asked to stop. If its drain takes longer than the stop timeout, those requests are killed exactly as in chapter 9 — so the deploy reports success and a slice of users saw an error. <strong>The stop timeout must exceed the drain time</strong>, and the proxy must stop sending new requests before the drain begins. Both demos on this page are about the same lesson: the mechanism is only as good as its timings.</p>
+      </div>
+    </section>
+
+    <section id="proxy">
+      <h2 data-nav="Reverse proxy">The reverse proxy</h2>
+      <p class="sub">TLS, routing and the health-aware switch.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">Caddy — automatic TLS in four lines</span><button class="copy">Copy</button></div>
+<pre data-lang="text"># Caddyfile
+api.acme.com {
+    reverse_proxy api:3000 {
+        health_uri /healthz
+        health_interval 5s
+        lb_try_duration 5s
+    }
+}</pre>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">and the service it fronts</span><button class="copy">Copy</button></div>
+<pre data-lang="yaml">services:
+  caddy:
+    image: caddy:2-alpine
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data          # the certificates live here — back this up
+    networks: [edge]
+    restart: unless-stopped
+
+  api:
+    image: ghcr.io/acme/api@sha256:41523187cf…
+    networks: [edge, backend]
+    expose: ["3000"]              # not published: only the proxy reaches it (ch. 12)
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 5s
+      start_period: 20s
+    restart: unless-stopped</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Proxy</th><th>Strength</th><th>Cost</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Caddy</strong></td><td>Automatic TLS with almost no configuration</td><td>Static config; no Docker discovery by default</td></tr>
+            <tr><td><strong>Traefik</strong></td><td>Discovers containers from <b>labels</b>; very little to maintain</td><td>Needs the Docker socket — use a read-only proxy (chapter 18)</td></tr>
+            <tr><td><strong>nginx</strong></td><td>Familiar, extremely capable</td><td>Manual TLS renewal wiring; reload on change</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Note the <code>api</code> service publishes nothing — it is reachable only over the <code>edge</code> network from the proxy, so the firewall question from chapter 12 never arises for it. And the proxy's certificate volume is real state: losing it means re-issuing certificates, which rate limits will make slow at exactly the wrong moment.</p>
+    </section>
+
+    <section id="upgrades">
+      <h2 data-nav="Daemon upgrades">Daemon upgrades and reboots</h2>
+      <p class="sub"><code>live-restore</code>, and what it does not cover.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">upgrading Docker without stopping containers</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># with "live-restore": true, containers survive a daemon restart
+$ sudo systemctl restart docker
+$ docker ps                       # still running, uptime unbroken
+
+$ docker events --since 5m --filter type=daemon</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th><code>live-restore</code> covers</th><th>It does not cover</th></tr></thead>
+          <tbody>
+            <tr><td>A daemon restart or upgrade</td><td>A <b>host reboot</b> — that is what restart policies are for</td></tr>
+            <tr><td>Containers keeping their processes and connections</td><td>Changes to the daemon's bridge or address pools</td></tr>
+            <tr><td>Patch upgrades of the daemon</td><td>Swarm mode, which is incompatible with it</td></tr>
+            <tr><td>—</td><td>The window where the API is unavailable, so no deploys mid-restart</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>For a host reboot, the combination that works is <code>restart: unless-stopped</code> on every service plus the Docker service enabled at boot — containers then come back in dependency order as Compose recorded it. Verify it rather than assuming: <strong>a planned reboot is the cheapest possible test of your restart configuration</strong>, and far better than discovering it during an unplanned one.</p>
+    </section>
+
+    <section id="backup">
+      <h2 data-nav="Backup and restore">Backup and restore</h2>
+      <p class="sub">Two numbers, and whether you have ever measured them.</p>
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Recovery model</h3>
+          <span class="hint">How much data you lose, and how long you are down</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:74px">method</span>
+            <span id="b-method" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:74px">cadence</span>
+            <span id="b-cadence" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl tight">
+            <label for="b-size" style="min-width:150px">data volume <b id="b-sizev">40</b> GB</label>
+            <input type="range" id="b-size" min="1" max="500" value="40" style="width:130px">
+          </div>
+          <div class="ctrl">
+            <label for="b-bw" style="min-width:150px">restore link <b id="b-bwv">80</b> MB/s</label>
+            <input type="range" id="b-bw" min="5" max="800" step="5" value="80" style="width:130px">
+            <span class="sep"></span>
+            <button class="btn mono" id="b-drill">restore drill rehearsed</button>
+          </div>
+          <div class="term" id="b-term"></div>
+          <div class="rgrid" id="b-out"></div>
+          <p class="readout" id="b-note"></p>
+        </div>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">what to back up, and what not to</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># yes: database dumps, taken by the database
+$ docker compose exec -T db pg_dump -U postgres -Fc app &gt; /backup/app-$(date +%F-%H).dump
+
+# yes: volumes holding uploads or state the app owns (chapter 11)
+$ docker run --rm -v uploads:/from:ro -v /backup:/to alpine \
+    tar czf /to/uploads-$(date +%F).tgz -C /from .
+
+# yes: the proxy's certificate volume, and your Compose files (in git)
+# no:  images. They are reproducible from a digest and a registry (chapter 15)
+# no:  container writable layers. If they hold anything you need, that is the bug</pre>
+      </div>
+      <div class="warn">
+        <span class="lbl">A tar of a running database directory may not restore</span>
+        <p>Copying data files while the engine is writing captures a torn state — some pages from before a checkpoint, some after — and the result can fail to start or, worse, start and be subtly corrupt. Use the database's own tool (<code>pg_dump</code>, <code>mysqldump</code>, <code>mongodump</code>), or stop the container first, or use a filesystem snapshot that is atomic. The model above prices this as a consistency risk because it is the difference between a backup and a file.</p>
+      </div>
+    </section>
+
+    <section id="runbook">
+      <h2 data-nav="Runbook">A single-host runbook</h2>
+      <p class="sub">The five things that actually happen.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">the disk is full</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker system df
+$ du -sh /var/lib/docker/containers/*/*-json.log | sort -h | tail   # usually this
+$ : &gt; /var/lib/docker/containers/&lt;id&gt;/&lt;id&gt;-json.log                 # truncate, do not delete
+$ docker image prune -af --filter until=168h
+$ docker builder prune -f
+# then fix the cause: log rotation in daemon.json (chapter 19)</pre>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">a container will not stop, or will not start</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker stop -t 60 api || docker kill api
+$ docker inspect -f '{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}}' api
+$ docker logs --tail 100 api                          # chapter 19's diagnoser
+$ journalctl -u docker --since "10 min ago"            # the daemon's own view
+$ docker run --rm -it --entrypoint sh &lt;image&gt;          # get in before the failure</pre>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">roll back, and drain for maintenance</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># roll back: repoint the tag at the previous digest and redeploy (chapter 15)
+$ docker buildx imagetools create -t ghcr.io/acme/api:prod ghcr.io/acme/api@sha256:&lt;prev&gt;
+$ docker compose pull api &amp;&amp; docker compose up -d --wait api
+
+# drain before host maintenance: stop accepting, let requests finish, then stop
+$ docker compose stop --timeout 60 api
+$ docker compose stop caddy
+$ sudo reboot                       # unless-stopped brings everything back</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Symptom</th><th>First check</th><th>Chapter</th></tr></thead>
+          <tbody>
+            <tr><td>Everything is slow at once</td><td>Disk full, or a blocking log driver</td><td>19</td></tr>
+            <tr><td>One container keeps dying</td><td>Exit code and <code>OOMKilled</code></td><td>10, 19</td></tr>
+            <tr><td>Latency spikes with low CPU</td><td><code>nr_throttled</code> in <code>cpu.stat</code></td><td>10</td></tr>
+            <tr><td>A service is unreachable from outside</td><td>Bind address, then the proxy's upstream health</td><td>12</td></tr>
+            <tr><td>Containers gone after a reboot</td><td>Restart policies, and Docker enabled at boot</td><td>9</td></tr>
+            <tr><td>Deploy succeeded, users saw errors</td><td>Drain time against the stop timeout</td><td>9, this one</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 20 in eight lines</h2>
+        <ul>
+          <li>One host is a legitimate production choice; its honest limit is being a <b>single point of failure</b>, not throughput.</li>
+          <li>The step people skip is <b>two hosts and a load balancer</b>, not a cluster.</li>
+          <li>Put <code>/var/lib/docker</code> on its own filesystem, set log rotation, and firewall via <code>DOCKER-USER</code>.</li>
+          <li><code>docker compose up -d</code> <b>stops before it starts</b> — the default deploy has real downtime.</li>
+          <li>Blue-green behind a proxy removes the downtime and costs <b>double the resources</b> during the switch.</li>
+          <li>Zero downtime still drops requests unless the <b>stop timeout exceeds the drain time</b>.</li>
+          <li><code>live-restore</code> survives a daemon restart; a <b>host reboot</b> needs restart policies instead.</li>
+          <li>Back up dumps and volumes, not images. <b>An unrehearsed restore is not a backup.</b></li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary>Your deploy is <code>git pull &amp;&amp; docker compose up -d</code>. Users report brief errors on every release. Why, and what is the smallest fix?</summary>
+        <div class="ans"><p>Compose recreates a changed service by <b>stopping the old container and then starting the new one</b>, so there is a gap covering the stop, the start and the time until the new process is actually serving — commonly ten to thirty seconds. The smallest real fix is a reverse proxy in front plus a blue-green switch: start the new container alongside, wait for its healthcheck, switch the proxy, then drain and stop the old one. That costs double the resources briefly and no downtime. Make sure the old container's stop timeout exceeds its drain time, or you have moved the errors rather than removed them.</p></div>
+      </details>
+      <details class="chk">
+        <summary>You back up a Postgres volume nightly with <code>tar</code> while the container runs. Assess this.</summary>
+        <div class="ans"><p>It is a file, not necessarily a backup. Tarring a data directory under active writes captures a torn state — pages from either side of a checkpoint — so the archive may refuse to start or start and be quietly corrupt, which is worse. Use <code>pg_dump</code>, which produces a consistent snapshot by design, or stop the container first, or take an atomic filesystem snapshot. Then <b>rehearse the restore</b>: the failure mode here is discovering at recovery time that months of archives were never usable, and only a drill finds that.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Docker needs a security update. How do you apply it with the least disruption, and what still stops?</summary>
+        <div class="ans"><p>With <code>"live-restore": true</code> in <code>daemon.json</code>, <code>systemctl restart docker</code> upgrades the daemon while containers keep running — their processes and connections survive, because <code>containerd</code> and the container processes are not children of the daemon in the way that would kill them. What stops is the <b>API</b>: for the restart window you cannot deploy, exec or read logs, and any daemon-level networking change is not covered. A <b>kernel</b> update is different — that needs a reboot, which means restart policies plus a drain, and it is the case worth rehearsing.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Your recovery target is one hour. Daily backups of 200&nbsp;GB, restored over a 50&nbsp;MB/s link. Do you meet it?</summary>
+        <div class="ans"><p>No, on both numbers. Transferring the stored archive is roughly 40 minutes at that link speed, and once you add noticing the failure, provisioning, verifying and starting up, the total lands over an hour — so the recovery <em>time</em> misses even before anything goes wrong. And with daily backups the recovery <em>point</em> is up to 24 hours of data loss, which a one-hour target almost certainly does not permit either. Fix the two separately: cadence drives data loss (more frequent backups, or continuous archiving such as WAL shipping), and bandwidth plus volume drive downtime (keep a copy nearer the host, or restore incrementally). The model above separates them precisely because they need different fixes.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Part 5 is complete. Chapter 21 opens Part 6 with the alternatives: Podman, containerd, nerdctl and the OCI standards that make them interchangeable.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li>Time a <code>docker compose up -d</code> recreate, end to end.</li>
+        <li><code>docker info -f '{{.LiveRestoreEnabled}}'</code>.</li>
+        <li>Restore last night's backup into a scratch volume and start it.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>Docker's daemon configuration and live-restore documentation, the Compose deployment notes, and the Caddy and Traefik reverse-proxy guides.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — deployment strategy timeline
+   ============================================================ */
+(function () {
+  var STRATS = [
+    { id: "recreate", label: "compose up -d (recreate)" },
+    { id: "bluegreen", label: "blue-green behind a proxy" },
+    { id: "rolling", label: "rolling, 3 replicas" }
+  ];
+  var strat = "recreate";
+  var STOP_SIGNAL = 0.05;    /* time for the proxy to switch upstreams */
+
+  var host = document.getElementById("s-strat");
+  var chart = document.getElementById("s-chart");
+  var term = document.getElementById("s-term");
+  var out = document.getElementById("s-out");
+  var note = document.getElementById("s-note");
+
+  STRATS.forEach(function (s) {
+    var b = document.createElement("button");
+    b.className = "btn mono" + (s.id === strat ? " on" : "");
+    b.textContent = s.label;
+    b.addEventListener("click", function () {
+      strat = s.id;
+      Array.prototype.forEach.call(host.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      render();
+    });
+    host.appendChild(b);
+  });
+
+  function v(k) { return parseInt(document.getElementById("s-" + k).value, 10); }
+
+  function model() {
+    var boot = v("boot"), drain = v("drain"), timeout = v("timeout"), rps = v("rps");
+
+    /* the old container's shutdown: killed early if the drain exceeds the timeout */
+    var stopTook = Math.min(drain, timeout);
+    var killed = drain > timeout;
+    /* in-flight requests lost when SIGKILL lands mid-drain (chapter 9) */
+    var inflight = Math.round(rps * Math.min(drain, 5));
+    var cutOff = killed ? Math.round(inflight * (1 - timeout / drain)) : 0;
+
+    if (strat === "recreate") {
+      /* stop old completely, then start new: the gap is downtime */
+      var downtime = stopTook + boot;
+      return { phases: [
+          { name: "stop old", t: stopTook, down: true },
+          { name: "start new", t: boot, down: true }
+        ],
+        downtime: downtime, dropped: Math.round(rps * downtime) + cutOff,
+        peak: 1.0, total: downtime, rollback: stopTook + boot, killed: killed, cutOff: cutOff };
+    }
+    if (strat === "bluegreen") {
+      /* new alongside old, switch, then drain the old one */
+      return { phases: [
+          { name: "start new alongside", t: boot, down: false },
+          { name: "proxy switch", t: STOP_SIGNAL, down: false },
+          { name: "drain + stop old", t: stopTook, down: false }
+        ],
+        downtime: 0, dropped: cutOff,
+        peak: 2.0, total: boot + STOP_SIGNAL + stopTook,
+        rollback: STOP_SIGNAL, killed: killed, cutOff: cutOff };
+    }
+    /* rolling: replace one of three at a time */
+    var per = boot + STOP_SIGNAL + stopTook;
+    return { phases: [
+        { name: "replace 1 of 3", t: per, down: false },
+        { name: "replace 2 of 3", t: per, down: false },
+        { name: "replace 3 of 3", t: per, down: false }
+      ],
+      downtime: 0, dropped: Math.round(cutOff / 3) * 3,
+      peak: 4 / 3, total: per * 3, rollback: per, killed: killed, cutOff: cutOff };
+  }
+
+  function render() {
+    ["boot", "drain", "timeout", "rps"].forEach(function (k) {
+      document.getElementById("s-" + k + "v").textContent = v(k);
+    });
+    var m = model();
+    var W = 470, H = 46, padL = 8;
+    var x = function (t) { return padL + (t / (m.total * 1.03)) * (W - padL - 8); };
+    var svg = ['<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;max-width:' + W + 'px;height:auto;font-family:var(--mono)">'];
+    var acc = 0;
+    m.phases.forEach(function (p) {
+      svg.push('<rect x="' + x(acc) + '" y="14" width="' + Math.max(1.5, x(acc + p.t) - x(acc)) +
+        '" height="14" rx="2" fill="' + (p.down ? "#B3372F" : "#1F7A52") + '"/>');
+      if (x(acc + p.t) - x(acc) > 46) {
+        svg.push('<text x="' + (x(acc) + 4) + '" y="24" font-size="8" fill="#fff">' + p.name + "</text>");
+      }
+      acc += p.t;
+    });
+    svg.push('<text x="' + padL + '" y="10" font-size="8.5" fill="#54677A">' +
+      (m.downtime ? '<tspan fill="#B3372F">red = no service</tspan>' : "green = serving throughout") + "</text>");
+    svg.push('<text x="' + (W - 8) + '" y="40" font-size="8.5" fill="#7F8FA1" text-anchor="end">' +
+      m.total.toFixed(1) + "s total</text>");
+    svg.push("</svg>");
+    chart.innerHTML = svg.join("");
+
+    var lines = [];
+    if (strat === "recreate") {
+      lines.push('<span class="p">$</span> docker compose up -d');
+      lines.push('<span class="r"> ⠿ acme-api-1  Stopping                    ' + (m.phases[0].t).toFixed(1) + "s</span>");
+      lines.push('<span class="r"> ⠿ acme-api-1  Starting</span>');
+      lines.push('<span class="r"> ⠿ acme-api-1  Waiting for health          ' + v("boot") + "s</span>");
+      lines.push('<span class="r">    ↳ nothing is serving for ' + m.downtime.toFixed(1) + " seconds</span>");
+    } else if (strat === "bluegreen") {
+      lines.push('<span class="p">$</span> docker compose up -d --scale api=2 --no-recreate');
+      lines.push('<span class="g"> ⠿ acme-api-2  Started, waiting for health  ' + v("boot") + "s</span>");
+      lines.push('<span class="g"> ⠿ proxy       upstream switched to api-2</span>');
+      lines.push('<span class="p">$</span> docker compose stop --timeout ' + v("timeout") + " api-1");
+      lines.push((m.killed ? '<span class="r">' : '<span class="g">') + " ⠿ acme-api-1  draining " +
+        m.phases[2].t.toFixed(1) + "s" + (m.killed ? " → SIGKILL, " + m.cutOff + " requests cut off" : ", clean") + "</span>");
+    } else {
+      lines.push('<span class="p">$</span> for i in 1 2 3; do replace_one; done');
+      lines.push('<span class="g"> ⠿ 2 of 3 replicas serving throughout each step</span>');
+      lines.push('<span class="d"> ⠿ ' + m.phases[0].t.toFixed(1) + "s per replica, " + m.total.toFixed(1) + "s total</span>");
+      if (m.killed) lines.push('<span class="r"> ⠿ ' + m.cutOff + " requests cut off across the three drains</span>");
+    }
+    term.innerHTML = lines.join("\n");
+
+    out.innerHTML = "";
+    tile("Downtime", m.downtime ? m.downtime.toFixed(1) + "s" : "none", "", m.downtime === 0);
+    tile("Requests dropped", String(m.dropped), m.downtime ? "mostly the gap" : m.dropped ? "cut mid-drain" : "none", m.dropped === 0);
+    tile("Peak resources", "×" + m.peak.toFixed(2), "of one version", m.peak < 1.5);
+    tile("Rollback", m.rollback < 1 ? "instant" : m.rollback.toFixed(0) + "s", strat === "bluegreen" ? "proxy switch" : "redeploy", m.rollback < 1);
+
+    var msgs = [];
+    if (strat === "recreate") {
+      msgs.push("<b>This is what <code>docker compose up -d</code> does by default</b>, and the downtime is not a rounding error: " +
+        m.downtime.toFixed(1) + " seconds with nothing serving, costing about " +
+        Math.round(v("rps") * m.downtime) + " requests at " + v("rps") +
+        " req/s. Most of it is waiting for the new container to become healthy, which no amount of tuning removes — you need the old one to keep serving while it happens.");
+    } else if (strat === "bluegreen") {
+      msgs.push("<b>No downtime, at double the resources</b> for " + v("boot") +
+        " seconds while both versions run. Rollback is the best feature here: switching the proxy back is instant, because the old container is still there and still healthy.");
+    } else {
+      msgs.push("<b>Rolling keeps two of three replicas serving at all times</b>, so peak resources are only ×" +
+        m.peak.toFixed(2) + " rather than double — the trade is that the deploy takes " +
+        m.total.toFixed(0) + " seconds instead of " + (v("boot") + Math.min(v("drain"), v("timeout"))).toFixed(0) +
+        ", and a bad version is live on some replicas for longer.");
+    }
+    if (m.killed) {
+      msgs.push("<b>The drain is " + (v("drain") - v("timeout")) +
+        " seconds longer than the stop timeout, so " + m.cutOff +
+        " in-flight requests are killed</b> — and this happens on every strategy, including the two that report zero downtime. Chapter 9's rule applies here: raise <code>stop_grace_period</code> above the drain time. That is the difference between a deploy nobody notices and one that shows up in the error rate.");
+    } else if (strat !== "recreate") {
+      msgs.push("The drain fits inside the stop timeout, so the old container exits cleanly with nothing cut off. That is the whole of \"zero downtime\" actually being true.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, val, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = val;
+    vv.style.fontSize = String(val).length > 8 ? "13px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  ["boot", "drain", "timeout", "rps"].forEach(function (k) {
+    document.getElementById("s-" + k).addEventListener("input", render);
+  });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — recovery model: RPO and RTO
+   ============================================================ */
+(function () {
+  var METHODS = [
+    { id: "dump", label: "database dump", consistent: true, ratio: 0.35,
+      steps: [["provision a host", 600], ["restore the dump", null], ["verify and start", 300]] },
+    { id: "tarlive", label: "tar of a live volume", consistent: false, ratio: 0.6,
+      steps: [["provision a host", 600], ["extract the archive", null], ["verify and start", 300]] },
+    { id: "tarstopped", label: "tar, container stopped", consistent: true, ratio: 0.6,
+      steps: [["provision a host", 600], ["extract the archive", null], ["verify and start", 300]] },
+    { id: "snapshot", label: "filesystem snapshot", consistent: true, ratio: 0,
+      transfers: false, steps: [["attach the snapshot", 180], ["start", 120]] },
+    { id: "none", label: "no backup", consistent: false, ratio: 0, steps: [] }
+  ];
+  var CADENCES = [
+    { id: "continuous", label: "continuous (WAL)", hours: 0.08 },
+    { id: "hourly", label: "hourly", hours: 1 },
+    { id: "daily", label: "daily", hours: 24 },
+    { id: "weekly", label: "weekly", hours: 168 }
+  ];
+  var method = "tarlive", cadence = "daily", drilled = false;
+  var DETECT = 900;   /* time to notice and decide to restore */
+
+  var mHost = document.getElementById("b-method");
+  var cHost = document.getElementById("b-cadence");
+  var term = document.getElementById("b-term");
+  var out = document.getElementById("b-out");
+  var note = document.getElementById("b-note");
+
+  function group(host, list, get, set) {
+    list.forEach(function (item) {
+      var b = document.createElement("button");
+      b.className = "btn mono" + (get() === item.id ? " on" : "");
+      b.textContent = item.label;
+      b.addEventListener("click", function () {
+        set(item.id);
+        Array.prototype.forEach.call(host.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+        b.classList.add("on");
+        render();
+      });
+      host.appendChild(b);
+    });
+  }
+  group(mHost, METHODS, function () { return method; }, function (v) { method = v; });
+  group(cHost, CADENCES, function () { return cadence; }, function (v) { cadence = v; });
+  var dBtn = document.getElementById("b-drill");
+  dBtn.addEventListener("click", function () { drilled = !drilled; dBtn.classList.toggle("on", drilled); render(); });
+
+  function v(k) { return parseInt(document.getElementById("b-" + k).value, 10); }
+
+  function model() {
+    var M = METHODS.filter(function (x) { return x.id === method; })[0];
+    var C = CADENCES.filter(function (x) { return x.id === cadence; })[0];
+    var sizeGB = v("size"), bw = v("bw");
+
+    if (M.id === "none") {
+      return { M: M, C: C, rpoAvg: Infinity, rpoWorst: Infinity, rto: Infinity, steps: [], transfer: 0 };
+    }
+    /* transfer time for the stored artefact, in seconds */
+    var transfer = (sizeGB * M.ratio * 1024) / bw;
+    var steps = M.steps.map(function (s) {
+      return [s[0], s[1] === null ? transfer : s[1]];
+    });
+    var work = steps.reduce(function (a, s) { return a + s[1]; }, 0);
+    /* an unrehearsed restore takes materially longer: unknown steps, missing
+       credentials, a procedure nobody has followed */
+    var penalty = drilled ? 1.0 : 2.2;
+    return { M: M, C: C, rpoAvg: C.hours / 2, rpoWorst: C.hours,
+             rto: (DETECT + work) * penalty, steps: steps,
+             transfer: M.transfers === false ? 0 : transfer,
+             transfers: M.transfers !== false, work: work, penalty: penalty };
+  }
+
+  function fmtT(s) {
+    if (s === Infinity) return "never";
+    if (s < 90) return Math.round(s) + " s";
+    if (s < 5400) return (s / 60).toFixed(0) + " min";
+    return (s / 3600).toFixed(1) + " h";
+  }
+  function fmtH(h) {
+    if (h === Infinity) return "everything";
+    if (h < 1) return Math.round(h * 60) + " min";
+    if (h < 48) return h.toFixed(1) + " h";
+    return (h / 24).toFixed(0) + " d";
+  }
+
+  function render() {
+    ["size", "bw"].forEach(function (k) { document.getElementById("b-" + k + "v").textContent = v(k); });
+    var m = model();
+
+    var lines = [];
+    if (m.M.id === "none") {
+      lines.push('<span class="r">there is no backup. The recovery point is "everything since launch"</span>');
+      lines.push('<span class="r">and the recovery time is "however long it takes to rebuild by hand".</span>');
+    } else {
+      lines.push('<span class="d">data loss window</span>');
+      lines.push("  " + m.C.label + " backups → up to " + fmtH(m.rpoWorst) + " lost, " + fmtH(m.rpoAvg) + " on average");
+      lines.push("");
+      lines.push('<span class="d">time to be serving again</span>');
+      lines.push("  " + "notice and decide".padEnd(24, "\u00a0") + fmtT(DETECT));
+      m.steps.forEach(function (s) {
+        lines.push("  " + s[0].padEnd(24, "\u00a0") + fmtT(s[1]) +
+          (s[1] === m.transfer ? '<span class="d">   ' + (v("size") * m.M.ratio).toFixed(0) + " GB at " + v("bw") + " MB/s</span>" : ""));
+      });
+      if (!drilled) {
+        lines.push('<span class="r">  ' + "never rehearsed".padEnd(24, "\u00a0") + "×" + m.penalty + "  on everything above</span>");
+      }
+      lines.push('<span class="p">  ' + "total".padEnd(24, "\u00a0") + fmtT(m.rto) + "</span>");
+      lines.push("");
+      lines.push(m.M.consistent
+        ? '<span class="g">the artefact is internally consistent</span>'
+        : '<span class="r">the artefact may be a torn copy — it might not restore at all</span>');
+    }
+    term.innerHTML = lines.join("\n");
+
+    out.innerHTML = "";
+    tile("RPO worst case", fmtH(m.rpoWorst), "data lost", m.rpoWorst <= 1);
+    tile("RTO", fmtT(m.rto), drilled ? "rehearsed" : "unrehearsed", m.rto < 3600);
+    tile("Transfer share", m.M.id === "none" ? "—" : !m.transfers ? "none"
+      : Math.round((m.transfer / m.work) * 100) + "%", m.transfers ? "of the work" : "attached in place", true);
+    tile("Consistent", m.M.id === "none" ? "n/a" : m.M.consistent ? "yes" : "at risk", "", m.M.consistent);
+
+    var msgs = [];
+    if (m.M.id === "none") {
+      msgs.push("<b>No backup is a decision, whether or not anyone made it deliberately.</b> On a single host it means a disk failure, a bad migration or a mistaken <code>docker volume prune</code> ends the service permanently.");
+    } else {
+      if (!m.M.consistent) {
+        msgs.push("<b>The consistency risk is the one that hides.</b> Copying a data directory while the engine writes captures pages from either side of a checkpoint, so the archive may refuse to start — and you find out at recovery time, having taken it nightly for a year. Switch to the database's own dump tool, stop the container first, or use an atomic snapshot.");
+      }
+      if (!drilled) {
+        msgs.push("<b>An unrehearsed restore is modelled at ×" + m.penalty +
+          "</b> — missing credentials, a procedure nobody has followed, a step discovered halfway. That multiplier is generous compared with most first attempts, and the only way to remove it is to actually run the restore into a scratch volume.");
+      }
+      var share = m.transfers ? (m.transfer / m.work) * 100 : 0;
+      if (share > 55) {
+        msgs.push("<b>Transfer dominates:</b> " + Math.round(share) + "% of the recovery work is moving " +
+          (v("size") * m.M.ratio).toFixed(0) + " GB at " + v("bw") +
+          " MB/s. More frequent backups will not help this at all — it is bandwidth and volume. Keep a copy nearer the host, or restore incrementally.");
+      } else if (m.M.id === "snapshot") {
+        msgs.push("A snapshot attaches rather than transfers, which is why its recovery time barely moves with data size — the trade is that it usually lives on the same infrastructure as the original, so it protects against a bad migration far better than against losing the host.");
+      }
+      msgs.push("<b>The two numbers need different fixes.</b> Cadence drives the recovery <em>point</em> (" +
+        fmtH(m.rpoWorst) + " of loss here); bandwidth and volume drive the recovery <em>time</em> (" +
+        fmtT(m.rto) + "). Improving one does nothing for the other, which is why a single \"do we have backups\" question never gets a useful answer.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, val, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = val;
+    vv.style.fontSize = String(val).length > 8 ? "13px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  ["size", "bw"].forEach(function (k) {
+    document.getElementById("b-" + k).addEventListener("input", render);
+  });
+  render();
+})();
+</script>
+</body>
+</html>

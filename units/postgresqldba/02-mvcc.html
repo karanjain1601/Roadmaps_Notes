@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · MVCC — PostgreSQL</title>
+<meta name="description" content="Tuple versions, transaction ids, snapshots and visibility — why readers never block writers, and what that costs.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 02 · The engine</div>
+    <h1>MVCC</h1>
+    <p class="standfirst">Postgres never overwrites a row in place. An update writes a new version and marks the old one dead, and every transaction sees whichever version was current when it started. That single mechanism gives you lock-free reads — and produces the bloat, the long-transaction problems and the wraparound alarm in the next chapter.</p>
+    <div class="chap-meta">
+      <span class="tagpill">tuple versions</span>
+      <span class="tagpill">xmin and xmax</span>
+      <span class="tagpill">snapshots</span>
+      <span class="tagpill">visibility</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Rows are versions</h2>
+
+<p>What Postgres stores is not a row but a <b>tuple</b> — one version of a row. Every tuple carries two hidden system columns that say which transactions bracket its life.</p>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the hidden columns you can select</span><button class="copy">Copy</button></div>
+<pre><code>SELECT xmin, xmax, ctid, * FROM accounts WHERE id = 1;
+
+--  xmin  | xmax |  ctid  | id | balance
+-- -------+------+--------+----+---------
+--   4812 |    0 | (0,1)  |  1 |   100
+--
+--   xmin  the transaction that CREATED this version
+--   xmax  the transaction that DELETED or superseded it; 0 means still live
+--   ctid  physical location: (page number, item number within the page)
+
+UPDATE accounts SET balance = 150 WHERE id = 1;
+SELECT xmin, xmax, ctid, * FROM accounts WHERE id = 1;
+
+--  xmin  | xmax |  ctid  | id | balance
+-- -------+------+--------+----+---------
+--   4813 |    0 | (0,2)  |  1 |   150      <- a NEW tuple at a new location
+--
+-- The old tuple at (0,1) is still on disk, now with xmax = 4813. It is invisible
+-- to new transactions and it still occupies space until vacuum reclaims it.
+-- An UPDATE in Postgres is physically an insert plus a mark.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Every consequence in this unit starts here</span>
+  <p>An <code>UPDATE</code> writes a whole new tuple, even if you changed one boolean. That means: updates are as expensive as inserts; every index on the table may need a new entry (chapter 5's HOT updates are the exception); the table grows until vacuum reclaims the dead versions; and a <code>DELETE</code> frees no space immediately. If you internalise one thing from this chapter, make it that <b>a row's history is physically present in the table until something cleans it up</b>.</p>
+</div>
+
+<h2><span class="h-rule"></span>Snapshots and visibility</h2>
+
+<div class="demo" id="mvcc">
+  <div class="demo-head">
+    <b>Tuple versions and who can see them</b>
+    <span>Run transactions against one row and watch the versions accumulate. Each session sees a different answer, from the same pages.</span>
+  </div>
+  <div class="demo-body">
+    <div style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:12px">
+      <button class="btn" id="v-update">A: UPDATE balance</button>
+      <button class="btn" id="v-commit">A: COMMIT</button>
+      <button class="btn ghost" id="v-begin-b">B: BEGIN (take snapshot)</button>
+      <button class="btn ghost" id="v-delete">A: DELETE</button>
+      <button class="btn ghost" id="v-reset">reset</button>
+    </div>
+    <div id="v-tuples"></div>
+    <div class="stat">
+      <div><b id="v-xid">4812</b><span>current xid</span></div>
+      <div><b id="v-live">1</b><span>live versions</span></div>
+      <div><b id="v-dead">0</b><span>dead versions</span></div>
+      <div><b id="v-bsee">—</b><span>session B sees</span></div>
+    </div>
+    <div class="out" id="v-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">the visibility rule, in full</span><button class="copy">Copy</button></div>
+<pre><code>A tuple is VISIBLE to a snapshot if:
+
+    xmin is committed
+    AND xmin is not still in progress according to the snapshot
+    AND (xmax is 0, OR xmax aborted, OR xmax is still in progress /
+         started after the snapshot)
+
+A snapshot is three things captured when the statement (or transaction, under
+REPEATABLE READ) begins:
+
+    xmin       the oldest transaction still running
+    xmax       the next xid to be assigned
+    xip_list   the transactions in progress right now
+
+Anything with an xid below the snapshot's xmin is settled — committed or
+aborted, and everyone agrees. Anything at or above xmax started later and is
+invisible. The in-progress list handles the middle.
+
+    SELECT pg_current_snapshot();     -- 4812:4820:4815,4817
+    --                                    xmin:xmax:xip_list</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">READ COMMITTED takes a new snapshot per statement</span>
+  <p>Under <code>READ COMMITTED</code> — the default — each <em>statement</em> gets a fresh snapshot, which is exactly why the SQL unit's non-repeatable read is possible: two identical queries in one transaction can see different data. Under <code>REPEATABLE READ</code> the snapshot is taken once at the first statement and held for the whole transaction, so the transaction sees one consistent instant. That difference is the entire implementation of the isolation levels — the same visibility rule, applied against a snapshot taken at a different moment.</p>
+</div>
+
+<h2><span class="h-rule"></span>Readers do not block writers</h2>
+
+<div class="cols">
+  <div class="col good">
+    <h4>What MVCC buys</h4>
+    <ul>
+      <li>A <code>SELECT</code> never waits for an <code>UPDATE</code>, and never blocks one</li>
+      <li>A long analytical query sees a consistent instant without holding read locks</li>
+      <li>Rollback is nearly free — the new tuples are simply never visible</li>
+      <li>No read locks to escalate, and no lock-manager contention on reads</li>
+      <li>Consistent backups without stopping writes (chapter 12)</li>
+    </ul>
+  </div>
+  <div class="col bad">
+    <h4>What it costs</h4>
+    <ul>
+      <li>Dead tuples accumulate and must be cleaned up (chapter 3)</li>
+      <li>Tables and indexes bloat, and bloat is not automatically reclaimed to the OS</li>
+      <li><code>UPDATE</code> writes a full new tuple, and often new index entries</li>
+      <li><code>count(*)</code> cannot read a stored counter — visibility is per transaction</li>
+      <li>Long transactions hold back cleanup for the entire cluster</li>
+      <li>Transaction ids are finite, so freezing is mandatory</li>
+    </ul>
+  </div>
+</div>
+
+<div class="note warn">
+  <span class="note-t">One long transaction degrades everything</span>
+  <p>Vacuum may only remove a dead tuple once no running transaction could still need to see it — so <b>the oldest open transaction in the cluster sets the horizon for cleanup everywhere</b>. A session left <code>idle in transaction</code> for two hours means two hours of dead tuples on every busy table, in every database, accumulating with nothing able to reclaim them. A forgotten psql window, a crashed worker, an analytics query with no timeout: any of them is enough. This is the single most common cause of sudden unexplained bloat, and chapter 3 is largely about detecting it.</p>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">finding the transaction holding everything back</span><button class="copy">Copy</button></div>
+<pre><code>SELECT pid,
+       now() - xact_start        AS transaction_age,
+       now() - state_change      AS in_state_for,
+       state,
+       backend_xmin,
+       left(query, 80)           AS query
+FROM pg_stat_activity
+WHERE backend_xmin IS NOT NULL
+ORDER BY age(backend_xmin) DESC
+LIMIT 10;
+
+-- The top row is the one holding the horizon. Note that "idle in transaction"
+-- is as damaging as a running query — the snapshot is held either way, and
+-- the session is not even doing anything with it.
+
+-- Two settings that prevent this entirely:
+--   idle_in_transaction_session_timeout = '5min'
+--   statement_timeout                   = '60s'    (per role, not globally)
+--
+-- Replication slots and long-running queries on a hot standby with
+-- hot_standby_feedback = on hold the horizon back too. Chapter 13.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Transaction ids are 32 bits</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the finite counter, and how it is made to work</span><button class="copy">Copy</button></div>
+<pre><code>-- xids are 32-bit, so there are about 4.2 billion of them and they WRAP.
+-- Comparison is modular: for any xid, half the space is "in the past" and half
+-- is "in the future". If a tuple's xmin fell more than 2 billion transactions
+-- behind, it would suddenly appear to be in the future and become invisible —
+-- data loss, silently.
+--
+-- The fix is FREEZING. Vacuum marks tuples old enough that everyone can see
+-- them as frozen, and a frozen tuple is visible to all transactions
+-- regardless of xid comparison. Its xmin no longer matters.
+
+SELECT datname,
+       age(datfrozenxid)                        AS xid_age,
+       2000000000 - age(datfrozenxid)           AS xids_remaining,
+       round(100.0 * age(datfrozenxid) / 2000000000, 1) AS pct_to_limit
+FROM pg_database
+ORDER BY xid_age DESC;
+
+-- Postgres warns from about 200 million behind autovacuum_freeze_max_age,
+-- and at 3 million remaining it REFUSES NEW WRITES to protect itself.
+-- That is a full outage, and it is entirely preventable — the number above
+-- climbs visibly for weeks first.
+--
+-- 64-bit xids have been under discussion for years and are not here yet.
+-- Chapter 3 covers keeping this number down.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Row locks live in the tuple</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">why Postgres never runs out of row locks</span><button class="copy">Copy</button></div>
+<pre><code>-- Locking a row sets xmax on the tuple with a flag saying "locked, not
+-- deleted". The lock is stored IN THE ROW, so there is no lock table to size
+-- and no escalation from row locks to a table lock.
+SELECT * FROM accounts WHERE id = 1 FOR UPDATE;
+
+-- Consequences:
+--   * you can lock ten million rows without exhausting anything
+--   * lock waits are per row, resolved by the waiter examining the tuple
+--   * SELECT FOR UPDATE writes to the page, so it dirties buffers and
+--     generates WAL — a "read-only" query that is not read-only
+--   * several sessions holding FOR SHARE on one row need a multixact, an
+--     extra structure that has its own wraparound to worry about
+--
+-- TABLE-level locks are different: they live in shared memory, sized by
+-- max_locks_per_transaction × max_connections. A transaction touching
+-- thousands of partitions can exhaust that, and the error names it directly.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>The counting consequence</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">why count(*) is not free, and what to do</span><button class="copy">Copy</button></div>
+<pre><code>-- There is no stored row count, because "how many rows" has no single answer:
+-- it depends on the asking transaction's snapshot. So count(*) must examine
+-- every candidate tuple and test its visibility.
+SELECT count(*) FROM orders;              -- scans the table or an index
+
+-- An index-only scan helps, and only when the visibility map says a page is
+-- all-visible — otherwise the heap must be consulted anyway (chapter 3).
+-- Which is why an aggressively vacuumed table counts much faster than a
+-- neglected one, and why the same query can be fast on Monday and slow on
+-- Friday with no change to the data volume.
+
+-- The estimate, accurate to a few percent and instant:
+SELECT reltuples::bigint FROM pg_class WHERE relname = 'orders';
+
+-- Nearly always sufficient. Chapter 14 of the SQL unit covers the rest.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>How other databases do it</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>System</th><th>Approach</th><th>Trade</th></tr></thead>
+<tbody>
+<tr><td><b>PostgreSQL</b></td><td>Old versions kept in the table itself</td><td>Cheap rollback and fast reads; bloat and vacuum</td></tr>
+<tr><td><b>MySQL / InnoDB</b></td><td>Old versions in a separate undo log</td><td>Tables stay compact; rollback is expensive and long readers make undo grow</td></tr>
+<tr><td><b>Oracle</b></td><td>Undo tablespace</td><td>Similar to InnoDB; the classic "snapshot too old" error when undo is recycled</td></tr>
+<tr><td><b>SQL Server</b></td><td>Locking by default; versions in tempdb with RCSI enabled</td><td>Readers block writers unless you opt in; tempdb becomes a bottleneck when you do</td></tr>
+</tbody>
+</table>
+<caption>Every design has a bill. Postgres's is paid by vacuum; InnoDB's is paid by the undo log and by rollback cost. Neither is a mistake, and knowing which bill you are paying is what makes the operational advice make sense.</caption>
+</div>
+
+<div class="note key">
+  <span class="note-t">The practical rules that follow from this chapter</span>
+  <p><b>Keep transactions short</b> — the oldest one holds back cleanup cluster-wide. <b>Update fewer columns and fewer rows</b>, because every update writes a new tuple. <b>Set <code>idle_in_transaction_session_timeout</code></b>, today, on every cluster. <b>Batch bulk changes</b> (SQL chapter 9) so no single statement creates millions of dead tuples at once. <b>Watch <code>age(datfrozenxid)</code></b>. Everything in chapter 3 is the enforcement of these.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Postgres stores <b>tuples, not rows</b> — versions bracketed by <code>xmin</code> and <code>xmax</code>.</li>
+    <li>An <code>UPDATE</code> is <b>physically an insert plus a mark</b>. The old version stays on disk until vacuum removes it.</li>
+    <li>A snapshot is <b>xmin, xmax and the in-progress list</b>; the isolation levels differ only in when it is taken.</li>
+    <li>Readers never block writers — which is what MVCC buys — and <b>dead tuples are what it costs</b>.</li>
+    <li><b>The oldest open transaction in the cluster holds back cleanup everywhere.</b> <code>idle in transaction</code> is as damaging as a running query.</li>
+    <li><b>Transaction ids are 32-bit and wrap.</b> Freezing prevents it, and neglect causes a full write outage.</li>
+    <li>Row locks live in the tuple, so they never run out — but <code>FOR UPDATE</code> <b>writes to the page</b>.</li>
+    <li>There is no stored row count because <b>visibility is per transaction</b>. Estimate from <code>reltuples</code>.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("02-mvcc.html");
+
+(function(){
+  const root = document.getElementById("mvcc");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  let xid, tuples, bSnapshot, log;
+
+  function reset(){
+    xid = 4812;
+    tuples = [{ctid:"(0,1)", xmin:4811, xmax:0, balance:100, committed:true}];
+    bSnapshot = null;
+    log = "One live tuple, created by transaction 4811. Press a button to change it.";
+    render();
+  }
+
+  function visibleTo(t, snap){
+    if(!t.committed && t.xmin >= snap) return false;
+    if(t.xmin >= snap) return false;
+    if(t.xmax !== 0 && t.xmax < snap) return false;
+    return true;
+  }
+
+  function render(){
+    const live = tuples.filter(t => t.xmax === 0).length;
+    const dead = tuples.length - live;
+
+    $("v-xid").textContent  = xid;
+    $("v-live").textContent = live;
+    $("v-dead").textContent = dead;
+
+    let bSees = "—";
+    if(bSnapshot !== null){
+      const v = tuples.filter(t => visibleTo(t, bSnapshot));
+      bSees = v.length ? "£" + v[0].balance : "no row";
+    }
+    $("v-bsee").textContent = bSees;
+
+    $("v-tuples").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:0 0 8px">' +
+      'Tuples physically present in the page</div>' +
+      '<div class="tw" style="margin:0"><table><thead><tr>' +
+      '<th>ctid</th><th>xmin</th><th>xmax</th><th>balance</th><th>state</th>' +
+      (bSnapshot !== null ? '<th>visible to B?</th>' : '') +
+      '</tr></thead><tbody>' +
+      tuples.map(t => {
+        const isDead = t.xmax !== 0;
+        const vis = bSnapshot !== null ? visibleTo(t, bSnapshot) : null;
+        return '<tr style="' + (isDead ? 'opacity:.62' : '') + '">' +
+          '<td style="font-family:var(--mono);font-size:12.5px">' + t.ctid + '</td>' +
+          '<td style="font-family:var(--mono);font-size:12.5px">' + t.xmin + '</td>' +
+          '<td style="font-family:var(--mono);font-size:12.5px">' + t.xmax + '</td>' +
+          '<td style="font-family:var(--mono);font-size:12.5px">' + (t.balance === null ? "—" : "£" + t.balance) + '</td>' +
+          '<td><span style="display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:700;' +
+          'background:' + (isDead ? "#FDECEA;color:#B0453B" : "#E7F7EF;color:#166B47") + '">' +
+          (isDead ? "dead" : "live") + '</span></td>' +
+          (bSnapshot !== null
+            ? '<td style="font-weight:700;color:' + (vis ? "#166B47" : "#B0453B") + '">' + (vis ? "yes" : "no") + '</td>'
+            : '') +
+          '</tr>';
+      }).join("") + '</tbody></table></div>';
+
+    $("v-note").textContent = log;
+  }
+
+  $("v-update").addEventListener("click", () => {
+    xid++;
+    const cur = tuples.filter(t => t.xmax === 0)[0];
+    if(!cur){ log = "No live tuple to update — the row has been deleted. Reset to start again."; render(); return; }
+    cur.xmax = xid;
+    const n = tuples.length + 1;
+    tuples.push({ctid:"(0," + n + ")", xmin:xid, xmax:0, balance:cur.balance + 50, committed:true});
+    log = "Transaction " + xid + " updated the balance. Note what physically happened: the old tuple was NOT modified in place — " +
+          "its xmax was set to " + xid + " to mark it superseded, and an entirely new tuple was written at (0," + n + ").\n\n" +
+          "There are now " + tuples.length + " tuples on disk for one logical row. The dead ones still occupy space, and every index on this table " +
+          "may have gained an entry pointing at the new location (chapter 5 covers the HOT-update exception).";
+    render();
+  });
+
+  $("v-commit").addEventListener("click", () => {
+    log = "Committed. Nothing physical changed — the tuples were already written. A commit just records the transaction's status in pg_xact, " +
+          "which is why COMMIT is cheap and why ROLLBACK is even cheaper: an aborted transaction's tuples are simply never visible to anyone, " +
+          "and vacuum removes them later like any other dead tuple.";
+    render();
+  });
+
+  $("v-begin-b").addEventListener("click", () => {
+    bSnapshot = xid + 1;
+    log = "Session B began a REPEATABLE READ transaction and took a snapshot at xid " + bSnapshot + ".\n\n" +
+          "A new column appears in the table. B will see exactly the versions that were current at this instant, for as long as its transaction lasts — " +
+          "no matter what session A does next. Try updating again and watch B's answer stay put while new versions pile up above it.\n\n" +
+          "This is also the mechanism behind the warning in this chapter: while B's transaction is open, vacuum cannot remove any tuple B might still need. " +
+          "One idle session holds the horizon for the whole cluster.";
+    render();
+  });
+
+  $("v-delete").addEventListener("click", () => {
+    xid++;
+    const cur = tuples.filter(t => t.xmax === 0)[0];
+    if(!cur){ log = "Already deleted. Reset to start again."; render(); return; }
+    cur.xmax = xid;
+    log = "Transaction " + xid + " deleted the row. Again, nothing was erased — the tuple's xmax was set, marking it invisible to transactions " +
+          "starting from now on.\n\n" +
+          "DELETE frees no space. The table is exactly as large as it was, and it will stay that way until vacuum reclaims the dead tuples — " +
+          "and even then the space is returned to the table for reuse, not to the operating system." +
+          (bSnapshot !== null ? "\n\nNote that session B can still see the row. Its snapshot predates the delete, so the tuple is still live as far as B is concerned — which is precisely why vacuum must not remove it yet." : "");
+    render();
+  });
+
+  $("v-reset").addEventListener("click", reset);
+  reset();
+})();
+</script>
+</body>
+</html>

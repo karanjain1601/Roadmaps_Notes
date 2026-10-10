@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · RAG part three: making it good — AI Engineer</title>
+<meta name="description" content="Splitting retrieval failure from generation failure, building a golden set, the metrics that matter, faithfulness scoring and a debugging order that works.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 13 · Knowledge and retrieval</div>
+    <h1>RAG part three: making it good</h1>
+    <p class="standfirst">Every RAG system works impressively on the first ten questions you try and disappoints on the next hundred. The gap between those two states is closed by measurement — specifically, by being able to say whether a bad answer was a retrieval failure or a generation failure, because the fixes have nothing in common.</p>
+    <div class="chap-meta">
+      <span class="tagpill">golden set</span>
+      <span class="tagpill">recall</span>
+      <span class="tagpill">faithfulness</span>
+      <span class="tagpill">llm judge</span>
+      <span class="tagpill">debugging order</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The one diagnostic that matters</h2>
+
+<p>A user reports: "it said returns take 30 days, but sale items are 14." Before touching anything, answer one question — <b>was the correct passage in the context the model received?</b></p>
+
+<div class="cols">
+  <div class="col bad">
+    <h4>No, it was not there</h4>
+    <p><b>Retrieval failure.</b> The generator did the best it could with what it was given. Prompt engineering cannot fix this and will waste a week.</p>
+    <p>Fixes live in chapters 11 and 12: chunking, enrichment, hybrid search, reranking, filters.</p>
+  </div>
+  <div class="col bad">
+    <h4>Yes, it was right there</h4>
+    <p><b>Generation failure.</b> The model had the fact and did not use it — ignored it, contradicted it, averaged across sources, or preferred pre-training.</p>
+    <p>Fixes are the prompt, the ordering, the number of passages, or the model.</p>
+  </div>
+</div>
+
+<p>These two failure modes are roughly equally common, they look identical to the user, and teams that cannot distinguish them tune the wrong half of their system for months. Everything below exists to make that distinction cheap and automatic.</p>
+
+<h2><span class="h-rule"></span>Building the golden set</h2>
+
+<p>You need a fixed set of questions with known-correct answers and known-correct source passages. Aim for <b>100–200 items</b>. Fifty is enough to start and enough to catch regressions; below thirty, run-to-run noise exceeds the effects you are measuring.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Source of questions</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td><b>Real user queries from logs</b></td><td>The highest-value source by far. Real questions are messier, shorter and more ambiguous than anything you would invent. Start collecting on day one, even before the system is good</td></tr>
+<tr><td><b>Support tickets and search logs</b></td><td>What people actually ask, phrased as they actually phrase it, including the typos and the missing context</td></tr>
+<tr><td><b>Domain experts</b></td><td>Ask the person who currently answers these questions for the twenty they get most, plus the five that are always got wrong</td></tr>
+<tr><td><b>LLM-generated from your corpus</b></td><td>Fast way to bootstrap coverage: for each chunk, generate questions it answers. <em>Must be human-reviewed</em> — generated questions are systematically too easy and too close to the source wording</td></tr>
+<tr><td><b>Deliberate hard cases</b></td><td>Multi-hop, comparisons, negations, questions with no answer in the corpus, questions where two documents conflict, superseded-policy questions</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="json">
+<div class="code-head"><span class="lang">golden/returns.jsonl — one line per case</span><button class="copy">Copy</button></div>
+<pre><code>{"id": "g-011",
+ "question": "Can I return something I bought in the January sale?",
+ "expected_chunk_ids": ["returns#sale-items"],
+ "expected_facts": ["14 days", "final sale items cannot be returned unless faulty"],
+ "answer_must_not_contain": ["30 days"],
+ "category": "exception",
+ "difficulty": "medium"}
+
+{"id": "g-034",
+ "question": "What's your policy on cryptocurrency payments?",
+ "expected_chunk_ids": [],
+ "expected_behaviour": "refuse",
+ "category": "unanswerable",
+ "difficulty": "easy"}
+
+{"id": "g-052",
+ "question": "If a sale item arrives broken, do I pay return postage?",
+ "expected_chunk_ids": ["returns#sale-items", "returns#faulty-items"],
+ "expected_facts": ["Northwind covers return postage", "including sale items"],
+ "category": "multi-hop",
+ "difficulty": "hard"}</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">The unanswerable cases are the most valuable ones</span>
+  <p>At least 15% of your golden set should be questions your corpus genuinely cannot answer. Without them you are only measuring whether the system answers — not whether it knows when to stop. A system that scores 95% on answerable questions and hallucinates confidently on every unanswerable one is worse in production than a system that scores 85% and refuses cleanly.</p>
+</div>
+
+<h2><span class="h-rule"></span>Retrieval metrics</h2>
+
+<p>These need no LLM, cost nothing, and run in seconds. Run them on every change to chunking, embedding or search.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Metric</th><th>Definition</th><th>What it tells you</th></tr></thead>
+<tbody>
+<tr><td><b>Recall@k</b></td><td>Fraction of cases where an expected chunk appears in the top k</td><td>The ceiling on everything downstream. If recall@20 is 0.7, no prompt can score above 0.7</td></tr>
+<tr><td><b>Precision@k</b></td><td>Fraction of returned chunks that are relevant</td><td>How much noise the model must read past</td></tr>
+<tr><td><b>MRR</b></td><td>Mean of 1/rank of the first relevant chunk</td><td>Whether the right passage is at position 1 or position 14 — matters because of packing order</td></tr>
+<tr><td><b>NDCG@k</b></td><td>Rank-discounted gain over graded relevance</td><td>The standard when relevance is not binary. Use it for reranker comparisons</td></tr>
+<tr><td><b>Recall@k before vs after rerank</b></td><td>Two measurements, one funnel</td><td>Separates "retrieval never found it" from "reranker discarded it". Track both or you cannot tell</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">eval_retrieval.py — runs in seconds, run it constantly</span><button class="copy">Copy</button></div>
+<pre><code>def evaluate_retrieval(cases: list[Case], k: int = 20) -> dict:
+    hits, rr, prec, post_rerank = [], [], [], []
+
+    for case in cases:
+        if not case.expected_chunk_ids:              # unanswerable: handled separately
+            continue
+        wide = retrieve_wide(case.question, limit=k)
+        ids = [c.id for c in wide]
+        expected = set(case.expected_chunk_ids)
+
+        hits.append(any(i in expected for i in ids))
+        prec.append(sum(i in expected for i in ids) / len(ids) if ids else 0)
+        rank = next((n for n, i in enumerate(ids, 1) if i in expected), None)
+        rr.append(1 / rank if rank else 0)
+
+        final = rerank_and_cut(case.question, wide, top_k=5)
+        post_rerank.append(any(c.id in expected for c in final))
+
+    return {
+        f"recall@{k}":       sum(hits) / len(hits),
+        f"precision@{k}":    sum(prec) / len(prec),
+        "mrr":               sum(rr) / len(rr),
+        "recall@5_reranked": sum(post_rerank) / len(post_rerank),
+        "rerank_loss":       sum(hits) / len(hits) - sum(post_rerank) / len(post_rerank),
+    }</code></pre>
+</div>
+
+<p><code>rerank_loss</code> is the one people forget. If wide retrieval finds the passage 92% of the time but only 74% survives reranking, your reranker is the bottleneck — and no amount of chunking work will help.</p>
+
+<h2><span class="h-rule"></span>Generation metrics</h2>
+
+<div class="terms">
+  <div><dt>Faithfulness (groundedness)</dt><dd>Is every claim in the answer supported by the retrieved context? The single most important generation metric, because unfaithful answers are the ones that damage trust.</dd></div>
+  <div><dt>Answer relevance</dt><dd>Does the answer address the question asked, rather than a related one?</dd></div>
+  <div><dt>Context relevance</dt><dd>What proportion of the retrieved context was actually needed? Low values mean you are paying for and diluting with noise.</dd></div>
+  <div><dt>Correctness</dt><dd>Does it match the reference answer or contain the expected facts? The only metric that needs ground truth, and the most trustworthy.</dd></div>
+  <div><dt>Refusal accuracy</dt><dd>On unanswerable questions, does it decline? On answerable ones, does it wrongly decline? Both directions matter.</dd></div>
+  <div><dt>Citation validity</dt><dd>Do cited ids exist, and do the cited passages actually contain the claim? Mechanically checkable, per chapter 12.</dd></div>
+</div>
+
+<h3>Cheap checks first</h3>
+
+<p>Before reaching for an LLM judge, a surprising amount is measurable with string operations — deterministic, instant, free, and never disagreeing with itself.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">eval_cheap.py — the assertions that catch most regressions</span><button class="copy">Copy</button></div>
+<pre><code>def cheap_checks(case: Case, result: Answer) -> list[str]:
+    fails = []
+
+    for fact in case.expected_facts:                 # substring or normalised match
+        if not contains_fact(result.text, fact):
+            fails.append(f"missing expected fact: {fact}")
+
+    for bad in case.answer_must_not_contain:
+        if bad.lower() in result.text.lower():
+            fails.append(f"contains forbidden text: {bad}")
+
+    if case.expected_behaviour == "refuse" and not is_refusal(result.text):
+        fails.append("answered an unanswerable question")
+
+    if case.expected_chunk_ids and is_refusal(result.text):
+        fails.append("refused an answerable question")
+
+    # Every number in the answer must appear in the context it was given.
+    for n in numbers_in(result.text):
+        if not any(n in c.text for c in result.context):
+            fails.append(f"fabricated number: {n}")
+
+    fails += citation_problems(result)               # from chapter 12
+    return fails</code></pre>
+</div>
+
+<h3>LLM-as-judge, done carefully</h3>
+
+<p>For the qualities that resist string matching — faithfulness, tone, completeness — use a model as the grader. It works well if you respect its limitations.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">judge.py — claim-level faithfulness beats holistic scoring</span><button class="copy">Copy</button></div>
+<pre><code>class ClaimVerdict(BaseModel):
+    claim: str
+    supported: Literal["yes", "no", "partial"]
+    source_id: str | None
+    quote: str | None = Field(description="Exact supporting text, or null")
+
+class Faithfulness(BaseModel):
+    claims: list[ClaimVerdict]
+
+JUDGE = """Break the ANSWER into individual factual claims. For each, decide
+whether the CONTEXT supports it. Quote the exact supporting sentence, or return
+null. Judge only support by the context — not whether the claim is true in general.
+
+<context>{context}</context>
+<answer>{answer}</answer>"""
+
+verdict = structured_call(Faithfulness, JUDGE.format(...), temperature=0)
+score = sum(c.supported == "yes" for c in verdict.claims) / len(verdict.claims)
+
+# Decomposing into claims and demanding a quote does three things:
+#   1. turns a vague 1-5 rating into countable, auditable decisions
+#   2. makes the failure inspectable - you see which claim was unsupported
+#   3. suppresses the judge's own hallucination, because it must find real text</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Judges have biases you must control for</span>
+  <p>Models prefer longer answers, prefer their own outputs over other models', are sensitive to option order in pairwise comparisons, and cluster their scores in the middle of any numeric scale. Countermeasures: use binary or three-way verdicts rather than 1–10 scores; randomise order and run both directions in pairwise tests; use a different model family as judge than as generator; set temperature to 0; and above all <b>validate the judge against human labels</b> on fifty cases before trusting it. If judge and human agree less than about 80% of the time, fix the rubric before using the numbers to make decisions.</p>
+</div>
+
+<h2><span class="h-rule"></span>Reading the numbers</h2>
+
+<div class="demo" id="diag">
+  <div class="demo-head">
+    <b>Failure diagnosis</b>
+    <span>Enter what your evaluation produced. The pattern between the three numbers tells you what to fix — and, more usefully, what not to.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="d-recall">Recall@20 (wide retrieval) — <span id="d-recallv">0.90</span></label>
+        <input type="range" id="d-recall" min="0" max="100" step="1" value="90">
+      </div>
+      <div>
+        <label for="d-post">Recall@5 (after rerank) — <span id="d-postv">0.82</span></label>
+        <input type="range" id="d-post" min="0" max="100" step="1" value="82">
+      </div>
+      <div>
+        <label for="d-faith">Faithfulness — <span id="d-faithv">0.88</span></label>
+        <input type="range" id="d-faith" min="0" max="100" step="1" value="88">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="d-correct">End-to-end correctness — <span id="d-correctv">0.71</span></label>
+        <input type="range" id="d-correct" min="0" max="100" step="1" value="71">
+      </div>
+      <div>
+        <label for="d-refuse">Refusal accuracy (unanswerable) — <span id="d-refusev">0.60</span></label>
+        <input type="range" id="d-refuse" min="0" max="100" step="1" value="60">
+      </div>
+    </div>
+    <div id="dout"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>The debugging order</h2>
+
+<p>Work through this in sequence. Each step is cheaper than the one after it, and doing them out of order is how weeks disappear.</p>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Is the fact even in the corpus?</b><span>Grep for it. Astonishingly often it was never ingested, or the parser dropped it. No amount of tuning fixes a missing document</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Is it in a retrievable chunk?</b><span>Find the chunk containing it and read it. Is it split mid-rule? Missing its heading? Buried in boilerplate?</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Does wide retrieval find that chunk?</b><span>Query the index directly for the golden question. If not: hybrid search, enrichment, chunking</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Does it survive filtering and reranking?</b><span>Check the filters did not exclude it and the reranker did not demote it</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Was it in the final prompt?</b><span>Print the literal prompt. Budget truncation and deduplication silently drop passages</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>6 · Now, and only now, blame the prompt</b><span>The model had the fact and ignored it. Ordering, passage count, explicit rules, or a better model</span></div>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Print the prompt</span>
+  <p>Every RAG framework hides the final prompt behind three layers of abstraction, and the number of bugs that turn out to be "the context was empty", "the template rendered <code>None</code>", or "the passages were truncated at 200 characters" is remarkable. Add a debug flag that dumps the exact string sent to the model. Look at it before forming any theory.</p>
+</div>
+
+<h2><span class="h-rule"></span>Running evaluation as part of the work</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">run_eval.py — one command, comparable across runs</span><button class="copy">Copy</button></div>
+<pre><code>import json, hashlib, datetime
+
+def run(cases: list[Case], config: Config) -> Report:
+    rows = []
+    for case in cases:
+        result = answer(case.question, config)
+        rows.append({
+            "id": case.id,
+            "category": case.category,
+            "retrieved_wide": [c.id for c in result.wide],
+            "retrieved_final": [c.id for c in result.context],
+            "recall_wide":  any(c.id in case.expected_chunk_ids for c in result.wide),
+            "recall_final": any(c.id in case.expected_chunk_ids for c in result.context),
+            "cheap_fails":  cheap_checks(case, result),
+            "faithfulness": judge_faithfulness(result),
+            "answer": result.text,
+            "latency_ms": result.latency_ms,
+            "cost_usd": result.cost_usd,
+        })
+
+    report = Report(
+        run_id=datetime.datetime.now().isoformat(timespec="seconds"),
+        config_hash=hashlib.sha256(json.dumps(config.as_dict(), sort_keys=True)
+                                   .encode()).hexdigest()[:8],
+        config=config.as_dict(),          # chunk size, model, top_k, prompt version…
+        rows=rows,
+    )
+    report.save(f"evals/{report.run_id}-{report.config_hash}.json")
+    return report
+
+
+# In CI: fail the build on regression, not on absolute score.
+prev, curr = load_baseline(), run(cases, config)
+assert curr.metric("recall@20")  >= prev.metric("recall@20")  - 0.02
+assert curr.metric("faithfulness") >= prev.metric("faithfulness") - 0.02
+assert curr.metric("refusal_accuracy") >= prev.metric("refusal_accuracy") - 0.02</code></pre>
+</div>
+
+<ul class="check">
+  <li><b>Store the config with every run.</b> "Recall went up" is meaningless without knowing chunk size, model, top-k and prompt version. The config hash makes runs comparable and reproducible.</li>
+  <li><b>Break results down by category.</b> An overall 0.78 hiding 0.95 on simple lookups and 0.3 on multi-hop is a completely different problem from a uniform 0.78.</li>
+  <li><b>Change one thing at a time.</b> Chunk size and reranker together means you learn nothing about either.</li>
+  <li><b>Keep every report.</b> Six months of runs is the only way to answer "when did this get worse, and what shipped that week?"</li>
+  <li><b>Look at failures individually.</b> Read twenty failed cases in full. Patterns invisible in aggregate metrics are obvious in the actual text.</li>
+  <li><b>Track cost and latency alongside quality.</b> A change that adds three points of recall and doubles response time is a decision, not an improvement.</li>
+</ul>
+
+<h2><span class="h-rule"></span>Online signals</h2>
+
+<p>The golden set catches regressions. It does not tell you what real users experience — for that, instrument production (chapter 18 covers this in general; these are the RAG-specific ones).</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Signal</th><th>Reads as</th></tr></thead>
+<tbody>
+<tr><td>Thumbs up/down rate</td><td>Sparse and biased toward complaints, but the trend is real and it is free</td></tr>
+<tr><td>Citation click-through</td><td>Users verifying. High rates can mean either good trust behaviour or low confidence — segment by whether they then rephrase</td></tr>
+<tr><td>Rephrase rate</td><td>Asking again in different words means the first answer failed. One of the best unsupervised quality signals available</td></tr>
+<tr><td>Refusal rate</td><td>Rising means retrieval or the corpus has degraded. Falling sharply can mean the model started guessing</td></tr>
+<tr><td>Zero-result rate</td><td>Queries where nothing cleared the rerank floor. Mine these for corpus gaps — they are a content backlog, not a bug</td></tr>
+<tr><td>Escalation to human</td><td>The metric the business cares about. Tie your quality work to it</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Feed the failures back: every thumbs-down with a rephrase becomes a golden-set candidate, and every zero-result query becomes either a documentation gap or a retrieval bug. That loop is what turns a demo into a system that improves.</p>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Always answer first: <b>was the correct passage in the context?</b> Retrieval and generation failures look identical and share no fixes.</li>
+    <li>Build a golden set of <b>100–200 cases from real logs</b>, with at least 15% unanswerable.</li>
+    <li>Retrieval metrics are free and instant. <b>Recall@k is the ceiling</b> on everything downstream.</li>
+    <li>Track <b>recall before and after reranking</b> separately, or you cannot see the reranker discarding good passages.</li>
+    <li>Do the <b>cheap deterministic checks first</b> — expected facts, forbidden text, fabricated numbers, citation validity.</li>
+    <li>For faithfulness, <b>decompose into claims and demand quotes</b>. Validate the judge against humans before trusting it.</li>
+    <li>Debug in order — corpus, chunk, retrieval, rerank, prompt contents — and <b>print the literal prompt</b> before theorising.</li>
+    <li>Run evaluation in CI against a baseline, store the config with every run, and <b>feed production failures back into the golden set</b>.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("13-rag-evaluation.html");
+
+(function(){
+  const root = document.getElementById("diag");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const ids = ["d-recall","d-post","d-faith","d-correct","d-refuse"];
+
+  function render(){
+    const v = {};
+    ids.forEach(id => {
+      v[id] = parseInt($(id).value, 10) / 100;
+      $(id + "v").textContent = v[id].toFixed(2);
+    });
+
+    const findings = [];
+    const add = (sev, title, body) => findings.push({sev, title, body});
+
+    const rerankLoss = v["d-recall"] - v["d-post"];
+
+    if(v["d-recall"] < 0.85)
+      add("bad", "Retrieval is your bottleneck",
+        "At recall@20 of " + v["d-recall"].toFixed(2) + ", the correct passage is missing from wide retrieval in " +
+        Math.round((1 - v["d-recall"]) * 100) + "% of cases. No prompt change can score above this number. " +
+        "Work the ingestion side: hybrid search first, then contextual prefixing, then chunk size. Do not touch the prompt.");
+    else
+      add("good", "Wide retrieval is healthy",
+        "Recall@20 of " + v["d-recall"].toFixed(2) + " means the evidence is usually being found. The problem, if there is one, is downstream.");
+
+    if(rerankLoss > 0.08)
+      add("bad", "The reranker is discarding good passages",
+        "You lose " + (rerankLoss * 100).toFixed(0) + " points between wide retrieval and the final five. " +
+        "Either the reranker is a poor fit for your domain, your score floor is too high, or top_k is too small. " +
+        "Try raising top_k to 8 and lowering the floor before changing reranker.");
+    else if(rerankLoss < 0.02 && v["d-recall"] > 0.85)
+      add("good", "Reranking is preserving recall",
+        "Almost nothing relevant is lost in the narrowing step, which is what you want.");
+
+    if(v["d-faith"] < 0.85)
+      add("bad", "The model is not staying grounded",
+        "Faithfulness of " + v["d-faith"].toFixed(2) + " means roughly " + Math.round((1 - v["d-faith"]) * 100) +
+        "% of claims are unsupported by the context it was given. Tighten the prompt: an explicit citation contract, " +
+        "a rule against using general knowledge, and fewer passages. If it persists, the model is too small for the task.");
+
+    if(v["d-refuse"] < 0.7)
+      add("bad", "It answers questions it cannot answer",
+        "Refusal accuracy of " + v["d-refuse"].toFixed(2) + " is the most damaging pattern in RAG, because the wrong answers " +
+        "look exactly like the right ones. Add an explicit low-confidence path when reranker scores fall below the floor, " +
+        "and put the exact refusal wording in the system prompt.");
+
+    if(v["d-post"] > 0.85 && v["d-faith"] > 0.9 && v["d-correct"] < 0.75)
+      add("warn", "Evidence arrives, answers still miss",
+        "Retrieval and faithfulness are both strong but correctness is not. This usually means partial evidence: " +
+        "the passage retrieved is related but does not contain the specific fact, or the answer needs two passages and only one arrives. " +
+        "Look at your multi-hop cases specifically, and consider parent expansion.");
+
+    if(v["d-correct"] > v["d-post"] + 0.1)
+      add("warn", "Correctness exceeds retrieval recall",
+        "Your end-to-end score is higher than the rate at which you retrieve the expected passage. Either the golden set's " +
+        "expected chunk ids are wrong, or the model is answering from pre-training — which will fail silently on anything " +
+        "outside its training data. Verify a few of these by hand.");
+
+    if(!findings.some(f => f.sev === "bad"))
+      add("good", "No dominant failure mode",
+        "Nothing here points at one bottleneck. Next step is qualitative: read twenty failing cases in full and look for a pattern " +
+        "the aggregate numbers are hiding — usually one category (multi-hop, comparisons, dates) doing badly inside an acceptable average.");
+
+    const colour = s => s === "bad" ? "#E2574C" : s === "warn" ? "#F2A03D" : "#3FB984";
+    $("dout").innerHTML = findings.map(f =>
+      '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid ' + colour(f.sev) +
+      ';border-radius:4px;padding:11px 13px;margin-bottom:8px">' +
+      '<div style="font-weight:600;font-size:14px;margin-bottom:3px">' + f.title + '</div>' +
+      '<div style="font-size:13.5px;line-height:1.5;color:#54677A">' + f.body + '</div></div>').join("");
+  }
+
+  ids.forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

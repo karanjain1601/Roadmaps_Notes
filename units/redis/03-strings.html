@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Strings, counters and bitmaps — Redis</title>
+<meta name="description" content="The simplest type, and far more than a place to put text: atomic counters, compare-and-set, bit operations and the encodings underneath.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 03 · The structures</div>
+    <h1>Strings, counters and bitmaps</h1>
+    <p class="standfirst">The type everyone learns first and stops thinking about. A Redis string is a byte array up to 512 MB, and the commands operating on it include atomic arithmetic, compare-and-set, and bit manipulation that turns a few kilobytes into a million-user presence index.</p>
+    <div class="chap-meta">
+      <span class="tagpill">set</span>
+      <span class="tagpill">incr</span>
+      <span class="tagpill">setnx</span>
+      <span class="tagpill">bitmaps</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>SET is more than SET</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the options are the interesting part</span><button class="copy">Copy</button></div>
+<pre><code>SET key value
+SET key value EX 60          # expire in 60 seconds
+SET key value PX 500         # milliseconds
+SET key value EXAT 1741950000    # absolute unix time
+SET key value KEEPTTL        # keep the existing TTL (chapter 2)
+SET key value NX             # only if the key does NOT exist
+SET key value XX             # only if it DOES
+SET key value GET            # return the OLD value (6.2+)
+
+# NX is the important one. It is an atomic test-and-set in a single command,
+# which is the basis of every lock in chapter 9:
+SET lock:invoice:8842 "worker-3" NX EX 30
+# OK    -> you hold the lock for 30 seconds
+# (nil) -> someone else does
+
+# Reads and multi-key forms:
+GET key
+GETDEL key                   # read and delete atomically (6.2+)
+GETEX key EX 60              # read and set a new TTL (6.2+)
+MSET a 1 b 2 c 3             # atomic across all of them
+MGET a b c                   # one round trip for many keys
+SETRANGE key 5 "xyz"         # overwrite from an offset
+GETRANGE key 0 9             # a substring
+STRLEN key
+APPEND key "more"            # amortised O(1)
+
+# MGET is worth knowing early: fetching 100 keys individually is 100 round
+# trips. MGET is one. Chapter 14 is largely this observation applied
+# everywhere.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Counters</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">atomic arithmetic, and why it matters so much</span><button class="copy">Copy</button></div>
+<pre><code>INCR      views:page:41          # 1
+INCRBY    views:page:41 10       # 11
+DECR      stock:TSH-001
+DECRBY    stock:TSH-001 3
+INCRBYFLOAT balance:41 12.50     # floats. See the warning below
+
+# The value is a string that Redis parses as an integer. It must fit in a
+# signed 64-bit integer, and INCR on a non-numeric string is an error rather
+# than a silent zero.
+
+# WHY THIS IS THE FOUNDATIONAL PRIMITIVE:
+#
+#   Read-modify-write in an application:
+#       n = GET counter       # both clients read 41
+#       SET counter n+1       # both write 42 — one increment is LOST
+#
+#   INCR:
+#       INCR counter          # 42, then 43. Cannot be wrong.
+#
+# One thread executing one command to completion (chapter 1) makes the lost
+# update from the SQL unit's chapter 10 structurally impossible. No lock, no
+# transaction, no retry loop.
+
+# The pattern that follows immediately — a rate limiter, complete:
+INCR  ratelimit:u41:1741946400
+EXPIRE ratelimit:u41:1741946400 60 NX
+# if the INCR result is > 100, reject. Chapter 10 does this properly.
+
+# DECR for stock, with the check built into the operation:
+DECRBY stock:TSH-001 3
+# if the result is negative, you oversold — compensate by adding it back.
+# Chapter 8 shows the Lua version that checks and decrements indivisibly.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Not for money</span>
+  <p><code>INCRBYFLOAT</code> uses long double arithmetic and Redis stores the result as a string, so repeated operations accumulate representation error exactly as any binary float does. This is the same argument as the SQL and MongoDB units and it has an extra edge here: there is no decimal type to switch to. <b>Store money as an integer number of minor units</b> — pence, cents — and use <code>INCRBY</code>. And be clear that a balance whose only copy is in Redis is a balance you can lose (chapter 13); the durable record belongs in a real database, with Redis holding a cache or a working counter that can be rebuilt.</p>
+</div>
+
+<h2><span class="h-rule"></span>Bitmaps</h2>
+
+<div class="demo" id="bit">
+  <div class="demo-head">
+    <b>A million users in 128 KB</b>
+    <span>A bitmap is a string addressed one bit at a time. Pick a use and see the arithmetic.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="b-use">Tracking</label>
+        <select id="b-use">
+          <option value="dau" selected>Daily active users</option>
+          <option value="feature">Feature flag per user</option>
+          <option value="retention">7-day retention cohort</option>
+          <option value="seen">Which articles a user has read</option>
+        </select>
+      </div>
+      <div>
+        <label for="b-users">Population — <span id="b-usersv">1 million</span></label>
+        <input type="range" id="b-users" min="1" max="6" step="1" value="4">
+      </div>
+      <div>
+        <label for="b-density">Density — <span id="b-densityv">20</span>% set</label>
+        <input type="range" id="b-density" min="1" max="100" step="1" value="20">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="b-bitmap">—</b><span>as a bitmap</span></div>
+      <div><b id="b-set">—</b><span>as a set of ids</span></div>
+      <div><b id="b-ratio">—</b><span>saving</span></div>
+      <div><b id="b-verdict">—</b><span>use</span></div>
+    </div>
+    <div id="b-code"></div>
+    <div class="out" id="b-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the bit commands</span><button class="copy">Copy</button></div>
+<pre><code>SETBIT active:2026-03-14 41 1        # user 41 was active today
+GETBIT active:2026-03-14 41          # 1
+BITCOUNT active:2026-03-14           # how many users were active
+BITCOUNT active:2026-03-14 0 99      # within a byte range
+BITPOS  active:2026-03-14 1          # first set bit — first active user id
+
+# Set operations ACROSS bitmaps, which is where this becomes powerful:
+BITOP AND retained:7d active:2026-03-08 active:2026-03-09 ... active:2026-03-14
+BITCOUNT retained:7d                 # users active EVERY day for a week
+
+BITOP OR  wau active:2026-03-08 ... active:2026-03-14
+BITCOUNT wau                         # weekly active users
+
+BITOP XOR churn active:2026-03-13 active:2026-03-14
+BITOP NOT inactive active:2026-03-14
+
+# BITFIELD packs several small counters into one string — useful when you
+# need many tiny values and one key per value would be all overhead:
+BITFIELD stats:41 SET u8 0 12 SET u8 8 3 INCRBY u8 0 1 GET u8 0
+#   u8/i8/u16/i32... at bit offsets, with overflow control:
+BITFIELD stats:41 OVERFLOW SAT INCRBY u8 0 250    # saturate instead of wrap
+
+# THE SPARSITY TRAP: SETBIT at offset 10,000,000 allocates the whole string
+# up to that bit — 1.25 MB — even if it is the only bit set. So bitmaps are
+# excellent for DENSE, sequential ids and terrible for sparse or non-numeric
+# ones. A UUID cannot be a bit offset; a monotonic integer user id can.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Bitmaps are the right answer surprisingly often</span>
+  <p>A year of daily-active-user tracking for a million users is 365 keys of 128 KB, which is 46 MB — and answers "how many were active on any day in March", "who was active every day last week" and "how many active users did we retain from January" with two commands and no scan. The equivalent as sets of user ids is around 40× the memory and much slower to intersect. The requirements are narrow — <b>dense, sequential, integer identifiers</b>, and a question that reduces to a yes/no per identifier — and when they hold, nothing else comes close.</p>
+</div>
+
+<h2><span class="h-rule"></span>What a string costs</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">three encodings, chosen automatically</span><button class="copy">Copy</button></div>
+<pre><code>SET n 12345
+OBJECT ENCODING n          # "int"    — stored as a long, no allocation
+SET s "hello"
+OBJECT ENCODING s          # "embstr" — value embedded with the object header,
+                           #            one allocation. Up to 44 bytes
+SET l "a very long string ..."
+OBJECT ENCODING l          # "raw"    — separate allocation, mutable
+
+APPEND s " world"
+OBJECT ENCODING s          # "raw"    — appending always converts to raw,
+                           #            even if the result is short
+
+# The practical consequences:
+#   * a short numeric value costs almost nothing beyond the key
+#   * values under 44 bytes get the cheaper single-allocation form
+#   * SETRANGE and APPEND over-allocate to make growth amortised, so a string
+#     built up incrementally uses more memory than the same value set at once
+
+MEMORY USAGE key           # actual bytes, including key name and overhead
+
+# THE REAL COST IS USUALLY THE KEY, NOT THE VALUE. Every key carries roughly
+# 50-80 bytes of overhead — the key string, the dict entry, the object header,
+# the expiry entry if it has a TTL. So ten million keys holding a single
+# integer each is on the order of 700 MB to hold 40 MB of data.
+#
+# When you have very many small values, a HASH holding them all is
+# dramatically cheaper, because a small hash is stored as a flat list with
+# almost no per-field overhead (chapters 4 and 12).</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Serialised objects</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the most common use, and its downside</span><button class="copy">Copy</button></div>
+<pre><code>SET user:41 '{"name":"Amara","tier":"gold","visits":412}' EX 3600
+GET user:41
+
+# Simple, and every read and write moves the WHOLE value. Updating `visits`
+# means: GET, parse, modify, serialise, SET — five steps, a race condition in
+# the middle, and the whole object across the network twice.
+
+# A hash does the same job with field-level access (chapter 4):
+HSET  user:41 name "Amara" tier "gold" visits 412
+HGET  user:41 tier            # one field
+HINCRBY user:41 visits 1      # atomic, no read, no race
+
+# WHEN A SERIALISED STRING IS STILL RIGHT:
+#   * the value is always read and written whole — a rendered HTML fragment,
+#     an API response, a compiled template
+#   * the shape is nested, and a hash is flat
+#   * you want compression: gzip the JSON and store the bytes. On a large
+#     document this can be a 5-10x memory saving, at CPU cost on both sides
+#
+# WHEN IT IS NOT:
+#   * you update individual fields  -> hash
+#   * you increment something in it -> hash, with HINCRBY
+#   * it is large and you read part -> hash, or split the key
+
+# One further note: use a compact serialisation. JSON is readable in
+# redis-cli and roughly twice the size of MessagePack or Protobuf for the
+# same data. On a cache holding millions of objects that is a real number,
+# and the readability is worth something too — decide deliberately.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Choosing</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>You want</th><th>Use</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>A cached blob</td><td><code>SET … EX</code></td><td>Read and written whole; TTL in the same command</td></tr>
+<tr><td>A counter</td><td><code>INCR</code></td><td>Atomic, no read, cannot lose an update</td></tr>
+<tr><td>Money</td><td><code>INCRBY</code> on minor units</td><td>Never <code>INCRBYFLOAT</code></td></tr>
+<tr><td>A lock</td><td><code>SET … NX EX</code></td><td>Atomic test-and-set with a lease (chapter 9)</td></tr>
+<tr><td>Yes/no per user id</td><td><code>SETBIT</code></td><td>One bit each, with set operations across days</td></tr>
+<tr><td>Many small numbers in one key</td><td><code>BITFIELD</code></td><td>Avoids per-key overhead</td></tr>
+<tr><td>An object with fields</td><td>a hash (chapter 4)</td><td>Field-level reads and atomic field increments</td></tr>
+<tr><td>Something over ~100 KB</td><td>reconsider</td><td>Moving it blocks the thread (chapter 14)</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b><code>SET</code>'s options are the interesting part</b> — <code>NX</code>, <code>XX</code>, <code>EX</code>, <code>KEEPTTL</code>, <code>GET</code>.</li>
+    <li><b><code>SET … NX EX</code> is an atomic test-and-set with a lease</b>, and the basis of every lock.</li>
+    <li><b><code>INCR</code> makes the lost update structurally impossible.</b> No lock, no transaction, no retry.</li>
+    <li><b>Never <code>INCRBYFLOAT</code> for money.</b> Integer minor units, and the durable record lives elsewhere.</li>
+    <li><b>Bitmaps</b> need dense sequential integer ids, and then they are unbeatable — a million users in 128 KB.</li>
+    <li><b><code>SETBIT</code> at a high offset allocates the whole string.</b> Sparse ids are the wrong fit.</li>
+    <li><b>The per-key overhead is 50–80 bytes.</b> Many small values belong in one hash, not many keys.</li>
+    <li><b><code>MGET</code>, not a loop of <code>GET</code>.</b> One round trip instead of a hundred.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("03-strings.html");
+
+(function(){
+  const root = document.getElementById("bit");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const POP = [1000, 10000, 100000, 1000000, 10000000, 100000000];
+  const PL  = ["1 thousand","10 thousand","100 thousand","1 million","10 million","100 million"];
+
+  function bytes(b){
+    if(b < 1024) return Math.round(b) + " B";
+    if(b < 1048576) return (b/1024).toFixed(1) + " KB";
+    if(b < 1073741824) return (b/1048576).toFixed(1) + " MB";
+    return (b/1073741824).toFixed(2) + " GB";
+  }
+
+  const U = {
+    dau: {lbl:"daily active users",
+      code:'# One key per day, one bit per user\nSETBIT active:2026-03-14 41 1\n\nBITCOUNT active:2026-03-14           # today\'s DAU\n\n# Weekly active — union of seven days\nBITOP OR wau active:2026-03-08 active:2026-03-09 \\\n              active:2026-03-10 active:2026-03-11 \\\n              active:2026-03-12 active:2026-03-13 \\\n              active:2026-03-14\nBITCOUNT wau',
+      note:"The canonical bitmap use, and the one where the alternative is most obviously worse.\n\nEach day is one key. Marking a user active is a single SETBIT and costs nothing beyond the bit. Counting is BITCOUNT, which is heavily optimised and runs over the raw bytes.\n\nThe part that makes it worth doing rather than merely clever is BITOP. Weekly actives is a union of seven keys; monthly is a union of thirty. Retention — users active on day one AND day seven — is an intersection. All of it happens server-side over contiguous memory, with no set of ids ever crossing the network."},
+    feature: {lbl:"feature flag membership",
+      code:'# Is this user in the rollout?\nSETBIT flag:new-checkout 41 1\nGETBIT flag:new-checkout 41          # 1\n\nBITCOUNT flag:new-checkout           # rollout size\n\n# Users in BOTH experiments\nBITOP AND both flag:new-checkout flag:dark-mode\nBITCOUNT both',
+      note:"A per-user boolean is exactly what a bitmap is for, and GETBIT is O(1) — so the flag check on the request path is a single fast command.\n\nThe intersection is the underrated part. \"How many users are in both experiments\" and \"who is in A but not B\" are BITOP AND and BITOP AND with NOT, computed server-side. Doing the same with sets of user ids means transferring both sets or running SINTERSTORE over much more memory.\n\nOne caveat: a bitmap tells you IF user 41 is in the rollout, not WHO is in it without scanning bit by bit. If you need to enumerate members frequently, a set is the better structure."},
+    retention: {lbl:"retention cohort",
+      code:'# Active every day for a week\nBITOP AND retained:7d \\\n  active:2026-03-08 active:2026-03-09 active:2026-03-10 \\\n  active:2026-03-11 active:2026-03-12 active:2026-03-13 \\\n  active:2026-03-14\nBITCOUNT retained:7d\n\n# Day-1 cohort still active on day 30\nBITOP AND r30 signup:2026-02-12 active:2026-03-14\nBITCOUNT r30',
+      note:"Retention questions are set algebra over per-day membership, which is precisely what BITOP does.\n\nSeven-day retention is one AND across seven keys. Cohort retention is an AND between a signup-day bitmap and an activity bitmap thirty days later. Each is a single server-side operation over a few hundred kilobytes.\n\nThe alternative in a relational database is a self-join or a series of EXISTS subqueries over an events table with hundreds of millions of rows — correct, and orders of magnitude more work.\n\nWorth noting that BITOP writes its result to a destination key, so give those a TTL or clean them up. A retention dashboard that computes fresh BITOP results per page load and never deletes them is a memory leak."},
+    seen: {lbl:"articles read per user",
+      code:'# One key PER USER, one bit per article\nSETBIT read:u41 8842 1\nGETBIT read:u41 8842\nBITCOUNT read:u41                    # how many they have read',
+      note:"This is the shape where bitmaps often go wrong, and it is worth seeing why.\n\nThe population here is ARTICLES, and each user gets their own key sized to the highest article id they have read. A user who reads one recent article — id 8,842,000 — allocates a 1.1 MB string for one bit, because SETBIT allocates the whole string up to that offset.\n\nMultiply by a million users and the memory is catastrophic, while the density slider shows why: at low density a bitmap wastes almost all of its space.\n\nThe fix depends on the numbers. If most users read many articles, keep the bitmap. If they read few, use a set of article ids per user — which costs proportional to what they actually read. Move the density slider to see where the crossover falls."}
+  };
+
+  function render(){
+    const k = $("b-use").value, u = U[k];
+    const pi = parseInt($("b-users").value,10) - 1;
+    const pop = POP[pi];
+    const dens = parseInt($("b-density").value,10) / 100;
+    $("b-usersv").textContent   = PL[pi];
+    $("b-densityv").textContent = Math.round(dens*100);
+
+    const bitmapBytes = pop / 8;
+    const members = pop * dens;
+    const setBytes = members * 60;          // intset/hashtable overhead per member
+    const ratio = setBytes / bitmapBytes;
+
+    $("b-bitmap").textContent = bytes(bitmapBytes);
+    $("b-set").textContent    = bytes(setBytes);
+    $("b-ratio").textContent  = ratio >= 1 ? ratio.toFixed(1) + "× smaller"
+                                           : (1/ratio).toFixed(1) + "× LARGER";
+    $("b-verdict").textContent = ratio >= 1.5 ? "bitmap" : ratio >= 0.8 ? "either" : "a set";
+
+    $("b-code").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid ' +
+      (ratio >= 1.5 ? "#3FB984" : ratio >= 0.8 ? "#F2A03D" : "#E2574C") +
+      ';border-radius:5px;padding:11px 13px;margin:16px 0 12px;font-family:var(--mono);' +
+      'font-size:12px;line-height:1.65;overflow-x:auto">' +
+      u.code.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>';
+
+    const notes = [u.note];
+
+    notes.push("A bitmap over " + PL[pi] + " identifiers is always " + bytes(bitmapBytes) +
+               " — the size depends only on the highest id, never on how many bits are set. A set of the same " +
+               Math.round(members).toLocaleString() + " ids costs roughly " + bytes(setBytes) +
+               ", scaling with the members present.");
+
+    if(ratio >= 3)
+      notes.push("At " + Math.round(dens*100) + "% density the bitmap wins by " + ratio.toFixed(1) +
+                 "×, and the memory is only part of it. BITCOUNT and BITOP run over contiguous bytes with SIMD-friendly loops, where the equivalent set intersection allocates and compares hash entries. For counting and combining, this is not close.");
+    else if(ratio < 0.8)
+      notes.push("At " + Math.round(dens*100) + "% density the bitmap is actually LARGER, because it pays for every identifier in the range whether or not the bit is set. This is the sparse case, and a set of ids is the right structure — it costs proportional to what is actually there.\n\nDrag the density slider up and watch the crossover. It sits around 1-2% for most id ranges, which means bitmaps are usually right for \"did this user do something today\" and usually wrong for \"which of ten million articles has this user read\".");
+    else
+      notes.push("Around the crossover, where the two are comparable on memory. Decide on the operations instead: if you need BITCOUNT and BITOP across many keys, take the bitmap. If you need to enumerate the members, take the set — a bitmap can only tell you which ids are set by walking it bit by bit.");
+
+    notes.push("Two requirements to check before choosing a bitmap: the identifiers must be DENSE and SEQUENTIAL INTEGERS, because the id is the bit offset. A UUID cannot be one. And SETBIT at a high offset allocates the entire string up to that point, so a single user with id 50,000,000 costs 6 MB regardless of how many others exist.");
+    $("b-note").textContent = notes.join("\n\n");
+  }
+
+  ["b-use","b-users","b-density"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

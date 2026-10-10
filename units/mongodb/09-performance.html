@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Performance patterns — MongoDB</title>
+<meta name="description" content="The working set, document growth, pagination without skip, the antipatterns, and knowing when the query is not the problem.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 09 · Making it fast</div>
+    <h1>Performance patterns</h1>
+    <p class="standfirst">Once the indexes are right, performance is mostly one question: does the data you touch fit in memory? Everything else in this chapter is either a way of making the answer yes, or a way of noticing that the problem is not the database at all.</p>
+    <div class="chap-meta">
+      <span class="tagpill">working set</span>
+      <span class="tagpill">wiredtiger cache</span>
+      <span class="tagpill">antipatterns</span>
+      <span class="tagpill">not the database</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The working set</h2>
+
+<p>Not the size of your data — the size of the part you actually touch, plus the indexes you touch it through. When that fits in the WiredTiger cache, reads are memory reads. When it does not, every miss is a disk seek, and performance falls off a cliff rather than degrading smoothly.</p>
+
+<div class="demo" id="ws">
+  <div class="demo-head">
+    <b>Does it fit?</b>
+    <span>The cliff is sharp. A few percent past it, latency changes by orders of magnitude.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="k-ram">RAM — <span id="k-ramv">32 GB</span></label>
+        <input type="range" id="k-ram" min="1" max="7" step="1" value="4">
+      </div>
+      <div>
+        <label for="k-data">Data on disk — <span id="k-datav">200 GB</span></label>
+        <input type="range" id="k-data" min="1" max="8" step="1" value="5">
+      </div>
+      <div>
+        <label for="k-hot">Fraction actively read — <span id="k-hotv">10</span>%</label>
+        <input type="range" id="k-hot" min="1" max="100" step="1" value="10">
+      </div>
+      <div>
+        <label for="k-idx">Index size as % of data — <span id="k-idxv">20</span>%</label>
+        <input type="range" id="k-idx" min="5" max="80" step="5" value="20">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="k-cache">—</b><span>WiredTiger cache</span></div>
+      <div><b id="k-need">—</b><span>working set</span></div>
+      <div><b id="k-hit">—</b><span>cache hit rate</span></div>
+      <div><b id="k-lat">—</b><span>typical read</span></div>
+    </div>
+    <div id="k-bars"></div>
+    <div class="out" id="k-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">measuring it</span><button class="copy">Copy</button></div>
+<pre><code>db.serverStatus().wiredTiger.cache;
+//   "maximum bytes configured"                       the cache size
+//   "bytes currently in the cache"                   how full
+//   "tracked dirty bytes in the cache"               awaiting write
+//   "pages read into cache"                          cumulative misses
+//   "unmodified pages evicted"                       pressure indicator
+
+// The cache defaults to 50% of RAM minus 1 GB. The other half is left to the
+// filesystem cache, which also holds compressed copies of the same pages —
+// so the effective total is larger than the cache figure suggests.
+
+db.stats();                     // dataSize, storageSize, indexSize
+db.orders.stats().wiredTiger;   // per collection, including compression
+
+// The number that actually tells you: how often a read had to go to disk.
+db.serverStatus().wiredTiger["cache"]["pages read into cache"];
+// Rising steadily under steady load means the working set does not fit.
+
+// Compression matters here. WiredTiger uses snappy by default and typically
+// gets 2-4x on real documents, so 200 GB of logical data may be 60 GB on
+// disk — and the cache holds UNCOMPRESSED pages, while the filesystem cache
+// holds compressed ones. Measure storageSize, not the size of your JSON.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">The fix is usually to shrink the working set, not to add RAM</span>
+  <p>Adding memory works and it is linear in cost and finite in ceiling. Shrinking what you touch is often free and frequently larger: <b>project fewer fields</b> so a listing endpoint does not pull 200 KB documents to display three lines; <b>cover the hot query</b> so it reads index pages instead of documents (chapter 8); <b>bucket or archive cold data</b> so old rows stop competing for cache; <b>drop unused indexes</b>, which occupy the same cache as documents. A collection where 5% is hot behaves like a small collection — right up until a full scan pulls all of it through the cache and evicts everything useful.</p>
+</div>
+
+<h2><span class="h-rule"></span>Document size</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">every read pays for the whole document</span><button class="copy">Copy</button></div>
+<pre><code>// A product document with a 180 KB description and 40 embedded reviews
+// costs 180 KB of cache and 180 KB of transfer EVERY time it is read,
+// including on the listing page that shows a name and a price.
+
+// Projection helps the transfer and not the cache — the whole document is
+// still read into memory to project from:
+db.products.find({ category: c }, { name: 1, price: 1, thumb: 1 });
+
+// A COVERED query avoids the document entirely (chapter 8):
+db.products.createIndex({ category: 1, popularity: -1, name: 1, price: 1 });
+db.products.find({ category: c }, { name: 1, price: 1, _id: 0 })
+           .sort({ popularity: -1 });
+
+// Or split the document, which is chapter 2's argument arriving as a
+// performance problem: the hot fields in one collection, the cold bulk in
+// another, fetched only when someone opens the detail page.
+
+// Finding the offenders:
+db.products.aggregate([
+  { $project: { size: { $bsonSize: "$$ROOT" }, name: 1 } },
+  { $sort: { size: -1 } }, { $limit: 20 }
+]);
+db.products.aggregate([
+  { $group: { _id: null, avg: { $avg: { $bsonSize: "$$ROOT" } },
+                         max: { $max: { $bsonSize: "$$ROOT" } } } }
+]);
+// A max far above the average is chapter 3's outlier pattern telling you it
+// is needed.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Document growth</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">why a growing array is quadratic</span><button class="copy">Copy</button></div>
+<pre><code>// WiredTiger does not update in place. A document that grows is written out
+// again in full — so appending one element to an array of N costs O(N).
+// Over the document's lifetime that is O(N²) of writes.
+
+db.devices.updateOne({ _id: id },
+  { $push: { readings: { t: now, v: 21.4 } } });   // slower every hour
+
+// At 100 readings the document is 4 KB and a push writes 4 KB.
+// At 100,000 readings it is 4 MB and a push writes 4 MB.
+// The rate did not change; the cost went up 1000x.
+
+// It also churns the cache: each rewrite dirties a large page, and dirty
+// pages must be written before they can be evicted.
+
+// The fixes, in order of preference:
+//   1. BUCKET — a new document per period (chapter 3). The gold standard
+//   2. Time-series collections, for genuine time-series
+//   3. A bounded array with $slice, when you only need the recent N
+//   4. A separate collection with a compound index, when you need all of it
+
+// A quick check for collections suffering from this:
+db.devices.aggregate([
+  { $project: { n: { $size: { $ifNull: ["$readings", []] } } } },
+  { $group: { _id: null, max: { $max: "$n" }, avg: { $avg: "$n" } } }
+]);
+// A max in the thousands and climbing is a modelling bug, not a tuning one.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>The antipatterns</h2>
+
+<div class="terms">
+  <div><dt>Unbounded arrays</dt><dd>The one above. Quadratic write cost, ending at the 16 MB limit. The commonest serious MongoDB performance problem, and it is a schema problem rather than a tuning one.</dd></div>
+  <div><dt><code>skip</code> for pagination</dt><dd>Linear in the page number, and incorrect under concurrent writes. Keyset pagination is constant-time and correct (chapter 4).</dd></div>
+  <div><dt>Too many collections</dt><dd>One per tenant, per day, per user. Each carries metadata and at least one index in cache. Thousands of collections degrade startup, replication and memory. Use a field and an index.</dd></div>
+  <div><dt>Unbounded results</dt><dd><code>find({}).toArray()</code> on a collection that grew. Always pair a query with a limit, or iterate the cursor.</dd></div>
+  <div><dt>Case-insensitive regex</dt><dd><code>{name: /amara/i}</code> cannot use an index — the anchoring and case-sensitivity requirements from chapter 4. Use a collation index, or store a normalised field.</dd></div>
+  <div><dt><code>$lookup</code> on the hot path</dt><dd>A nested loop per input document. Occasional joins are fine; a schema built on them is chapter 2's extended reference waiting to be applied.</dd></div>
+  <div><dt>Individual writes in a loop</dt><dd>A thousand round trips instead of one <code>bulkWrite</code>. Typically 10–50× slower, and the easiest win available (chapter 6).</dd></div>
+  <div><dt>Indexing every field</dt><dd>Every index is maintained on write and competes for cache. Index the access patterns, not the schema.</dd></div>
+  <div><dt>A single hot document</dt><dd>A global counter every write touches. Document-level concurrency means those writes serialise. Shard the counter or approximate it (chapter 3).</dd></div>
+</div>
+
+<h2><span class="h-rule"></span>Connections</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">one client, one pool</span><button class="copy">Copy</button></div>
+<pre><code>// MongoDB drivers pool connections internally. Create ONE MongoClient per
+// process and reuse it — creating a client per request is the classic
+// serverless and framework mistake, and it produces connection storms.
+
+const client = new MongoClient(uri, {
+  maxPoolSize: 20,            // per client. Default 100, usually too high
+  minPoolSize: 5,
+  maxIdleTimeMS: 60000,
+  waitQueueTimeoutMS: 5000,   // fail fast rather than queueing forever
+  serverSelectionTimeoutMS: 5000,
+  retryWrites: true,          // default. Keep it
+  retryReads: true
+});
+
+// A connection is a thread on the server, not a process — much cheaper than
+// PostgreSQL's model — but not free. maxPoolSize × instances is the number
+// the server sees, and that multiplication is the thing that surprises
+// people during an autoscale event.
+
+db.serverStatus().connections;      // current, available, totalCreated
+// totalCreated growing fast relative to current means connections are being
+// churned rather than pooled — usually a client created per request.
+
+// Atlas and most managed deployments cap connections by tier. Exceeding it
+// produces connection errors that look like the database being down.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Reads and writes at the storage layer</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Symptom</th><th>Check</th><th>Usual cause</th></tr></thead>
+<tbody>
+<tr><td>Reads slow, writes fine</td><td><code>pages read into cache</code></td><td>Working set exceeds cache</td></tr>
+<tr><td>Writes slow, reads fine</td><td><code>tracked dirty bytes</code></td><td>Cache dirty pressure, or slow disks</td></tr>
+<tr><td>Periodic latency spikes</td><td>Checkpoint timing</td><td>60-second checkpoint flushing dirty pages</td></tr>
+<tr><td>Everything slow together</td><td><code>currentOp</code>, wait times</td><td>A collection scan evicting the cache</td></tr>
+<tr><td>One collection slow</td><td><code>$indexStats</code>, <code>explain</code></td><td>A missing or wrong index</td></tr>
+<tr><td>Slow only for some inputs</td><td>Plan cache</td><td>A cached plan suiting a different value (chapter 8)</td></tr>
+<tr><td>Gradual degradation</td><td>Document size trend</td><td>Growing documents</td></tr>
+<tr><td>Slow after a deploy</td><td>New queries, new indexes</td><td>A new access pattern with no index</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">what is happening right now</span><button class="copy">Copy</button></div>
+<pre><code>db.currentOp({ "secs_running": { $gte: 3 }, active: true });
+//   read: ns, op, secs_running, planSummary, waitingForLock
+//   planSummary: COLLSCAN on a large collection is your answer
+
+db.killOp(opid);        // stop one operation
+
+// Slow query log — on by default above 100ms:
+db.getProfilingStatus();
+db.setProfilingLevel(1, { slowms: 100 });
+db.system.profile.aggregate([
+  { $group: { _id: "$command.filter", n: { $sum: 1 },
+              avgMs: { $avg: "$millis" }, total: { $sum: "$millis" } } },
+  { $sort: { total: -1 } }, { $limit: 20 }
+]);
+// Sort by TOTAL time, not average — the same argument as pg_stat_statements
+// in the PostgreSQL unit. A 40ms query running ten thousand times a minute
+// matters more than a 4-second one running hourly.
+
+db.serverStatus().opcounters;       // query/insert/update/delete rates
+db.serverStatus().globalLock;       // queued readers and writers
+db.serverStatus().metrics.document; // documents returned vs scanned</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Frequently it is not the database</span>
+  <p>Before tuning MongoDB, rule out the two things that make it look guilty. <b>The connection pool</b> — if it is exhausted, every request queues and the symptom is total unavailability while the server sits nearly idle. <b>The application's own work</b> — an N+1 pattern issuing 200 queries per page request is 200 round trips of network latency that no index will fix, and the answer is one query or one <code>$lookup</code> rather than a faster individual query. Both present as "the database is slow" and neither is improved by touching the database.</p>
+</div>
+
+<h2><span class="h-rule"></span>Sensible defaults</h2>
+
+<ul class="check">
+  <li><b>One <code>MongoClient</code> per process</b>, with <code>maxPoolSize</code> set deliberately rather than left at 100.</li>
+  <li><b>A limit on every query</b> that could match a growing set, and <code>maxTimeMS</code> on anything serving a user request.</li>
+  <li><b>Projection on list endpoints.</b> Do not transfer fields you will not render.</li>
+  <li><b>Keyset pagination</b>, not <code>skip</code>.</li>
+  <li><b><code>bulkWrite</code> with <code>ordered: false</code></b> for any batch of independent operations.</li>
+  <li><b>An index for each of your top queries</b>, designed by ESR, and no others.</li>
+  <li><b>Bucket anything append-heavy</b> before it becomes a problem, not after.</li>
+  <li><b>Watch document size and array length trends</b>, not just query latency — those degrade first and silently.</li>
+</ul>
+
+<div class="note tip">
+  <span class="note-t">Measure at production scale or do not bother</span>
+  <p>Every performance characteristic in this chapter is a function of size. A collection scan on 50,000 documents is 20 milliseconds and a missing index is undetectable; the working set always fits; a growing array is small; <code>skip(1000)</code> is instant. Development and CI datasets are typically three to five orders of magnitude smaller than production, which means <b>almost none of these problems can be observed there</b> — they are found by users. Keep a restored production-sized dataset available and run <code>explain</code> against it before shipping anything on a hot path.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Performance is mostly one question: <b>does the working set fit in the WiredTiger cache?</b> The cliff is sharp.</li>
+    <li>The cache defaults to <b>50% of RAM minus 1 GB</b>, and holds uncompressed pages while the filesystem cache holds compressed ones.</li>
+    <li><b>Shrinking the working set usually beats adding RAM</b> — project less, cover the hot query, archive cold data, drop unused indexes.</li>
+    <li><b>Every read pays for the whole document</b>, so large documents cost cache even when you project.</li>
+    <li><b>A growing array is quadratic.</b> Bucket it.</li>
+    <li><b>One <code>MongoClient</code> per process.</b> A client per request is the classic serverless failure.</li>
+    <li>Sort the slow query log by <b>total time, not average</b>.</li>
+    <li><b>None of these problems are visible at development scale.</b> Test against production-sized data.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("09-performance.html");
+
+(function(){
+  const root = document.getElementById("ws");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const RAM  = [4, 8, 16, 32, 64, 128, 256];
+  const DATA = [10, 50, 100, 200, 500, 1000, 5000, 20000];
+
+  function gb(v){ return v >= 1000 ? (v/1000).toFixed(1) + " TB" : Math.round(v) + " GB"; }
+
+  function render(){
+    const ram  = RAM[parseInt($("k-ram").value,10)-1];
+    const data = DATA[parseInt($("k-data").value,10)-1];
+    const hot  = parseInt($("k-hot").value,10) / 100;
+    const idxP = parseInt($("k-idx").value,10) / 100;
+    $("k-ramv").textContent  = gb(ram);
+    $("k-datav").textContent = gb(data);
+    $("k-hotv").textContent  = Math.round(hot*100);
+    $("k-idxv").textContent  = Math.round(idxP*100);
+
+    const cache = Math.max(0.25, ram * 0.5 - 1);
+    const hotData = data * hot;
+    const idxTotal = data * idxP;
+    const need = hotData + idxTotal;          // indexes are touched broadly
+    const fit = Math.min(1, cache / need);
+
+    // hit rate: sharp knee
+    const hitRate = fit >= 1 ? 0.9995 : 1 - Math.pow(1 - fit, 1.4) * 0.55;
+    const lat = 0.12 + (1 - hitRate) * 1400;   // ms, disk seek dominated
+
+    $("k-cache").textContent = gb(cache);
+    $("k-need").textContent  = gb(need);
+    $("k-hit").textContent   = (hitRate*100).toFixed(hitRate > 0.99 ? 2 : 1) + "%";
+    $("k-lat").textContent   = lat < 1 ? lat.toFixed(2) + " ms" : lat.toFixed(0) + " ms";
+
+    const bars = [
+      ["Hot documents", hotData, "#25B7C4"],
+      ["Indexes", idxTotal, "#7C8CF8"],
+      ["Cache available", cache, fit >= 1 ? "#3FB984" : "#E2574C"]
+    ];
+    const max = Math.max.apply(null, bars.map(b => b[1]));
+    $("k-bars").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      'Working set against cache</div>' +
+      bars.map(([lab, v, col]) =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px">' +
+        '<span style="min-width:140px;font-size:13px">' + lab + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + Math.max(1, v/max*100).toFixed(0) +
+        '%;background:' + col + '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:62px;text-align:right">' +
+        gb(v) + '</span></div>').join("");
+
+    const notes = [];
+
+    if(fit >= 1){
+      notes.push("The working set fits. Reads are memory reads at around " + lat.toFixed(2) +
+                 " ms, and the collection's total size on disk is nearly irrelevant — a 5 TB collection where you only touch 8 GB behaves like an 8 GB collection.\n\nThat is the property to protect. The thing that breaks it is not growth in the data, it is a change in ACCESS pattern: one full collection scan pulls everything through the cache and evicts the hot pages, and latency for every other query jumps until they are read back in.");
+    } else {
+      notes.push("The working set is " + gb(need) + " against " + gb(cache) + " of cache — it does not fit. Roughly " +
+                 ((1-hitRate)*100).toFixed(1) + "% of reads go to storage, and each of those is a seek rather than a memory access.\n\nNote how sharp this is. At full fit reads are sub-millisecond; a few percent over and the average is " +
+                 lat.toFixed(0) + " ms, because a single miss costs more than a thousand hits. It is a cliff, not a slope, which is why systems seem fine and then suddenly are not.");
+    }
+
+    if(idxTotal > hotData)
+      notes.push("Indexes are larger than the hot data here (" + gb(idxTotal) + " against " + gb(hotData) +
+                 "), and they compete for exactly the same cache. That is worth checking with $indexStats — an unused index occupies memory that documents could be using, and dropping one is the cheapest possible way to shrink the working set.");
+
+    if(hot > 0.5)
+      notes.push("With " + Math.round(hot*100) + "% of the data actively read, there is not much cold data to archive and the working set is close to the whole collection. That is a genuine scaling signal: either the access pattern needs narrowing, or this is where sharding starts to be the answer rather than a bigger machine (chapter 13).");
+    else if(hot <= 0.1 && fit < 1)
+      notes.push("Only " + Math.round(hot*100) + "% is hot, so the shape of the problem is index size and document size rather than data volume. Two things usually close the gap without more RAM: covering the hot query so it reads index pages instead of documents (chapter 8), and splitting large documents so the cold bulk is not pulled in with the hot fields (chapter 2).");
+
+    if(data / ram > 20 && fit < 1)
+      notes.push("Data is " + Math.round(data/ram) + "× RAM. At that ratio, adding memory buys a linear improvement against a problem that is growing — worth doing once, and not a strategy. The durable answers are shrinking what you touch, archiving what you do not, or sharding.");
+
+    notes.push("Remember compression: WiredTiger uses snappy by default and typically achieves 2-4× on real documents, so the figure to measure is storageSize rather than the size of your JSON. The cache holds uncompressed pages; the filesystem cache holds compressed ones, which is why the effective total is larger than the cache setting suggests.");
+    $("k-note").textContent = notes.join("\n\n");
+  }
+
+  ["k-ram","k-data","k-hot","k-idx"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

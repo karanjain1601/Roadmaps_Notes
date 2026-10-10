@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · High availability and failover — PostgreSQL</title>
+<meta name="description" content="What automatic failover requires, Patroni and consensus, split-brain, fencing, and the client's side of the problem.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 14 · Running it</div>
+    <h1>High availability and failover</h1>
+    <p class="standfirst">Postgres has no built-in automatic failover, and that is a deliberate omission rather than a gap. Deciding that a primary is dead — rather than briefly unreachable — is a distributed consensus problem, and getting it wrong loses data in ways a database cannot repair.</p>
+    <div class="chap-meta">
+      <span class="tagpill">consensus</span>
+      <span class="tagpill">patroni</span>
+      <span class="tagpill">split-brain</span>
+      <span class="tagpill">clients</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The hard part is not promoting</h2>
+
+<p>Promoting a standby is one command. The hard part is the question before it: <b>is the primary actually dead, or can I merely not reach it?</b> Those look identical from a single observer, and answering wrong produces two primaries accepting writes.</p>
+
+<div class="demo" id="ha">
+  <div class="demo-head">
+    <b>Failover decisions</b>
+    <span>A three-node cluster with a consensus store. Pick a failure and see what a correct system does — and what a naive one does instead.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="h-fail">What failed</label>
+        <select id="h-fail">
+          <option value="crash" selected>The primary process crashed</option>
+          <option value="host">The primary host died</option>
+          <option value="netprimary">The primary is network-partitioned from everything</option>
+          <option value="netstandby">One standby lost the network</option>
+          <option value="disk">The primary's disk is full</option>
+          <option value="slow">The primary is alive but very slow</option>
+          <option value="dcs">The consensus store is unreachable from all nodes</option>
+        </select>
+      </div>
+      <div>
+        <label for="h-fencing">Fencing configured?</label>
+        <select id="h-fencing">
+          <option value="yes" selected>Yes — the old primary is demoted or killed</option>
+          <option value="no">No</option>
+        </select>
+      </div>
+    </div>
+    <div id="h-nodes"></div>
+    <div class="stat">
+      <div><b id="h-action">—</b><span>correct action</span></div>
+      <div><b id="h-risk">—</b><span>split-brain risk</span></div>
+      <div><b id="h-loss">—</b><span>data loss</span></div>
+    </div>
+    <div class="out" id="h-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>What automatic failover requires</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Component</th><th>Job</th><th>Failure if missing</th></tr></thead>
+<tbody>
+<tr><td><b>A consensus store</b></td><td>Agree who the primary is. etcd, Consul or ZooKeeper</td><td>Two nodes each decide they are the primary</td></tr>
+<tr><td><b>An odd number of voters</b></td><td>A partition always has one side with a majority</td><td>Both sides tie and neither can act, or both act</td></tr>
+<tr><td><b>Health checks from several places</b></td><td>Distinguish "dead" from "I cannot see it"</td><td>A network blip triggers an unnecessary failover</td></tr>
+<tr><td><b>Fencing</b></td><td>Guarantee the old primary stops accepting writes</td><td><b>Split-brain</b></td></tr>
+<tr><td><b>A stable endpoint</b></td><td>Clients reach the current primary without reconfiguration</td><td>Every application needs a restart to recover</td></tr>
+<tr><td><b>Client retry logic</b></td><td>Survive the connection break during promotion</td><td>Errors surface to users even though failover worked</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">Two nodes cannot do this</span>
+  <p>With a primary and one standby, a network partition between them is indistinguishable from the primary having died — from the standby's point of view those are the same observation. Promote and you may have two primaries; do not promote and you have no automatic failover. There is no configuration that resolves it, because the information genuinely is not there. <b>You need a third voter</b>: a third database node, or — cheaper and usually sufficient — a third member of the consensus store on a separate machine. This is why every serious HA setup has an odd number of somethings.</p>
+</div>
+
+<h2><span class="h-rule"></span>Patroni</h2>
+
+<div class="code" data-lang="yaml">
+<div class="code-head"><span class="lang">patroni.yml — the parts that matter</span><button class="copy">Copy</button></div>
+<pre><code>scope: orders-cluster
+name: node1
+
+etcd3:
+  hosts: [10.0.1.10:2379, 10.0.1.11:2379, 10.0.1.12:2379]   # THREE
+
+bootstrap:
+  dcs:
+    ttl: 30                    # leader key lifetime; a dead leader is
+                               # detected after this
+    loop_wait: 10              # how often each node checks in
+    retry_timeout: 10          # tolerance for a slow DCS before demoting
+    maximum_lag_on_failover: 1048576   # 1 MB — a laggier standby is not
+                                       # eligible, which bounds data loss
+    synchronous_mode: true             # do not promote a standby that might
+                                       # be missing committed transactions
+    postgresql:
+      use_pg_rewind: true
+      parameters:
+        wal_log_hints: 'on'            # chapter 13 — required for pg_rewind
+        max_wal_senders: 10
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: 10.0.1.10:5432
+  data_dir: /var/lib/postgresql/16/main
+  authentication:
+    replication: {username: replicator, password: '…'}
+    superuser:   {username: postgres,   password: '…'}
+
+# The mechanism: the leader holds a key in etcd with a TTL and refreshes it
+# every loop_wait. If it stops refreshing, the key expires and the remaining
+# nodes race to take it — etcd's consensus guarantees exactly one wins.
+# A node that cannot reach etcd DEMOTES ITSELF, which is the fencing.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Self-demotion is the whole trick</span>
+  <p>The behaviour that makes Patroni safe is not the promotion, it is what a node does when it cannot reach the consensus store: <b>it demotes itself</b>, immediately, without needing to be told. A partitioned primary therefore stops accepting writes on its own, before any standby is promoted — so even if both sides act, only one is ever writable. This is the correct shape for any failover system, and it is exactly what hand-rolled scripts using a health check and a promote command do not do.</p>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">operating it</span><button class="copy">Copy</button></div>
+<pre><code>patronictl -c /etc/patroni.yml list
+# + Cluster: orders-cluster ------+---------+---------+----+-----------+
+# | Member | Host      | Role    | State   | TL | Lag in MB |
+# +--------+-----------+---------+---------+----+-----------+
+# | node1  | 10.0.1.10 | Leader  | running | 12 |           |
+# | node2  | 10.0.1.11 | Replica | running | 12 |         0 |
+# | node3  | 10.0.1.12 | Replica | running | 12 |         0 |
+
+patronictl switchover --leader node1 --candidate node2   # PLANNED. No loss
+patronictl failover --candidate node2                    # forced; may lose data
+patronictl pause                                         # maintenance mode:
+                                                         # no automatic action
+patronictl resume
+patronictl reinit node3                                  # rebuild from the leader
+
+# switchover and failover are different operations and the distinction matters:
+#   switchover  waits for the candidate to catch up fully, then swaps cleanly
+#   failover    promotes now, accepting whatever the candidate is missing
+# Use switchover for every planned change — upgrades, maintenance, rebalancing.
+
+# ALWAYS pause before manual maintenance. Otherwise Patroni sees the node you
+# just stopped, decides it has failed, and fails over in the middle of your
+# planned work.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Getting clients to the new primary</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Method</th><th>Failover time</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><b>libpq multi-host</b></td><td>Seconds</td><td><code>host=a,b,c&amp;target_session_attrs=read-write</code>. No extra infrastructure, and most drivers support it</td></tr>
+<tr><td><b>HAProxy + Patroni REST</b></td><td>Seconds</td><td>Health-checks <code>/primary</code> on each node. The standard setup</td></tr>
+<tr><td><b>A virtual IP</b></td><td>Seconds</td><td>Fast, needs layer-2 adjacency. Awkward in cloud</td></tr>
+<tr><td><b>DNS</b></td><td>Minutes</td><td>TTLs are ignored by many resolvers and JVMs cache forever. Too slow alone</td></tr>
+<tr><td><b>Kubernetes service</b></td><td>Seconds</td><td>The operator relabels the primary pod; the service follows</td></tr>
+<tr><td><b>Cloud load balancer</b></td><td>Seconds</td><td>Health check hits the Patroni REST endpoint</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">the two routing options worth knowing</span><button class="copy">Copy</button></div>
+<pre><code># 1. No infrastructure at all — the driver finds the primary itself.
+postgresql://a.db,b.db,c.db/orders?target_session_attrs=read-write
+postgresql://a.db,b.db,c.db/orders?target_session_attrs=prefer-standby  # reads
+
+# The driver tries each host and asks whether it accepts writes. On failover
+# the connection breaks, the driver reconnects, and it lands on the new
+# primary. Supported by libpq 10+, JDBC, psycopg, Npgsql, Go pgx and others.
+
+# 2. HAProxy in front, health-checking Patroni's REST API.
+listen postgres_primary
+    bind *:5432
+    option httpchk GET /primary          # 200 only on the leader
+    http-check expect status 200
+    default-server inter 3s fall 3 rise 2 on-marked-down shutdown-sessions
+    server node1 10.0.1.10:5432 check port 8008
+    server node2 10.0.1.11:5432 check port 8008
+    server node3 10.0.1.12:5432 check port 8008
+
+listen postgres_replicas
+    bind *:5433
+    option httpchk GET /replica
+    balance roundrobin
+    server node1 10.0.1.10:5432 check port 8008
+    ...
+
+# on-marked-down shutdown-sessions is the important flag: it kills existing
+# connections to a demoted node rather than leaving them attached to a server
+# that is now read-only and will fail every write.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Failover is not transparent to the application</span>
+  <p>Whatever the routing, in-flight transactions are lost and open connections break. The application sees connection errors for a few seconds, and if it does not retry, users see errors even though failover worked perfectly. Three things are needed on the client side: <b>connection-level retry with backoff</b>, <b>idempotent writes</b> so a retry after an ambiguous failure is safe (SQL chapter 9), and <b>a short connection timeout</b> so a dead host is abandoned quickly rather than hanging for the operating system's default. Teams build an excellent HA setup and then discover their failover is thirty seconds because a JDBC socket timeout was never configured.</p>
+</div>
+
+<h2><span class="h-rule"></span>Split-brain</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">how it happens, and what it costs</span><button class="copy">Copy</button></div>
+<pre><code>1. The network partitions. The primary is isolated; standbys and the DCS are
+   on the other side.
+2. The primary is fine and keeps accepting writes from any clients that can
+   still reach it.
+3. The standbys see no leader, elect one, and promote it.
+4. Two primaries. Both accept writes. Both are internally consistent.
+5. The partition heals.
+
+Now there are two divergent histories with no automatic reconciliation. Both
+sets of transactions are real, both were acknowledged to clients, and no tool
+can merge them — you choose one and manually extract what you can from the
+other, if the data even permits it.
+
+Preventing it — in order of importance:
+  * SELF-DEMOTION. A node that cannot reach the DCS stops being primary.
+    This alone prevents the scenario above
+  * A majority requirement, so the minority side can never elect
+  * Fencing: STONITH, a cloud API call to stop the instance, or revoking
+    its storage access
+  * synchronous_mode, so a standby missing committed transactions is not
+    promoted at all
+  * Routing that actively rejects the demoted node, rather than relying on
+    it to stop answering</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">A clean shutdown is not fencing</span>
+  <p>Asking the old primary to stop assumes you can reach it — and in a network partition, by definition, you cannot. Real fencing does not require the failing node's cooperation: a cloud API call that stops the instance, a management-controller power-off, or revoking its access to shared storage. In the common cloud setup Patroni's self-demotion covers the realistic cases, because the node fences <em>itself</em> when it loses the DCS. If you are relying on something reaching in and stopping it, test that path — it is the one that fails exactly when it is needed.</p>
+</div>
+
+<h2><span class="h-rule"></span>Options</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Approach</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><b>Patroni</b></td><td>The de facto standard for self-managed. Needs etcd or Consul. Well documented, widely deployed</td></tr>
+<tr><td><b>repmgr</b></td><td>Simpler, no external DCS. Weaker split-brain protection as a consequence</td></tr>
+<tr><td><b>pg_auto_failover</b></td><td>A dedicated monitor node. Easier to run, one more thing to keep alive</td></tr>
+<tr><td><b>Kubernetes operators</b></td><td>CloudNativePG, Zalando, Crunchy. Use the Kubernetes API as the DCS. Excellent if you are already there</td></tr>
+<tr><td><b>Managed services</b></td><td>RDS, Cloud SQL, Azure. Failover is theirs. Check the documented RTO and whether it is synchronous</td></tr>
+<tr><td><b>Manual failover</b></td><td>A completely legitimate choice. A runbook plus paging is more reliable than a badly-configured automatic system</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">Automatic failover is not obviously worth it</span>
+  <p>It adds a distributed system whose failure modes include <em>causing</em> outages — an unnecessary failover triggered by a network blip, a promotion to a lagging standby, a DCS problem that demotes a healthy primary. Before adopting it, work out honestly how often the primary actually fails, and what a paged engineer following a runbook would cost in minutes. For many systems the answer is that fifteen minutes of downtime a few times a year is acceptable, and a well-tested manual runbook is more reliable than automation nobody exercises. <b>Automate failover when the availability requirement genuinely demands it, and then test it monthly</b> — untested automatic failover is worse than none.</p>
+</div>
+
+<h2><span class="h-rule"></span>Testing it</h2>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Planned switchover, in production</b><span>Monthly. If you will not do this, the automatic path will not work either</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Kill the primary process</b><span>The easy case. Measure end-to-end recovery, not just promotion</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Stop the primary host abruptly</b><span>No clean shutdown, so recovery and fencing both get exercised</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Partition the network</b><span>The one that finds split-brain. Firewall the primary from the DCS and the standbys</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Fill the primary's disk</b><span>It stays up and stops accepting writes — often the worst case for detection</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>6 · Break the DCS</b><span>All nodes should demote and refuse writes. Verify they do</span></div>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">what to measure during a test</span><button class="copy">Copy</button></div>
+<pre><code>-- Run a write loop from a client throughout, and record:
+--   t0  the failure is injected
+--   t1  the failover system notices               (ttl + loop_wait)
+--   t2  a new primary is promoted
+--   t3  routing points at it
+--   t4  the client's first successful write        <- the number that matters
+--
+-- t4 − t0 is your real recovery time. It is nearly always longer than the
+-- promotion itself, and the gap is usually routing and client retry — the
+-- two parts nobody tests.
+
+-- Afterwards, confirm nothing was lost that was acknowledged:
+SELECT count(*), max(id) FROM write_test;      -- against the client's log
+SELECT pg_last_wal_replay_lsn(), pg_current_wal_lsn();
+
+-- And that the old node rejoined rather than sitting broken:
+--   patronictl list        all members running, same timeline (TL), lag 0</code></pre>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Promoting is easy. <b>Deciding the primary is dead rather than unreachable</b> is the hard part, and it needs consensus.</li>
+    <li><b>Two nodes cannot do automatic failover safely.</b> You need a third voter — a node, or a third DCS member.</li>
+    <li><b>Self-demotion is the mechanism that prevents split-brain</b>: a node that cannot reach the DCS stops being primary on its own.</li>
+    <li><code>switchover</code> is planned and lossless; <code>failover</code> is forced and may lose data. <b>Pause before manual maintenance.</b></li>
+    <li>Routing needs a <b>stable endpoint</b> — multi-host connection strings or HAProxy against Patroni's REST API.</li>
+    <li><b>Failover is not transparent.</b> Clients need retry, idempotent writes and short timeouts, or your HA works and users still see errors.</li>
+    <li><b>A clean shutdown is not fencing.</b> Real fencing does not need the failing node's cooperation.</li>
+    <li>Automatic failover <b>adds failure modes</b>. Adopt it when the requirement demands it, then test it monthly — including a network partition.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("14-ha.html");
+
+(function(){
+  const root = document.getElementById("ha");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const F = {
+    crash: {
+      nodes:[["node1","primary","down"],["node2","replica","ok"],["node3","replica","ok"]],
+      action:"promote node2", risk:"none", loss:"async lag only",
+      note:"The clean case. The primary process is gone, the host is still reachable, and both standbys plus the DCS agree. The leader key expires after its TTL and node2 takes it.\n\nData loss is whatever had not reached the standby — milliseconds under asynchronous replication, nothing under synchronous. maximum_lag_on_failover bounds it explicitly by refusing to promote a standby that is too far behind.\n\nAfterwards node1 can rejoin with pg_rewind, provided wal_log_hints or checksums were enabled (chapter 13). Without those it needs a full rebuild."
+    },
+    host: {
+      nodes:[["node1","primary","gone"],["node2","replica","ok"],["node3","replica","ok"]],
+      action:"promote node2", risk:"none", loss:"async lag only",
+      note:"Functionally the same as a process crash from the cluster's point of view, and simpler in one respect: the host is definitively gone, so there is no possibility of it still accepting writes from somewhere.\n\nThe majority of the cluster is intact and can act with confidence. This is the failure that automatic failover handles best, and the one people imagine when they design for it — which is worth noticing, because it is not the failure that causes the trouble."
+    },
+    netprimary: {
+      nodes:[["node1","primary","isolated"],["node2","replica","ok"],["node3","replica","ok"]],
+      action:"node1 self-demotes, then promote node2", risk:"HIGH without self-demotion", loss:"writes accepted while isolated",
+      note:"The dangerous one, and the reason consensus is required at all. node1 is perfectly healthy — it just cannot see anyone. If it keeps accepting writes while node2 is promoted, you have two primaries and two divergent histories that cannot be merged.\n\nWhat makes this safe is not the promotion, it is node1's own behaviour: unable to reach the DCS, it demotes itself before any standby can be promoted. The minority side stops writing without being told to.\n\nAny client that could still reach node1 during the window loses whatever it wrote after the partition. That is unavoidable, and it is far better than the alternative."
+    },
+    netstandby: {
+      nodes:[["node1","primary","ok"],["node2","replica","isolated"],["node3","replica","ok"]],
+      action:"nothing — do not fail over", risk:"none", loss:"none",
+      note:"A standby lost the network. Nothing should happen: the primary is healthy and holds the majority with node3 and the DCS.\n\nThis is the case a naive health-check script gets wrong in the other direction — some monitoring systems, seeing a node unreachable, start doing things. The correct action is to alert and wait.\n\nOne thing to watch: node2's replication slot is now inactive and retaining WAL on the primary. If the partition lasts, max_slot_wal_keep_size is what stops it filling the primary's disk (chapters 4 and 13)."
+    },
+    disk: {
+      nodes:[["node1","primary","degraded"],["node2","replica","ok"],["node3","replica","ok"]],
+      action:"free space, or switch over", risk:"low", loss:"none if handled",
+      note:"The primary is up, responding to health checks, and refusing writes because the filesystem is full. Many failover systems will NOT act, because the node looks alive — and from a liveness perspective it is.\n\nThis is often the worst case for detection: an outage where every automated check reports green. Health checks that only test connectivity miss it entirely; one that performs a trivial write catches it.\n\nUsual causes, all covered earlier: an inactive replication slot, a failing archive_command, or WAL accumulating faster than checkpoints recycle it (chapters 4 and 12). Deal with the cause; a switchover only moves the workload to a node that will fill up next."
+    },
+    slow: {
+      nodes:[["node1","primary","slow"],["node2","replica","ok"],["node3","replica","ok"]],
+      action:"investigate — do NOT fail over automatically", risk:"medium", loss:"n/a",
+      note:"The genuinely ambiguous case. The primary is alive and answering, just slowly — a runaway query, lock contention, an anti-wraparound vacuum, a noisy neighbour.\n\nFailing over usually makes it worse. The new primary inherits the same workload, and if the cause is the workload rather than the machine it will be equally slow within minutes, having also cost you a promotion and every in-flight transaction.\n\nThis is why failover triggers should be based on liveness rather than performance. Slowness is a paging condition for a human with chapter 18's playbook, not a trigger for automation."
+    },
+    dcs: {
+      nodes:[["node1","primary","no dcs"],["node2","replica","no dcs"],["node3","replica","no dcs"]],
+      action:"all nodes demote — cluster is read-only", risk:"none", loss:"none",
+      note:"The consensus store itself is unreachable. Every node demotes, so the cluster becomes read-only and stays consistent — safe, and a complete write outage.\n\nThat is the correct trade and it is worth being explicit about: you have made the DCS a dependency of your write availability. Run three or five etcd members, spread across failure domains, monitor them as carefully as the database, and do not co-locate all of them with the database nodes.\n\nIt is also the argument for patronictl pause during DCS maintenance: paused, Patroni takes no automatic action and the primary keeps serving."
+    }
+  };
+
+  function render(){
+    const k = $("h-fail").value;
+    const f = F[k];
+    const fenced = $("h-fencing").value === "yes";
+
+    const COL = {ok:"#3FB984", down:"#E2574C", gone:"#E2574C",
+                 isolated:"#F2A03D", degraded:"#F2A03D", slow:"#F2A03D", "no dcs":"#F2A03D"};
+
+    $("h-nodes").innerHTML =
+      '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:9px;margin:16px 0 4px">' +
+      f.nodes.map(([n, role, state]) =>
+        '<div style="background:#fff;border:2px solid ' + COL[state] + ';border-radius:6px;padding:11px 12px;text-align:center">' +
+        '<div style="font-family:var(--mono);font-size:13px;font-weight:700;color:#16232F">' + n + '</div>' +
+        '<div style="font-size:12px;color:#54677A;margin-top:2px">' + role + '</div>' +
+        '<div style="font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;font-weight:700;color:' +
+        COL[state] + ';margin-top:5px">' + state + '</div></div>').join("") + '</div>';
+
+    let risk = f.risk;
+    if(!fenced && (k === "netprimary")) risk = "CRITICAL";
+    else if(!fenced && (k === "crash" || k === "host" || k === "disk")) risk = "elevated";
+
+    $("h-action").textContent = f.action;
+    $("h-risk").textContent   = risk;
+    $("h-loss").textContent   = f.loss;
+
+    const notes = [f.note];
+    if(!fenced && k === "netprimary")
+      notes.push("WITHOUT self-demotion or fencing, this is split-brain. node1 keeps accepting writes from anything that can still reach it while node2 is promoted, and when the partition heals you have two divergent histories that no tool can merge. Both sets of transactions were acknowledged to clients; you will pick one and manually reconstruct what you can from the other.");
+    else if(!fenced)
+      notes.push("Without fencing this particular failure is survivable, because the old primary is genuinely unable to serve. That is luck rather than design — the same configuration meets the partition case eventually, and then it is not survivable. Self-demotion costs nothing and covers all of them.");
+    else if(k === "netprimary")
+      notes.push("With self-demotion configured this is safe: node1 stops being primary on its own, before node2 is promoted, because it cannot reach the DCS. Only one node is ever writable. This is the single most important property of a failover system, and the one hand-rolled scripts almost always lack.");
+
+    notes.push("Whatever happens here, the client side is a separate problem. In-flight transactions are lost and connections break, so the application needs retry with backoff, idempotent writes and a short connection timeout — otherwise the failover succeeds and users still see errors for thirty seconds.");
+    $("h-note").textContent = notes.join("\n\n");
+  }
+
+  ["h-fail","h-fencing"].forEach(id => $(id).addEventListener("change", render));
+  render();
+})();
+</script>
+</body>
+</html>

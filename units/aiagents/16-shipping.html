@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Shipping an agent — AI Agents</title>
+<meta name="description" content="Synchronous or queued, streaming progress, interruption and resumption, budgets and quotas, rollout, and the operational runbook.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 16 · Making it work</div>
+    <h1>Shipping an agent</h1>
+    <p class="standfirst">Agents break the assumptions your web stack was built on: requests that run for minutes, work that must survive a deploy, costs that vary by an order of magnitude between two users on the same plan. This chapter is the operational shape that accommodates that.</p>
+    <div class="chap-meta">
+      <span class="tagpill">execution model</span>
+      <span class="tagpill">progress</span>
+      <span class="tagpill">interruption</span>
+      <span class="tagpill">budgets</span>
+      <span class="tagpill">rollout</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Synchronous, streamed, or queued</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Model</th><th>Suits</th><th>Requires</th><th>Breaks when</th></tr></thead>
+<tbody>
+<tr><td><b>Synchronous request</b></td><td>Runs under ~10s, simple clients, internal tools</td><td>Nothing extra</td><td>A slow tool pushes past a proxy or load-balancer timeout. Common and confusing</td></tr>
+<tr><td><b>Streamed response</b></td><td>10–60s interactive runs — the usual choice for a user-facing agent</td><td>SSE or websockets; a proxy that does not buffer</td><td>The connection drops and the run is lost with it</td></tr>
+<tr><td><b>Queued job with a progress channel</b></td><td>Anything over a minute, or that must survive a deploy</td><td>A queue, durable run state, a way to subscribe to updates</td><td>Rarely. This is the robust shape</td></tr>
+<tr><td><b>Scheduled or event-triggered</b></td><td>Monitoring, batch triage, overnight work</td><td>All of the above, plus idempotency and alerting</td><td>Nobody notices it has been failing for a week</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">Pick queued earlier than feels necessary</span>
+  <p>The migration from "hold the connection open" to "durable job with progress" is disruptive: it changes the API shape, the client, the error handling and the tests. Doing it before launch costs a couple of days. Doing it after, because a customer's run reliably takes ninety seconds and your gateway caps at sixty, costs a sprint and an incident. If there is any realistic path to runs exceeding thirty seconds, start queued.</p>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">api.py — the shape that scales in both directions</span><button class="copy">Copy</button></div>
+<pre><code>@app.post("/runs")
+async def create_run(req: RunRequest, ctx: RequestContext = Depends(session)):
+    if not quota.allow(ctx.user_id, ctx.tenant_id):
+        raise HTTPException(429, "daily agent quota reached")
+
+    run_id = uuid7()
+    await runs.create(run_id, goal=req.goal, status="queued",
+                      authority=ctx.authority.restrict(tools=toolset_for(req.kind)),
+                      budget=budget_for(ctx.plan, req.kind))
+    await queue.enqueue("agent.run", run_id=run_id)
+    return {"run_id": run_id, "status": "queued",
+            "events": f"/runs/{run_id}/events"}
+
+
+@app.get("/runs/{run_id}/events")
+async def events(run_id: str, ctx = Depends(session)):
+    run = await runs.get(run_id)
+    authorise_read(run, ctx)                       # never trust the id alone
+
+    async def gen():
+        # Replay anything that already happened, so a reconnect is seamless.
+        for e in await runs.events_since(run_id, 0):
+            yield sse(e)
+        async for e in runs.subscribe(run_id):
+            yield sse(e)
+            if e.kind in ("done", "error", "cancelled"):
+                return
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform",
+                 "X-Accel-Buffering": "no"})       # or nginx buffers it away
+
+
+@app.post("/runs/{run_id}/cancel")
+async def cancel(run_id: str, ctx = Depends(session)):
+    await runs.request_cancel(run_id)              # the worker checks this each step
+    return {"status": "cancelling"}</code></pre>
+</div>
+
+<p>Replaying stored events before subscribing is the small detail that makes reconnection work. A user switching networks, closing a laptop lid, or refreshing gets the whole run so far and then continues live — rather than a blank screen for work that is already half done.</p>
+
+<h2><span class="h-rule"></span>Showing progress</h2>
+
+<div class="demo" id="ship">
+  <div class="demo-head">
+    <b>What the user experiences</b>
+    <span>The same 34-second run, presented four ways. Nothing about the agent changes.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="h-mode">Presentation</label>
+        <select id="h-mode">
+          <option value="none">Spinner until complete</option>
+          <option value="dots">Spinner with "Thinking…"</option>
+          <option value="labels" selected>Labelled step events</option>
+          <option value="full">Labelled steps + streamed final answer</option>
+        </select>
+      </div>
+      <div>
+        <label><input type="checkbox" id="h-cancel" checked> Cancel button that actually cancels</label>
+      </div>
+    </div>
+    <div style="margin-top:12px"><button class="btn" id="h-run">Run it</button></div>
+    <div id="h-screen"></div>
+    <div class="stat">
+      <div><b id="h-first">—</b><span>first feedback</span></div>
+      <div><b id="h-total">34s</b><span>total</span></div>
+      <div><b id="h-blind">—</b><span>time with no signal</span></div>
+    </div>
+    <div class="out" id="h-note"></div>
+  </div>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Rule</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><b>Emit an event within 1 second</b></td><td>Even "planning the approach". Silence past about two seconds reads as broken</td></tr>
+<tr><td><b>Label steps in domain language</b></td><td>"Checking payment history", not <code>list_payments(order_id=…)</code>. Never leak raw arguments — they contain customer data</td></tr>
+<tr><td><b>Keep completed steps visible</b></td><td>The list of what has been done is reassurance, and it is what the user quotes back to support</td></tr>
+<tr><td><b>Stream the final answer</b></td><td>The last 4 seconds become 0.6 seconds to first word</td></tr>
+<tr><td><b>Say when a step is slow</b></td><td>"Still searching the archive…" beats a stalled label</td></tr>
+<tr><td><b>Make cancel real</b></td><td>It must stop the worker and stop billing, not just close the tab</td></tr>
+<tr><td><b>Show what was pended</b></td><td>"Refund queued for approval (AP-2210)" — never let a held action look like a completed one</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>Interruption and resumption</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">worker.py — cancellable, resumable, deploy-safe</span><button class="copy">Copy</button></div>
+<pre><code>async def worker(run_id: str):
+    run = await runs.get(run_id)
+    state = run.state or initial_state(run)          # resume mid-run if state exists
+
+    for n in range(state.step, run.budget.max_steps + 1):
+        if await runs.cancel_requested(run_id):
+            await runs.finish(run_id, status="cancelled",
+                              text=wrap_up(state.messages, "cancelled by user"))
+            return
+        if shutting_down.is_set():                   # SIGTERM during a deploy
+            await runs.checkpoint(run_id, state)     # persist and requeue
+            await queue.enqueue("agent.run", run_id=run_id, delay=5)
+            return
+
+        result = await do_step(state, run)
+        state = result.state
+        await runs.checkpoint(run_id, state)         # after every step, not at the end
+        await runs.emit(run_id, result.event)
+
+        if result.awaiting_approval:
+            await runs.pause(run_id, pending=result.pending)
+            return                                   # resumed by the approval webhook
+        if result.done:
+            await runs.finish(run_id, status="completed", text=result.text)
+            return
+
+    await runs.finish(run_id, status="halted",
+                      text=wrap_up(state.messages, "step limit"))</code></pre>
+</div>
+
+<ul class="check">
+  <li><b>Checkpoint after every step</b>, not at the end. A step is the natural transaction boundary and losing one is cheap.</li>
+  <li><b>Handle SIGTERM.</b> Deploys happen mid-run. Persist, requeue, exit — do not fight the shutdown.</li>
+  <li><b>Cancel must reach the model call.</b> Pass a cancellation token into the provider client so an in-flight request aborts and stops billing.</li>
+  <li><b>Version the state.</b> A checkpoint written by yesterday's code will be resumed by today's; either migrate it or fail it cleanly with a clear message.</li>
+  <li><b>Expire paused runs.</b> A run waiting on an approval nobody gives should time out, notify, and release its budget.</li>
+  <li><b>Make resumption idempotent.</b> A requeued job must not re-execute the write that was already committed (chapter 5).</li>
+</ul>
+
+<h2><span class="h-rule"></span>Budgets and quotas</h2>
+
+<p>Agent cost per user varies far more than in a single-call product. One user asking hard questions can cost more than a thousand asking easy ones, and the difference does not show up in your plan tiers unless you put it there.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Control</th><th>Level</th><th>On breach</th></tr></thead>
+<tbody>
+<tr><td>Per-run budget</td><td>Steps, tokens, seconds, cost</td><td>Halt with a summary of what was established (chapter 2)</td></tr>
+<tr><td>Per-user daily quota</td><td>Runs or spend, by plan</td><td>Refuse politely, say when it resets, offer the non-agent path</td></tr>
+<tr><td>Per-tenant monthly cap</td><td>Spend</td><td>Alert the account owner well before the wall, not at it</td></tr>
+<tr><td>Global circuit breaker</td><td>Total daily spend</td><td>Degrade to a cheaper model, then disable. Page someone</td></tr>
+<tr><td>Concurrency limit</td><td>Runs in flight per tenant</td><td>Queue rather than reject; show position</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">budget_for — derive limits from the plan and the task</span><button class="copy">Copy</button></div>
+<pre><code>def budget_for(plan: Plan, kind: str) -> Budget:
+    base = TASK_BUDGETS[kind]              # a quick lookup differs from a deep investigation
+    return Budget(
+        max_steps   = min(base.steps, plan.max_steps),
+        max_tokens  = min(base.tokens, plan.max_tokens),
+        max_seconds = base.seconds,
+        max_cost_usd= min(base.cost, plan.remaining_today()),
+    )
+
+# Track cost per completed task by tenant and by task kind, and alert on the
+# rate of change rather than the absolute. Cost per run doubling overnight is a
+# broken prompt cache or a tool returning far more than it used to — both of
+# which you want to know about today, not on the invoice.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Rolling it out</h2>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Shadow</b><span>Run on real traffic, serve nothing. Compare trajectories and cost against the human or the old path</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Internal</b><span>Your own support team uses it. They will find things no eval set contains</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Assisted</b><span>Agent drafts and proposes; a human approves everything. Measure approval and edit rates</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Narrow autonomy</b><span>Auto-approve the safest class of action below a low threshold. Watch the reversal rate</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Widen deliberately</b><span>One action class or one threshold at a time, with a week of data between changes</span></div>
+</div>
+
+<p>Stage three is the one to linger in. Approval rate tells you whether the agent is right; <b>edit rate</b> tells you whether it is useful. An agent whose drafts are approved 95% of the time but edited heavily is doing the easy half of the job — and the traces of those edits are the best specification you will get for what to fix next.</p>
+
+<div class="note trap">
+  <span class="note-t">The kill switch must be tested in production</span>
+  <p>Feature-flag the agent so it can be disabled — entirely, or just its write tools — without a deploy. Then actually flip it in production, during business hours, and check three things: runs in flight terminate gracefully with a useful message, the non-agent path still works, and nothing 500s. An untested kill switch is a comforting name for code that has never run, and you will discover which it is at the worst possible moment.</p>
+</div>
+
+<h2><span class="h-rule"></span>The runbook</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Situation</th><th>First action</th></tr></thead>
+<tbody>
+<tr><td>Unsafe attempt detected</td><td>Disable write tools via flag. Query traces for the pattern. Chapter 15</td></tr>
+<tr><td>Cost spike</td><td>Check cached-token ratio and observation sizes before anything else — usually a prompt edit broke the cache</td></tr>
+<tr><td>Step count jumped</td><td>Did a model version, a prompt or a tool change? Compare against the previous release's baseline</td></tr>
+<tr><td>A tool is down</td><td>Confirm the circuit breaker opened and the agent reports the gap rather than hiding it</td></tr>
+<tr><td>Runs timing out</td><td>Per-stage latency in traces. Usually one tool, not the model</td></tr>
+<tr><td>Approval queue backing up</td><td>Threshold too low, or the agent is over-proposing. Check the proposal-to-approval ratio</td></tr>
+<tr><td>Quality complaints, no error rate change</td><td>Read ten traces. Distributional regressions do not throw exceptions</td></tr>
+<tr><td>Provider outage</td><td>Fail over. Confirm the fallback model's tool-calling behaves — it differs</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>Before launch</h2>
+
+<div class="cols">
+  <div class="col">
+    <h4>Correctness</h4>
+    <ul>
+      <li>Eval suite passing against a baseline</li>
+      <li>Adversarial slice at 100%, zero unsafe attempts</li>
+      <li>Unanswerable tasks refused cleanly</li>
+      <li>Degraded-tool tasks report the gap</li>
+    </ul>
+  </div>
+  <div class="col">
+    <h4>Control</h4>
+    <ul>
+      <li>All four budgets enforced per run</li>
+      <li>Per-user quota and a global breaker</li>
+      <li>Guards wired with metrics on each</li>
+      <li>Kill switch flipped in production once</li>
+    </ul>
+  </div>
+  <div class="col">
+    <h4>Safety</h4>
+    <ul>
+      <li>Authority scoped to the session, narrowing only</li>
+      <li>Consequential actions gated</li>
+      <li>Egress allowlisted, output sanitised</li>
+      <li>Trifecta reviewed across the whole session</li>
+    </ul>
+  </div>
+  <div class="col">
+    <h4>Operations</h4>
+    <ul>
+      <li>Tracing on, sampled, redacted before write</li>
+      <li>Cost attributed by tenant and task kind</li>
+      <li>Alerts on distributions, not just errors</li>
+      <li>Runbook written and findable</li>
+    </ul>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Where this unit ends</h2>
+
+<p>Sixteen chapters ago the claim was that an agent is a loop that fits in forty lines. That is still true, and it is still the least interesting part. What the rest of the unit added is the machinery that makes those forty lines safe to leave running: tools described well enough to be chosen correctly, execution gates that hold when the prompt does not, a context that stays a working set, detectors for the dozen ways runs go wrong, evaluation that distinguishes a good run from a lucky one, traces that answer the question at 3am, and an authority model that can only shrink.</p>
+
+<p>None of that is specific to any model generation. The models will get better at picking tools and knowing when to stop, and several specifics here will date. The reason the machinery still matters is that it does not derive from the model's weaknesses — it derives from the fact that you have wired a probabilistic component to real systems, and that arrangement needs the same guarantees whether the component is right 80% of the time or 99%.</p>
+
+<p>The useful next step is not more reading. Take the loop from chapter 2, give it three tools and a read-only credential, put twenty golden tasks behind it, and point it at something real. The failures you get in the first week will make every chapter here concrete in a way this text cannot.</p>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Choose queued earlier than feels necessary.</b> Migrating from a held-open connection after launch costs a sprint.</li>
+    <li><b>Replay stored events before subscribing</b> so reconnection is seamless.</li>
+    <li>Emit a labelled event within a second, in <b>domain language, never raw arguments</b>.</li>
+    <li><b>Checkpoint after every step</b>, handle SIGTERM, version the state, keep resumption idempotent.</li>
+    <li>Cancel must <b>reach the model call</b> and stop billing — not just close the tab.</li>
+    <li>Budget at four levels: <b>per run, per user, per tenant, globally</b>. Alert on rate of change.</li>
+    <li>Roll out through <b>shadow → internal → assisted → narrow autonomy</b>, and linger at assisted: edit rate is the honest signal.</li>
+    <li><b>Flip the kill switch in production once</b>, before you need it.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("16-shipping.html");
+
+(function(){
+  const root = document.getElementById("ship");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const STEPS = [
+    {at:0.9,  label:"Planning the approach"},
+    {at:4.2,  label:"Finding the order"},
+    {at:9.8,  label:"Checking payment history"},
+    {at:16.5, label:"Reading the refunds policy"},
+    {at:24.0, label:"Preparing a remedy"},
+    {at:29.5, label:"Writing the answer"}
+  ];
+  const TOTAL = 34;
+  let timer = null;
+
+  function paint(mode, t, cancel){
+    let html = "";
+    if(mode === "none"){
+      html = t < TOTAL
+        ? '<div style="display:flex;align-items:center;gap:10px;color:#54677A;font-size:14px"><span class="spin"></span>Working…</div>'
+        : '<div style="font-size:13.5px">Order NW-8842 was captured twice — £48 at 10:14 and again at 10:16. A refund of the second capture is queued for approval (AP-2210).</div>';
+    } else if(mode === "dots"){
+      html = t < TOTAL
+        ? '<div style="display:flex;align-items:center;gap:10px;color:#54677A;font-size:14px"><span class="spin"></span>Thinking…</div>'
+        : '<div style="font-size:13.5px">Order NW-8842 was captured twice — £48 at 10:14 and again at 10:16. A refund of the second capture is queued for approval (AP-2210).</div>';
+    } else {
+      const done = STEPS.filter(s => s.at <= t);
+      html = done.map((s, i) => {
+        const last = i === done.length - 1 && t < TOTAL;
+        return '<div style="display:flex;align-items:center;gap:9px;font-size:13.5px;margin-bottom:5px;color:' +
+          (last ? "#16232F" : "#54677A") + '">' +
+          (last ? '<span class="spin"></span>' :
+            '<svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M3 8.5l3.2 3L13 5" stroke="#3FB984" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>') +
+          s.label + '</div>';
+      }).join("");
+      if(t >= TOTAL){
+        const answer = "Order NW-8842 was captured twice — £48 at 10:14 and again at 10:16 on 2 March. A refund of the second capture is queued for approval (AP-2210); once approved it reaches the card in 5–10 working days.";
+        const shown = mode === "full"
+          ? answer.slice(0, Math.min(answer.length, Math.round((t - 29.5) / 4.5 * answer.length)))
+          : answer;
+        html += '<div style="margin-top:10px;padding-top:10px;border-top:1px solid #E1E7EC;font-size:13.5px">' + shown + '</div>';
+      } else if(mode === "full" && t > 29.5){
+        const answer = "Order NW-8842 was captured twice — £48 at 10:14 and again at 10:16 on 2 March. A refund of the second capture is queued for approval (AP-2210)…";
+        html += '<div style="margin-top:10px;padding-top:10px;border-top:1px solid #E1E7EC;font-size:13.5px">' +
+          answer.slice(0, Math.round((t - 29.5) / 4.5 * answer.length)) + '</div>';
+      }
+    }
+    if(cancel && t < TOTAL)
+      html += '<div style="margin-top:10px"><button class="btn ghost" style="pointer-events:none">Stop</button></div>';
+
+    $("h-screen").innerHTML =
+      '<div style="background:#fff;border:1px solid #E1E7EC;border-radius:5px;padding:14px 15px;margin:14px 0;min-height:96px">' +
+      html + '</div>';
+  }
+
+  function stats(mode){
+    const first = mode === "none" || mode === "dots" ? TOTAL : STEPS[0].at;
+    const blind = mode === "none" ? TOTAL
+                : mode === "dots" ? TOTAL
+                : mode === "labels" ? STEPS[0].at
+                : STEPS[0].at;
+    $("h-first").textContent = mode === "none" || mode === "dots" ? "34s" : first.toFixed(1) + "s";
+    $("h-blind").textContent = blind.toFixed(1) + "s";
+
+    const notes = [];
+    if(mode === "none")
+      notes.push("Thirty-four seconds of nothing. Users reload, click twice, or leave — and a second click usually starts a second run, so you pay twice for the abandonment.");
+    if(mode === "dots")
+      notes.push("A label on the spinner is marginally better than none, but it conveys no information and does not change over 34 seconds. It reads as a stalled process rather than a working one.");
+    if(mode === "labels")
+      notes.push("First signal at 0.9s and a visible sequence after that. The same 34 seconds now reads as a system doing identifiable work. This costs nothing — the step events already exist in the loop from chapter 2.");
+    if(mode === "full")
+      notes.push("Steps plus a streamed answer: first signal at 0.9s, first words of the answer at ~30s instead of 34s. The perceived end of the wait moves earlier and the ending feels progressive rather than abrupt.");
+    if(!$("h-cancel").checked)
+      notes.push("No cancel: a user who realises they asked the wrong question can only wait or reload. Reloading does not stop the worker, so you keep paying for a run nobody wants. Cancel must reach the model call, not just the browser.");
+    else
+      notes.push("Cancel is wired to the worker, which checks it each step and aborts the in-flight model request — so it stops the work and the billing, not just the tab.");
+    $("h-note").textContent = notes.join("\n\n");
+  }
+
+  function run(){
+    clearInterval(timer);
+    const mode = $("h-mode").value;
+    const cancel = $("h-cancel").checked;
+    let t = 0;
+    stats(mode);
+    paint(mode, 0, cancel);
+    timer = setInterval(() => {
+      t += 0.55;
+      if(t >= TOTAL){ t = TOTAL; clearInterval(timer); }
+      paint(mode, t, cancel);
+    }, 55);
+  }
+
+  const style = document.createElement("style");
+  style.textContent = ".spin{width:12px;height:12px;border:2px solid #CFD8E0;border-top-color:#E0699F;" +
+    "border-radius:50%;display:inline-block;animation:sp .7s linear infinite;flex:none}" +
+    "@keyframes sp{to{transform:rotate(360deg)}}";
+  document.head.appendChild(style);
+
+  $("h-run").addEventListener("click", run);
+  ["h-mode","h-cancel"].forEach(id => $(id).addEventListener("change", run));
+  run();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Streams — Redis</title>
+<meta name="description" content="An append-only log with consumer groups, acknowledgements and replay — the type to reach for when pub/sub is not enough.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 06 · The structures</div>
+    <h1>Streams</h1>
+    <p class="standfirst">An append-only log with consumer groups, per-message acknowledgement and recovery of abandoned work. It is the answer to every "but what if the worker crashes" left hanging by lists and pub/sub, and it is the most complex type Redis has.</p>
+    <div class="chap-meta">
+      <span class="tagpill">xadd</span>
+      <span class="tagpill">consumer groups</span>
+      <span class="tagpill">pending</span>
+      <span class="tagpill">trimming</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The log</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">append, and read by range</span><button class="copy">Copy</button></div>
+<pre><code>XADD events * type "click" user "u41" page "/pricing"
+# "1741946400123-0"
+#   ^ the ID: milliseconds-sequence. The * asks Redis to generate it.
+
+# IDs are monotonically increasing and unique. The sequence number
+# disambiguates entries added in the same millisecond, so you can add
+# millions per second without collision.
+
+XLEN   events
+XRANGE events - +                       # everything. - and + are the extremes
+XRANGE events 1741946400000 + COUNT 10  # from a timestamp
+XREVRANGE events + - COUNT 1            # the most recent entry
+XDEL   events 1741946400123-0           # rarely needed
+
+# Each entry is a set of field-value pairs — a small flat record, not a blob.
+XRANGE events - + COUNT 1
+# 1) 1) "1741946400123-0"
+#    2) 1) "type"  2) "click"  3) "user"  4) "u41"
+
+# READING AS A CONSUMER, without a group — like tail -f:
+XREAD COUNT 10 STREAMS events 0            # from the beginning
+XREAD BLOCK 0 STREAMS events $             # $ = only NEW entries, blocking
+XREAD BLOCK 5000 STREAMS events 1741946400123-0   # after a specific ID
+
+# This is already better than pub/sub: the data persists, so a consumer that
+# reconnects can resume from the last ID it saw rather than losing whatever
+# arrived while it was away (chapter 11). What it still lacks is any notion
+# of which consumer has handled what — that is a consumer group.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Consumer groups</h2>
+
+<div class="demo" id="cg">
+  <div class="demo-head">
+    <b>The lifecycle of a message</b>
+    <span>Step through what happens to one entry as workers read, acknowledge, crash and recover.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="c-step">Step — <span id="c-stepv">1</span> of 7</label>
+        <input type="range" id="c-step" min="1" max="7" step="1" value="1">
+      </div>
+    </div>
+    <div id="c-state"></div>
+    <div class="stat">
+      <div><b id="c-where">—</b><span>message is</span></div>
+      <div><b id="c-pel">—</b><span>in the PEL</span></div>
+      <div><b id="c-risk">—</b><span>if everything crashes now</span></div>
+    </div>
+    <div id="c-cmd"></div>
+    <div class="out" id="c-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">creating and consuming</span><button class="copy">Copy</button></div>
+<pre><code>XGROUP CREATE events processors $ MKSTREAM
+#   $        start from new messages only
+#   0        start from the beginning of the stream
+#   MKSTREAM create the stream if it does not exist
+
+# Each consumer names itself. The group hands each message to exactly ONE
+# consumer in the group.
+XREADGROUP GROUP processors worker-3 COUNT 10 BLOCK 5000 STREAMS events >
+#   >  means "messages never delivered to anyone in this group"
+#   0  means "messages already delivered to ME and not yet acknowledged"
+#      — i.e. my own pending entries, for recovery after a restart
+
+# ... process ...
+XACK events processors 1741946400123-0
+
+# THE PENDING ENTRIES LIST is the whole point. When XREADGROUP hands a
+# message to a consumer, the message enters that consumer's PEL and stays
+# there until it is acknowledged. If the consumer dies, the message is still
+# recorded as owed — nothing is lost and nothing is silently redelivered.
+
+XPENDING events processors                       # a summary
+XPENDING events processors - + 10                # the ten oldest, in detail
+# 1) 1) "1741946400123-0"
+#    2) "worker-3"          <- who has it
+#    3) (integer) 421000    <- idle time in ms
+#    4) (integer) 1         <- delivery attempts
+
+# RECLAIMING abandoned work — the command that makes this reliable:
+XAUTOCLAIM events processors worker-9 60000 0 COUNT 10
+#   take up to 10 messages idle for more than 60 seconds and reassign them
+#   to worker-9. Returns a cursor for iteration.
+
+XCLAIM events processors worker-9 60000 1741946400123-0   # one specific ID
+
+# XAUTOCLAIM (6.2+) is what a background reaper runs on a timer. It replaces
+# the "detect dead workers and move their processing list back" machinery
+# that chapter 4's list queue requires you to build yourself.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">The pending entries list is what you are actually buying</span>
+  <p>Everything else in a stream — the ordering, the persistence, the ranges — a sorted set could approximate. What it cannot give you is a server-side record of <b>which consumer was handed which message, when, and how many times</b>, surviving the consumer's death. That record is why a stream can guarantee at-least-once delivery: a message is not gone when it is read, only when it is acknowledged, and anything left unacknowledged for too long can be reclaimed by a healthy worker. Chapter 4's reliable-list pattern is an attempt to rebuild exactly this, badly.</p>
+</div>
+
+<h2><span class="h-rule"></span>Poison messages</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">a message that kills every worker that touches it</span><button class="copy">Copy</button></div>
+<pre><code># XAUTOCLAIM redelivers indefinitely. A malformed message that crashes the
+# consumer is therefore reclaimed, crashes the next worker, is reclaimed
+# again — a loop that takes down the whole pool one worker at a time.
+
+# The delivery counter is how you detect it:
+XPENDING events processors - + 10
+#    4) (integer) 47        <- delivered 47 times. This is poison.
+
+# So the reaper must check the count and divert, not just reclaim:
+EVAL "
+  local claimed = redis.call('XAUTOCLAIM', KEYS[1], ARGV[1], ARGV[2], 60000, '0', 'COUNT', 10)
+  -- inspect delivery counts via XPENDING and route the repeat offenders
+" ...
+
+# In practice: read XPENDING with IDLE, and for anything above a threshold
+XADD  events:dead * original_id "1741946400123-0" reason "max-deliveries"
+XACK  events processors 1741946400123-0
+# acknowledge it out of the live group and deal with it separately.
+
+# A dead-letter stream is not built in. XAUTOCLAIM has a JUSTID option and
+# increments the counter, and deciding what "too many" means and where those
+# messages go is yours. Every production stream consumer needs this and it is
+# the piece most often missing.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Trimming</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">a stream grows forever unless you bound it</span><button class="copy">Copy</button></div>
+<pre><code># Cap on write, which is the only reliable way:
+XADD events MAXLEN ~ 100000 * type "click" user "u41"
+#   ~  APPROXIMATE — trims to at least this many, at a node boundary.
+#      Much cheaper, and the right default
+#   =  exact. O(N) in what it removes
+
+XADD events MINID ~ 1741860000000 * ...      # trim by ID/time instead (6.2+)
+
+# Explicit trimming:
+XTRIM events MAXLEN ~ 100000
+XTRIM events MINID  ~ 1741860000000
+XTRIM events MAXLEN ~ 100000 LIMIT 1000      # bound the work per call
+
+# THE TRAP: trimming removes entries whether or not they have been
+# acknowledged. A slow consumer group can have its unread messages deleted
+# out from underneath it, and the PEL then references entries that no longer
+# exist.
+#
+# So size the cap for your worst consumer lag, not your average, and monitor
+# it. XINFO GROUPS gives you the number that matters:
+XINFO GROUPS events
+#   name, consumers, pending, last-delivered-id, ENTRIES-READ, LAG
+#
+# `lag` is how many entries the group has not yet read. Alert on it.
+
+XINFO STREAM events
+XINFO STREAM events FULL              # includes the full PEL
+XINFO CONSUMERS events processors     # per consumer: pending, idle time
+
+# Consumers are not cleaned up automatically. A worker that scales down
+# leaves a consumer entry behind forever:
+XGROUP DELCONSUMER events processors worker-3
+# — and note this DISCARDS its pending entries, so claim them first.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Trimming and acknowledgement are unrelated</span>
+  <p>This surprises people coming from Kafka, where retention interacts with consumer offsets. In Redis they are entirely independent: <code>MAXLEN</code> removes the oldest entries on a length rule, with no regard for whether any group has read or acknowledged them. A consumer group that falls an hour behind on a stream capped at 100,000 entries simply loses the messages that fell off the end — no error, no warning, and the <code>lag</code> figure quietly resets. <b>Cap the stream generously, alert on group lag, and treat lag approaching the cap as an incident rather than a metric.</b></p>
+</div>
+
+<h2><span class="h-rule"></span>Streams against the alternatives</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th>Pub/Sub</th><th>List queue</th><th>Stream</th></tr></thead>
+<tbody>
+<tr><td>Persistence</td><td>None</td><td>Until popped</td><td><b>Until trimmed</b></td></tr>
+<tr><td>Late subscriber sees history</td><td>No</td><td>No</td><td><b>Yes</b></td></tr>
+<tr><td>Acknowledgement</td><td>No</td><td>No</td><td><b>Yes</b></td></tr>
+<tr><td>Recover a crashed worker's message</td><td>No</td><td>Build it yourself</td><td><b><code>XAUTOCLAIM</code></b></td></tr>
+<tr><td>Several independent consumer groups</td><td>Every subscriber gets all</td><td>No</td><td><b>Yes</b></td></tr>
+<tr><td>Work split across a pool</td><td>No</td><td>Yes</td><td><b>Yes</b></td></tr>
+<tr><td>Delivery</td><td>At most once</td><td>At most once</td><td><b>At least once</b></td></tr>
+<tr><td>Memory cost</td><td>Zero</td><td>Per queued item</td><td>Per retained entry</td></tr>
+<tr><td>Complexity</td><td>Trivial</td><td>Low</td><td><b>Real</b></td></tr>
+</tbody>
+</table>
+<caption>Streams cost more to operate than either alternative. Pay it when losing a message matters.</caption>
+</div>
+
+<h2><span class="h-rule"></span>A consumer that works</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">the shape worth copying</span><button class="copy">Copy</button></div>
+<pre><code>GROUP, ME = "processors", f"worker-{os.getpid()}"
+
+try:
+    r.xgroup_create("events", GROUP, id="$", mkstream=True)
+except ResponseError:
+    pass                                    # BUSYGROUP — already exists
+
+# 1. On startup, reclaim anything THIS consumer left pending from a previous
+#    life. '0' means "my own pending entries", not new ones.
+pending = r.xreadgroup(GROUP, ME, {"events": "0"}, count=100)
+for _, entries in pending:
+    for msg_id, fields in entries:
+        handle(msg_id, fields)              # MUST be idempotent
+        r.xack("events", GROUP, msg_id)
+
+# 2. Then the normal loop.
+while True:
+    resp = r.xreadgroup(GROUP, ME, {"events": ">"}, count=10, block=5000)
+    if not resp:
+        # 3. Idle time is when a reaper reclaims abandoned work.
+        claimed = r.xautoclaim("events", GROUP, ME, min_idle_time=60000,
+                               start_id="0-0", count=10)
+        for msg_id, fields in claimed[1]:
+            if delivery_count(msg_id) > 5:
+                dead_letter(msg_id, fields)
+                r.xack("events", GROUP, msg_id)
+            else:
+                handle(msg_id, fields)
+                r.xack("events", GROUP, msg_id)
+        continue
+
+    for _, entries in resp:
+        for msg_id, fields in entries:
+            try:
+                handle(msg_id, fields)
+                r.xack("events", GROUP, msg_id)   # ACK AFTER, never before
+            except Exception:
+                log.exception(msg_id)              # leave it pending;
+                                                   # it will be reclaimed
+
+# The five things that make this correct:
+#   * reclaim your OWN pending entries on startup, or a restart strands them
+#   * ACK after the work, not before — at-least-once, not at-most-once
+#   * an idempotent handler, because at-least-once means duplicates
+#   * a reaper for other consumers' abandoned messages
+#   * a delivery-count check and a dead-letter path, or one poison message
+#     takes down the pool</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Redis streams are not Kafka</span>
+  <p>They look similar and the differences decide whether this is the right tool. Streams live in memory, so retention is bounded by RAM rather than disk — days of high-volume events is a different proposition from Kafka's weeks. There is no partitioning within a stream, so one stream's throughput is one thread's throughput; you shard by using several stream keys and hashing to them yourself. There is no log compaction, no exactly-once semantics, no consumer rebalancing protocol, and no broker-side schema handling. <b>What you get instead is that it is already running.</b> For hundreds of thousands of events a day with a handful of consumers, a stream is an afternoon's work against a Kafka cluster's ongoing operational cost — and at ten million events an hour with a week of retention, that trade reverses.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>An <b>append-only log</b> with time-ordered IDs, readable by range and replayable from any point.</li>
+    <li><b>Consumer groups split work</b> across a pool, with each message going to exactly one consumer.</li>
+    <li><b>The pending entries list is what you are buying</b> — a server-side record of who holds what, surviving their death.</li>
+    <li><b><code>XAUTOCLAIM</code> reclaims abandoned messages</b>, replacing the reaper a list queue makes you build.</li>
+    <li><b>ACK after the work, never before.</b> At-least-once means handlers must be idempotent.</li>
+    <li><b>Check the delivery count and dead-letter poison messages</b>, or one bad entry takes down every worker in turn.</li>
+    <li><b>Trimming ignores acknowledgement.</b> A slow group loses messages off the end silently — alert on <code>lag</code>.</li>
+    <li><b>Not Kafka.</b> Memory-bound retention, no partitioning, no compaction — and already running.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("06-streams.html");
+
+(function(){
+  const root = document.getElementById("cg");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const STEPS = [
+    {
+      title:"Producer appends", where:"in the stream", pel:"no", risk:"nothing lost",
+      stream:["1741946400123-0  type=click user=u41"], pelRows:[], consumers:[],
+      cmd:'XADD events * type "click" user "u41"\n# "1741946400123-0"',
+      note:"The entry is in the stream with a monotonic ID of milliseconds-sequence. It is durable to whatever extent your persistence configuration makes it durable (chapter 13), and it will stay there until trimming removes it — regardless of whether anyone reads it.\n\nThat is already the first difference from pub/sub, where a message with no current subscriber simply evaporates. Here a consumer that starts tomorrow can still read this entry."
+    },
+    {
+      title:"Group created", where:"in the stream", pel:"no", risk:"nothing lost",
+      stream:["1741946400123-0  type=click user=u41"], pelRows:[], consumers:["worker-3 (idle)"],
+      cmd:'XGROUP CREATE events processors $ MKSTREAM\n\n# $ = deliver only NEW messages from here on\n# 0 = deliver the whole history to this group',
+      note:"A consumer group is a cursor plus a bookkeeping structure, created on the stream. Several groups can exist on one stream independently — each gets every message, and within a group each message goes to exactly one consumer.\n\nThat combination is what pub/sub and list queues each provide only half of: pub/sub fans out to every subscriber but cannot split work, a list splits work but cannot fan out.\n\nNote the starting position. $ means this group only sees messages added after creation, which is usually right for a new consumer joining a live system. 0 replays the entire retained history, which is what you want when adding a projector that must process everything."
+    },
+    {
+      title:"Worker reads", where:"delivered to worker-3", pel:"YES", risk:"reclaimable",
+      stream:["1741946400123-0  type=click user=u41"],
+      pelRows:[["1741946400123-0","worker-3","0 ms","1"]], consumers:["worker-3 (processing)"],
+      cmd:'XREADGROUP GROUP processors worker-3 \\\n  COUNT 10 BLOCK 5000 STREAMS events >\n\n# > = messages never delivered to anyone in this group',
+      note:"This is the moment that distinguishes a stream from every other Redis structure. The message has been handed to worker-3 and it is STILL IN THE STREAM — reading does not remove it.\n\nInstead an entry appears in the pending entries list: message ID, owning consumer, idle time, delivery count. Redis now knows that worker-3 owes an acknowledgement for this message.\n\nCompare with LPOP on a list: the item leaves Redis entirely, and if the worker dies a millisecond later there is no record that it ever existed. Here the record survives the worker."
+    },
+    {
+      title:"Worker crashes", where:"still pending", pel:"YES", risk:"reclaimable",
+      stream:["1741946400123-0  type=click user=u41"],
+      pelRows:[["1741946400123-0","worker-3","74,000 ms","1"]], consumers:["worker-3 (DEAD)"],
+      cmd:'# worker-3 is gone. Nothing was acknowledged.\n\nXPENDING events processors - + 10\n# 1) 1) "1741946400123-0"\n#    2) "worker-3"\n#    3) (integer) 74000     <- idle 74 seconds\n#    4) (integer) 1',
+      note:"Nothing has been lost. The PEL still records that worker-3 was handed this message and never acknowledged it, and the idle time is climbing.\n\nThis is the failure a list queue handles badly. With BRPOP the item is simply gone. With the BLMOVE-to-a-processing-list pattern the item is recoverable, and only if you built a reaper that knows which workers are dead and which processing lists belong to them — which is real code that most implementations skip.\n\nHere the server tracks it. The idle time is the signal, and no knowledge of worker liveness is required: a message idle for longer than the work should take is, by definition, one that needs reclaiming."
+    },
+    {
+      title:"Reaper reclaims", where:"delivered to worker-9", pel:"YES", risk:"reclaimable",
+      stream:["1741946400123-0  type=click user=u41"],
+      pelRows:[["1741946400123-0","worker-9","0 ms","2"]], consumers:["worker-9 (processing)"],
+      cmd:'XAUTOCLAIM events processors worker-9 60000 0 COUNT 10\n\n# reassign anything idle > 60s to worker-9',
+      note:"XAUTOCLAIM transfers ownership of messages idle beyond a threshold. worker-9 now owns it and the delivery count has incremented to 2.\n\nThat counter is the poison-message defence. A message that crashes whatever processes it will be reclaimed repeatedly, and without a check it takes down the entire worker pool one at a time. Read the count in XPENDING and divert anything above a threshold to a dead-letter stream, then XACK it out of the live group.\n\nNote XAUTOCLAIM returns a cursor, so a reaper iterates rather than processing everything at once. Run it during idle periods in the normal consumer loop, or as a separate process on a timer."
+    },
+    {
+      title:"Worker acknowledges", where:"in the stream", pel:"no", risk:"nothing owed",
+      stream:["1741946400123-0  type=click user=u41"], pelRows:[], consumers:["worker-9 (idle)"],
+      cmd:'# ... work completed successfully ...\nXACK events processors 1741946400123-0\n# (integer) 1',
+      note:"The PEL entry is removed and the message is no longer owed by anyone. It remains in the stream — acknowledgement is per group, so a second consumer group reading the same stream is completely unaffected.\n\nThe ordering matters: acknowledge AFTER the work, never before. Acking first turns at-least-once into at-most-once, and a crash between the ack and the work loses it silently.\n\nBecause the work may be done more than once — a crash after completing but before acking means the message is reclaimed and redone — handlers must be idempotent. That is the same requirement as MongoDB's change streams and Redis's own retry semantics, and for the same reason."
+    },
+    {
+      title:"Trimming removes it", where:"gone", pel:"no", risk:"unreadable",
+      stream:[], pelRows:[], consumers:["worker-9 (idle)"],
+      cmd:'XADD events MAXLEN ~ 100000 * type "click" ...\n\n# or explicitly\nXTRIM events MINID ~ 1741860000000',
+      note:"Eventually trimming removes the entry. The stream is bounded by the cap, not by consumption.\n\nThis is the part that catches people coming from Kafka, where retention and consumer offsets interact. In Redis they are completely independent: MAXLEN removes the oldest entries on a length rule with no regard for whether any group has read them.\n\nSo a consumer group that falls behind on a stream capped at 100,000 entries loses whatever falls off the end. No error, no warning, and the group's lag figure quietly resets as though nothing happened.\n\nUse ~ for approximate trimming — it stops at a node boundary and is far cheaper than exact. Cap generously for your WORST consumer lag rather than your average, and alert on the lag field from XINFO GROUPS. Lag approaching the cap is an incident, not a metric."
+    }
+  ];
+
+  function render(){
+    const i = parseInt($("c-step").value, 10) - 1;
+    const s = STEPS[i];
+    $("c-stepv").textContent = i + 1;
+
+    let html = '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin:16px 0 8px">' + s.title + '</div>';
+
+    html += '<div style="background:#fff;border:1px solid #E1E7EC;border-radius:5px;padding:11px 13px;margin-bottom:8px">' +
+      '<div style="font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:#8FA0AF;margin-bottom:6px">Stream</div>' +
+      (s.stream.length
+        ? s.stream.map(e => '<div style="font-family:var(--mono);font-size:11.5px;color:#0F7A85">' + e + '</div>').join("")
+        : '<div style="font-family:var(--mono);font-size:11.5px;color:#B4C0CA">(trimmed — empty)</div>') +
+      '</div>';
+
+    html += '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid ' +
+      (s.pelRows.length ? "#F2A03D" : "#CFD8E0") + ';border-radius:5px;padding:11px 13px;margin-bottom:8px">' +
+      '<div style="font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:#8FA0AF;margin-bottom:6px">' +
+      'Pending entries list</div>' +
+      (s.pelRows.length
+        ? '<div style="font-family:var(--mono);font-size:11px;color:#8FA0AF;margin-bottom:3px">' +
+          'id'.padEnd(22) + 'consumer'.padEnd(12) + 'idle'.padEnd(12) + 'delivered</div>' +
+          s.pelRows.map(r => '<div style="font-family:var(--mono);font-size:11.5px;color:#B0762A">' +
+            r[0].padEnd(22) + r[1].padEnd(12) + r[2].padEnd(12) + r[3] + '</div>').join("")
+        : '<div style="font-family:var(--mono);font-size:11.5px;color:#B4C0CA">(empty — nothing owed)</div>') +
+      '</div>';
+
+    html += '<div style="background:#fff;border:1px solid #E1E7EC;border-radius:5px;padding:11px 13px">' +
+      '<div style="font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:#8FA0AF;margin-bottom:6px">Consumers</div>' +
+      (s.consumers.length
+        ? s.consumers.map(c => '<div style="font-family:var(--mono);font-size:11.5px;color:' +
+            (c.includes("DEAD") ? "#B0453B" : "#54677A") + '">' + c + '</div>').join("")
+        : '<div style="font-family:var(--mono);font-size:11.5px;color:#B4C0CA">(none)</div>') +
+      '</div>';
+
+    $("c-state").innerHTML = html;
+    $("c-where").textContent = s.where;
+    $("c-pel").textContent   = s.pel;
+    $("c-risk").textContent  = s.risk;
+
+    $("c-cmd").innerHTML =
+      '<pre style="background:#0C1D30;color:#CFE0EC;border-radius:5px;padding:11px 13px;margin:14px 0 12px;' +
+      'font-family:var(--mono);font-size:12px;line-height:1.65;overflow-x:auto">' +
+      s.cmd.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>';
+
+    $("c-note").textContent = s.note;
+  }
+
+  $("c-step").addEventListener("input", render);
+  render();
+})();
+</script>
+</body>
+</html>

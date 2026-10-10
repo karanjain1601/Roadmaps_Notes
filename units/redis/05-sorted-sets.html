@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Sorted sets — Redis</title>
+<meta name="description" content="The type with no real equivalent in any other database, and the one that quietly solves leaderboards, priority queues, rate limits and time-ordered indexes.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 05 · The structures</div>
+    <h1>Sorted sets</h1>
+    <p class="standfirst">A set where every member carries a numeric score, kept permanently in score order. It sounds narrow and it is the most versatile structure Redis has — leaderboards, priority queues, sliding-window rate limiters, secondary indexes and scheduled work are all the same type wearing different scores.</p>
+    <div class="chap-meta">
+      <span class="tagpill">zset</span>
+      <span class="tagpill">ranges</span>
+      <span class="tagpill">rank</span>
+      <span class="tagpill">skip list</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>What it is</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">unique members, ordered by a score you control</span><button class="copy">Copy</button></div>
+<pre><code>ZADD leaderboard 4820 "u41" 3100 "u9" 5940 "u7"
+
+ZSCORE   leaderboard "u41"          # 4820          O(1)
+ZINCRBY  leaderboard 10 "u41"       # 4830, atomic  O(log N)
+ZRANK    leaderboard "u41"          # 1 — position, lowest first
+ZREVRANK leaderboard "u41"          # 1 — highest first
+ZCARD    leaderboard                # 3             O(1)
+ZCOUNT   leaderboard 4000 6000      # how many in a score range
+
+# Members are UNIQUE, like a set. ZADD on an existing member updates its
+# score rather than adding a duplicate — which is what makes a leaderboard
+# work without any deduplication logic.
+#
+# Ties are broken by lexicographic order of the member, so ordering is
+# deterministic and stable across calls. That matters more than it sounds:
+# pagination over a leaderboard with tied scores does not skip or repeat.
+
+# Internally: a hash table (member -> score, giving O(1) ZSCORE) plus a
+# SKIP LIST (ordered by score, giving O(log N) insert and range queries).
+# Two structures kept in step, which is why a sorted set costs roughly twice
+# what a plain set does per member.
+#
+# Small ones use the listpack encoding instead (chapter 4):
+OBJECT ENCODING leaderboard         # "listpack" or "skiplist"</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Ranges</h2>
+
+<div class="demo" id="zr">
+  <div class="demo-head">
+    <b>Range queries, against real data</b>
+    <span>Three coordinate systems — rank, score and lexicographic. Pick a query and see what it returns.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="z-q">Query</label>
+        <select id="z-q">
+          <option value="top" selected>ZREVRANGE board 0 4 WITHSCORES</option>
+          <option value="rank">ZRANGE board 0 4 WITHSCORES</option>
+          <option value="score">ZRANGEBYSCORE board 3000 5000</option>
+          <option value="exclusive">ZRANGEBYSCORE board (3000 +inf</option>
+          <option value="limit">ZRANGEBYSCORE board -inf +inf LIMIT 2 3</option>
+          <option value="around">Rank of u9, plus neighbours</option>
+          <option value="count">ZCOUNT board 3000 5000</option>
+          <option value="remove">ZREMRANGEBYSCORE board -inf 3000</option>
+        </select>
+      </div>
+    </div>
+    <div id="z-set"></div>
+    <div class="stat">
+      <div><b id="z-n">—</b><span>returned</span></div>
+      <div><b id="z-big">—</b><span>complexity</span></div>
+      <div><b id="z-use">—</b><span>used for</span></div>
+    </div>
+    <div class="out" id="z-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the range commands</span><button class="copy">Copy</button></div>
+<pre><code># BY RANK — position in the ordering. 0-based, negative counts from the end.
+ZRANGE    leaderboard 0 9 WITHSCORES      # lowest ten
+ZRANGE    leaderboard 0 -1                # everything. O(N) — careful
+ZREVRANGE leaderboard 0 9 WITHSCORES      # top ten
+
+# BY SCORE — the useful one.
+ZRANGEBYSCORE leaderboard 3000 5000
+ZRANGEBYSCORE leaderboard (3000 +inf      # ( makes the bound EXCLUSIVE
+ZRANGEBYSCORE leaderboard -inf +inf LIMIT 20 10   # offset, count
+ZREVRANGEBYSCORE leaderboard +inf 3000
+
+# 6.2 unified all of these into ZRANGE with an argument. Both forms work;
+# the older ones are clearer to read and are not going away:
+ZRANGE leaderboard 3000 5000 BYSCORE
+ZRANGE leaderboard "+inf" "-inf" BYSCORE REV LIMIT 0 10
+ZRANGESTORE dest leaderboard 0 9          # store the result (6.2+)
+
+# BY LEX — when every member has the SAME score, ordering falls back to
+# lexicographic and you can range over the member strings themselves.
+ZADD autocomplete 0 "redis" 0 "redisearch" 0 "relational"
+ZRANGEBYLEX autocomplete "[red" "[red\xff"
+#   [ = inclusive, ( = exclusive, - = minimum, + = maximum
+# This is a prefix index. It is how autocomplete is built on Redis.
+
+# POPPING — take the extremes, atomically.
+ZPOPMIN leaderboard          # lowest-scored member, and remove it
+ZPOPMAX leaderboard 3        # highest three
+BZPOPMIN queue 0             # BLOCKING — a priority queue with no polling
+ZMPOP 2 q1 q2 MIN            # from the first non-empty (7.0+)
+
+# BULK REMOVAL — how a sorted set stays bounded.
+ZREMRANGEBYSCORE window -inf 1741946340   # everything older than a cutoff
+ZREMRANGEBYRANK leaderboard 0 -1001       # keep only the top 1000</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Score-range plus LIMIT is the pattern to internalise</span>
+  <p><code>ZRANGEBYSCORE key min max LIMIT offset count</code> is O(log N + M) — logarithmic to find the start of the range, then linear in what you actually return. It does not touch the rest of the set. That single property is why a sorted set works as a scheduler (<code>score = due time</code>, take everything up to now), a sliding-window rate limiter (<code>score = timestamp</code>, count what is in the window), a paginated feed (<code>score = created at</code>, take the next twenty) and a priority queue (<code>score = priority</code>, pop the minimum) — the same command with a different meaning attached to the score.</p>
+</div>
+
+<h2><span class="h-rule"></span>Five things this type does</h2>
+
+<h3>Leaderboards</h3>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the obvious one, done correctly</span><button class="copy">Copy</button></div>
+<pre><code>ZINCRBY leaderboard:2026-03 50 "u41"        # award points, atomically
+ZREVRANGE leaderboard:2026-03 0 9 WITHSCORES    # top ten
+ZREVRANK  leaderboard:2026-03 "u41"             # "you are #1,204"
+ZCARD     leaderboard:2026-03                   # total players
+
+# "Players around me" — the feature every leaderboard needs:
+rank=$(redis-cli ZREVRANK leaderboard:2026-03 u41)
+ZREVRANGE leaderboard:2026-03 $((rank-2)) $((rank+2)) WITHSCORES
+
+# Ties: members with equal scores are ordered lexicographically, so ranks are
+# stable and pagination is consistent. If you want ties broken by who got
+# there first, encode the timestamp into the score:
+#     score = points * 10^10 + (10^10 - epoch_seconds)
+# Careful — a double has 53 bits of integer precision, so composite scores
+# have a real ceiling. Above 2^53 you silently lose the low-order part, which
+# is exactly the tiebreak you encoded.
+
+# Keep it bounded — a leaderboard for every user who ever played is unbounded:
+ZREMRANGEBYRANK leaderboard:2026-03 0 -100001       # keep the top 100k</code></pre>
+</div>
+
+<h3>Time-ordered indexes and feeds</h3>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">score = timestamp</span><button class="copy">Copy</button></div>
+<pre><code>ZADD feed:u41 1741946400 "post:8842"
+ZREVRANGEBYSCORE feed:u41 +inf -inf LIMIT 0 20        # newest 20
+
+# Keyset pagination, exactly as in the SQL and MongoDB units — the next page
+# starts below the last score seen, so page 500 costs the same as page 1:
+ZREVRANGEBYSCORE feed:u41 (1741946400 -inf LIMIT 0 20
+
+# Retention by time, in one command:
+ZREMRANGEBYSCORE feed:u41 -inf $(date -d '30 days ago' +%s)
+
+# Compare with a list: a list can hold the same ids in the same order, and it
+# cannot answer "everything since this timestamp", cannot remove by age, and
+# cannot tell you an item's position. A sorted set can do all three because
+# the ordering key is a value rather than an accident of insertion.</code></pre>
+</div>
+
+<h3>Scheduled and delayed work</h3>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">score = when it should run</span><button class="copy">Copy</button></div>
+<pre><code>ZADD scheduled 1741950000 "send-reminder:8842"
+
+# A worker, polling once a second:
+ZRANGEBYSCORE scheduled -inf $(date +%s) LIMIT 0 100
+
+# The naive version has a race: two workers read the same due jobs and both
+# process them. Do the read and the removal atomically in Lua (chapter 8):
+EVAL "
+  local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 100)
+  if #due > 0 then redis.call('ZREM', KEYS[1], unpack(due)) end
+  return due
+" 1 scheduled $(date +%s)
+
+# This is a delayed-job queue in about ten lines, with no extra
+# infrastructure. It handles retries too: on failure, ZADD it back with a
+# score of now + backoff.
+#
+# What it does not handle is a worker crashing mid-job, since the item was
+# already removed. Move it to an in-flight sorted set scored by a deadline
+# instead of removing it, and reap entries whose deadline has passed — which
+# is the same reliable-queue argument as chapter 4, and the same conclusion:
+# if the work must not be lost, chapter 6's streams do this properly.</code></pre>
+</div>
+
+<h3>Sliding-window rate limiting</h3>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">score = request time</span><button class="copy">Copy</button></div>
+<pre><code># A precise sliding window: at most 100 requests in any rolling 60 seconds.
+now=$(date +%s%3N)
+MULTI
+  ZREMRANGEBYSCORE ratelimit:u41 -inf $((now - 60000))   # drop old
+  ZADD             ratelimit:u41 $now "$now-$RANDOM"     # record this one
+  ZCARD            ratelimit:u41                          # count the window
+  EXPIRE           ratelimit:u41 60
+EXEC
+# if ZCARD > 100, reject
+
+# The member must be unique per request — two requests in the same
+# millisecond would otherwise collapse into one member. A random suffix or a
+# request id does it.
+#
+# The cost is one entry per request in the window, so this is precise and
+# memory-hungry compared with a fixed-window counter. Chapter 10 compares
+# all four algorithms against the same traffic.</code></pre>
+</div>
+
+<h3>Secondary indexes</h3>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the range query Redis otherwise does not have</span><button class="copy">Copy</button></div>
+<pre><code># Redis has no WHERE (chapter 2). A sorted set gives you one axis of it.
+ZADD idx:product:price 2499 "TSH-001" 1250 "MUG-114"
+ZRANGEBYSCORE idx:product:price 1000 3000          # products £10-£30
+
+ZADD idx:user:lastseen 1741946400 "u41"
+ZRANGEBYSCORE idx:user:lastseen -inf $(date -d '90 days ago' +%s)  # dormant
+
+# COMBINING indexes — ZINTERSTORE does set algebra with score arithmetic:
+ZINTERSTORE tmp 2 idx:product:price idx:in-stock WEIGHTS 1 0
+ZRANGEBYSCORE tmp 1000 3000
+DEL tmp
+#   AGGREGATE SUM (default) | MIN | MAX
+#   WEIGHTS multiplies each input's scores before aggregating — the 0 here
+#   means "use in-stock only as a filter, keep the price as the score"
+ZUNIONSTORE / ZDIFFSTORE work the same way.
+ZINTERCARD 2 a b LIMIT 100      # just the count, stopping early (7.0+)
+
+# THE OBLIGATION: every index is a structure YOU maintain. Creating a
+# product means ZADD to every index it belongs in; deleting means ZREM from
+# each; changing a price means ZADD again with the new score. Miss one write
+# path and the index silently diverges from the truth.
+#
+# That is the trade. You get range queries in a system that has none, and you
+# take on the job a real database's index does for you. Worth it for one or
+# two hot access patterns; a sign you want a real database if you are
+# maintaining eight.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Scores are doubles, so large integers lose precision</span>
+  <p>A sorted-set score is an IEEE-754 double, which represents integers exactly only up to 2<sup>53</sup> — about 9×10<sup>15</sup>. Unix seconds and milliseconds are fine. Microseconds are fine. <b>Nanosecond timestamps are not</b>, and neither are composite scores that multiply a value by a large factor to encode a tiebreak. The failure is silent: two distinct scores compare equal, ordering becomes arbitrary within the collision, and pagination starts repeating or skipping items. If you need more than 53 bits of ordering, put the tiebreak in the member string and rely on lexicographic ordering within equal scores instead.</p>
+</div>
+
+<h2><span class="h-rule"></span>What it costs</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Operation</th><th>Complexity</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><code>ZADD</code>, <code>ZINCRBY</code>, <code>ZREM</code></td><td>O(log N)</td><td>Skip-list insert</td></tr>
+<tr><td><code>ZSCORE</code>, <code>ZCARD</code></td><td>O(1)</td><td>From the hash table</td></tr>
+<tr><td><code>ZRANK</code>, <code>ZREVRANK</code></td><td>O(log N)</td><td>Skip lists carry span counts</td></tr>
+<tr><td><code>ZCOUNT</code></td><td>O(log N)</td><td>Two rank lookups; does not walk the range</td></tr>
+<tr><td><code>ZRANGEBYSCORE</code></td><td>O(log N + M)</td><td><b>M is what you return.</b> Use <code>LIMIT</code></td></tr>
+<tr><td><code>ZRANGE 0 -1</code></td><td>O(N)</td><td>Everything. The command to avoid</td></tr>
+<tr><td><code>ZREMRANGEBY*</code></td><td>O(log N + M)</td><td>M is what is removed</td></tr>
+<tr><td><code>ZPOPMIN</code>, <code>ZPOPMAX</code></td><td>O(log N)</td><td></td></tr>
+<tr><td><code>ZINTERSTORE</code></td><td>O(N·K + M log M)</td><td>Expensive. Cache the result</td></tr>
+<tr><td>Memory per member</td><td>~60–100 bytes</td><td>Two structures. ~2× a plain set</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note tip">
+  <span class="note-t">When you cannot decide, it is probably a sorted set</span>
+  <p>The recurring shape: you have a list and need "everything since a timestamp", or a set and need ranking, or a hash and need "the top ten". A sorted set does all of those with one structure, at the cost of roughly twice the memory of a plain set and O(log N) writes instead of O(1) — which for anything below tens of millions of members is a difference you will not measure. <b>Reaching for a sorted set slightly too often is a much cheaper mistake than discovering three months in that your list cannot answer the question you now need.</b></p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Unique members, ordered by a <b>numeric score you control</b> — insertion order is not involved.</li>
+    <li><b><code>ZRANGEBYSCORE … LIMIT</code> is O(log N + M)</b> and is the pattern behind almost every use.</li>
+    <li>The same type is a <b>leaderboard, feed, scheduler, rate limiter and secondary index</b> — only the score's meaning changes.</li>
+    <li><b><code>ZINCRBY</code> is atomic</b>, so a leaderboard needs no locking and no read.</li>
+    <li><b>Ties break lexicographically</b>, so ranks are stable and pagination is consistent.</li>
+    <li><b><code>ZRANGEBYLEX</code> on equal scores</b> is a prefix index — this is how autocomplete is built.</li>
+    <li><b>Scores are doubles</b>: exact to 2<sup>53</sup>. Nanoseconds and composite scores overflow silently.</li>
+    <li><b>Every index is one you maintain.</b> Fine for two access patterns, a warning sign at eight.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("05-sorted-sets.html");
+
+(function(){
+  const root = document.getElementById("zr");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const SET = [
+    {m:"u12", s:1840}, {m:"u3", s:2650}, {m:"u9", s:3100},
+    {m:"u22", s:3100}, {m:"u41", s:4820}, {m:"u7", s:5940}, {m:"u5", s:7210}
+  ];
+  // sorted ascending by score, ties lexicographic
+  const asc = SET.slice().sort((a,b) => a.s - b.s || (a.m < b.m ? -1 : 1));
+
+  const Q = {
+    top: {
+      run: () => asc.slice().reverse().slice(0,5),
+      big:"O(log N + M)", use:"top ten",
+      note:"ZREVRANGE walks from the high end by RANK — position in the ordering, not score. Rank 0 is the highest-scored member.\n\nThe skip list carries span counts at each level, so jumping to a rank is logarithmic rather than a walk from the end. Returning five members then costs five steps.\n\nThis is the leaderboard query. Note WITHSCORES doubles the reply size, so omit it when you only need the ids."
+    },
+    rank: {
+      run: () => asc.slice(0,5),
+      big:"O(log N + M)", use:"lowest scores",
+      note:"The same operation from the other end. ZRANGE is ascending, ZREVRANGE descending, and rank indices are 0-based with negative values counting from the far end — so ZRANGE key 0 -1 is everything, which is the O(N) command to avoid on a large set.\n\nNotice u9 and u22 both score 3100. Ties break lexicographically by member, so u9 comes before u22 consistently on every call. That stability is what makes rank-based pagination safe: without it, two members with equal scores could swap between page requests and you would skip or repeat one."
+    },
+    score: {
+      run: () => asc.filter(x => x.s >= 3000 && x.s <= 5000),
+      big:"O(log N + M)", use:"a band of scores",
+      note:"By SCORE rather than rank, and this is the version that does most of the work in practice.\n\nBoth bounds are inclusive by default. The cost is logarithmic to locate the start of the range plus linear in what is actually returned — the rest of the set is never touched, however large it is.\n\nThat property is why the same command serves a scheduler (score = due time, range from -inf to now), a rate limiter (score = timestamp, range over the window) and a feed (score = created at, range below the last seen). Only the meaning of the score changes."
+    },
+    exclusive: {
+      run: () => asc.filter(x => x.s > 3000),
+      big:"O(log N + M)", use:"strictly greater",
+      note:"The ( prefix makes a bound exclusive, and +inf / -inf are the open ends.\n\nThe exclusive form is what makes keyset pagination correct. The next page starts strictly BELOW the last score you returned — (lastScore rather than lastScore — so the boundary item is not returned twice.\n\nWith ties, exclusive-by-score is not quite enough on its own, since several members share the boundary score. Either use rank-based paging within a tie, or make scores unique by construction.\n\nThe same syntax appears in ZCOUNT, ZREMRANGEBYSCORE and ZRANGEBYLEX, where [ and ( mean inclusive and exclusive."
+    },
+    limit: {
+      run: () => asc.slice(2,5),
+      big:"O(log N + M)", use:"pagination",
+      note:"LIMIT offset count, borrowed from SQL — and it carries the same warning as OFFSET does there.\n\nThe offset is walked, not skipped: LIMIT 100000 20 traverses a hundred thousand entries before returning twenty. On a large sorted set that is the same linear-cost pagination problem the SQL unit's chapter 14 and the MongoDB unit's chapter 4 both argue against.\n\nThe fix is identical: page by score rather than by offset. Remember the last score returned and start the next page at (lastScore with LIMIT 0 20. Constant time regardless of depth.\n\nLIMIT with a small offset — the first few pages — is perfectly fine."
+    },
+    around: {
+      run: () => {
+        const i = asc.slice().reverse().findIndex(x => x.m === "u9");
+        return asc.slice().reverse().slice(Math.max(0,i-2), i+3);
+      },
+      big:"O(log N + M)", use:"'players near you'",
+      note:"Two commands: ZREVRANK to find the member's position, then ZREVRANGE around it.\n\nThis is the feature every leaderboard needs and the one a list or a set cannot provide at all — you need both \"what position is this member in\" and \"who is at positions n-2 through n+2\", and only a sorted set answers both cheaply.\n\nZRANK is O(log N) because the skip list stores how many elements each forward pointer spans, so the rank accumulates as you descend rather than requiring a count.\n\nDo the two commands in a pipeline. They are not atomic together, so the rank could shift between them — for a leaderboard display that is entirely acceptable, and if it is not, a two-line Lua script makes it atomic (chapter 8)."
+    },
+    count: {
+      run: () => asc.filter(x => x.s >= 3000 && x.s <= 5000),
+      big:"O(log N)", use:"counting a window",
+      note:"ZCOUNT is O(log N) rather than O(log N + M) — it does not walk the range at all. It finds the rank of each bound and subtracts.\n\nSo counting how many members fall in a score band is nearly free regardless of how many are in it, which is exactly what a sliding-window rate limiter needs: remove the expired entries, add this request, count the window, decide. All logarithmic.\n\nZCARD is the same idea for the whole set and is O(1), since the count is maintained.\n\nThe corresponding trap: ZCOUNT is cheap, ZRANGEBYSCORE returning the same members is not. If you only need the number, do not fetch the members and count them in your application."
+    },
+    remove: {
+      run: () => asc.filter(x => x.s > 3000),
+      big:"O(log N + M)", use:"trimming",
+      note:"ZREMRANGEBYSCORE removes everything in a score range, and it is how a sorted set stays bounded.\n\nFor a time-scored structure this is retention in one command: everything older than a cutoff, gone. For a rate-limit window it is the eviction step. For a feed it is the thirty-day cleanup.\n\nThe result shown here is what REMAINS after removing scores up to 3000 — u12 and u3 are gone.\n\nThe complexity is in what is removed, so trimming incrementally is cheap and trimming a huge backlog at once is not. Pair the removal with the write, as with LTRIM in chapter 4, rather than letting the structure grow and cleaning up on a schedule.\n\nZREMRANGEBYRANK is the other form — ZREMRANGEBYRANK board 0 -100001 keeps the top hundred thousand and discards the rest."
+    }
+  };
+
+  function render(){
+    const k = $("z-q").value, q = Q[k];
+    const out = q.run();
+    const outSet = new Set(out.map(x => x.m));
+
+    $("z-set").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:16px 0 8px">' +
+      'The sorted set · ascending by score, ties lexicographic</div>' +
+      '<div style="display:flex;flex-direction:column;gap:4px">' +
+      asc.map((x, i) => {
+        const hit = outSet.has(x.m);
+        return '<div style="display:flex;align-items:center;gap:12px;background:' +
+          (hit ? "#EEFAFB" : "#fff") + ';border:1px solid ' + (hit ? "#25B7C4" : "#E1E7EC") +
+          ';border-left:3px solid ' + (hit ? "#25B7C4" : "#CFD8E0") +
+          ';border-radius:4px;padding:7px 12px;font-family:var(--mono);font-size:12px">' +
+          '<span style="color:#8FA0AF;min-width:56px">rank ' + i + '</span>' +
+          '<span style="font-weight:700;color:' + (hit ? "#0F7A85" : "#54677A") + ';min-width:44px">' + x.m + '</span>' +
+          '<span style="color:#54677A">score ' + x.s + '</span>' +
+          (hit ? '<span style="margin-left:auto;color:#0F7A85;font-weight:700">' +
+                 (k === "remove" ? "kept" : "returned") + '</span>' : '') +
+          '</div>';
+      }).join("") + '</div>';
+
+    $("z-n").textContent   = out.length + " of " + asc.length;
+    $("z-big").textContent = q.big;
+    $("z-use").textContent = q.use;
+    $("z-note").textContent = q.note;
+  }
+
+  $("z-q").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

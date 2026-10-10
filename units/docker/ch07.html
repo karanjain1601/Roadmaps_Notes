@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7 · Multi-stage builds and small images — Docker</title>
+<meta name="description" content="Multi-stage builds and the stage DAG, an honest comparison of alpine, slim, distroless and scratch, the musl versus glibc consequences, static builds, and the image slimming checklist.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Crect x='6' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='19' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='10' width='5' height='5' fill='%23fff'/%3E%3Cpath d='M4 22h22a5 5 0 004-4' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch07">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Docker
+    </a>
+    <div class="chno"><b>Chapter 7</b><span>Building images</span></div>
+    <h1>Multi-stage builds and small images</h1>
+    <p class="lede">A compiler, a package manager, header files and your source code are all things you need to <em>build</em> an application and none of them are things you need to <em>run</em> it. <b>Multi-stage builds separate the two</b>, and once they are separated the question of which base image to ship becomes interesting — with a real trade behind every megabyte you remove.</p>
+    <div class="meta"><span>26 min</span><span>2 demos</span><span>8 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="problem">
+      <h2 data-nav="The problem">What is in a naive image</h2>
+      <p class="sub">Mostly things you would be alarmed to find in production.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">a single-stage Dockerfile that works fine</span><button class="copy">Copy</button></div>
+<pre data-lang="dockerfile">FROM node:22
+WORKDIR /app
+COPY . .
+RUN npm ci &amp;&amp; npm run build
+CMD ["node", "dist/server.js"]</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>What ships</th><th>Needed at runtime?</th></tr></thead>
+          <tbody>
+            <tr><td>The full Debian base with a package manager and shell</td><td>Rarely</td></tr>
+            <tr><td>Development dependencies — test runners, type checkers, bundlers</td><td class="no">no</td></tr>
+            <tr><td>The TypeScript source alongside the compiled output</td><td class="no">no</td></tr>
+            <tr><td>Build toolchains pulled in by native modules — gcc, make, python3</td><td class="no">no</td></tr>
+            <tr><td>The npm cache, unless cleaned in the same layer (chapter 3)</td><td class="no">no</td></tr>
+            <tr><td><code>.git</code>, if there is no <code>.dockerignore</code></td><td class="no">no — and it is a disclosure risk</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Three separate costs follow. <strong>Transfer</strong>: every node pulls it on every deploy. <strong>Attack surface</strong>: every package is a package that can have a CVE, and a shell plus a package manager is what turns a code-execution bug into a foothold (chapter 18). <strong>Noise</strong>: a scanner reporting 240 vulnerabilities in build tooling you do not run makes it impossible to see the two that matter (chapter 17).</p>
+    </section>
+
+    <section id="multistage">
+      <h2 data-nav="Multi-stage builds">Multi-stage builds</h2>
+      <p class="sub">Several <code>FROM</code>s in one file. Only the last one ships.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">the same application, staged</span><button class="copy">Copy</button></div>
+<pre data-lang="dockerfile"># syntax=docker/dockerfile:1
+
+FROM node:22-alpine AS base
+WORKDIR /app
+
+FROM base AS deps
+COPY package*.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+
+FROM base AS prod-deps
+COPY package*.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
+
+FROM deps AS build
+COPY . .
+RUN npm run build
+
+FROM deps AS test
+COPY . .
+RUN npm test
+
+FROM base AS runtime
+ENV NODE_ENV=production
+COPY --from=prod-deps --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/dist ./dist
+USER node
+EXPOSE 3000
+CMD ["node", "dist/server.js"]</pre>
+      </div>
+      <p>Six stages, one shipped image. The runtime stage contains production dependencies and compiled output and nothing else — no source, no dev dependencies, no build toolchain. And because stages form a graph rather than a sequence, <strong>a stage nothing depends on is never built</strong>:</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Stage graph and <code>--target</code></h3>
+          <span class="hint">Which stages build, which are skipped, and what BuildKit runs in parallel</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:64px">--target</span>
+            <span id="s-targets" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl">
+            <label for="s-par" style="min-width:96px">parallelism <b id="s-parv">4</b></label>
+            <input type="range" id="s-par" min="1" max="6" value="4" style="width:120px">
+            <span class="sep"></span>
+            <button class="btn mono" id="s-legacy">legacy builder (no DAG)</button>
+          </div>
+          <div id="s-graph" style="overflow-x:auto;margin:4px 0 10px"></div>
+          <div class="term" id="s-term"></div>
+          <div class="rgrid" id="s-out"></div>
+          <p class="readout" id="s-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Form</th><th>Copies from</th></tr></thead>
+          <tbody>
+            <tr><td><code>COPY --from=build /app/dist ./dist</code></td><td>A named stage in this file</td></tr>
+            <tr><td><code>COPY --from=0 /out /out</code></td><td>A stage by index — works, but name them</td></tr>
+            <tr><td><code>COPY --from=nginx:alpine /etc/nginx/nginx.conf ./</code></td><td>Straight out of another <b>image</b>, no stage needed</td></tr>
+            <tr><td><code>docker build --target test .</code></td><td>Stops at that stage — the CI test entry point</td></tr>
+            <tr><td><code>docker build --target artifact -o type=local,dest=./out .</code></td><td>Exports files to the host instead of producing an image</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="tip">
+        <span class="lbl">A test stage costs a production build nothing</span>
+        <p>Because unreferenced stages are skipped, adding <code>AS test</code> and <code>AS lint</code> stages gives CI a single-command entry point (<code>docker build --target test .</code>) without adding a second to the image build — the demo above shows exactly which stages each target pulls in. It also means the tests run in an environment identical to the one that produced the artefact, which is the property a separate CI test job does not give you.</p>
+      </div>
+    </section>
+
+    <section id="bases">
+      <h2 data-nav="Choosing a base">Choosing a base image</h2>
+      <p class="sub">Every megabyte you remove takes a capability with it.</p>
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Base image chooser</h3>
+          <span class="hint">State what the runtime genuinely needs; the recommendation and its costs are derived</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:86px">language</span>
+            <span id="b-lang" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:86px">at runtime</span>
+            <span id="b-needs" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div id="b-result"></div>
+          <div class="rgrid" id="b-out"></div>
+          <p class="readout" id="b-note"></p>
+        </div>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Base</th><th>Roughly</th><th>Contains</th><th>Costs you</th></tr></thead>
+          <tbody>
+            <tr><td><code>debian:12</code></td><td>~120 MB</td><td>Full userland, apt, shell</td><td>Size, and a large CVE surface</td></tr>
+            <tr><td><code>debian:12-slim</code></td><td>~75 MB</td><td>Same minus docs and locales</td><td>Little — a sensible default</td></tr>
+            <tr><td><code>alpine:3.20</code></td><td>~8 MB</td><td>busybox, apk, <b>musl libc</b></td><td>musl compatibility — see below</td></tr>
+            <tr><td><code>distroless/base</code></td><td>~20 MB</td><td>glibc, libssl, CA certs, tzdata</td><td>No shell, no package manager</td></tr>
+            <tr><td><code>distroless/static</code></td><td>~2 MB</td><td>CA certs, tzdata, <code>/etc/passwd</code></td><td>Static binaries only</td></tr>
+            <tr><td><code>scratch</code></td><td>0 bytes</td><td>Nothing at all</td><td>You supply certs, timezones, users, everything</td></tr>
+            <tr><td>Wolfi / Chainguard</td><td>~10–20 MB</td><td>glibc, apk, frequently rebuilt</td><td>A different ecosystem to learn</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="sub" style="margin-top:-4px">Sizes are approximate and move with every release — check with <code>docker images</code> rather than trusting a table, including this one.</p>
+    </section>
+
+    <section id="musl">
+      <h2 data-nav="The musl question">Alpine, musl, and the cost nobody mentions</h2>
+      <p class="sub">Alpine is not simply a smaller Debian.</p>
+      <p>Alpine uses <strong>musl</strong> rather than glibc. It is a legitimate, standards-conformant C library, and it is a different one — which matters because the pre-built binaries the ecosystem ships are usually compiled against glibc:</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Effect</th><th>What happens</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Python wheels</strong></td><td>PyPI's <code>manylinux</code> wheels are glibc. On Alpine, pip needs <code>musllinux</code> wheels or it <b>compiles from source</b> — turning a 20-second install into ten minutes plus a build toolchain</td></tr>
+            <tr><td><strong>Node native modules</strong></td><td>Prebuilt binaries often miss, so <code>node-gyp</code> runs and needs <code>python3</code>, <code>make</code> and <code>g++</code> in the image</td></tr>
+            <tr><td><strong>DNS resolution</strong></td><td>musl's resolver historically differs from glibc's over search domains and parallel queries; Kubernetes DNS setups have been bitten by it</td></tr>
+            <tr><td><strong>Allocation-heavy workloads</strong></td><td>musl's allocator has different performance characteristics; some workloads measurably regress</td></tr>
+            <tr><td><strong>Debugging tools</strong></td><td>Different <code>ldd</code>, different stack traces, different core-dump tooling than most guides assume</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="trap">
+        <span class="lbl">The Alpine Python trap, with numbers</span>
+        <p>A <code>python:3.12-alpine</code> image looks 90&nbsp;MB smaller than <code>python:3.12-slim</code>. Then a dependency without a <code>musllinux</code> wheel forces a source build, so the Dockerfile grows <code>gcc</code>, <code>musl-dev</code>, <code>libffi-dev</code> and friends — and either the final image is <em>bigger</em> than the slim one, or you need a multi-stage build to get rid of them again, with the added risk that a compiled-from-source extension behaves subtly differently. For Python, <strong><code>-slim</code> is usually the better default</strong>, and the size difference is not worth the build time. For Go and Rust the calculus flips entirely, because a static binary does not care what libc the base has.</p>
+      </div>
+    </section>
+
+    <section id="static">
+      <h2 data-nav="Static to scratch">Static binaries and <code>scratch</code></h2>
+      <p class="sub">Where the two-megabyte image is genuinely available.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">Go to a near-empty image</span><button class="copy">Copy</button></div>
+<pre data-lang="dockerfile"># syntax=docker/dockerfile:1
+
+FROM golang:1.23-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/server ./cmd/server
+
+FROM gcr.io/distroless/static:nonroot
+COPY --from=build /out/server /server
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/server"]</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>What <code>scratch</code> lacks</th><th>Symptom</th><th>Supply it with</th></tr></thead>
+          <tbody>
+            <tr><td>CA certificates</td><td>Every HTTPS call fails with a certificate error</td><td><code>COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/</code></td></tr>
+            <tr><td>Timezone data</td><td><code>UTC</code> only; local-time formatting breaks</td><td><code>COPY --from=build /usr/share/zoneinfo /usr/share/zoneinfo</code></td></tr>
+            <tr><td><code>/etc/passwd</code></td><td><code>USER app</code> fails; numeric UIDs still work</td><td>A crafted passwd file, or use <code>distroless/static:nonroot</code></td></tr>
+            <tr><td>A shell</td><td><code>docker exec sh</code> is impossible (chapter 19)</td><td>Nothing — use ephemeral debug containers instead</td></tr>
+            <tr><td><code>/tmp</code></td><td>Anything writing a temp file fails</td><td><code>--tmpfs /tmp</code>, or create it in the build</td></tr>
+            <tr><td>glibc</td><td>A dynamically linked binary exits immediately</td><td><code>CGO_ENABLED=0</code>, or use <code>distroless/base</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><code>CGO_ENABLED=0</code> is the line that makes this work for Go: it forces a pure-Go build with no dynamic linking, so the binary needs no libc at all. If you need cgo — SQLite, some crypto bindings, <code>os/user</code> — you need <code>distroless/base</code> or a static build against musl instead. For Rust, the equivalent is the <code>x86_64-unknown-linux-musl</code> target.</p>
+      <div class="key">
+        <span class="lbl">Prefer <code>distroless/static</code> over bare <code>scratch</code></span>
+        <p>It is about two megabytes and it already contains the CA certificates, timezone database and a non-root user entry that you would otherwise assemble by hand and get subtly wrong. <code>scratch</code> is the right answer when you genuinely want nothing, and the wrong answer when what you actually wanted was "very small".</p>
+      </div>
+    </section>
+
+    <section id="shrink">
+      <h2 data-nav="The slimming checklist">The slimming checklist</h2>
+      <p class="sub">In descending order of how much it usually saves.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Technique</th><th>Typically saves</th><th>Chapter</th></tr></thead>
+          <tbody>
+            <tr><td>Multi-stage: ship the artefact, not the toolchain</td><td>Hundreds of MB</td><td>this one</td></tr>
+            <tr><td>A smaller base — full → slim → distroless</td><td>50–100 MB</td><td>this one</td></tr>
+            <tr><td>Production-only dependencies (<code>--omit=dev</code>, <code>--no-dev</code>)</td><td>Tens to hundreds of MB</td><td>this one</td></tr>
+            <tr><td>Cleanup in the <em>same</em> <code>RUN</code></td><td>Tens of MB</td><td>3</td></tr>
+            <tr><td>Cache mounts, so caches are never layers</td><td>Tens of MB</td><td>6</td></tr>
+            <tr><td><code>--no-install-recommends</code></td><td>10–50 MB</td><td>this one</td></tr>
+            <tr><td><code>COPY --chown</code> instead of a later <code>chown -R</code></td><td>Whatever you copied, again</td><td>3</td></tr>
+            <tr><td><code>.dockerignore</code></td><td>Build time, cache hits, and disclosure risk</td><td>5, 6</td></tr>
+            <tr><td>Strip binaries (<code>-ldflags="-s -w"</code>, <code>strip</code>)</td><td>A few MB</td><td>this one</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">a worked before-and-after</span><button class="copy">Copy</button></div>
+<pre data-lang="text">node:22 single-stage, no .dockerignore, dev deps, npm cache      1.31 GB
+  + .dockerignore (drop .git and local node_modules)             1.24 GB
+  + node:22-slim base                                              412 MB
+  + multi-stage, ship only dist/ and node_modules                  268 MB
+  + npm ci --omit=dev in a prod-deps stage                         198 MB
+  + node:22-alpine base                                            126 MB
+  + cache mount for /root/.npm (cache never becomes a layer)       121 MB
+
+Indicative figures for one real application — yours will differ.
+The order matters: multi-stage first, because it makes the rest cheap.</pre>
+      </div>
+      <div class="note">
+        <span class="lbl">Two things that do not work as advertised</span>
+        <p><strong>Layer count is not size.</strong> Merging every <code>RUN</code> into one giant instruction to "reduce layers" makes the cache useless (chapter 6) and saves nothing, because size is the sum of the content, not a per-layer overhead. Combine instructions when they share a cleanup, not to hit a number. And <strong><code>--squash</code></strong> flattens history into one layer, which destroys layer sharing between images (chapter 3) — so the registry stores your base again for every image. It has been experimental for years; multi-stage builds are the supported answer.</p>
+      </div>
+    </section>
+
+    <section id="dockerignore">
+      <h2 data-nav=".dockerignore">.dockerignore, properly</h2>
+      <p class="sub">Three jobs, and only one of them is about speed.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Job</th><th>Effect</th></tr></thead>
+          <tbody>
+            <tr><td>Context size</td><td>Less to archive and transfer on every build (chapter 5)</td></tr>
+            <tr><td>Cache stability</td><td><code>COPY . .</code> stops being invalidated by <code>.git</code> or local build output (chapter 6)</td></tr>
+            <tr><td><strong>Disclosure</strong></td><td>A stray <code>COPY . .</code> cannot pull in <code>.env</code>, a private key or a <code>.npmrc</code> with a token</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">a .dockerignore worth starting from</span><button class="copy">Copy</button></div>
+<pre data-lang="text"># everything, then allow back what the build needs
+*
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+!public/</pre>
+      </div>
+      <p>That inverted form — exclude everything, then re-include explicitly — is stricter than a deny list and worth the extra thought on anything that handles credentials. A deny list silently ships whatever you forgot to name; an allow list fails the build instead, which is the failure you want.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">per-Dockerfile ignore files</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># Dockerfile.prod uses Dockerfile.prod.dockerignore if it exists,
+# otherwise it falls back to .dockerignore
+$ ls
+Dockerfile.prod  Dockerfile.prod.dockerignore  Dockerfile.dev  .dockerignore
+$ docker build -f Dockerfile.prod -t app:prod .</pre>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 7 in eight lines</h2>
+        <ul>
+          <li>Multi-stage builds ship the artefact and discard the toolchain — the single biggest size win, and it makes every other technique cheaper.</li>
+          <li>Stages form a <b>graph, not a sequence</b>: unreferenced stages are never built, and independent ones build in parallel.</li>
+          <li>So a <code>test</code> or <code>lint</code> stage costs a production build nothing, while giving CI one command that runs in the real build environment.</li>
+          <li><code>COPY --from=</code> takes a stage name, a stage index, or <b>any image</b>.</li>
+          <li>Base image sizes buy capabilities: slim loses docs, distroless loses the shell and package manager, scratch loses everything including CA certs.</li>
+          <li><b>Alpine means musl</b>, so prebuilt glibc wheels and native modules may compile from source — often making a Python image slower to build and no smaller.</li>
+          <li>For Go and Rust, a static binary (<code>CGO_ENABLED=0</code>) plus <code>distroless/static</code> gives a genuinely tiny image; prefer it to bare <code>scratch</code>.</li>
+          <li><b>Layer count is not size</b>, and <code>--squash</code> destroys layer sharing. Neither is a slimming technique.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary>Your Dockerfile has stages <code>base</code>, <code>deps</code>, <code>build</code>, <code>test</code>, <code>lint</code> and <code>runtime</code>. What does a plain <code>docker build .</code> build?</summary>
+        <div class="ans"><p>Only the stages the final one transitively depends on: <code>runtime</code>, plus whatever it copies from — typically <code>build</code>, and <code>deps</code> and <code>base</code> beneath it. <code>test</code> and <code>lint</code> are <b>not built at all</b>, because nothing references them. That is what makes them free to keep in the file, and it is why <code>docker build --target test .</code> is a good CI entry point: it builds the same <code>deps</code> layers the production build uses, so the tests run against the real dependency set. The demo above shows the dependency closure for each target.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A team switches a Python image from <code>slim</code> to <code>alpine</code>. The image is 40&nbsp;MB smaller and builds take eleven minutes instead of forty seconds. Explain.</summary>
+        <div class="ans"><p>Alpine uses musl, and PyPI's prebuilt wheels are mostly <code>manylinux</code> — compiled against glibc. Any dependency without a <code>musllinux</code> wheel is built from source, so pip is now invoking a compiler for packages that previously arrived as binaries; the Dockerfile also has to install <code>gcc</code> and the relevant <code>-dev</code> headers, which partly cancels the size saving. For Python, <code>-slim</code> is usually the better default. If Alpine is required, use a multi-stage build so the toolchain does not ship, and expect to maintain the list of build dependencies.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A Go binary works in <code>golang:alpine</code> and exits immediately with no output on <code>scratch</code>. Diagnose it.</summary>
+        <div class="ans"><p>It is dynamically linked and <code>scratch</code> has no libc, so the loader fails before <code>main</code> runs — which is why there is no output. It happens when cgo is enabled, either explicitly or by importing a package that needs it (<code>net</code> with the default resolver, <code>os/user</code>, SQLite bindings). Build with <code>CGO_ENABLED=0</code> for a pure-Go static binary, or ship on <code>distroless/base</code>, which has glibc. Once it starts, the next two failures are usually missing CA certificates on outbound HTTPS and a missing <code>/etc/passwd</code> if you used a named <code>USER</code> — all three of which <code>distroless/static:nonroot</code> already solves.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A colleague merges twelve <code>RUN</code> instructions into one to "reduce layers and shrink the image". Assess it.</summary>
+        <div class="ans"><p>It will not shrink the image, because size is the sum of the content — there is no meaningful per-layer overhead. It <em>will</em> destroy the build cache: twelve cache boundaries become one, so any change to any of those commands reruns all twelve (chapter 6). The genuine reason to combine instructions is different and narrower: when a later command <em>removes</em> what an earlier one created, they must share a layer or the bytes remain (chapter 3). So combine <code>apt-get update &amp;&amp; install &amp;&amp; rm -rf /var/lib/apt/lists/*</code>, and leave unrelated steps apart.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Chapter 8 closes Part 2 with BuildKit itself: cross-building for arm64, build secrets that never reach a layer, and the attestations that record where an image came from.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li><code>docker build --target test .</code> on a file with a test stage.</li>
+        <li>Compare <code>docker images</code> for <code>python:3.12</code>, <code>-slim</code> and <code>-alpine</code>.</li>
+        <li><code>docker run --rm gcr.io/distroless/static ls</code> — and see why it fails.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>Docker's multi-stage build documentation, the distroless project, Alpine's musl documentation, and the Go and Rust cross-compilation guides.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — stage graph, --target and parallelism
+   ============================================================ */
+(function () {
+  var STAGES = [
+    { id: "base", from: null, secs: 3.0, label: "FROM node:22-alpine" },
+    { id: "deps", from: ["base"], secs: 48.0, label: "npm ci" },
+    { id: "prod-deps", from: ["base"], secs: 30.0, label: "npm ci --omit=dev" },
+    { id: "build", from: ["deps"], secs: 21.8, label: "npm run build" },
+    { id: "test", from: ["deps"], secs: 35.0, label: "npm test" },
+    { id: "lint", from: ["deps"], secs: 12.0, label: "npm run lint" },
+    { id: "runtime", from: ["base", "prod-deps", "build"], secs: 3.0, label: "COPY --from=…" }
+  ];
+  var target = "runtime", legacy = false;
+
+  var tHost = document.getElementById("s-targets");
+  var graph = document.getElementById("s-graph");
+  var term = document.getElementById("s-term");
+  var out = document.getElementById("s-out");
+  var note = document.getElementById("s-note");
+
+  ["runtime", "build", "test", "lint", "deps"].forEach(function (t) {
+    var b = document.createElement("button");
+    b.className = "btn mono" + (t === target ? " on" : "");
+    b.textContent = t === "runtime" ? "(default) runtime" : t;
+    b.addEventListener("click", function () {
+      target = t;
+      Array.prototype.forEach.call(tHost.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      render();
+    });
+    tHost.appendChild(b);
+  });
+  var lb = document.getElementById("s-legacy");
+  lb.addEventListener("click", function () { legacy = !legacy; lb.classList.toggle("on", legacy); render(); });
+
+  function byId(id) { return STAGES.filter(function (s) { return s.id === id; })[0]; }
+
+  function closure(id) {
+    var seen = {};
+    (function walk(n) {
+      if (seen[n]) return;
+      seen[n] = true;
+      var s = byId(n);
+      (s.from || []).forEach(walk);
+    })(id);
+    return Object.keys(seen);
+  }
+
+  function levels(ids) {
+    var depth = {};
+    function d(n) {
+      if (depth[n] !== undefined) return depth[n];
+      var s = byId(n);
+      var parents = (s.from || []).filter(function (p) { return ids.indexOf(p) !== -1; });
+      depth[n] = parents.length ? 1 + Math.max.apply(null, parents.map(d)) : 0;
+      return depth[n];
+    }
+    ids.forEach(d);
+    var out2 = [];
+    ids.forEach(function (n) { (out2[depth[n]] = out2[depth[n]] || []).push(n); });
+    return out2;
+  }
+
+  function schedule(ids, par) {
+    /* level by level; within a level, run at most `par` at once */
+    var L = levels(ids), total = 0;
+    L.forEach(function (group) {
+      var times = group.map(function (n) { return byId(n).secs; }).sort(function (a, b) { return b - a; });
+      var lanes = new Array(Math.max(1, par)).fill(0);
+      times.forEach(function (t) {
+        var i = lanes.indexOf(Math.min.apply(null, lanes));
+        lanes[i] += t;
+      });
+      total += Math.max.apply(null, lanes);
+    });
+    return { levels: L, total: total };
+  }
+
+  function render() {
+    var par = parseInt(document.getElementById("s-par").value, 10);
+    document.getElementById("s-parv").textContent = par;
+    var built = closure(target);
+    var skipped = STAGES.filter(function (s) { return built.indexOf(s.id) === -1; }).map(function (s) { return s.id; });
+    var seq = built.reduce(function (a, id) { return a + byId(id).secs; }, 0);
+    var sch = schedule(built, legacy ? 1 : par);
+
+    /* graph */
+    var X = {}, Y = {};
+    var L = levels(STAGES.map(function (s) { return s.id; }));
+    L.forEach(function (group, li) {
+      group.forEach(function (id, gi) { X[id] = 52 + li * 132; Y[id] = 22 + gi * 34; });
+    });
+    var W = 52 + L.length * 132, H = 22 + Math.max.apply(null, L.map(function (g) { return g.length; })) * 34 + 6;
+    var svg = ['<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;max-width:' + W + 'px;height:auto;font-family:var(--mono)">'];
+    STAGES.forEach(function (s) {
+      (s.from || []).forEach(function (p) {
+        var on = built.indexOf(s.id) !== -1 && built.indexOf(p) !== -1;
+        svg.push('<path d="M' + (X[p] + 46) + " " + Y[p] + " C" + (X[p] + 80) + " " + Y[p] + " " +
+          (X[s.id] - 34) + " " + Y[s.id] + " " + (X[s.id] - 46) + " " + Y[s.id] +
+          '" fill="none" stroke="' + (on ? "#7C8CF8" : "#D8DEE4") + '" stroke-width="' + (on ? 2 : 1.4) + '"/>');
+      });
+    });
+    STAGES.forEach(function (s) {
+      var on = built.indexOf(s.id) !== -1;
+      var isT = s.id === target;
+      svg.push('<rect x="' + (X[s.id] - 46) + '" y="' + (Y[s.id] - 11) + '" width="92" height="22" rx="5" fill="' +
+        (isT ? "#3D4CC0" : on ? "#EEF0FE" : "#F6F8F9") + '" stroke="' + (on ? "#7C8CF8" : "#D8DEE4") +
+        '" stroke-width="' + (isT ? 2.5 : 1.5) + '"/>');
+      svg.push('<text x="' + X[s.id] + '" y="' + (Y[s.id] + 3.5) + '" text-anchor="middle" font-size="9.5" fill="' +
+        (isT ? "#fff" : on ? "#20456A" : "#A9B7C4") + '">' + s.id + "</text>");
+    });
+    svg.push("</svg>");
+    graph.innerHTML = svg.join("");
+
+    var lines = ['<span class="p">$</span> docker build' + (target === "runtime" ? "" : " --target " + target) + " ."];
+    lines.push("");
+    sch.levels.forEach(function (group, li) {
+      var t = Math.max.apply(null, group.map(function (n) { return byId(n).secs; }));
+      lines.push('<span class="d">wave ' + (li + 1) + (group.length > 1 && !legacy ? "  (in parallel)" : "") + "</span>");
+      group.forEach(function (n) {
+        lines.push('  <span class="g">' + n.padEnd(11, "\u00a0") + "</span>" + byId(n).label +
+          '<span class="d">   ' + byId(n).secs.toFixed(1) + "s</span>");
+      });
+    });
+    if (skipped.length) {
+      lines.push("");
+      lines.push('<span class="d">never built: ' + skipped.join(", ") + "</span>");
+    }
+    lines.push("");
+    lines.push('<span class="p">wall clock</span> ' + sch.total.toFixed(1) + "s" +
+      '<span class="d">   (sequential sum would be ' + seq.toFixed(1) + "s)</span>");
+    term.innerHTML = lines.join("\n");
+
+    out.innerHTML = "";
+    tile("Stages built", built.length + "/" + STAGES.length, skipped.length + " skipped", true);
+    tile("Sequential", seq.toFixed(1) + "s", "sum of stages");
+    tile("Wall clock", sch.total.toFixed(1) + "s", legacy ? "no parallelism" : "at " + par + "-way", sch.total < seq);
+    tile("Saved", (seq - sch.total).toFixed(1) + "s", "by the DAG", seq - sch.total > 1);
+
+    var msgs = [];
+    if (target === "runtime") {
+      msgs.push("The default target is the last stage, and it pulls in only what it copies from — so <b>" +
+        skipped.join(" and ") + " are never built</b>. That is what makes it safe to keep test and lint stages in a production Dockerfile.");
+    } else if (target === "test" || target === "lint") {
+      msgs.push("<code>--target " + target + "</code> builds <b>" + built.join(", ") +
+        "</b> and stops. Note it reuses the same <code>deps</code> stage the production build uses, so the tests run against the identical dependency tree — and if <code>deps</code> is already cached from an earlier build, this costs only " +
+        byId(target).secs.toFixed(0) + " seconds.");
+    } else if (target === "deps") {
+      msgs.push("Targeting an intermediate stage is how you warm a cache deliberately: build <code>deps</code> once in CI, export it (chapter 6), and every later target starts from it.");
+    } else {
+      msgs.push("<code>--target build</code> stops before the runtime stage, which is useful when you want the compiled output rather than a shippable image — pair it with <code>-o type=local,dest=./out</code> to extract the files instead of producing an image.");
+    }
+    if (legacy) {
+      msgs.push("<b>With the legacy builder there is no graph.</b> Stages run top to bottom, every stage in the file is built whether or not anything needs it, and nothing overlaps — " +
+        sch.total.toFixed(0) + " seconds instead of " + schedule(built, par).total.toFixed(0) +
+        ". BuildKit has been the default since Docker 23, and this is a large part of why.");
+    } else if (sch.levels.some(function (g) { return g.length > 1; })) {
+      msgs.push("Stages at the same depth have no dependency between them, so BuildKit runs them concurrently — the wave view above shows which. Raising the parallelism slider only helps while a wave has more stages than lanes.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13.5px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  document.getElementById("s-par").addEventListener("input", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — base image chooser
+   ============================================================ */
+(function () {
+  var LANGS = [
+    { id: "go", label: "Go / Rust", static: true },
+    { id: "node", label: "Node.js", static: false },
+    { id: "python", label: "Python", static: false },
+    { id: "java", label: "Java", static: false }
+  ];
+  var NEEDS = [
+    { id: "shell", label: "a shell", on: false },
+    { id: "pkg", label: "a package manager", on: false },
+    { id: "native", label: "native modules / C extensions", on: false },
+    { id: "glibc", label: "glibc-only binaries", on: false },
+    { id: "tz", label: "timezones or HTTPS", on: true }
+  ];
+  var lang = "node";
+
+  var langHost = document.getElementById("b-lang");
+  var needHost = document.getElementById("b-needs");
+  var result = document.getElementById("b-result");
+  var out = document.getElementById("b-out");
+  var note = document.getElementById("b-note");
+
+  LANGS.forEach(function (l) {
+    var b = document.createElement("button");
+    b.className = "btn" + (l.id === lang ? " on" : "");
+    b.textContent = l.label;
+    b.addEventListener("click", function () {
+      lang = l.id;
+      Array.prototype.forEach.call(langHost.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      render();
+    });
+    langHost.appendChild(b);
+  });
+  NEEDS.forEach(function (n) {
+    var b = document.createElement("button");
+    b.className = "btn mono" + (n.on ? " on" : "");
+    b.textContent = n.label;
+    b.addEventListener("click", function () { n.on = !n.on; b.classList.toggle("on", n.on); render(); });
+    needHost.appendChild(b);
+  });
+
+  /* approximate sizes, keyed by image so every branch reports the same figure */
+  var SIZES = {
+    "scratch": 0,
+    "gcr.io/distroless/static:nonroot": 2,
+    "alpine:3.20": 8,
+    "gcr.io/distroless/base": 20,
+    "python:3.12-alpine": 55,
+    "gcr.io/distroless/nodejs22": 120,
+    "node:22-alpine": 130,
+    "python:3.12-slim": 130,
+    "eclipse-temurin:21-jre": 180,
+    "gcr.io/distroless/java21": 190,
+    "node:22-slim": 220
+  };
+
+  function need(id) { return NEEDS.filter(function (n) { return n.id === id; })[0].on; }
+
+  function choose() {
+    var L = LANGS.filter(function (x) { return x.id === lang; })[0];
+    var reasons = [], costs = [];
+
+    if (need("shell") || need("pkg")) {
+      /* must keep a userland */
+      if (need("glibc") || lang === "python" || lang === "java") {
+        reasons.push("a shell or package manager is required at runtime, and glibc is needed");
+        costs.push("~75 MB of base, and a package manager in production is an attack-surface decision (ch. 18)");
+        var b1 = lang === "python" ? "python:3.12-slim" : lang === "java" ? "eclipse-temurin:21-jre" : "node:22-slim";
+        return { base: b1, mb: SIZES[b1], reasons: reasons, costs: costs, tier: "slim" };
+      }
+      reasons.push("a shell or package manager is required at runtime");
+      costs.push("musl rather than glibc — check every prebuilt binary you depend on");
+      var b2 = lang === "node" ? "node:22-alpine" : "alpine:3.20";
+      return { base: b2, mb: SIZES[b2], reasons: reasons, costs: costs, tier: "alpine" };
+    }
+
+    if (L.static && !need("native") && !need("glibc")) {
+      if (need("tz")) {
+        reasons.push("a static binary needs no libc, and distroless/static already carries CA certificates, timezone data and a non-root user");
+        costs.push("no shell, so debugging needs an ephemeral container (ch. 19)");
+        return { base: "gcr.io/distroless/static:nonroot", mb: SIZES["gcr.io/distroless/static:nonroot"], reasons: reasons, costs: costs, tier: "static" };
+      }
+      reasons.push("a static binary with no need for certificates or timezones");
+      costs.push("you supply everything — certs, /etc/passwd, /tmp — or discover their absence at runtime");
+      return { base: "scratch", mb: SIZES["scratch"], reasons: reasons, costs: costs, tier: "scratch" };
+    }
+
+    if (need("glibc") || need("native")) {
+      if (lang === "python") {
+        reasons.push("C extensions plus glibc wheels: Alpine would compile from source");
+        costs.push("~130 MB, and no shell only if you move to distroless later");
+        return { base: "python:3.12-slim", mb: SIZES["python:3.12-slim"], reasons: reasons, costs: costs, tier: "slim" };
+      }
+      if (lang === "java") {
+        reasons.push("a JRE is required, and it is dynamically linked against glibc");
+        costs.push("the JRE dominates the image size whatever base you pick");
+        return { base: "eclipse-temurin:21-jre", mb: SIZES["eclipse-temurin:21-jre"], reasons: reasons, costs: costs, tier: "slim" };
+      }
+      if (L.static) {
+        reasons.push("cgo or a glibc dependency rules out a static build");
+        costs.push("no shell and no package manager, but glibc is present");
+        return { base: "gcr.io/distroless/base", mb: SIZES["gcr.io/distroless/base"], reasons: reasons, costs: costs, tier: "base" };
+      }
+      reasons.push("native modules need glibc, so slim rather than alpine");
+      costs.push("~220 MB with the runtime included");
+      return { base: "node:22-slim", mb: SIZES["node:22-slim"], reasons: reasons, costs: costs, tier: "slim" };
+    }
+
+    /* interpreted, no native deps, no shell needed */
+    if (lang === "node") {
+      reasons.push("pure JavaScript with no native modules and no shell requirement");
+      costs.push("no shell or package manager; the Node runtime is most of the size");
+      return { base: "gcr.io/distroless/nodejs22", mb: SIZES["gcr.io/distroless/nodejs22"], reasons: reasons, costs: costs, tier: "distroless" };
+    }
+    if (lang === "python") {
+      reasons.push("pure Python with no C extensions");
+      costs.push("Alpine means musl: verify every wheel resolves, or builds get slow (see the trap above)");
+      return { base: "python:3.12-alpine", mb: SIZES["python:3.12-alpine"], reasons: reasons, costs: costs, tier: "alpine" };
+    }
+    reasons.push("a JRE with no shell requirement");
+    costs.push("no shell; jlink can trim the runtime further");
+    return { base: "gcr.io/distroless/java21", mb: SIZES["gcr.io/distroless/java21"], reasons: reasons, costs: costs, tier: "distroless" };
+  }
+
+  function render() {
+    var c = choose();
+    result.innerHTML =
+      '<div style="border:1px solid var(--acc-line);background:var(--acc-wash);border-radius:5px;padding:11px 13px;margin:4px 0 0">' +
+      '<div style="font-family:var(--mono);font-size:15px;font-weight:700;color:var(--acc-deep)">' + c.base + "</div>" +
+      '<div style="font-size:12.5px;color:var(--text-2);margin-top:5px"><b>Why:</b> ' + c.reasons.join("; ") + "</div>" +
+      '<div style="font-size:12.5px;color:var(--text-2);margin-top:3px"><b>Costs:</b> ' + c.costs.join("; ") + "</div></div>";
+
+    var hasShell = c.tier === "slim" || c.tier === "alpine";
+    out.innerHTML = "";
+    tile("Base size", c.mb === 0 ? "0" : "~" + c.mb + " MB", "approximate", c.mb <= 20);
+    tile("Shell", hasShell ? "yes" : "no", hasShell ? "" : "debug via ch. 19", hasShell);
+    tile("libc", c.tier === "alpine" ? "musl" : c.tier === "scratch" ? "none" : "glibc", "");
+    tile("Constraints met", String(NEEDS.filter(function (n) { return n.on; }).length), "requirements");
+
+    var msgs = [];
+    if (c.tier === "scratch") {
+      msgs.push("<b>Nothing is in this image but your binary.</b> That is a real answer for a static Go or Rust service — and if you later need an HTTPS call or local time formatting, it fails at runtime rather than at build time. Ticking \"timezones or HTTPS\" moves the recommendation to <code>distroless/static</code>, which is 2 MB and already has both.");
+    }
+    if (!hasShell) {
+      msgs.push("With no shell, <code>docker exec sh</code> is impossible. That is a security gain and an operational cost, and the mitigation is a debug sidecar sharing the namespaces (chapter 19) — decide you are willing to do that before shipping it.");
+    }
+    if (need("pkg")) {
+      msgs.push("Needing a package manager at <b>runtime</b> is worth questioning: installing software into a running container means the container is no longer the artefact you tested. If it is for a start-up script, move it into the build; if it is for debugging, use an ephemeral container instead.");
+    }
+    if (c.tier === "alpine" && lang === "python") {
+      msgs.push("This one is a genuine trade rather than a win. Re-read the trap above before committing: the 90 MB you save can cost ten minutes of build time and a compiler in the image.");
+    }
+    if (need("glibc") && c.tier !== "scratch") {
+      msgs.push("Requiring glibc rules out Alpine entirely — not as a preference but as a link-time fact. Prebuilt wheels, vendor SDKs and anything with a <code>.so</code> compiled elsewhere fall into this category.");
+    }
+    if (!msgs.length) {
+      msgs.push("The rule this encodes: keep the smallest base that still satisfies a real runtime requirement, and treat \"we might need to poke around inside\" as a requirement to be met another way rather than one to be met with a shell.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

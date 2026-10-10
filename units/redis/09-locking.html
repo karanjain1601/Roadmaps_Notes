@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Locking and coordination — Redis</title>
+<meta name="description" content="Distributed locks that mostly work, the failure modes nobody mentions, fencing tokens, and the honest limits of Redlock.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 09 · Patterns</div>
+    <h1>Locking and coordination</h1>
+    <p class="standfirst">A distributed lock in Redis is one command, and every tutorial stops there. The interesting part is the four ways it breaks, which of those you can fix, and the one you cannot — which decides whether you should be using a lock at all.</p>
+    <div class="chap-meta">
+      <span class="tagpill">setnx</span>
+      <span class="tagpill">leases</span>
+      <span class="tagpill">fencing</span>
+      <span class="tagpill">redlock</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The lock</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">acquire and release, done correctly</span><button class="copy">Copy</button></div>
+<pre><code>token = uuid4().hex
+
+# ACQUIRE — atomic test-and-set with an expiry, in one command.
+acquired = r.set(f"lock:{resource}", token, nx=True, ex=30)
+if not acquired:
+    return None                     # someone else holds it
+
+try:
+    do_the_work()
+finally:
+    # RELEASE — only if the token still matches. THIS MUST BE ATOMIC.
+    r.eval("""
+      if redis.call('GET', KEYS[1]) == ARGV[1] then
+        return redis.call('DEL', KEYS[1])
+      end
+      return 0
+    """, 1, f"lock:{resource}", token)
+
+# THE TWO NON-NEGOTIABLE DETAILS, and both are commonly wrong:
+#
+#   1. THE TTL. Without EX, a holder that crashes leaves the lock held
+#      forever and the resource is permanently blocked. There is no
+#      automatic cleanup, no lock table to inspect, nothing.
+#
+#   2. THE TOKEN, checked atomically on release. A plain DEL releases
+#      whatever lock is there — including one a DIFFERENT holder acquired
+#      after yours expired. That turns "my lock expired" into "I deleted
+#      someone else's lock", which is strictly worse.
+#
+# GET-then-DEL is not sufficient. Between the GET and the DEL, your lock can
+# expire and be reacquired, and you delete the new holder's lock. Lua makes
+# the compare-and-delete indivisible (chapter 8).</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">A Redis lock is a lease, not a lock</span>
+  <p>The TTL is not a safety net bolted on — it is the whole design. Because a holder can die without releasing, the lock must expire on its own, which means <b>you hold it for a fixed period rather than until you are finished</b>. If the work takes longer than the lease, you no longer hold the lock and you have no way of knowing that from inside the work. Every failure mode below flows from this one property, and the mitigations are all about narrowing the window rather than closing it. Any design that assumes "I have the lock, therefore I am the only one running" is assuming something Redis cannot guarantee.</p>
+</div>
+
+<h2><span class="h-rule"></span>How it breaks</h2>
+
+<div class="demo" id="lk">
+  <div class="demo-head">
+    <b>Four failure modes</b>
+    <span>Three are fixable. Read the fourth carefully before building anything important on this.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="l-fail">Failure</label>
+        <select id="l-fail">
+          <option value="crash" selected>The holder crashes</option>
+          <option value="nodel">Release with a plain DEL</option>
+          <option value="overrun">The work outlives the lease</option>
+          <option value="pause">A GC pause or scheduler stall</option>
+          <option value="failover">The Redis primary fails over</option>
+        </select>
+      </div>
+      <div>
+        <label for="l-fence">Fencing tokens on the resource?</label>
+        <select id="l-fence">
+          <option value="no" selected>No</option>
+          <option value="yes">Yes</option>
+        </select>
+      </div>
+    </div>
+    <div id="l-time"></div>
+    <div class="stat">
+      <div><b id="l-outcome">—</b><span>outcome</span></div>
+      <div><b id="l-fixable">—</b><span>fixable in Redis?</span></div>
+      <div><b id="l-mit">—</b><span>mitigation</span></div>
+    </div>
+    <div class="out" id="l-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Extending a lease</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">a watchdog, and what it does not solve</span><button class="copy">Copy</button></div>
+<pre><code># A background thread renews the lease while the work runs, so a long job
+# does not lose the lock partway through.
+
+def renew(key, token, ttl=30):
+    return r.eval("""
+      if redis.call('GET', KEYS[1]) == ARGV[1] then
+        return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+      end
+      return 0
+    """, 1, key, token, ttl * 1000)
+
+# Renew at roughly a third of the TTL, so two consecutive failures still
+# leave time to notice. If renew() ever returns 0, YOU NO LONGER HOLD THE
+# LOCK — abort the work immediately rather than continuing.
+
+# EXPIRE gained conditional flags in 7.0, which make this safer:
+r.expire(key, 30, gt=True)      # only extend, never accidentally shorten
+
+# WHAT A WATCHDOG FIXES: work that legitimately takes longer than one lease.
+#
+# WHAT IT DOES NOT FIX: the process being stopped. If a GC pause, a container
+# freeze or a hypervisor stall suspends your process for longer than the TTL,
+# the watchdog is suspended too — the lock expires, someone else takes it,
+# and when your process resumes it carries on believing it is the holder.
+#
+# The renew check catches this ONLY at the next renewal, which is after the
+# damage. There is no way for code inside the critical section to know that
+# time has passed and its lease has gone.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Fencing tokens</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">the only real fix, and it needs the resource's cooperation</span><button class="copy">Copy</button></div>
+<pre><code># Hand out a monotonically increasing number with every lock acquisition.
+token = r.incr("lock:fence:invoice")        # 41, 42, 43, ...
+r.set("lock:invoice", token, nx=True, ex=30)
+
+# Then the PROTECTED RESOURCE rejects anything with a stale token:
+#
+#   writer A gets fence 41, stalls
+#   lease expires, writer B gets fence 42, writes with 42
+#   A wakes, tries to write with 41  ->  REJECTED, 41 < 42
+#
+# The resource enforces the mutual exclusion. The lock only decides who
+# tries.
+
+# In the database:
+UPDATE invoices SET data = %s, fence = %s
+WHERE id = %s AND fence < %s
+
+# In Redis itself:
+EVAL "
+  local cur = tonumber(redis.call('HGET', KEYS[1], 'fence') or 0)
+  if tonumber(ARGV[1]) <= cur then return 0 end
+  redis.call('HSET', KEYS[1], 'fence', ARGV[1], 'data', ARGV[2])
+  return 1
+" 1 invoice:8842 42 "..."
+
+# THIS IS THE ONLY MECHANISM THAT MAKES A DISTRIBUTED LOCK SAFE against a
+# stalled holder. And note what it requires: the resource must support a
+# conditional write on a version number. If the protected thing is an
+# external API, a file, or a payment provider, you cannot fence it — and
+# then no lock, in Redis or anywhere else, gives you the guarantee you want.
+
+# The realistic conclusion: if you can fence, do — and then ask whether you
+# needed the lock at all, since the fence is doing the correctness work.
+# If you cannot fence, choose a design where a duplicate execution is
+# harmless (idempotency) rather than one that relies on it never happening.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Redlock does not solve the stall problem</span>
+  <p>Redlock is the algorithm for acquiring a lock across several independent Redis instances, requiring a majority. It addresses a real failure — the single-instance failover case, where an async replica is promoted without the lock — and it is genuinely more robust for that. It does <b>not</b> address a stalled holder, because no amount of consensus about <em>who</em> holds a lease tells you whether the holder is still running. Martin Kleppmann's critique and Salvatore Sanfilippo's reply are both worth reading in full; the practical summary is that Redlock's guarantees depend on bounded clock drift and bounded process pauses, and neither is bounded in a real system. <b>If correctness depends on the lock, you need fencing tokens — and if you have fencing tokens, Redlock's extra complexity buys you little.</b></p>
+</div>
+
+<h2><span class="h-rule"></span>What locks are actually good for</h2>
+
+<div class="cols">
+  <div class="col good">
+    <h4>Reasonable uses</h4>
+    <ul>
+      <li><b>Reducing duplicate work</b> — one cache recompute instead of a thousand (chapter 7)</li>
+      <li><b>Leader election</b> for a scheduled job, where a rare double run is tolerable</li>
+      <li><b>Rate-limiting an expensive operation</b> to one at a time</li>
+      <li><b>Politeness</b> — not hammering a third-party API from every instance</li>
+      <li><b>Anywhere a duplicate is wasteful but not wrong</b></li>
+    </ul>
+  </div>
+  <div class="col bad">
+    <h4>Do not</h4>
+    <ul>
+      <li><b>Guard financial correctness</b> — use a database transaction</li>
+      <li><b>Prevent double-charging</b> — use an idempotency key at the provider</li>
+      <li><b>Enforce uniqueness</b> — use a unique constraint where the data lives</li>
+      <li><b>Serialise long-running work</b> — the lease will not hold</li>
+      <li><b>Anywhere a duplicate execution is unrecoverable</b></li>
+    </ul>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">The question to ask first</span>
+  <p><b>What happens if two processes run this simultaneously?</b> If the answer is "some wasted work", a Redis lock is an excellent, cheap optimisation and none of the failure modes above matter much — they make the optimisation occasionally less effective, not incorrect. If the answer is "we charge the customer twice" or "the ledger is wrong", a lock is the wrong tool regardless of implementation, because you are trying to buy a guarantee it cannot sell. Put the constraint where the data lives: a unique index, a conditional update, a transaction, an idempotency key at the payment provider. <b>The lock reduces contention; the constraint provides correctness.</b> Conflating the two is the actual mistake, and it survives any amount of care with the lock itself.</p>
+</div>
+
+<h2><span class="h-rule"></span>Other coordination primitives</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">often a better fit than a lock</span><button class="copy">Copy</button></div>
+<pre><code># LEADER ELECTION — one instance does the scheduled work.
+SET leader:reports "instance-7" NX EX 15
+# renew every 5s while leading; if the renew fails, stop being leader
+# immediately. Design the job so a brief double-run is harmless, because
+# during a failover there WILL be one.
+
+# ONCE-ONLY EXECUTION — cheaper and safer than a lock.
+SET job:daily-rollup:2026-03-14 "done" NX EX 172800
+# 1 -> you run it. 0 -> already done or in progress.
+# There is no lock to release, no expiry mid-work, and no double execution
+# unless the key expires. For idempotent daily jobs this is strictly better.
+
+# A SEMAPHORE — at most N concurrent workers, via a sorted set scored by
+# acquisition time so stale holders age out.
+ZREMRANGEBYSCORE sem:export -inf $(($(date +%s) - 60))    # expire holders
+ZADD  sem:export $(date +%s) "worker-3"
+ZRANK sem:export "worker-3"
+# if rank >= N, ZREM yourself and back off. Chapter 5's structure doing
+# coordination work.
+
+# A BARRIER / COUNTDOWN — wait for N things to finish.
+DECR pending:batch-7          # each worker decrements on completion
+# 0 -> you are the last one; trigger whatever comes next. Atomic, one
+# command, no coordination needed at all.
+
+# A QUEUE INSTEAD OF A LOCK — frequently the right answer. If the reason for
+# the lock is "only one worker should process this entity at a time", route
+# all work for that entity to one consumer by hashing the entity id to a
+# stream or a list. No lock, no lease, no stall problem — serialisation by
+# construction (chapters 4 and 6).</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Use a library, and read what it does</span>
+  <p>Redlock implementations exist for every language — Redisson for Java, redlock-py, node-redlock — and they handle the token, the Lua release, the retry backoff and the watchdog properly, which is more than most hand-rolled attempts. Use one rather than writing your own. <b>And read its documentation on the guarantees it claims</b>, because some are careful and honest about the stall problem while others describe themselves as providing mutual exclusion without qualification. A library cannot give you a guarantee the underlying algorithm does not have; what it can do is stop you making the three fixable mistakes.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b><code>SET key token NX EX ttl</code></b> to acquire. Both the token and the TTL are mandatory.</li>
+    <li><b>Release with a Lua compare-and-delete.</b> A plain <code>DEL</code> can delete someone else's lock.</li>
+    <li><b>A Redis lock is a lease.</b> You hold it for a period, not until you are finished.</li>
+    <li>A <b>watchdog</b> fixes long work; it does not fix a stalled process, because the watchdog stalls too.</li>
+    <li><b>Fencing tokens are the only real fix</b>, and they require the protected resource to reject stale writes.</li>
+    <li><b>Redlock addresses failover, not stalls.</b> It cannot make a lease safe against an unbounded pause.</li>
+    <li>Ask first: <b>what happens if two run at once?</b> "Wasted work" means use a lock; "wrong data" means use a constraint.</li>
+    <li><b>Often you want something else</b> — once-only execution, a semaphore, or routing work for an entity to one consumer.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("09-locking.html");
+
+(function(){
+  const root = document.getElementById("lk");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const F = {
+    crash: {
+      steps:[["A","acquires lock, ttl 30s","ok"],["A","crashes mid-work","bad"],
+             ["—","30s pass, lock expires","ok"],["B","acquires lock","ok"]],
+      outcome:"recovers", fixable:"yes — the TTL is the fix", mit:"always set EX",
+      note:"The failure the TTL exists for, and it works. A holder that dies never releases, so without an expiry the resource is blocked permanently — no lock table to inspect, no timeout, nothing to clean it up.\n\nWith a TTL the lock self-heals after at most that long. The cost is that the resource is unavailable for the remainder of the lease, so a 300-second TTL means a five-minute outage after a crash.\n\nThe trade is direct: a short TTL recovers quickly from crashes and increases the chance the lease expires under a holder that is merely slow. Set it to a few times the expected work duration, and use a watchdog to extend it rather than making it generous up front."
+    },
+    nodel: {
+      steps:[["A","acquires, ttl 30s","ok"],["A","work runs long, lease expires","bad"],
+             ["B","acquires the lock","ok"],["A","finishes, calls DEL","bad"],
+             ["C","acquires — while B is still working","bad"]],
+      outcome:"TWO holders", fixable:"yes — check the token", mit:"Lua compare-and-delete",
+      note:"A plain DEL releases whatever lock is currently there, not necessarily yours.\n\nHere A's lease expired and B took the lock legitimately. When A finishes and calls DEL, it deletes B's lock — and C immediately acquires it while B is still working. One expired lease has become two concurrent holders, which is worse than the original problem.\n\nThe fix is to store a unique token as the lock's value and release with a Lua script that deletes only if the value still matches.\n\nGET-then-DEL is NOT sufficient, and this is the subtle part: between the GET and the DEL your lock can expire and be reacquired, so you check, see your token, and then delete someone else's. The comparison and the deletion must be one operation."
+    },
+    overrun: {
+      steps:[["A","acquires, ttl 30s","ok"],["A","work takes 45s","bad"],
+             ["—","at 30s the lock expires","bad"],["B","acquires and starts","bad"],
+             ["A","still running, believes it holds the lock","bad"]],
+      outcome:"TWO holders", fixable:"partly — a watchdog", mit:"renew at ttl/3",
+      note:"The work simply takes longer than the lease. A is still executing, entirely healthy, and no longer holds the lock — and has no way to know.\n\nA watchdog fixes the honest version of this: a background thread renews the lease every ttl/3 while the work runs, so a legitimately long job keeps its lock. If a renewal ever fails, the work must abort immediately rather than continuing.\n\nWhat the watchdog cannot fix is the next scenario, where the process itself is suspended and the watchdog is suspended with it.\n\nUse EXPIRE with the GT flag (7.0+) when renewing, so a renewal can only extend the lease and never accidentally shorten it."
+    },
+    pause: {
+      steps:[["A","acquires, ttl 30s","ok"],["A","GC pause / container freeze, 40s","bad"],
+             ["—","lock expires, watchdog is frozen too","bad"],["B","acquires and works","ok"],
+             ["A","resumes, continues its critical section","bad"]],
+      outcome:"TWO holders", fixable:"NO — not in Redis", mit:"fencing tokens",
+      note:"This is the one that cannot be fixed by any lock implementation, and it is why the honest framing of this chapter matters.\n\nA is stopped — a stop-the-world GC pause, a container CPU freeze, a hypervisor migration, a swap storm. Not crashed: suspended. The lease expires while A is frozen and the watchdog is frozen too, so nothing renews and nothing notices.\n\nB acquires the lock legitimately and starts work. Then A resumes, in the middle of its critical section, with no indication that any time has passed. From A's perspective the next instruction simply executes.\n\nThere is no check A can perform, because any check is followed by more instructions that could themselves be preceded by another pause. This is not a Redis limitation — it applies to every lease-based distributed lock, including Redlock.\n\nThe only real defence is fencing: hand out a monotonically increasing token with each acquisition and have the PROTECTED RESOURCE reject writes carrying a stale one. That moves the mutual exclusion to where the data is, which is the only place it can be enforced."
+    },
+    failover: {
+      steps:[["A","acquires on the primary","ok"],["—","primary fails BEFORE replicating","bad"],
+             ["—","replica promoted — no lock present","bad"],["B","acquires on the new primary","bad"],
+             ["A","still working","bad"]],
+      outcome:"TWO holders", fixable:"partly — Redlock", mit:"fencing tokens",
+      note:"Redis replication is asynchronous (chapter 15). A write acknowledged by the primary may not have reached any replica, so a failover a moment later promotes a replica that has never heard of your lock.\n\nB then acquires it perfectly legitimately, and both hold what each believes is an exclusive lock.\n\nThis is the failure Redlock addresses: acquire on a majority of independent Redis instances, so losing one does not lose the lock. It genuinely helps here, and it is more complex to operate and depends on bounded clock drift between nodes.\n\nWhat it does not help with is the previous scenario. No amount of agreement about WHO holds a lease tells you whether the holder is still running.\n\nWAIT 1 1000 after acquiring gets you closer on a single instance — it blocks until a replica has the write — and it is not a guarantee either, since WAIT can time out and report fewer replicas than requested. Fencing remains the answer if correctness depends on this."
+    }
+  };
+
+  function render(){
+    const k = $("l-fail").value, f = F[k];
+    const fenced = $("l-fence").value === "yes";
+
+    $("l-time").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:16px 0 8px">' +
+      'Timeline</div>' +
+      f.steps.map((s, i) =>
+        '<div style="display:flex;align-items:center;gap:12px;background:#fff;border:1px solid #E1E7EC;' +
+        'border-left:3px solid ' + (s[2] === "bad" ? "#E2574C" : "#3FB984") +
+        ';border-radius:4px;padding:7px 12px;margin-bottom:4px">' +
+        '<span style="font-family:var(--mono);font-size:11px;color:#8FA0AF;min-width:14px">' + (i+1) + '</span>' +
+        '<span style="font-family:var(--mono);font-size:12px;font-weight:700;color:' +
+        (s[0] === "—" ? "#B4C0CA" : "#0F7A85") + ';min-width:22px">' + s[0] + '</span>' +
+        '<span style="flex:1;font-size:13px;color:' + (s[2] === "bad" ? "#B0453B" : "#25323E") + '">' +
+        s[1] + '</span></div>').join("");
+
+    const twoHolders = f.outcome === "TWO holders";
+    $("l-outcome").textContent = fenced && twoHolders ? "stale write rejected" : f.outcome;
+    $("l-fixable").textContent = f.fixable;
+    $("l-mit").textContent     = f.mit;
+
+    const notes = [f.note];
+
+    if(fenced && twoHolders)
+      notes.push("WITH FENCING TOKENS this becomes survivable. A holds token 41 and B holds 42. When A eventually writes, the resource compares 41 against the 42 it has already recorded and rejects it.\n\nBoth processes ran, which is wasteful, and only one write took effect — which is the property you actually needed. Note where the enforcement lives: in the resource's conditional update, not in Redis. The lock decided who tried; the fence decided who succeeded.\n\nThe requirement is that the protected resource supports a conditional write on a version number. A database row can. A file can, with care. An external payment API generally cannot, and for those the answer is an idempotency key at the provider rather than a lock on your side.");
+    else if(!fenced && twoHolders)
+      notes.push("WITHOUT FENCING, two processes execute the critical section concurrently and both writes take effect. Whether that matters depends entirely on the work: two cache recomputes is wasted CPU, two charges to a card is an incident.\n\nTurn on fencing above to see the difference, and note that it is the RESOURCE doing the work — it must reject writes carrying a stale token. If the thing you are protecting cannot do that, no lock gives you this guarantee.");
+
+    notes.push("The question that decides how much of this matters: what happens if two processes run this simultaneously? If the answer is \"wasted work\", a Redis lock is a fine optimisation and every failure here is merely a lost optimisation. If the answer is \"wrong data\", you want a constraint where the data lives — a unique index, a conditional update, an idempotency key — and the lock is only reducing contention.");
+    $("l-note").textContent = notes.join("\n\n");
+  }
+
+  ["l-fail","l-fence"].forEach(id => $(id).addEventListener("change", render));
+  render();
+})();
+</script>
+</body>
+</html>

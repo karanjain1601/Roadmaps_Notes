@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Change streams and the oplog — MongoDB</title>
+<meta name="description" content="Reacting to writes as they happen, resume tokens, ordering guarantees, and using MongoDB as an event source.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 14 · At scale</div>
+    <h1>Change streams and the oplog</h1>
+    <p class="standfirst">A supported, resumable feed of every change to a collection, built on the replication log the database already maintains. It is the mechanism that makes several of the earlier chapters' patterns practical — and it has exactly one operational constraint that decides whether it works.</p>
+    <div class="chap-meta">
+      <span class="tagpill">change streams</span>
+      <span class="tagpill">resume tokens</span>
+      <span class="tagpill">the window</span>
+      <span class="tagpill">cdc</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Watching a collection</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">the whole API, essentially</span><button class="copy">Copy</button></div>
+<pre><code>const stream = db.collection("orders").watch();
+
+for await (const change of stream) {
+  console.log(change.operationType);   // insert, update, replace, delete,
+                                       // drop, rename, invalidate
+  console.log(change.documentKey);     // { _id: ... }
+  console.log(change.fullDocument);    // inserts and replaces; updates only
+                                       // if you ask (see below)
+  console.log(change.updateDescription);
+  //   { updatedFields: { status: "paid" }, removedFields: [] }
+  console.log(change._id);             // THE RESUME TOKEN
+}
+
+// Watch at three levels:
+db.collection("orders").watch();     // one collection
+db.watch();                          // every collection in a database
+client.watch();                      // the entire deployment
+
+// Filter server-side with a pipeline, so unwanted events never reach you:
+db.collection("orders").watch([
+  { $match: { operationType: "update",
+              "updateDescription.updatedFields.status": "paid" } }
+]);
+
+// Requires a replica set or a sharded cluster — the oplog is what it reads.
+// Not available on a standalone mongod.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">This is a supported API, not oplog tailing</span>
+  <p>Before change streams arrived in 3.6, applications read <code>local.oplog.rs</code> directly. That worked and it coupled you to an internal format, gave no resumption guarantees, broke on failover, and required each consumer to reimplement ordering and deduplication. Change streams are the same data behind a stable interface with resume tokens, correct failover behaviour and cluster-wide ordering. <b>If you find code tailing the oplog directly, it predates 3.6 and should be replaced.</b> Everything in this chapter assumes the supported API.</p>
+</div>
+
+<h2><span class="h-rule"></span>Resuming</h2>
+
+<div class="demo" id="cs">
+  <div class="demo-head">
+    <b>What happens when a consumer stops</b>
+    <span>Resumption is the whole design problem. It turns on one number.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="v-down">Consumer offline for — <span id="v-downv">2 hours</span></label>
+        <input type="range" id="v-down" min="1" max="8" step="1" value="4">
+      </div>
+      <div>
+        <label for="v-win">Oplog window — <span id="v-winv">24 hours</span></label>
+        <input type="range" id="v-win" min="1" max="7" step="1" value="4">
+      </div>
+      <div>
+        <label for="v-store">Resume token stored</label>
+        <select id="v-store">
+          <option value="db" selected>persisted after each processed event</option>
+          <option value="mem">in memory only</option>
+          <option value="none">not stored</option>
+        </select>
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="v-can">—</b><span>can it resume?</span></div>
+      <div><b id="v-miss">—</b><span>events missed</span></div>
+      <div><b id="v-fix">—</b><span>recovery</span></div>
+    </div>
+    <div id="v-bar"></div>
+    <div class="out" id="v-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">persisting the token, which is the whole job</span><button class="copy">Copy</button></div>
+<pre><code>// Every event carries change._id — an opaque resume token. Store it AFTER
+// processing the event, in the same place you write the results if you can.
+
+let token = await tokens.findOne({ _id: "orders-consumer" });
+
+const stream = db.collection("orders").watch([], {
+  resumeAfter: token?.value,           // pick up after this event
+  fullDocument: "updateLookup"
+});
+
+for await (const change of stream) {
+  await handle(change);                                    // do the work
+  await tokens.updateOne({ _id: "orders-consumer" },        // then record it
+    { $set: { value: change._id } }, { upsert: true });
+}
+
+// Order matters. Process, THEN store — so a crash between the two replays
+// the last event rather than skipping it. That makes delivery AT LEAST ONCE,
+// which is why handlers must be idempotent (chapter 6).
+//
+// Better still: do both in one transaction, or write the result and the
+// token into the same document, so they cannot disagree.
+
+// Three ways to position a new stream:
+{ resumeAfter: token }        // after a specific event
+{ startAfter: token }         // like resumeAfter, but survives an invalidate
+                              // (a dropped or renamed collection)
+{ startAtOperationTime: ts }  // from a timestamp — no token needed</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">The oplog window is the constraint</span>
+  <p>A resume token points at a position in the oplog. If a consumer is offline longer than the oplog window (chapter 10), the entry it wants has been overwritten and <b>the stream cannot resume</b> — you get <code>ChangeStreamHistoryLost</code>, and there is no way to recover the missed events from MongoDB. Your options are a full reconciliation pass or accepting the gap. Since the window shrinks silently as write volume grows, this failure arrives one day without any configuration having changed. <b>Monitor the window, size the oplog for your longest plausible consumer outage, and alert when a consumer's lag approaches it.</b></p>
+</div>
+
+<h2><span class="h-rule"></span>fullDocument</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">an update event does not contain the document</span><button class="copy">Copy</button></div>
+<pre><code>// By default an update event gives you only what CHANGED:
+{ operationType: "update",
+  documentKey: { _id: ObjectId("A") },
+  updateDescription: { updatedFields: { status: "paid" }, removedFields: [] } }
+
+// To get the whole document:
+db.collection("orders").watch([], { fullDocument: "updateLookup" });
+
+// IMPORTANT: updateLookup fetches the document AS IT IS NOW, at lookup time
+// — not as it was immediately after the change. If the document was updated
+// twice in quick succession, both events may return the same later state,
+// and a deleted document returns null.
+//
+// So updateLookup gives you the current state, not a point-in-time snapshot.
+// For an audit trail or anything order-sensitive, use updateDescription and
+// build the state yourself.
+
+// Since 6.0, with pre- and post-images enabled on the collection:
+db.runCommand({ collMod: "orders", changeStreamPreAndPostImages: { enabled: true } });
+db.collection("orders").watch([], {
+  fullDocument: "whenAvailable",
+  fullDocumentBeforeChange: "whenAvailable"
+});
+// Now you get the actual before and after states of the change itself,
+// which makes proper auditing and change-data-capture possible.
+// The cost is storage: pre-images are retained in a system collection.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>What it is good for</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Use</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><b>Maintaining denormalised copies</b></td><td>Chapter 2's extended references, kept in sync automatically</td></tr>
+<tr><td><b>The outbox pattern</b></td><td>Chapter 12 — watch for outbox entries and perform the side effect</td></tr>
+<tr><td><b>Computed fields</b></td><td>Chapter 3's counts and aggregates, updated as the source changes</td></tr>
+<tr><td><b>Search index sync</b></td><td>Feeding Elasticsearch or an external index</td></tr>
+<tr><td><b>Cache invalidation</b></td><td>Evict on the change rather than on a timer</td></tr>
+<tr><td><b>Real-time UI</b></td><td>Push updates to connected clients over websockets</td></tr>
+<tr><td><b>Audit trails</b></td><td>With pre- and post-images enabled</td></tr>
+<tr><td><b>Feeding a data warehouse</b></td><td>Change-data-capture into Kafka, or the official connector</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note tip">
+  <span class="note-t">The natural fix for denormalisation drift</span>
+  <p>Chapters 2 and 3 kept saying the same thing: every duplicated field needs an owner and a reconciliation. A change stream is the best available owner, because it cannot be bypassed — it sees every write regardless of which service or script made it, so a copy maintained this way stays correct even when someone updates the source directly in a console. Compare that with maintaining the copy in application code, which every other write path can skip. It does not remove the need for a periodic reconciliation job, since a stream can fall behind or lose history, but it makes drift the exception rather than the expectation.</p>
+</div>
+
+<h2><span class="h-rule"></span>Guarantees</h2>
+
+<div class="cols">
+  <div class="col good">
+    <h4>What you get</h4>
+    <ul>
+      <li><b>Total ordering</b>, including across shards</li>
+      <li><b>At-least-once</b> delivery, with a persisted token</li>
+      <li>Only <b>majority-committed</b> changes — never an event for a write that gets rolled back</li>
+      <li>Survives failover; the stream follows the new primary</li>
+      <li>Server-side filtering with a pipeline</li>
+    </ul>
+  </div>
+  <div class="col bad">
+    <h4>What you do not</h4>
+    <ul>
+      <li><b>Exactly-once</b> — handlers must be idempotent</li>
+      <li>History beyond the oplog window</li>
+      <li>Events for TTL deletions distinguishable from ordinary ones</li>
+      <li>The before-image, unless you enable pre-images</li>
+      <li>Low overhead at very high change rates on a sharded cluster</li>
+    </ul>
+  </div>
+</div>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">ordering, and what it costs on a sharded cluster</span><button class="copy">Copy</button></div>
+<pre><code>// On a replica set, ordering is free — one oplog, one sequence.
+//
+// On a SHARDED cluster, mongos merges streams from every shard into one
+// totally ordered sequence. To do that it must wait until it has heard from
+// every shard up to a given cluster time — so a shard with NO activity still
+// has to report periodically, and one slow shard delays the whole stream.
+//
+// The practical effect: change stream latency on a sharded cluster is bounded
+// by the slowest shard, and an idle shard adds a small constant delay. This
+// is fine at moderate rates and is a real consideration at very high ones.
+
+// A change stream is a cursor and behaves like one (chapter 4):
+const stream = coll.watch([], { maxAwaitTimeMS: 1000, batchSize: 100 });
+// maxAwaitTimeMS controls how long the server waits for new events before
+// returning empty — the trade between latency and polling overhead.
+
+// It reads from wherever your read preference points, and secondaries lag —
+// so a stream on a secondary is behind by the replication lag. For anything
+// driving a side effect, read from the primary.
+
+// Resource cost: each open stream is a cursor holding server resources.
+// Hundreds of streams — one per connected user, say — is a design that will
+// not scale. Run a small number of consumers and fan out in your application.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>A consumer that works</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">the shape worth copying</span><button class="copy">Copy</button></div>
+<pre><code>async function consume() {
+  const state = db.collection("_streamState");
+  const NAME = "orders-projector";
+
+  while (true) {
+    const saved = await state.findOne({ _id: NAME });
+    let stream;
+    try {
+      stream = db.collection("orders").watch(
+        [{ $match: { operationType: { $in: ["insert", "update", "replace"] } } }],
+        { startAfter: saved?.token, fullDocument: "updateLookup" }
+      );
+
+      for await (const change of stream) {
+        await handleIdempotently(change);          // safe to run twice
+        await state.updateOne({ _id: NAME },
+          { $set: { token: change._id, at: new Date() } }, { upsert: true });
+      }
+    } catch (err) {
+      if (err.code === 286 || err.codeName === "ChangeStreamHistoryLost") {
+        // The oplog window was exceeded. There is no way to recover the
+        // missed events — run a full reconciliation, then start fresh.
+        await reconcileEverything();
+        await state.deleteOne({ _id: NAME });
+      } else {
+        await sleep(backoff());                    // transient — reconnect
+      }
+    } finally {
+      await stream?.close();
+    }
+  }
+}
+
+// The four things that make this correct:
+//   startAfter rather than resumeAfter — survives a collection drop
+//   process THEN persist — at-least-once rather than at-most-once
+//   an idempotent handler — because at-least-once means duplicates
+//   an explicit path for history loss — because it will happen eventually
+//
+// Also: monitor how far behind the consumer is. now() minus the timestamp
+// of the last processed event, compared against the oplog window, is the
+// number that tells you whether you are about to lose history.</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Only one consumer per stream, or you will duplicate work</span>
+  <p>A change stream is not a queue with competing consumers — every open stream receives every event. Running three instances of a projector for availability means every change is processed three times, and since handlers are idempotent this often <em>looks</em> fine while tripling the write load and occasionally interleaving badly. If you need high availability, use leader election (a lock document with a TTL, or your orchestrator's leader mechanism) so exactly one instance is consuming. If you need throughput, either partition the stream with a <code>$match</code> on a hash of <code>_id</code>, or feed events into a real queue and scale the workers behind it.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Change streams are a <b>supported, resumable feed</b> over the oplog. Do not tail <code>local.oplog.rs</code> directly.</li>
+    <li><b>Persist the resume token after processing each event</b>, ideally with the result in one write.</li>
+    <li><b>The oplog window decides everything.</b> Offline longer than it and the stream cannot resume — no recovery, only reconciliation.</li>
+    <li><b>Delivery is at-least-once.</b> Handlers must be idempotent.</li>
+    <li><code>fullDocument: "updateLookup"</code> returns the document <b>as it is now</b>, not as it was at the change.</li>
+    <li><b>Only majority-committed changes appear</b>, so you never see an event for a write that gets rolled back.</li>
+    <li>They are the <b>best available owner for denormalised copies</b>, because nothing can bypass them.</li>
+    <li><b>Every open stream gets every event.</b> Use leader election, not multiple instances.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("14-change-streams.html");
+
+(function(){
+  const root = document.getElementById("cs");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const DOWN = [0.25, 0.5, 1, 2, 6, 12, 48, 168];
+  const DLBL = ["15 minutes","30 minutes","1 hour","2 hours","6 hours","12 hours","2 days","1 week"];
+  const WIN  = [1, 3, 6, 24, 72, 168, 720];
+  const WLBL = ["1 hour","3 hours","6 hours","24 hours","3 days","1 week","30 days"];
+
+  function render(){
+    const di = parseInt($("v-down").value,10) - 1;
+    const wi = parseInt($("v-win").value,10) - 1;
+    const store = $("v-store").value;
+    const down = DOWN[di], win = WIN[wi];
+    $("v-downv").textContent = DLBL[di];
+    $("v-winv").textContent  = WLBL[wi];
+
+    const hasToken = store === "db";
+    const inWindow = down < win;
+    const can = hasToken && inWindow;
+
+    $("v-can").textContent = can ? "yes" : "NO";
+    $("v-miss").textContent = can ? "none"
+                            : !hasToken ? "everything while offline"
+                            : "everything before the window";
+    $("v-fix").textContent = can ? "automatic"
+                           : !hasToken ? "full reconciliation"
+                           : "full reconciliation";
+
+    const pct = Math.min(100, down / win * 100);
+    $("v-bar").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      'Downtime against the oplog window</div>' +
+      '<div style="background:#fff;border:1px solid #E1E7EC;border-radius:5px;padding:12px">' +
+      '<div style="position:relative;height:26px;background:#EDF1F4;border-radius:4px;overflow:hidden">' +
+      '<div style="position:absolute;left:0;top:0;bottom:0;width:' + pct.toFixed(1) +
+      '%;background:' + (pct >= 100 ? "#E2574C" : pct > 70 ? "#F2A03D" : "#3FB984") + '"></div>' +
+      '<div style="position:absolute;right:8px;top:4px;font-family:var(--mono);font-size:11.5px;' +
+      'color:#54677A">window: ' + WLBL[wi] + '</div></div>' +
+      '<div style="font-family:var(--mono);font-size:11.5px;color:#54677A;margin-top:6px">offline ' +
+      DLBL[di] + ' — ' + pct.toFixed(0) + '% of the window' +
+      (pct >= 100 ? '  ← history lost' : '') + '</div></div>';
+
+    const notes = [];
+
+    if(store === "none")
+      notes.push("With no resume token stored, restarting the consumer means calling watch() with no position — which starts from NOW. Every change that happened while it was offline is simply never seen, and nothing reports that.\n\nThis is the failure mode that produces \"the search index is missing some documents and nobody knows which\". The gap is silent, unbounded and only discovered by comparison.\n\nStore the token. It is one small write per event, and it is the difference between a consumer that recovers and one that quietly drops data.");
+    else if(store === "mem")
+      notes.push("An in-memory token survives a network blip and nothing else. A process restart, a deploy, a pod rescheduling, an OOM kill — all lose the position, and the consumer restarts from now with an unrecorded gap.\n\nSince deploys are routine, this is effectively the same as not storing it, just less often. Persist the token to a collection alongside whatever the handler writes.");
+    else if(can)
+      notes.push("The token is persisted and the downtime is inside the oplog window, so the stream resumes exactly where it stopped. Every event during the outage is delivered in order, and the consumer catches up.\n\nThis is the case the design is for: as long as the token survives and the window covers the gap, an outage is invisible downstream.");
+
+    if(hasToken && !inWindow)
+      notes.push("The token is valid and the position it points at has been overwritten. MongoDB returns ChangeStreamHistoryLost, and the missed events are NOT RECOVERABLE from the database — the oplog is a capped collection and those entries are gone.\n\nYour only options are a full reconciliation pass against the source collection, or accepting the gap. Whichever you choose, it has to be written before it happens: a consumer that crashes on this error and restarts from now will silently skip everything, which is the worst outcome.\n\nHandle code 286 explicitly, reconcile, then start a fresh stream.");
+
+    if(pct > 60 && pct < 100)
+      notes.push("At " + pct.toFixed(0) + "% of the window this recovered, and there was not much margin. Two things shrink that margin without anyone changing a setting: write volume growing, which shortens the window, and outages lasting longer than the last one did.\n\nAlert on the consumer's lag as a fraction of the window rather than on an absolute duration, so the alarm tracks the actual risk.");
+
+    if(win <= 6)
+      notes.push("A " + WLBL[wi] + " oplog window is short for anything driving change streams. It is a capped collection, so enlarging it costs disk and nothing else, and it can be resized without a restart:\n\n    db.adminCommand({ replSetResizeOplog: 1, size: 51200 })\n\nSize it for the longest consumer outage or maintenance window you can imagine, not the average. 24 to 72 hours is a common target.");
+
+    notes.push("Whatever the outcome here, delivery is at-least-once: the correct order is process the event, THEN persist the token, so a crash between them replays rather than skips. That means handlers must be idempotent, which is the same requirement as chapter 6's retryable writes and for the same reason.");
+    $("v-note").textContent = notes.join("\n\n");
+  }
+
+  ["v-down","v-win","v-store"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

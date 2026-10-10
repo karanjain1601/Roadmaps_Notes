@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Tracing and debugging a run — AI Agents</title>
+<meta name="description" content="Span design for agent runs, replay, the questions a trace must answer, sampling and redaction, and a debugging workflow that converges.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 14 · Making it work</div>
+    <h1>Tracing and debugging a run</h1>
+    <p class="standfirst">When an agent does something inexplicable, you have one artefact to work from. If it does not contain the literal prompt, the exact arguments and the raw observations, you are guessing — and guessing about a non-deterministic system is not debugging.</p>
+    <div class="chap-meta">
+      <span class="tagpill">spans</span>
+      <span class="tagpill">what to capture</span>
+      <span class="tagpill">replay</span>
+      <span class="tagpill">sampling</span>
+      <span class="tagpill">workflow</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The questions a trace must answer</h2>
+
+<p>Design the trace backwards from the questions you will ask it at 3am. There are seven, and if any of them requires opening a database by hand, the trace is incomplete.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Question</th><th>Needs</th></tr></thead>
+<tbody>
+<tr><td>What did the model actually see at step 7?</td><td>The literal message array sent, not the template</td></tr>
+<tr><td>Why did it pick that tool?</td><td>The reasoning text, and the tool set that was available at that moment</td></tr>
+<tr><td>What did the tool really return?</td><td>The raw result, plus the truncated version the model received — both</td></tr>
+<tr><td>Where did the time go?</td><td>Per-span duration, split into model, tool and framework overhead</td></tr>
+<tr><td>What did this cost?</td><td>Tokens in and out per call, cached tokens, cost, running total</td></tr>
+<tr><td>Did a guard fire?</td><td>Guard events as spans, with which detector and why</td></tr>
+<tr><td>What changed in the world?</td><td>Every write, with its idempotency key and result</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">Store the rendered prompt, not the ingredients</span>
+  <p>Almost every framework logs the template and the variables. That is not the same thing, and the difference is exactly where the bugs live: a variable that rendered as <code>None</code>, a list that serialised to <code>[object Object]</code>, a truncation that cut mid-JSON, a system prompt that a mid-run edit invalidated. Store the exact string. It is large, so sample it — but never lose it on the runs that failed.</p>
+</div>
+
+<h2><span class="h-rule"></span>Span structure</h2>
+
+<p>An agent run is a tree, and mapping it onto ordinary distributed-tracing spans means your agent shows up next to your HTTP and database spans rather than in a separate tool.</p>
+
+<div class="flow stack">
+  <div class="step"><b>agent.run</b><span>The whole task. Holds goal, budget, final status, totals</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>agent.step</b><span>One iteration. Parent for the model call and any tool calls it triggered</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>llm.call · tool.execute · guard.fire · subagent.run</b><span>The leaves, each with its own attributes</span></div>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">tracing.py — OpenTelemetry spans with agent attributes</span><button class="copy">Copy</button></div>
+<pre><code>from opentelemetry import trace
+tracer = trace.get_tracer("agents")
+
+def run_agent(goal, ctx, tools, budget):
+    with tracer.start_as_current_span("agent.run") as run_span:
+        run_span.set_attributes({
+            "agent.name":          ctx.agent_name,
+            "agent.version":       ctx.agent_version,      # prompt + tool set version
+            "agent.model":         ctx.model_id,           # pinned, exact
+            "agent.goal":          redact(goal),
+            "agent.tools":         ",".join(sorted(tools)),
+            "agent.budget.steps":  budget.max_steps,
+            "agent.budget.usd":    budget.max_cost_usd,
+            "session.id":          ctx.session_id,
+            "user.id_hash":        ctx.user_id_hash,       # hashed, never raw
+            "tenant.id":           str(ctx.tenant_id),
+            "deploy.release":      RELEASE,
+        })
+
+        for n in range(1, budget.max_steps + 1):
+            with tracer.start_as_current_span("agent.step") as step_span:
+                step_span.set_attribute("agent.step.n", n)
+
+                with tracer.start_as_current_span("llm.call") as llm_span:
+                    reply = model.complete(messages, tools=schemas)
+                    llm_span.set_attributes({
+                        "llm.model":            ctx.model_id,
+                        "llm.tokens.in":        reply.usage.input_tokens,
+                        "llm.tokens.out":       reply.usage.output_tokens,
+                        "llm.tokens.cached":    reply.usage.cached_tokens,
+                        "llm.cost_usd":         reply.cost_usd,
+                        "llm.finish_reason":    reply.finish_reason,
+                        "llm.tool_calls":       len(reply.tool_calls),
+                        "llm.reasoning":        reply.text[:2000],
+                        # The big ones go to blob storage, keyed by span id.
+                        "llm.prompt_ref":       blobs.put(run_span, n, messages),
+                    })
+
+                for call in reply.tool_calls:
+                    with tracer.start_as_current_span("tool.execute") as t:
+                        t.set_attributes({
+                            "tool.name":        call.name,
+                            "tool.args":        redact_json(call.arguments),
+                            "tool.consequence": tools[call.name].consequence,
+                        })
+                        out = execute(call, ctx, tools, steps)
+                        t.set_attributes({
+                            "tool.ok":            out.ok,
+                            "tool.result_ref":    blobs.put_result(t, out.raw),
+                            "tool.observation":   out.observation[:1000],
+                            "tool.truncated":     out.truncated,
+                            "tool.idempotency":   out.key,
+                        })
+                        if not out.ok:
+                            t.set_status(trace.StatusCode.ERROR, out.observation[:200])</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Attributes for querying, blobs for reading</span>
+  <p>Trace backends index attributes and choke on 40KB strings. Put the small, queryable facts on the span — tool name, tokens, cost, ok — and push prompts and raw results into object storage with a reference. You can then ask "show me every run where <code>list_payments</code> returned <code>ok=false</code> and cost exceeded £0.20" in a query, and only pull the heavy content for the handful you open.</p>
+</div>
+
+<h2><span class="h-rule"></span>The debugging workflow</h2>
+
+<div class="demo" id="trace">
+  <div class="demo-head">
+    <b>Diagnose from a trace</b>
+    <span>A real-shaped run that went wrong. Work down it — the answer is visible in the numbers before you read any prose.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="k-case">Reported problem</label>
+        <select id="k-case">
+          <option value="slow" selected>"It takes 40 seconds"</option>
+          <option value="wrong">"It gave the wrong answer"</option>
+          <option value="expensive">"It cost £2 for one question"</option>
+          <option value="ignored">"It ignored our approval rule"</option>
+        </select>
+      </div>
+    </div>
+    <div id="k-out"></div>
+    <div class="out" id="k-note"></div>
+  </div>
+</div>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Find the run</b><span>Trace id from the response, or query by user, time and status</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Read the shape before the content</b><span>Step count, durations, costs, which spans errored. The anomaly is usually visible here</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Open the step where it went wrong</b><span>Not step 1. Find the first step whose reasoning stops making sense</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Read the literal prompt for that step</b><span>Half of all investigations end here</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Compare the raw result with the observation</b><span>Truncation, shaping and error-formatting bugs live in this gap</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>6 · Replay with a change</b><span>Same inputs, one difference. Confirm the fix before shipping it</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>7 · Add it to the eval suite</b><span>With fixtures reproducing the world state (chapter 13)</span></div>
+</div>
+
+<h2><span class="h-rule"></span>Replay</h2>
+
+<p>A trace that can be replayed turns debugging from archaeology into experiment. The recorded observations become a scripted environment, so you can change one thing and see what the model does differently — deterministically, offline, for the price of the model calls.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">replay.py — the trace becomes the test fixture</span><button class="copy">Copy</button></div>
+<pre><code>class RecordedTools:
+    """Replays observations from a trace. Unknown calls are surfaced, not faked."""
+    def __init__(self, trace: Trace, strict: bool = True):
+        self.by_sig = {(s.tool, s.arg_sig): s.raw_result
+                       for s in trace.tool_spans()}
+        self.strict = strict
+        self.novel: list[tuple[str, dict]] = []
+
+    def execute(self, call, ctx, tools, steps):
+        key = (call.name, sig(call.name, call.arguments))
+        if key in self.by_sig:
+            return Outcome(render(self.by_sig[key]), True, {})
+        self.novel.append((call.name, call.arguments))
+        if self.strict:
+            # The model diverged. That is the finding, not an error to paper over.
+            raise Diverged(call.name, call.arguments)
+        return Outcome(f"[not recorded: {call.name}]", False, {})
+
+
+def replay(trace_id: str, **changes) -> Run:
+    trace = traces.load(trace_id)
+    cfg = trace.config.with_changes(**changes)      # prompt version, model, tool set…
+    return run_agent(trace.goal,
+                     ctx=trace.ctx.with_tools(RecordedTools(trace)),
+                     tools=tools_for(cfg), budget=trace.budget)
+
+# Uses that pay for themselves:
+#   replay(id)                              -> is it deterministic?
+#   replay(id, model="next-version")        -> does the upgrade change behaviour?
+#   replay(id, prompt_version="v9")         -> did my fix work on the real case?
+#   replay(id, tools=narrowed)              -> was the tool set the problem?
+#
+# Divergence is informative: the point where the model asks for something the
+# original run never called is usually the point your change took effect.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Sampling and redaction</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Content</th><th>Retain</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>Span attributes (all runs)</td><td>100%, 30–90 days</td><td>Small and queryable. This is your metrics substrate</td></tr>
+<tr><td>Prompts and raw results — failed runs</td><td>100%, 30 days</td><td>Never sample away a failure. These are what you actually open</td></tr>
+<tr><td>Prompts and raw results — unsafe attempts or guard fires</td><td>100%, 90 days</td><td>Security-relevant; longer retention</td></tr>
+<tr><td>Prompts and raw results — successes</td><td>1–5%, 7 days</td><td>Enough to spot drift and build fixtures. Cheap to keep small</td></tr>
+<tr><td>Runs flagged by a user</td><td>100%, until resolved</td><td>Link the trace id to the feedback record</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Traces are the biggest accidental PII store you will build</span>
+  <p>Tool observations contain customer records in full. Prompts contain the user's own words. Arguments contain email addresses and order references. Redact <b>before</b> writing, not on read — a redaction applied at display time still leaves the raw data in storage and in every backup. Hash user identifiers, drop or tokenise structured identifiers, and set retention deliberately per category rather than accepting a default. Then check what you actually stored, by reading some.</p>
+</div>
+
+<h2><span class="h-rule"></span>What to watch continuously</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Signal</th><th>Alert when</th><th>Usually means</th></tr></thead>
+<tbody>
+<tr><td>Steps per run, p50 and p95</td><td>p95 rises 30%</td><td>A tool degraded, or a model version changed under you</td></tr>
+<tr><td>Cost per run</td><td>Doubles</td><td>Cache broken by a prompt edit, or runs getting longer</td></tr>
+<tr><td>Cached-token ratio</td><td>Collapses</td><td>Someone made the system prompt or tool schemas vary per step</td></tr>
+<tr><td>Guard fire rate by detector</td><td>Any detector doubles</td><td>Chapter 12's table — each detector points somewhere specific</td></tr>
+<tr><td>Tool error rate by tool</td><td>Above baseline</td><td>An upstream dependency, surfacing through the agent</td></tr>
+<tr><td>Halted-run rate</td><td>Above 10%</td><td>Budgets too tight, or steps being wasted</td></tr>
+<tr><td>Unsafe attempts</td><td>Any</td><td>Page someone. Chapter 15</td></tr>
+<tr><td>Time to first step event</td><td>Above 2s</td><td>The user is staring at nothing (chapter 16)</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">The silent regressions are distributional</span>
+  <p>None of the failures that matter most throw an exception. Average step count creeping from 4 to 6, cached-token ratio quietly falling after a prompt edit, one tool's error rate rising from 0.2% to 3% — all invisible in an error dashboard, all expensive. Alert on the <em>shape</em> of these distributions, and re-baseline deliberately after every model or prompt change so you notice when the new normal is worse than the old one.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Design the trace backwards from <b>the seven questions</b> you will ask it during an incident.</li>
+    <li><b>Store the rendered prompt</b>, not the template and variables. That gap is where the bugs live.</li>
+    <li>Model the run as <b>agent.run → agent.step → llm.call / tool.execute / guard.fire</b>, in your existing tracing system.</li>
+    <li><b>Attributes for querying, blobs for reading.</b> Keep spans small and indexable; push heavy content to object storage.</li>
+    <li>Debug by <b>shape before content</b>: durations, costs and error spans usually locate the problem before you read any prose.</li>
+    <li><b>Replay turns a trace into a fixture.</b> Change one variable, rerun offline, and treat divergence as the finding.</li>
+    <li>Sample successes, <b>never sample away failures</b>, and redact before writing rather than on read.</li>
+    <li>The regressions that hurt are <b>distributional, not exceptional</b>. Alert on shape and re-baseline after every change.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("14-observability.html");
+
+(function(){
+  const root = document.getElementById("trace");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const CASES = {
+    slow: {
+      spans: [
+        {n:"agent.run",     d:41200, tok:"—",    c:"0.061", note:"status: completed"},
+        {n:"  step 1 · llm", d:1100, tok:"2.1k",  c:"0.008", note:"plan"},
+        {n:"  step 1 · tool find_orders", d:180, tok:"—", c:"—", note:"ok"},
+        {n:"  step 2 · llm", d:1240, tok:"2.9k",  c:"0.010", note:""},
+        {n:"  step 2 · tool search_policy", d:14800, tok:"—", c:"—", note:"ok — 14.8s", flag:true},
+        {n:"  step 3 · llm", d:1310, tok:"3.6k",  c:"0.012", note:""},
+        {n:"  step 3 · tool search_policy", d:15100, tok:"—", c:"—", note:"ok — 15.1s", flag:true},
+        {n:"  step 4 · llm", d:1450, tok:"4.2k",  c:"0.014", note:"final answer"},
+        {n:"  stream · first event", d:2900, tok:"—", c:"—", note:"user saw nothing until 2.9s", flag:true}
+      ],
+      finding: "Two calls to search_policy account for 30s of the 41s. The model calls are fine.",
+      lesson: "Shape before content: the duration column answers this without reading a single prompt. Two fixes, in order — put a timeout on search_policy so it cannot take 15 seconds, and cache it within the run so the second identical call is free. Then look at why the user waited 2.9s for the first step event; that is a streaming problem, not a latency one, and it is the part they actually experienced."
+    },
+    wrong: {
+      spans: [
+        {n:"agent.run",     d:8900, tok:"—",   c:"0.019", note:"status: completed"},
+        {n:"  step 1 · llm", d:980,  tok:"2.0k", c:"0.007", note:"\"I'll look up the order first\""},
+        {n:"  step 1 · tool get_order", d:120, tok:"—", c:"—", note:"ok"},
+        {n:"  step 2 · llm", d:1100, tok:"2.6k", c:"0.009", note:"\"Now the payment history\""},
+        {n:"  step 2 · tool list_payments", d:95, tok:"—", c:"—", note:"ok — returned []", flag:true},
+        {n:"  step 3 · llm", d:1240, tok:"3.1k", c:"0.010", note:"\"No duplicate charge found.\""},
+        {n:"  · raw result", d:0, tok:"—", c:"—", note:"{\"payments\":[{...},{...}],\"page\":2}", flag:true},
+        {n:"  · observation sent", d:0, tok:"—", c:"—", note:"[]", flag:true}
+      ],
+      finding: "The raw result contained two payments. The observation the model received was an empty array.",
+      lesson: "This is why you store both the raw result and the observation. The renderer read result['data'] on a response that used a different key on page 2, silently produced an empty list, and the model answered correctly from what it was given. Nothing in the prompt, the model or the tool was at fault — the bug was twelve lines of shaping code, and it was invisible without both values side by side."
+    },
+    expensive: {
+      spans: [
+        {n:"agent.run",     d:38000, tok:"—",    c:"2.14", note:"status: completed", flag:true},
+        {n:"  step 1 · llm", d:1900, tok:"3.1k",  c:"0.047", note:"cached: 0", flag:true},
+        {n:"  step 4 · llm", d:2600, tok:"18.4k", c:"0.276", note:"cached: 0", flag:true},
+        {n:"  step 8 · llm", d:3900, tok:"41.2k", c:"0.618", note:"cached: 0", flag:true},
+        {n:"  step 11 · llm", d:4800, tok:"63.7k", c:"0.955", note:"cached: 0", flag:true},
+        {n:"  · tool fetch_document ×4", d:0, tok:"—", c:"—", note:"avg 4,800 tokens each, untruncated", flag:true}
+      ],
+      finding: "Zero cached tokens on every call, and observations averaging 4,800 tokens.",
+      lesson: "Two compounding problems. The cached column being zero throughout means the stable prefix is changing between steps — check whether something appends to the system prompt mid-run, which chapter 7 warns about specifically. And fetch_document has no cap, so four documents put 19k tokens into a context that is resent eleven times. Fix the cap first: it is one line and it reduces every subsequent step."
+    },
+    ignored: {
+      spans: [
+        {n:"agent.run",     d:11200, tok:"—",   c:"0.031", note:"status: completed"},
+        {n:"  step 3 · llm", d:1200, tok:"5.1k", c:"0.017", note:"\"The customer is clearly owed this, I'll process it\""},
+        {n:"  step 3 · tool issue_refund", d:0, tok:"—", c:"—", note:"consequence: financial", flag:true},
+        {n:"  step 3 · guard.fire", d:2, tok:"—", c:"—", note:"detector: consequence_gate — held, AP-2210"},
+        {n:"  step 4 · llm", d:1150, tok:"5.4k", c:"0.018", note:"\"Refund queued for approval.\""},
+        {n:"  · tool set granted", d:0, tok:"—", c:"—", note:"includes issue_refund", flag:true}
+      ],
+      finding: "The guard worked — the refund was held. But the agent had issue_refund in its tool set at all.",
+      lesson: "The rule was enforced and nothing bad happened, so this will not appear in any error dashboard. It still matters: the model reached for a financial action on its own judgement, and a guard is a backstop rather than a design. Two changes — remove issue_refund from this agent's tool set entirely and expose only propose_refund, and add this exact case to the adversarial slice of the eval suite so the unsafe-attempt count catches it next time."
+    }
+  };
+
+  function render(){
+    const c = CASES[$("k-case").value];
+    const max = Math.max.apply(null, c.spans.map(s => s.d));
+
+    $("k-out").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">Trace</div>' +
+      '<div style="display:flex;gap:10px;font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:#8FA0AF;padding:0 11px 5px">' +
+      '<span style="flex:1">span</span><span style="min-width:120px">duration</span>' +
+      '<span style="min-width:52px;text-align:right">tokens</span><span style="min-width:52px;text-align:right">cost</span></div>' +
+      c.spans.map(s =>
+        '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid ' +
+        (s.flag ? "#E2574C" : "#3FB984") + ';border-radius:4px;padding:7px 11px;margin-bottom:4px">' +
+        '<div style="display:flex;gap:10px;align-items:center">' +
+        '<span style="flex:1;font-family:var(--mono);font-size:12px;white-space:pre">' + s.n + '</span>' +
+        '<span style="min-width:120px;display:flex;align-items:center;gap:6px">' +
+        (s.d > 0 ? '<span class="bar" style="flex:1"><i style="width:' + Math.max(2, s.d/max*100).toFixed(0) +
+          '%' + (s.flag ? ';background:#E2574C' : '') + '"></i></span>' +
+          '<span style="font-family:var(--mono);font-size:11px;color:#54677A;min-width:44px;text-align:right">' +
+          (s.d/1000).toFixed(1) + 's</span>' : '<span style="width:100%"></span>') + '</span>' +
+        '<span style="min-width:52px;text-align:right;font-family:var(--mono);font-size:11px;color:#54677A">' + s.tok + '</span>' +
+        '<span style="min-width:52px;text-align:right;font-family:var(--mono);font-size:11px;color:#54677A">' + s.c + '</span></div>' +
+        (s.note ? '<div style="font-size:12.5px;color:' + (s.flag ? "#E2574C" : "#54677A") +
+          ';margin-top:3px;padding-left:2px">' + s.note.replace(/[<>&]/g, ch => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[ch])) + '</div>' : '') +
+        '</div>').join("");
+
+    $("k-note").textContent = "FINDING — " + c.finding + "\n\n" + c.lesson;
+  }
+
+  $("k-case").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

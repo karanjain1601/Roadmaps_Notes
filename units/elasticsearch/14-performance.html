@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Performance and sizing — Elasticsearch</title>
+<meta name="description" content="Shard sizing, the refresh interval, segment merging, the caches, and the heap rules that have not changed in a decade.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 14 · Running it</div>
+    <h1>Performance and sizing</h1>
+    <p class="standfirst">Most Elasticsearch performance problems are capacity problems wearing a disguise, and most capacity problems come from three decisions: how many shards, how much heap, and how often to refresh. All three are easier to get right at the start than to fix later.</p>
+    <div class="chap-meta">
+      <span class="tagpill">shard sizing</span>
+      <span class="tagpill">merging</span>
+      <span class="tagpill">caches</span>
+      <span class="tagpill">heap</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Sizing a cluster</h2>
+
+<div class="demo" id="sz">
+  <div class="demo-head">
+    <b>Work it out from the data</b>
+    <span>The arithmetic is not complicated. Skipping it is the usual cause of the problems in this chapter.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="s-data">Data in a year — <span id="s-datav">400</span> GB</label>
+        <input type="range" id="s-data" min="1" max="40" step="1" value="8">
+      </div>
+      <div>
+        <label for="s-target">Target shard size — <span id="s-targetv">40</span> GB</label>
+        <input type="range" id="s-target" min="10" max="60" step="5" value="40">
+      </div>
+      <div>
+        <label for="s-rep">Replicas — <span id="s-repv">1</span></label>
+        <input type="range" id="s-rep" min="0" max="2" step="1" value="1">
+      </div>
+      <div>
+        <label for="s-nodes">Data nodes — <span id="s-nodesv">5</span></label>
+        <input type="range" id="s-nodes" min="1" max="20" step="1" value="5">
+      </div>
+      <div>
+        <label for="s-heap">Heap per node — <span id="s-heapv">30</span> GB</label>
+        <input type="range" id="s-heapv2" min="4" max="31" step="1" value="30">
+      </div>
+    </div>
+    <div id="s-out"></div>
+    <div class="stat">
+      <div><b id="s-shards">—</b><span>primary shards</span></div>
+      <div><b id="s-disk">—</b><span>disk needed</span></div>
+      <div><b id="s-perNode">—</b><span>shards per node</span></div>
+      <div><b id="s-verdict">—</b><span>verdict</span></div>
+    </div>
+    <div class="out" id="s-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">The heap rules, which have not changed in a decade</span>
+  <p><b>Half of RAM, and never above about 31 GB.</b> Half, because Lucene needs the other half for the filesystem cache — segments are memory-mapped files and the page cache is what makes searching them fast, so a node with all its memory in heap is a node doing disk I/O for every query. And below 32 GB because the JVM uses compressed object pointers under that threshold; crossing it makes every reference larger, so <b>a 32 GB heap holds less usable data than a 31 GB one</b>. If you have a 128 GB machine, run 31 GB of heap and let Lucene use the rest, or run two nodes on it. Then the shard count rule: <b>aim below 20 shards per GB of heap</b>, which puts a 30 GB node at 600 shards maximum and comfortably fewer in practice.</p>
+</div>
+
+<h2><span class="h-rule"></span>Indexing throughput</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the levers, in order of effect</span><button class="copy">Copy</button></div>
+<pre><code># 1. BULK, and size it in bytes. 5-15 MB per request (chapter 6)
+# 2. RAISE THE REFRESH INTERVAL. Each refresh makes a segment, and segments
+#    must be merged. 1s is for search freshness you probably do not need
+PUT /logs/_settings { "index": { "refresh_interval": "30s" } }
+
+# 3. FOR A BULK LOAD: no refreshes, no replicas, then restore both
+PUT /logs/_settings
+{ "index": { "refresh_interval": "-1", "number_of_replicas": 0 } }
+
+# 4. LET ELASTICSEARCH GENERATE IDS. A supplied id forces a lookup to check
+#    whether that document already exists; a generated one is known to be new
+
+# 5. INDEX LESS. The largest wins are usually in the mapping (chapter 4):
+"index": false          # not searchable — for fields you only display
+"doc_values": false     # not sortable or aggregatable
+"norms": false          # no length normalisation
+"_source": { "excludes": [ "huge_blob" ] }
+#    Check what is actually costing you:
+GET /logs/_disk_usage?run_expensive_tasks=true
+
+# 6. INDEX BUFFER, shared across all shards on the node
+indices.memory.index_buffer_size: 10%      # default. 512mb+ helps heavy loads
+
+# 7. MULTIPLE CLIENT THREADS. One bulk stream will not saturate a cluster.
+#    Increase concurrency until you see 429s, then back off one step. The
+#    429 is the signal that you have found the ceiling — it is backpressure,
+#    not an error, and should be retried with backoff
+
+# WHAT TO WATCH:
+GET /_nodes/stats/thread_pool
+#   thread_pool.write.rejected      rising = you are past capacity
+#   thread_pool.write.queue
+GET /_cat/thread_pool/write?v
+GET /_nodes/stats/indices/indexing
+#   index_total, index_time_in_millis -> ms per document
+
+# TWO THINGS THAT DO NOT HELP AS MUCH AS PEOPLE EXPECT:
+#   * more shards. Indexing is already parallel across shards; beyond one
+#     per node you are adding overhead rather than throughput
+#   * faster CPUs. Indexing is usually bound by disk and by merge I/O.
+#     Fast local SSDs are the hardware that matters</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Merging</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">the background process that explains a lot of I/O</span><button class="copy">Copy</button></div>
+<pre><code>Every refresh creates a segment. Segments are immutable, so deletes and
+updates accumulate as tombstones inside them (chapter 6). Merging combines
+small segments into larger ones and drops the deleted documents on the way.
+
+WHY IT MATTERS:
+  * a search must visit EVERY segment in a shard, so hundreds of tiny
+    segments is hundreds of times the per-segment overhead
+  * deleted documents occupy disk and are scanned until a merge removes them
+  * merging is the single largest consumer of background disk I/O, and it
+    competes directly with indexing and searching
+
+  GET /_cat/segments/logs?v
+  GET /_cat/indices/logs?v&h=index,docs.count,docs.deleted,store.size
+  #   docs.deleted large relative to docs.count = dead weight
+
+  GET /_nodes/stats/indices/merges
+  #   current, total_time_in_millis, total_throttled_time_in_millis
+  #   THROTTLED TIME RISING means merges cannot keep up with indexing, and
+  #   segment count will grow until searches slow down
+
+  indices.store.throttle / index.merge.scheduler.max_thread_count
+  #   defaults are tuned for SSDs. On spinning disks set max_thread_count
+  #   to 1 — concurrent merges on a single spindle are pathological
+
+FORCE MERGE, and the trap:
+  POST /logs-2026.03.14/_forcemerge?max_num_segments=1
+
+  ONLY on an index that will never be written to again. On a live index it
+  produces one enormous segment that the merge policy will never select
+  again — so any documents deleted from it afterwards are stuck there
+  permanently, and the shard carries that dead weight forever.
+  This is the right thing to do to yesterday's log index as part of ILM
+  (chapter 15), and the wrong thing to do to a live search index.
+
+  Note vector indices merge much more slowly, because HNSW graphs must be
+  rebuilt rather than concatenated (chapter 13).</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Search performance</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Do</th><th>Because</th></tr></thead>
+<tbody>
+<tr><td>Put yes/no conditions in <code>filter</code></td><td>Cacheable bitsets, no scoring (chapter 7)</td></tr>
+<tr><td>Round <code>now</code> in date ranges</td><td>Makes the filter cacheable at all</td></tr>
+<tr><td>Return only the fields you render</td><td><code>_source</code> is fetched and decompressed per hit</td></tr>
+<tr><td>Set <code>size</code> to what you display</td><td>Every shard returns <code>from + size</code> (chapter 9)</td></tr>
+<tr><td>Use <code>search_after</code>, not deep <code>from</code></td><td>Constant cost per page</td></tr>
+<tr><td>Cap <code>track_total_hits</code></td><td>Counting every match is expensive and nobody reads it</td></tr>
+<tr><td>Prefer <code>keyword</code> over <code>text</code> for exact fields</td><td>Half the index, and it can be sorted and aggregated</td></tr>
+<tr><td>Use <code>index_sorting</code> for time-series</td><td>Queries can stop early instead of scanning</td></tr>
+<tr><td>Force-merge read-only indices</td><td>One segment, minimal per-segment overhead</td></tr>
+<tr><td>Warm the page cache after a restart</td><td>A cold node serves from disk and looks broken</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the three caches, and what invalidates each</span><button class="copy">Copy</button></div>
+<pre><code># 1. NODE QUERY CACHE — per-segment bitsets for filter clauses
+indices.queries.cache.size: 10%            # of heap
+GET /_nodes/stats/indices/query_cache
+#   hit_count, miss_count, evictions
+#   Only caches clauses used repeatedly, on segments above a size threshold
+
+# 2. SHARD REQUEST CACHE — whole responses for size=0 requests
+index.requests.cache.enable: true          # default true for size=0
+indices.requests.cache.size: 1%            # of heap
+GET /_nodes/stats/indices/request_cache
+#   Invalidated on REFRESH, so it only helps indices that are not being
+#   written to. Which describes yesterday's log index perfectly, and is why
+#   dashboards over historical data are so much faster than over today's
+
+# 3. THE FILESYSTEM CACHE — the operating system's page cache
+#   Not an Elasticsearch feature and by far the most important. Segments are
+#   memory-mapped files; if they are in the page cache, searching them is
+#   memory speed, and if not, it is disk speed.
+#
+#   THIS IS THE REASON FOR THE HALF-OF-RAM HEAP RULE. Every GB you give the
+#   JVM is a GB Lucene cannot use for caching segments.
+
+GET /_stats/fielddata?fields=*              # should be near zero
+GET /_nodes/stats/breaker
+#   Circuit breakers: parent, fielddata, request, in_flight_requests
+#   A tripped breaker returns a 429 or 503 rather than an OOM. Rising trip
+#   counts mean queries are asking for more memory than is available —
+#   usually a huge aggregation or an unbounded terms size (chapter 12)
+
+# PROFILE A SLOW QUERY — per-shard, per-clause timing:
+GET /logs/_search
+{ "profile": true, "query": { ... } }
+# Verbose, and it tells you exactly which clause and which phase cost the
+# time. Use it on one slow query rather than guessing.
+
+# SLOW LOGS, which are off by default and worth turning on:
+PUT /logs/_settings
+{ "index.search.slowlog.threshold.query.warn": "5s",
+  "index.search.slowlog.threshold.fetch.warn": "1s",
+  "index.indexing.slowlog.threshold.index.warn": "10s" }</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Watch the fetch phase separately from the query phase</span>
+  <p>A search has two phases (chapter 9) and they fail for different reasons. A slow <b>query phase</b> means the matching itself is expensive — an unbounded aggregation, a leading wildcard, too many shards, a heavy scoring function. A slow <b>fetch phase</b> means the matching was fine and retrieving the documents is the problem: large <code>_source</code>, highlighting over big fields, or too many hits requested. The distinction matters because the fixes have nothing in common, and the slow log threshold is configured separately for each. When a search is slow and the query looks cheap, check <code>indices.search.fetch_time_in_millis</code> against <code>query_time_in_millis</code> before optimising the wrong half.</p>
+</div>
+
+<h2><span class="h-rule"></span>Hardware</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">what to spend money on, in order</span><button class="copy">Copy</button></div>
+<pre><code>1. FAST LOCAL SSDs. NVMe if possible. Elasticsearch is I/O bound far more
+   often than CPU bound, and network-attached storage adds latency to every
+   segment read. If you are on cloud block storage, provision IOPS
+   deliberately and watch for burst-credit exhaustion — a cluster that was
+   fine for three weeks and then was not is very often this.
+
+2. RAM. Half for heap (capped near 31 GB), half for the page cache. More RAM
+   means more of your index is served from memory.
+
+3. CPU. Matters for indexing, aggregations and vector search. Rarely the
+   first bottleneck.
+
+4. NETWORK. Matters during recovery and rebalancing, when whole shards move
+   between nodes. A 200 GB shard on a 1 Gbps link is a long recovery.
+
+  ------------------------------------------------------------------
+  ALSO:
+    * bootstrap.memory_lock: true, and set the ulimit to match. A swapped
+      heap is catastrophic — GC pauses of tens of seconds
+    * set -Xms and -Xmx to the SAME value. A growing heap causes pauses
+    * do not disable swap without also setting memory_lock; do both
+    * vm.max_map_count = 262144. Elasticsearch memory-maps every segment
+      file and will refuse to start without enough map entries
+    * one node per machine unless the machine is large enough to justify
+      two, in which case configure them not to hold copies of the same shard
+  ------------------------------------------------------------------
+
+MANY SMALL NODES OR FEW LARGE ONES? Prefer a moderate number of moderate
+nodes. Very large nodes hold too many shards and recover slowly; very small
+ones spend a disproportionate fraction of their memory on per-shard
+overhead and cluster state. Three to ten data nodes covers a great many
+production deployments, and going wider should be a response to a measured
+limit rather than an assumption.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Benchmark with your own data, and with Rally</span>
+  <p>Every number in this chapter is a starting point that your workload will contradict. <b>Rally</b> is Elastic's own benchmarking tool and the same one they use to test releases: it drives a defined workload — including your own indices and queries — and reports indexing throughput, query latency percentiles and resource usage, so you can compare configurations rather than argue about them. The specific things worth measuring before committing: <b>refresh interval</b> against indexing throughput, <b>shard count</b> against query latency at your real concurrency, and <b>heap size</b> against GC behaviour under load. An afternoon with Rally on representative data settles questions that otherwise get decided by whichever blog post was read most recently.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Target 10–50 GB per shard</b>, sized for the data you will have in a year, and under 20 shards per GB of heap.</li>
+    <li><b>Half of RAM for heap, never above ~31 GB.</b> Above 32 GB the JVM loses compressed pointers and a bigger heap holds less.</li>
+    <li><b>The filesystem cache is the most important cache</b>, and it is the other half of your RAM.</li>
+    <li><b>Raise the refresh interval.</b> Each refresh makes a segment, and segments must be merged.</li>
+    <li><b>Merging is the largest background I/O consumer.</b> Rising throttled time means it cannot keep up.</li>
+    <li><b>Force-merge only read-only indices</b>, or deleted documents are stuck in one giant segment forever.</li>
+    <li><b>Separate the query phase from the fetch phase</b> when diagnosing; the fixes have nothing in common.</li>
+    <li><b>Spend on SSDs first, RAM second.</b> Elasticsearch is I/O bound far more often than CPU bound.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("14-performance.html");
+
+(function(){
+  const root = document.getElementById("sz");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  function render(){
+    const data   = parseInt($("s-data").value, 10) * 50;      // GB
+    const target = parseInt($("s-target").value, 10);
+    const rep    = parseInt($("s-rep").value, 10);
+    const nodes  = parseInt($("s-nodes").value, 10);
+    const heap   = parseInt($("s-heapv2").value, 10);
+
+    $("s-datav").textContent  = data;
+    $("s-targetv").textContent = target;
+    $("s-repv").textContent   = rep;
+    $("s-nodesv").textContent = nodes;
+    $("s-heapv").textContent  = heap;
+
+    const shards = Math.max(1, Math.ceil(data / target));
+    const copies = rep + 1;
+    const totalShards = shards * copies;
+    const disk = data * copies;
+    const perNode = totalShards / nodes;
+    const shardLimit = heap * 20;
+    const diskPerNode = disk / nodes;
+
+    $("s-shards").textContent  = shards;
+    $("s-disk").textContent    = disk.toLocaleString() + " GB";
+    $("s-perNode").textContent = perNode.toFixed(1);
+
+    const problems = [];
+    if(copies > nodes) problems.push("more copies than nodes");
+    if(perNode > shardLimit) problems.push("over the heap shard limit");
+    if(shards < nodes && shards > 1) problems.push("fewer shards than nodes");
+    if(target < 15) problems.push("shards too small");
+    if(target > 55) problems.push("shards too large");
+    if(diskPerNode > 2000) problems.push("very large nodes");
+    if(rep === 0) problems.push("no redundancy");
+
+    const verdict = problems.length === 0 ? "sound" : problems.length === 1 ? "one issue" : problems.length + " issues";
+    $("s-verdict").textContent = verdict;
+    $("s-verdict").style.color = problems.length === 0 ? "#3FB984" : problems.length === 1 ? "#F2A03D" : "#E2574C";
+
+    $("s-out").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin:16px 0 8px">The arithmetic</div>' +
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-radius:5px;padding:11px 13px;' +
+      'margin:0 0 12px;font-family:var(--mono);font-size:11.5px;line-height:1.8;overflow-x:auto">' +
+      data + ' GB / ' + target + ' GB per shard   = ' + shards + ' primary shards\n' +
+      shards + ' × ' + copies + ' copies             = ' + totalShards + ' shard copies\n' +
+      data + ' GB × ' + copies + '                  = ' + disk.toLocaleString() + ' GB of disk\n' +
+      totalShards + ' / ' + nodes + ' nodes' + ' '.repeat(Math.max(1, 18 - String(totalShards).length - String(nodes).length)) +
+      '= ' + perNode.toFixed(1) + ' shards per node\n' +
+      heap + ' GB heap × 20            = ' + shardLimit + ' shards max per node\n' +
+      disk.toLocaleString() + ' GB / ' + nodes + ' nodes' + ' '.repeat(Math.max(1, 15 - String(disk).length - String(nodes).length)) +
+      '= ' + Math.round(diskPerNode).toLocaleString() + ' GB per node' +
+      '</pre>' +
+      (problems.length
+        ? problems.map(p =>
+            '<div style="background:#FFF7EC;border:1px solid #F2A03D;border-radius:4px;' +
+            'padding:7px 11px;margin-bottom:4px;font-size:12.5px;color:#8A5A18">' + p + '</div>').join("")
+        : '<div style="background:#EAF7F1;border:1px solid #3FB984;border-radius:4px;padding:9px 12px;' +
+          'font-size:12.5px;color:#1F7A52">Every constraint satisfied. This shape will behave.</div>');
+
+    const notes = [];
+
+    notes.push(shards + " primary shards for " + data + " GB, at " + target +
+      " GB each. With " + rep + " replica" + (rep === 1 ? "" : "s") + " that is " + totalShards +
+      " shard copies and " + disk.toLocaleString() + " GB of disk — the multiplication people forget when budgeting storage.\n\nSize for the data you will have in a YEAR, not today. The primary count cannot be changed on a live index (chapter 2), so getting it wrong means a reindex, and a reindex of a live search index is a project.");
+
+    if(copies > nodes)
+      notes.push("You have asked for " + copies + " copies of each shard across " + nodes +
+        " node" + (nodes === 1 ? "" : "s") + ". A replica is never placed on the same node as its primary, so the surplus copies cannot be allocated and the cluster sits permanently yellow (chapter 2).");
+
+    if(perNode > shardLimit)
+      notes.push("At " + perNode.toFixed(1) + " shards per node against a limit of " + shardLimit +
+        " for " + heap + " GB of heap, this is oversharded.\n\nThe guidance is under 20 shards per GB of heap. Beyond it, per-shard memory overhead eats the heap, cluster state grows, node joins and recovery get slower, and the master starts struggling to propagate updates.\n\nThe symptoms arrive months later and look like general cluster sickness rather than a configuration mistake, which is why this is the most persistent self-inflicted Elasticsearch problem. Either raise the target shard size, add nodes, or add heap.");
+
+    if(shards < nodes && shards > 1)
+      notes.push("With only " + shards + " shards across " + nodes +
+        " nodes, some nodes hold no primary at all and cannot contribute to indexing throughput for this index.\n\nThat is fine if this is one index among many — the others will fill the gaps. If it is your only index, either use fewer nodes or smaller shards so the work spreads.");
+
+    if(target < 15)
+      notes.push("A target of " + target + " GB per shard is small. Every shard costs memory for its own Lucene structures, file handles and a slot in the cluster state, and every search fans out to all of them and merges the results.\n\nBelow roughly 10 GB you are usually paying more in overhead than you gain in parallelism. The exception is time-series data managed by rollover, where each backing index is deliberately small and short-lived (chapter 15).");
+
+    if(target > 55)
+      notes.push("A target of " + target + " GB per shard is large. A shard is the unit of recovery and relocation, so a shard this size must be copied in full when a node fails or the cluster rebalances — slow, and it saturates the network.\n\nIt is also the unit of parallelism: one shard is searched by one thread, so an oversized shard makes a single query slow with no way to speed it up. Time-series workloads routinely run larger than search workloads and 50 GB is the usual upper guidance.");
+
+    if(diskPerNode > 2000)
+      notes.push("At " + Math.round(diskPerNode).toLocaleString() +
+        " GB per node these are very large nodes, which brings two problems.\n\nRecovery time: losing one node means moving that much data across the network. And the ratio of data to memory — with " +
+        heap + " GB of heap and perhaps the same again for the page cache, only a small fraction of this node's data can be cached, so most searches will hit disk.\n\nA moderate number of moderate nodes usually behaves better than a few very large ones.");
+
+    if(rep === 0)
+      notes.push("Zero replicas means one copy of everything: any single node failure takes the cluster red and that data is unreachable until the node returns or you restore a snapshot.\n\nIt is the right setting for a development cluster and for the duration of a bulk load, where you raise it afterwards and let the copies be built from finished shards rather than document by document. It is the wrong setting for anything you care about — and note replicas also serve reads, so zero replicas means no read scaling either.");
+
+    if(heap > 31)
+      notes.push("Heap above 31 GB crosses the JVM's compressed-pointer threshold, so every object reference becomes larger and a 32 GB heap holds LESS usable data than a 31 GB one.\n\nThe rule is half of RAM, capped just under 32. On a 128 GB machine that means 31 GB of heap and 97 GB left for the filesystem cache — which is the right allocation, because segments are memory-mapped files and the page cache is what makes searching them fast.");
+    else if(heap <= 8 && data > 200)
+      notes.push("At " + heap + " GB of heap for " + data +
+        " GB of data, the ratio is tight. Heap is consumed by per-shard structures, aggregation buckets, the query and request caches, and in-flight requests — and aggregations in particular can ask for a great deal of it at once (chapter 12).\n\nExpect circuit breakers to trip under load. Check GET /_nodes/stats/breaker for rising trip counts before assuming a query is at fault.");
+
+    if(problems.length === 0)
+      notes.push("Worth stating what this arithmetic does NOT tell you: whether the nodes can serve your query rate, and whether indexing throughput is sufficient. Those depend on the workload and need measuring.\n\nRally is Elastic's own benchmarking tool and it drives your indices and your queries, reporting indexing throughput and latency percentiles. The three things worth measuring before committing are refresh interval against indexing throughput, shard count against query latency at real concurrency, and heap size against GC behaviour under load.");
+
+    $("s-note").textContent = notes.join("\n\n");
+  }
+
+  ["s-data","s-target","s-rep","s-nodes","s-heapv2"].forEach(id =>
+    $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

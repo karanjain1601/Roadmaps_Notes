@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · The persistence context — Spring Boot</title>
+<meta name="description" content="Entity states, dirty checking and flush timing, save against merge, identity generation and batching, equals and hashCode on entities.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%233FB984' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+<style>
+  .sqlbox{background:#0F2438;border-radius:5px;padding:11px 14px;font-family:var(--mono);font-size:12px;
+    line-height:1.75;color:#C7D8E6;overflow-x:auto;white-space:pre;min-height:112px}
+  .sqlbox .kw{color:#89B4E8;font-weight:600}.sqlbox .id{color:#8FD3B0}
+  .sqlbox .pm{color:#E4C989}.sqlbox .cm{color:#6C8299}.sqlbox .new{color:#F2A0A0}
+</style>
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">Spring Boot</a><span class="sep">/</span><span>Chapter 09</span></p>
+    <p class="chno">Chapter 09 · Data</p>
+    <h1>The persistence context</h1>
+    <p class="lede">The thing that makes JPA confusing is that your objects are not just objects. Inside a transaction they are <em>tracked</em>, and Hibernate decides on its own when to write, what to write and whether to write at all. Almost every JPA surprise is this mechanism behaving exactly as designed.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapter 08</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="states">
+<h2>Four states</h2><div class="h2rule"></div>
+
+<div class="kv">
+<dt>Transient</dt><dd>A plain object you created with <code>new</code>. No identity, unknown to Hibernate, changes go nowhere.</dd>
+<dt>Managed</dt><dd class="yes">Inside the persistence context. Hibernate holds it, holds a snapshot of how it looked when loaded, and will compare the two at flush. <strong>Changing a field is enough — there is no save call.</strong></dd>
+<dt>Detached</dt><dd>Was managed, but its context closed. It has an identity and its changes are tracked by nobody. Lazy associations now throw.</dd>
+<dt>Removed</dt><dd>Scheduled for deletion at the next flush.</dd>
+</div>
+
+<div class="demo" id="d-state">
+  <div class="demo-top"><div class="demo-title">Four scenarios, and the SQL each produces</div><div class="demo-hint">Start with the first — note what is missing from the code</div></div>
+  <div class="demo-body">
+    <canvas id="cState" aria-label="Entity state transitions with the SQL emitted at each step"></canvas>
+    <div class="sqlbox" id="stSql" style="margin-top:12px"></div>
+    <div class="ctrls" style="justify-content:center;flex-wrap:wrap;margin-top:12px">
+      <div class="ctrl"><label>Scenario</label><select id="scS" style="max-width:none">
+        <option value="load" selected>load it, change a field, commit</option>
+        <option value="seq">a new entity with a SEQUENCE id</option>
+        <option value="identity">a new entity with an IDENTITY id</option>
+        <option value="detached">save() on a detached entity</option></select></div>
+      <button class="btn primary" id="scNext">Step</button>
+      <button class="btn" id="scAuto">Play</button>
+      <button class="btn" id="scRst">Restart</button>
+    </div>
+    <div class="rgrid" id="scOut"></div>
+    <div class="readout" id="scNote"></div>
+  </div>
+</div>
+
+<div class="box warn"><b class="tag">Three consequences worth memorising</b>
+<ul style="margin-bottom:0">
+<li><strong>You do not need to call <code>save()</code> on a managed entity.</strong> Loading it inside a transaction and setting a field is enough; flush will find the change. Calling <code>save()</code> is harmless but misleading, because it suggests the write happens there.</li>
+<li><strong>An accidental change is still a change.</strong> A getter that normalises a string, a setter called during mapping, a lazily initialised default — Hibernate cannot tell these from a deliberate edit and will issue an <code>UPDATE</code>. This is where mysterious writes in read-only-looking code come from.</li>
+<li><strong><code>save()</code> on a detached entity is a <code>merge</code>, and merge reads first.</strong> It loads the current row, copies your fields over it and returns a <em>different, managed</em> instance — so mutating the object you passed in does nothing from then on. Any field you left null overwrites the stored value with null.</li>
+</ul>
+</div>
+
+<div class="tw">
+<table class="tight">
+<thead><tr><th>Flush happens</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>At commit</td><td class="yes">The normal case</td></tr>
+<tr><td>Before a JPQL query that might overlap pending changes</td><td>Hibernate flushes so the query sees them. A surprising place for a constraint violation to surface</td></tr>
+<tr><td>On <code>flush()</code> or <code>saveAndFlush()</code></td><td>Explicit. Useful to force a constraint error where you can catch it</td></tr>
+<tr><td>Before an <code>IDENTITY</code> insert</td><td class="no">The insert cannot be deferred — the id comes from the database</td></tr>
+<tr><td class="no">Never, if <code>FlushMode.MANUAL</code></td><td>What <code>@Transactional(readOnly = true)</code> effectively gives you, which is why it is worth setting</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="ids">
+<h2>Identity generation, and why it decides your insert throughput</h2><div class="h2rule"></div>
+
+<div class="demo" id="d-batch">
+  <div class="demo-top"><div class="demo-title">Inserting rows in one transaction</div><div class="demo-hint">The id strategy is the whole story</div></div>
+  <div class="demo-body">
+    <canvas id="cBatch" aria-label="Round trips required to insert rows under different id strategies"></canvas>
+    <div class="ctrls" style="justify-content:center;flex-wrap:wrap">
+      <div class="ctrl"><label>Rows</label><input type="range" id="bcR" min="10" max="5000" step="10" value="1000"><output id="bcRo">1,000</output></div>
+      <div class="ctrl"><label>Round trip</label><input type="range" id="bcL" min="1" max="20" step="1" value="5"><output id="bcLo">0.5 ms</output></div>
+    </div>
+    <div class="rgrid" id="bcOut"></div>
+    <div class="readout" id="bcNote"></div>
+  </div>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">java + yaml — the configuration that follows</span><button class="code-copy">Copy</button></div><pre><span class="f">@Entity</span>
+<span class="k">class</span> Order {
+    <span class="f">@Id</span>
+    <span class="f">@GeneratedValue</span>(strategy = SEQUENCE, generator = <span class="s">"order_seq"</span>)
+    <span class="f">@SequenceGenerator</span>(name = <span class="s">"order_seq"</span>, sequenceName = <span class="s">"order_seq"</span>,
+                       allocationSize = <span class="n">50</span>)     <span class="c">← must match the database's</span>
+    <span class="k">private</span> Long id;                              <span class="c">  INCREMENT BY, or you get</span>
+}                                                 <span class="c">  duplicate key errors</span>
+
+<span class="c">// ✗ @GeneratedValue(strategy = IDENTITY)  — convenient, and it makes</span>
+<span class="c">//   JDBC batching impossible: Hibernate must execute each insert to</span>
+<span class="c">//   learn the generated key. Fine for one row, terrible for a thousand.</span>
+<span class="c">//</span>
+<span class="c">// ✗ @GeneratedValue(strategy = AUTO) with a random UUID — no sequence</span>
+<span class="c">//   round trips, and random primary keys destroy B-tree locality on</span>
+<span class="c">//   insert. Chapter 8 of the Backend unit. Use UUIDv7 if you want a</span>
+<span class="c">//   UUID that is time-ordered.</span>
+
+<span class="c"># and batching does not happen unless you ask for it:</span>
+spring.jpa.properties.hibernate:
+  jdbc.batch_size: 50
+  order_inserts: true                <span class="c">← group inserts by table, or the</span>
+  order_updates: true                <span class="c">  batch breaks on every switch</span>
+  batch_versioned_data: true         <span class="c">← batch updates on @Version entities</span></pre></div>
+
+<div class="box tip"><b class="tag">Bulk inserts: clear as you go</b>
+<p style="margin:0">Even with batching, a single transaction inserting 100,000 entities holds every one of them in the persistence context — plus a snapshot each — and dirty-checks the lot on every flush, which makes the work quadratic. The pattern is to flush and clear every batch: <code>if (i % 50 == 0) { em.flush(); em.clear(); }</code>. Better still, for a genuine bulk load, skip JPA entirely and use <code>JdbcClient</code> with a batch update or the database's native copy mechanism. The ORM is for the object graph, not for moving a million rows.</p>
+</div>
+</section>
+
+<section id="pitfalls">
+<h2>The rest of the sharp edges</h2><div class="h2rule"></div>
+
+<div class="code"><div class="code-top"><span class="code-lang">java — equals and hashCode, which cannot be got right by accident</span><button class="code-copy">Copy</button></div><pre><span class="c">// ✗ Lombok's @Data or @EqualsAndHashCode on an entity: it uses every</span>
+<span class="c">//   field, so equals() touches lazy associations and loads half your</span>
+<span class="c">//   database — and the hash changes when any field is edited.</span>
+
+<span class="c">// ✗ the generated id alone: a transient entity has id == null, so two</span>
+<span class="c">//   unsaved entities are "equal", and adding both to a Set keeps one.</span>
+<span class="c">//   Worse, the hash changes when the id is assigned at flush — so an</span>
+<span class="c">//   entity added to a HashSet before saving can never be found again.</span>
+
+<span class="c">// ✓ a business key, if one exists — an order number, an email, an ISBN</span>
+<span class="f">@Entity</span>
+<span class="k">class</span> Order {
+    <span class="f">@Id @GeneratedValue</span>(strategy = SEQUENCE) <span class="k">private</span> Long id;
+    <span class="f">@NaturalId</span> <span class="k">private</span> String orderNumber;      <span class="c">← immutable, unique, known</span>
+                                                 <span class="c">  at construction</span>
+    <span class="f">@Override public boolean</span> <span class="f">equals</span>(Object o) {
+        <span class="k">return</span> o <span class="k">instanceof</span> Order other
+            &amp;&amp; Objects.equals(orderNumber, other.orderNumber);
+    }
+    <span class="f">@Override public int</span> <span class="f">hashCode</span>() {
+        <span class="k">return</span> Objects.hash(orderNumber);        <span class="c">← constant for the object's</span>
+    }                                            <span class="c">  whole life. That is the</span>
+}                                                <span class="c">  actual requirement</span>
+
+<span class="c">// ✓ if there is no business key: assign a UUID in the constructor</span>
+<span class="c">//   rather than letting the database generate it. The identity then</span>
+<span class="c">//   exists from the moment the object does, which removes the problem.</span></pre></div>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th><code>findById</code></th><th><code>getReferenceById</code></th></tr></thead>
+<tbody>
+<tr><td>Hits the database</td><td class="yes">Immediately</td><td class="no">Not until a field is read</td></tr>
+<tr><td>Returns</td><td><code>Optional&lt;T&gt;</code></td><td>A proxy, always non-null</td></tr>
+<tr><td>Missing row</td><td class="yes">Empty optional</td><td class="no"><code>EntityNotFoundException</code> later, somewhere else</td></tr>
+<tr><td>Good for</td><td class="yes">Everything you will read</td><td class="yes">Setting a foreign key without loading the row — <code>order.setCustomer(users.getReferenceById(id))</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="kv">
+<dt>The first-level cache is per transaction</dt><dd>Calling <code>findById(x)</code> five times in one transaction produces one query and returns the identical instance each time. But a <em>query</em> — anything with a where clause — always goes to the database, then reconciles results against the context. That asymmetry surprises people who expect the cache to prevent all repeat reads.</dd>
+<dt><code>readOnly = true</code> is worth setting</dt><dd class="yes">It sets the flush mode to manual and marks entities read-only, so Hibernate skips dirty checking and the snapshots — measurably cheaper on large result sets, and it prevents the accidental-update problem entirely. It also routes to a replica if you have configured one.</dd>
+<dt><code>ddl-auto</code></dt><dd class="no"><code>validate</code> in every real environment, <code>create-drop</code> in tests if you are not using Testcontainers, and <strong>never <code>update</code></strong>: it never drops or renames anything, applies changes in an order it chooses, and produces a schema that no migration file describes — so no two environments match and nothing is reproducible. Flyway or Liquibase owns the schema; Hibernate checks it.</dd>
+<dt>Turn on the SQL log while learning</dt><dd class="yes"><code>logging.level.org.hibernate.SQL: debug</code> plus <code>hibernate.format_sql: true</code>, and add a statement counter to your tests. Nearly everything in this chapter and the next becomes obvious the first time you watch the statements go past.</dd>
+</div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>You load an entity in a transaction, set a field, and never call <code>save()</code>. What happens?
+<button class="reveal">Show answer</button><div class="ans">It is persisted. The entity is managed, so Hibernate holds a snapshot of how it looked when loaded and compares field by field at flush — finding the change and issuing an <code>UPDATE</code> at commit. This is the intended design and the reason <code>save()</code> on a managed entity is a no-op. It also means an accidental modification, such as a getter that normalises a value, produces a real write.</div></li>
+
+<li>Why does <code>save()</code> on a detached entity issue a <code>SELECT</code> first?
+<button class="reveal">Show answer</button><div class="ans">Because it becomes a <code>merge</code>, and merge must load the current row to know what changed and to attach a managed copy. Two consequences follow: it returns a <em>different</em> instance, so mutating the object you passed in has no further effect; and every field you left null overwrites the stored value with null, since merge copies the whole object. If you only mean to change two columns, load the entity and set those two.</div></li>
+
+<li>Why does <code>IDENTITY</code> make batching impossible?
+<button class="reveal">Show answer</button><div class="ans">Because the id comes from the insert itself, so Hibernate must execute each statement immediately to learn the generated key before it can return a managed entity. There is nothing to accumulate, so JDBC batching is disabled entirely and a thousand rows are a thousand round trips. A sequence with an allocation size lets Hibernate reserve a block of ids up front, assign them in memory and send inserts in batches.</div></li>
+
+<li>Why is using the generated id in <code>equals</code> and <code>hashCode</code> dangerous?
+<button class="reveal">Show answer</button><div class="ans">Because the id is null until flush. Two unsaved entities both have null ids and therefore compare equal, so a <code>Set</code> silently keeps one. Worse, the hash code changes when the id is assigned, so an entity added to a <code>HashSet</code> before saving lands in the wrong bucket and can never be found again — including inside Hibernate's own collection handling. Use an immutable business key, or assign a UUID in the constructor.</div></li>
+
+<li>Why should <code>ddl-auto: update</code> never be used outside a laptop?
+<button class="reveal">Show answer</button><div class="ans">Because it only adds. It never drops a column, never renames, never changes a type, and applies what it does apply in an order it chooses — so the resulting schema depends on the history of deploys that machine has seen. No two environments end up identical, nothing is reproducible, and there is no file describing the change. Use Flyway or Liquibase to own the schema and set <code>validate</code> so Hibernate verifies its mapping against it at startup.</div></li>
+
+<li>What does <code>@Transactional(readOnly = true)</code> actually buy?
+<button class="reveal">Show answer</button><div class="ans">Hibernate sets the flush mode to manual and marks loaded entities read-only, so it skips dirty checking and does not retain loaded-state snapshots — a measurable saving on large result sets, and it makes accidental updates impossible rather than merely unlikely. It also passes the read-only hint to the driver, and with a routing datasource it can direct the transaction to a replica.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin:0">Chapter 10 takes on associations — where the persistence context, lazy loading and the N+1 problem meet.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 09</h2><p>The persistence context. Part of the Spring Boot unit — <a href="index.html">all 20 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 10 (lazy loading), 11 (flush and rollback), 16 (batching and pools).</p></div>
+    <div><h2>Going deeper</h2><p>Vlad Mihalcea's blog is the best free resource on every topic in this chapter, particularly identity generation and equals.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: entity states ============ */
+(function(){
+  const cv=document.getElementById("cState"); if(!cv) return;
+  const sEl=document.getElementById("scS"), sql=document.getElementById("stSql"),
+        out=document.getElementById("scOut"), note=document.getElementById("scNote");
+  let k=0, timer=null;
+  const SC={
+    load:[
+      {op:"var o = repo.findById(id).orElseThrow()",st:"managed",ctx:1,
+       sql:'<span class="new"><span class="kw">select</span> o.* <span class="kw">from</span> <span class="id">orders</span> o <span class="kw">where</span> o.id = <span class="pm">?</span></span>',
+       n:"<b>The row is loaded and the entity is now managed.</b> Hibernate has put it in the persistence context <em>and</em> kept a private snapshot of every field as it was loaded. That snapshot is the whole mechanism for what follows."},
+      {op:"o.setStatus(PAID)",st:"managed · dirty",ctx:1,sql:'<span class="cm">-- nothing yet</span>',
+       n:"<b>A plain setter, and no SQL.</b> The object now differs from the snapshot, so Hibernate knows there is a pending change — but it has not written anything. There is no <code>save()</code> call in this scenario and there does not need to be."},
+      {op:"// method returns, transaction commits",st:"managed → detached",ctx:0,
+       sql:'<span class="new"><span class="kw">update</span> <span class="id">orders</span> <span class="kw">set</span> status = <span class="pm">?</span> <span class="kw">where</span> id = <span class="pm">?</span></span>\n<span class="new"><span class="kw">commit</span></span>',
+       fin:true,
+       n:"<b>At commit Hibernate compares the entity to its snapshot, finds <code>status</code> changed, and issues an <code>UPDATE</code> with only that column.</b> Note two things. First, the write was never requested — being managed was enough, which is why an accidental modification in read-only-looking code produces a real update. Second, only the changed column appears, because dynamic update is what dirty checking enables. After commit the context closes and the entity is detached."}],
+    seq:[
+      {op:"var o = new Order(...)",st:"transient",ctx:0,sql:'<span class="cm">-- nothing. Hibernate has never seen this object</span>',
+       n:"<b>A plain Java object.</b> No identity, not tracked, and any change to it goes nowhere."},
+      {op:"repo.save(o)",st:"managed",ctx:1,
+       sql:'<span class="new"><span class="kw">select nextval</span>(<span class="id">\'order_seq\'</span>)</span>   <span class="cm">-- one call per 50 ids</span>',
+       n:"<b><code>save()</code> on a transient entity calls <code>persist</code>.</b> Hibernate needs an id, so it draws one from the sequence — with <code>allocationSize = 50</code> that is one round trip per fifty entities, and the rest are handed out from memory. <strong>The insert has not run.</strong> It is queued in the action list until flush, which is the property the next step depends on."},
+      {op:"o.setStatus(PAID)",st:"managed · dirty",ctx:1,sql:'<span class="cm">-- still nothing</span>',
+       n:"<b>Modifying it before flush changes what will be inserted, not what was.</b> Because the insert is still pending, Hibernate simply writes the final values when it eventually runs."},
+      {op:"commit",st:"detached",ctx:0,
+       sql:'<span class="new"><span class="kw">insert into</span> <span class="id">orders</span> (id, status, total, …) <span class="kw">values</span> (<span class="pm">?</span>,<span class="pm">?</span>,<span class="pm">?</span>,…)</span>\n<span class="new"><span class="kw">commit</span></span>',
+       fin:true,
+       n:"<b>One <code>INSERT</code>, carrying the value set after <code>save()</code>.</b> Two statements for the whole scenario, and one of them is amortised across fifty entities. Compare this with the <code>IDENTITY</code> version."}],
+    identity:[
+      {op:"var o = new Order(...)",st:"transient",ctx:0,sql:'<span class="cm">-- nothing</span>',
+       n:"<b>The same starting point: a transient object.</b> The only difference in this scenario is the id strategy."},
+      {op:"repo.save(o)",st:"managed",ctx:1,
+       sql:'<span class="new"><span class="kw">insert into</span> <span class="id">orders</span> (status, total, …) <span class="kw">values</span> (<span class="pm">?</span>,<span class="pm">?</span>,…)</span>\n<span class="cm">-- executed IMMEDIATELY, returning the generated key</span>',
+       n:"<b>The insert runs right now.</b> With <code>IDENTITY</code> the id comes from the insert itself, so Hibernate cannot defer it — it must execute the statement to learn the key before it can return a managed entity. This single fact is why <code>IDENTITY</code> disables JDBC batching entirely."},
+      {op:"o.setStatus(PAID)",st:"managed · dirty",ctx:1,sql:'<span class="cm">-- the row already exists, so this is a pending UPDATE</span>',
+       n:"<b>The row is already in the database with the old value.</b> Changing the field now means an update is required, where the sequence version needed no second statement."},
+      {op:"commit",st:"detached",ctx:0,
+       sql:'<span class="new"><span class="kw">update</span> <span class="id">orders</span> <span class="kw">set</span> status = <span class="pm">?</span> <span class="kw">where</span> id = <span class="pm">?</span></span>\n<span class="new"><span class="kw">commit</span></span>',
+       fin:true,
+       n:"<b>An <code>INSERT</code> followed by an <code>UPDATE</code> — for one new entity.</b> The sequence scenario did it in one statement. Multiply this by a batch import and the difference is the demo below: <code>IDENTITY</code> forces one round trip per row, with no batching available at all."}],
+    detached:[
+      {op:"// entity arrives from a controller, previous tx closed",st:"detached",ctx:0,
+       sql:'<span class="cm">-- it has an id, but no context is tracking it</span>',
+       n:"<b>A detached entity: it has an identity and nobody is watching it.</b> This is what you have when an entity is deserialised from a request body, cached, or carried over from an earlier transaction. Touching a lazy association on it now throws."},
+      {op:"repo.save(o)",st:"detached → merge",ctx:0,
+       sql:'<span class="new"><span class="kw">select</span> o.* <span class="kw">from</span> <span class="id">orders</span> o <span class="kw">where</span> o.id = <span class="pm">?</span></span>\n<span class="cm">-- a SELECT nobody asked for</span>',
+       n:"<b><code>save()</code> on a detached entity is <code>merge</code>, and merge reads first.</b> Hibernate has to load the current row to know what it is changing and to produce a managed copy. That extra select is invisible in the code and appears in the log."},
+      {op:"var managed = <the return value>",st:"managed copy",ctx:1,
+       sql:'<span class="cm">-- your original object is STILL detached</span>',
+       n:"<b>Merge returns a different instance, and that is the one being tracked.</b> Anything you do to the object you passed in from here on is ignored — a genuinely common bug, because <code>repo.save(o)</code> looks like it modified <code>o</code>. The habit that avoids it: always use the returned value."},
+      {op:"commit",st:"detached",ctx:0,
+       sql:'<span class="new"><span class="kw">update</span> <span class="id">orders</span> <span class="kw">set</span> status = <span class="pm">?</span>, total = <span class="pm">?</span>, notes = <span class="kw">null</span>, …</span>\n<span class="new"><span class="kw">commit</span></span>',
+       fin:true,bad:true,
+       n:"<b>Merge copied <em>every</em> field, including the ones your detached object never had.</b> If it came from a request body containing three fields, everything else is now null — silently. This is the mass-assignment problem from the other direction, and it is the strongest argument for the rule in chapter 5: take a DTO at the boundary, load the entity inside the transaction, and set the two fields you meant to change."}]
+  };
+  function draw(){
+    const S=SC[sEl.value], s=S[Math.min(k,S.length-1)], shown=S.slice(0,Math.max(1,k));
+    const w=cv.clientWidth||660, h=26+S.length*26, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h);
+    ctx.textBaseline="middle";
+    ctx.fillStyle="#8195A6"; ctx.font="9px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("operation", 16, 12);
+    ctx.textAlign="right"; ctx.fillText("entity state", w-16, 12);
+    const C={"transient":["#F5F7F9","#CFD8E0","#54677A"],"managed":["#E7F7EF","#3FB984","#166B47"],
+             "managed · dirty":["#FFF6E8","#D98324","#B0651A"],"detached":["#F2F5F7","#8195A6","#54677A"],
+             "managed → detached":["#E7F7EF","#3FB984","#166B47"],"detached → merge":["#FDEBF3","#E0699F","#B44379"],
+             "managed copy":["#E7F7EF","#3FB984","#166B47"]};
+    S.forEach((st,i)=>{
+      const y=22+i*26, on=i<k, cur=i===k-1, c=C[st.st]||C["transient"];
+      ctx.fillStyle= !on?"#FAFBFC": cur?c[0]:"#fff";
+      ctx.strokeStyle= !on?"#F0F3F5": cur?c[1]:"#EDF1F4"; ctx.lineWidth= cur?2:1;
+      ctx.fillRect(14,y,w-28,22); ctx.strokeRect(14.5,y+.5,w-29,22);
+      ctx.fillStyle= !on?"#DDE3E8": cur?"#16232F":"#8195A6";
+      ctx.font=(cur?"600 ":"")+"10px ui-monospace, monospace"; ctx.textAlign="left";
+      const cut=Math.floor((w-190)/5.6);
+      ctx.fillText(st.op.length>cut?st.op.slice(0,cut-1)+"…":st.op, 22, y+11);
+      if(on){ ctx.fillStyle= cur?c[2]:"#B8C4CE"; ctx.font=(cur?"600 ":"")+"9.5px Archivo, Arial"; ctx.textAlign="right";
+        ctx.fillText(st.st, w-22, y+11); }
+    });
+    sql.innerHTML= k===0
+      ? '<span class="cm">-- step through to see the statements Hibernate emits</span>'
+      : shown.map(x=>x.sql).join("\n");
+    out.innerHTML=
+      '<div><span>step</span><b>'+k+' / '+S.length+'</b></div>'+
+      '<div><span>state</span><b>'+(k?s.st:"—")+'</b></div>'+
+      '<div><span>in the context</span><b>'+(k?s.ctx:0)+' entit'+((k?s.ctx:0)===1?"y":"ies")+'</b></div>'+
+      '<div><span>statements</span><b style="color:'+(k&&shown.filter(x=>x.sql.includes("new")).length>2?"#D98324":"#1F7A52")+'">'+
+        (k?shown.reduce((a,x)=>a+(x.sql.match(/class="new"/g)||[]).length,0):0)+'</b></div>'+
+      '<div><span>outcome</span><b style="color:'+(s.fin?(s.bad?"#D9534F":"#1F7A52"):"#8195A6")+'">'+
+        (s.fin?(s.bad?"data loss":"correct"):"—")+'</b></div>';
+    note.innerHTML= k===0
+      ? "<b>Four scenarios, and the fourth loses data.</b> Step through each and watch the state column and the statement log together — the pairing is what makes JPA legible."
+      : s.n;
+  }
+  function stop(){ if(timer){clearInterval(timer);timer=null;document.getElementById("scAuto").textContent="Play";} }
+  document.getElementById("scNext").addEventListener("click",()=>{ if(k<SC[sEl.value].length){k++;draw();} });
+  document.getElementById("scRst").addEventListener("click",()=>{ stop(); k=0; draw(); });
+  document.getElementById("scAuto").addEventListener("click",function(){
+    if(timer){stop();return;} this.textContent="Pause";
+    timer=setInterval(()=>{ if(k<SC[sEl.value].length){k++;draw();} else stop(); },1800);
+  });
+  sEl.addEventListener("change",()=>{ stop(); k=0; draw(); });
+  draw(); debounceResize(draw);
+})();
+
+/* ============ demo 2: id strategy and batching ============ */
+(function(){
+  const cv=document.getElementById("cBatch"); if(!cv) return;
+  const rEl=document.getElementById("bcR"), lEl=document.getElementById("bcL"),
+        out=document.getElementById("bcOut"), note=document.getElementById("bcNote");
+  function draw(){
+    const n=+rEl.value, rtt=+lEl.value/10;
+    document.getElementById("bcRo").textContent=n.toLocaleString();
+    document.getElementById("bcLo").textContent=rtt.toFixed(1)+" ms";
+    const M=[
+      {n:"IDENTITY",trips:n,d:"One insert per row, executed immediately, because the id comes from the statement. No batching is possible — Hibernate disables it entirely for this strategy."},
+      {n:"SEQUENCE, allocationSize = 1",trips:n*2,d:"A sequence call and an insert per row. Twice the round trips of IDENTITY, and the worst of the three — this is the default if you write @SequenceGenerator without an allocation size."},
+      {n:"SEQUENCE alloc 1, batch 50",trips:n+Math.ceil(n/50),d:"The inserts batch now, but every id still costs its own round trip, so the sequence calls dominate. Batching without an allocation size solves half the problem."},
+      {n:"SEQUENCE alloc 50, batch 50",trips:Math.ceil(n/50)*2,d:"One sequence call per fifty ids and one batched insert per fifty rows. Two round trips per fifty entities rather than one per entity."}
+    ];
+    const max=Math.max(...M.map(m=>m.trips));
+    const w=cv.clientWidth||660, h=20+M.length*34, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h);
+    ctx.textBaseline="middle";
+    const lx=Math.min(212,w*0.40), rx=w-104, span=rx-lx;
+    M.forEach((m,i)=>{
+      const y=12+i*34, best=m.trips===Math.min(...M.map(x=>x.trips)), worst=m.trips===max;
+      ctx.fillStyle= best?"#16232F":"#54677A"; ctx.font=(best?"600 ":"")+"11px ui-monospace, monospace"; ctx.textAlign="right";
+      ctx.fillText(m.n, lx-9, y+12);
+      const wd=Math.max(3,(m.trips/max)*span);
+      ctx.fillStyle= worst?"#E8908B": best?"#3FB984":"#F2A03D";
+      ctx.fillRect(lx,y,wd,24);
+      ctx.fillStyle= best?"#1F7A52": worst?"#B0403C":"#54677A"; ctx.font="600 11px ui-monospace, monospace"; ctx.textAlign="left";
+      const t=(m.trips*rtt>=1000?(m.trips*rtt/1000).toFixed(2)+" s":Math.round(m.trips*rtt)+" ms");
+      ctx.fillText(m.trips.toLocaleString()+" trips · "+t, lx+wd+7, y+12);
+    });
+    const worstM=M[1], bestM=M[3];
+    out.innerHTML=
+      '<div><span>rows</span><b>'+n.toLocaleString()+'</b></div>'+
+      '<div><span>IDENTITY</span><b style="color:#D9534F">'+(M[0].trips*rtt>=1000?(M[0].trips*rtt/1000).toFixed(2)+" s":Math.round(M[0].trips*rtt)+" ms")+'</b></div>'+
+      '<div><span>sequence + batching</span><b style="color:#1F7A52">'+(bestM.trips*rtt>=1000?(bestM.trips*rtt/1000).toFixed(2)+" s":Math.round(bestM.trips*rtt)+" ms")+'</b></div>'+
+      '<div><span>speedup</span><b style="color:#1F7A52">'+(M[0].trips/bestM.trips).toFixed(0)+'×</b></div>'+
+      '<div><span>worst case</span><b style="color:#D9534F">'+worstM.trips.toLocaleString()+' trips</b></div>';
+    note.innerHTML="<b>"+n.toLocaleString()+" rows: "+(M[0].trips*rtt>=1000?(M[0].trips*rtt/1000).toFixed(1)+" seconds":Math.round(M[0].trips*rtt)+" ms")+
+      " with <code>IDENTITY</code> against "+(bestM.trips*rtt>=1000?(bestM.trips*rtt/1000).toFixed(2)+" seconds":Math.round(bestM.trips*rtt)+" ms")+
+      " with a sequence and batching — "+(M[0].trips/bestM.trips).toFixed(0)+" times faster, from configuration alone.</b> "+
+      "Two details are worth pulling out. The second row is the one people accidentally ship: <code>@SequenceGenerator</code> with no <code>allocationSize</code> is <em>slower</em> than <code>IDENTITY</code>, because you have added a sequence round trip without gaining batching. And the third row shows that turning on <code>hibernate.jdbc.batch_size</code> alone only fixes half of it, since each id still costs a trip. "+
+      "You need both, and the <code>allocationSize</code> must match the sequence's <code>INCREMENT BY</code> in the database or you will get duplicate key errors under concurrency.";
+  }
+  [rEl,lEl].forEach(e=>e.addEventListener("input",draw));
+  draw(); debounceResize(draw);
+})();
+</script>
+</body>
+</html>

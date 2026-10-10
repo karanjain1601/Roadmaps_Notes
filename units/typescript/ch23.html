@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>23 · Compiler performance and project structure — TypeScript</title>
+<meta name="description" content="What actually makes type checking slow, how to measure it, the usual causes ranked by frequency, project references and incremental builds, and the settings that matter in a large repository.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%233178C6' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+<style>
+  .cause{
+    border:1px solid var(--rule-2);border-left:3px solid var(--rule);border-radius:0 4px 4px 0;
+    background:#FBFCFD;margin:0 0 4px;overflow:hidden;
+  }
+  .causetop{display:grid;grid-template-columns:1fr 148px 66px;gap:10px;align-items:center;padding:8px 11px}
+  .causetop .nm2{font-family:var(--sans);font-size:12.3px;font-weight:600;color:var(--ink)}
+  .causetop .bar2{position:relative;height:16px;background:#EDF1F4;border-radius:3px;overflow:hidden}
+  .causetop .bar2 i{position:absolute;left:0;top:0;bottom:0;display:block;border-radius:3px}
+  .causetop .pc2{font-family:var(--mono);font-size:11px;text-align:right;font-weight:600;color:var(--text-2)}
+  .causebody{padding:0 11px 9px;font-family:var(--sans);font-size:11.8px;line-height:1.55;color:var(--text-2)}
+  .causebody b.dtc{
+    display:block;font-size:9.6px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+    color:var(--line-dk);margin:6px 0 2px;
+  }
+  .cause.sev3{border-left-color:#C24C42}
+  .cause.sev2{border-left-color:#D9A93A}
+  .cause.sev1{border-left-color:#7C9CB5}
+
+  /* dependency graph */
+  .pkgs{display:flex;gap:5px;flex-wrap:wrap;margin:0 0 12px}
+  .pkgs button{
+    font-family:var(--mono);font-size:11.2px;border:1px solid var(--rule);border-radius:4px;
+    padding:5px 10px;background:var(--card);color:var(--text-2);
+  }
+  .pkgs button[aria-pressed="true"]{background:var(--ink);border-color:var(--ink);color:#fff}
+  .strat{display:grid;gap:8px;margin:0 0 12px}
+  .srow{
+    display:grid;grid-template-columns:150px 1fr 96px;gap:10px;align-items:center;
+    font-family:var(--sans);font-size:11.9px;
+  }
+  .srow .sn{font-family:var(--mono);font-size:11.3px;color:var(--text-2)}
+  .strack{position:relative;height:24px;background:#EDF1F4;border:1px solid var(--rule-2);border-radius:3px;overflow:hidden;display:flex}
+  .strack span{
+    display:flex;align-items:center;justify-content:center;height:100%;
+    font-family:var(--mono);font-size:9.8px;font-weight:700;color:#fff;
+    border-right:1px solid rgba(255,255,255,.35);overflow:hidden;
+  }
+  .strack span.skip{background:#D5DCE2;color:#7C8B99}
+  .strack span.work{background:#C24C42}
+  .strack span.workl{background:#D9A93A}
+  .sval{font-family:var(--mono);font-size:11.4px;text-align:right;font-weight:600;font-variant-numeric:tabular-nums}
+  .graphnote{
+    font-family:var(--mono);font-size:11.5px;background:var(--ink);color:#DCE7F1;
+    border-radius:5px;padding:11px 13px;margin:0 0 12px;line-height:1.8;white-space:pre-wrap;
+  }
+  .graphnote .hl2{color:#F0C066;font-weight:700}
+  .graphnote .cm6{color:#7E97AC}
+</style>
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">TypeScript</a><span class="sep">/</span><span>Part 6 · At scale</span></p>
+    <p class="chno">CHAPTER 23</p>
+    <h1>Compiler performance and project structure</h1>
+    <p class="lede">Type checking gets slow for a small number of specific reasons, almost none of which is "the project is large". The number that matters is type instantiations rather than files, and there is a profiler that will tell you exactly which type is responsible.</p>
+    <p class="meta"><b>Part 6</b> At scale<span class="pipe">·</span><b>Reading time</b> 30 minutes<span class="pipe">·</span><b>Demos</b> the usual causes, what a change forces you to recheck<span class="pipe">·</span><b>Prerequisites</b> Chapters 2, 16</p>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="Unit contents"></nav>
+
+  <main>
+    <div class="strip"></div>
+
+    <!-- ============================================================ -->
+    <section class="ch" id="slow23">
+      <h2 class="sec"><span class="num">1</span>What is actually slow</h2>
+      <p class="sechint">Not the file count. Not the line count.</p>
+
+      <p class="lead">The compiler's work is dominated by <strong>type instantiations</strong> — each time a generic type is applied to concrete arguments, a new type is constructed and cached. A project with 3,000 files and simple types checks faster than one with 300 files and a deeply generic component library, because the second one asks the compiler to build hundreds of thousands of intermediate types that the first never needs. That is why the useful diagnostic is a count of instantiations rather than anything about your source.</p>
+
+      <div class="kv">
+        <dt><code>tsc --extendedDiagnostics</code></dt>
+        <dd>The first look. Reports files, lines, <strong>instantiations</strong>, memory, and time split across parse, bind, check and emit. A healthy medium project is in the low millions of instantiations; tens of millions means something specific is wrong and it is findable.</dd>
+        <dt><code>tsc --generateTrace ./trace</code></dt>
+        <dd>The one that answers the question. It writes a trace loadable in Chrome's profiler viewer showing which <em>types</em> and which <em>files</em> consumed the time. Almost nobody knows it exists and it is the difference between guessing and knowing.</dd>
+        <dt>Measure the editor, not the build</dt>
+        <dd>The language server repeats this work as you type. A type that adds two seconds to a build adds a pause to every hover and completion, which is a much worse experience than the build number suggests. The TypeScript extension's <em>Open TS Server Log</em> command shows what it is doing.</dd>
+        <dt>And measure before changing anything</dt>
+        <dd>Every recommendation in this chapter is worth reversing if your trace says something else. Performance advice ages badly, and the profiler does not.</dd>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="ch" id="causes">
+      <h2 class="sec"><span class="num">2</span>The usual causes</h2>
+      <p class="sechint">Ranked by how often they turn out to be the answer, with how to detect each.</p>
+
+      <div class="demo" id="cz">
+        <div class="demo-top">
+          <b>Seven things that make checking slow</b>
+          <span class="demo-hint">The bar is rough relative impact when the cause is present, not a benchmark.</span>
+        </div>
+        <div class="demo-body">
+          <div id="cz-rows"></div>
+
+          <div class="rgrid">
+            <div class="tile"><span class="lab">Fixable in an hour</span><span class="v" id="cz-q">—</span></div>
+            <div class="tile"><span class="lab">Needs restructuring</span><span class="v" id="cz-r">—</span></div>
+            <div class="tile"><span class="lab">Most common</span><span class="v" id="cz-c" style="font-size:12px">—</span></div>
+            <div class="tile"><span class="lab">Best first move</span><span class="v" id="cz-f" style="font-size:12px">—</span></div>
+          </div>
+          <p class="readout" id="cz-note"></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="ch" id="refs">
+      <h2 class="sec"><span class="num">3</span>What a change forces you to recheck</h2>
+      <p class="sechint">Six packages, one dependency graph, three build strategies. Pick what you edited.</p>
+
+      <div class="demo" id="pr">
+        <div class="demo-top">
+          <b>A typical monorepo</b>
+          <span class="demo-hint"><code>utils</code> ← <code>types</code> ← <code>api</code> ← <code>ui</code> ← <code>web</code>, plus a standalone <code>docs</code>.</span>
+        </div>
+        <div class="demo-body">
+          <div class="pkgs" id="pr-pick"></div>
+          <div class="graphnote" id="pr-graph"></div>
+          <div class="strat" id="pr-rows"></div>
+
+          <div class="rgrid">
+            <div class="tile"><span class="lab">Single tsconfig</span><span class="v" id="pr-a">—</span></div>
+            <div class="tile"><span class="lab">Project references</span><span class="v" id="pr-b">—</span></div>
+            <div class="tile"><span class="lab">Saved</span><span class="v" id="pr-s">—</span></div>
+            <div class="tile"><span class="lab">Worth it when</span><span class="v" id="pr-w" style="font-size:12px">—</span></div>
+          </div>
+          <p class="readout" id="pr-note"></p>
+        </div>
+      </div>
+
+      <div class="codewrap">
+        <div class="cap">The configuration, minimally <span>JSON</span></div>
+        <pre><code><span class="c">// packages/api/tsconfig.json</span>
+{
+  <span class="s">"compilerOptions"</span>: {
+    <span class="s">"composite"</span>: <span class="k">true</span>,          <span class="c">// required: emits .d.ts + .tsbuildinfo</span>
+    <span class="s">"declaration"</span>: <span class="k">true</span>,
+    <span class="s">"declarationMap"</span>: <span class="k">true</span>,     <span class="c">// go-to-definition lands in source</span>
+    <span class="s">"outDir"</span>: <span class="s">"dist"</span>,
+    <span class="s">"rootDir"</span>: <span class="s">"src"</span>
+  },
+  <span class="s">"references"</span>: [{ <span class="s">"path"</span>: <span class="s">"../types"</span> }, { <span class="s">"path"</span>: <span class="s">"../utils"</span> }]
+}
+
+<span class="c">// then build the graph, not the files:
+//   tsc --build            — only what changed and its dependents
+//   tsc --build --watch    — the same, incrementally
+//   tsc --build --clean    — when a .tsbuildinfo goes stale</span>
+
+<span class="c">// THE TRADE. Referenced projects are consumed via their emitted
+// .d.ts files, so a change to `utils` is not visible to `api`
+// until `utils` is rebuilt. That is exactly what buys the speed,
+// and it is also the thing that confuses people on day one.</span></code></pre>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="ch" id="isolated">
+      <h2 class="sec"><span class="num">4</span>Separate the check from the build</h2>
+      <p class="sechint">The single biggest win available to most projects, and it is a config change.</p>
+
+      <div class="kv">
+        <dt>Do not use <code>tsc</code> to produce your bundle</dt>
+        <dd>esbuild, SWC and Vite transpile file-by-file without type checking and are one to two orders of magnitude faster. Type checking becomes a separate parallel job — <code>tsc --noEmit</code> — that runs in CI and in your editor, where it belongs.</dd>
+        <dt>Which requires <code>isolatedModules: true</code></dt>
+        <dd>It rejects the handful of constructs a single-file transpiler cannot handle correctly: re-exporting a type without <code>export type</code>, <code>const enum</code> across modules, and a few others. Turn it on regardless — it costs nothing and it keeps your options open.</dd>
+        <dt>And <code>verbatimModuleSyntax</code>, ideally</dt>
+        <dd>Makes import elision explicit: an import without <code>type</code> is always emitted, one with it is always erased. Removes a whole class of confusion about why a side-effecting import disappeared from the output.</dd>
+        <dt><code>incremental: true</code> for the check itself</dt>
+        <dd>Writes a <code>.tsbuildinfo</code> so subsequent <code>tsc --noEmit</code> runs only redo what changed. Cache it in CI keyed on the lockfile and it is close to free.</dd>
+        <dt>And <code>skipLibCheck: true</code>, with one eye open</dt>
+        <dd>Skips checking <code>.d.ts</code> files, which is often a large fraction of the total. The cost is that a genuinely broken declaration file in a dependency goes unreported. Nearly everyone runs it; know that you are trading a real check for real time.</dd>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="ch" id="checklist23">
+      <h2 class="sec"><span class="num">5</span>A checklist</h2>
+      <p class="sechint">In order. Stop when it is fast enough.</p>
+
+      <div class="tw">
+        <table>
+          <thead><tr><th style="width:8%">#</th><th style="width:44%">Do</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>Run <code>--extendedDiagnostics</code>, write down the instantiation count</td><td>Everything else is guessing without it.</td></tr>
+            <tr><td>2</td><td>Turn on <code>skipLibCheck</code> and <code>incremental</code></td><td>Two lines, frequently a large fraction of the total.</td></tr>
+            <tr><td>3</td><td>Move emit to esbuild or SWC; <code>tsc --noEmit</code> for checking</td><td>The biggest single win in most projects.</td></tr>
+            <tr><td>4</td><td>Run <code>--generateTrace</code> and look at the top ten types</td><td>Now you know rather than suspect.</td></tr>
+            <tr><td>5</td><td>Fix or delete the worst two or three</td><td>Usually a recursive utility or an over-generic component. Chapter 16, section 6.</td></tr>
+            <tr><td>6</td><td>Add explicit return type annotations on exported functions</td><td>Stops the compiler re-deriving large inferred types at every call site, and improves error locality besides.</td></tr>
+            <tr><td>7</td><td>Only then consider project references</td><td>Real benefit at real scale, real complexity at any scale.</td></tr>
+          </tbody>
+        </table>
+        <p class="cap">Step 6 deserves a word, because it is the one that sounds like busywork and is not. An exported function with an inferred return type forces every consumer to re-derive that type, and if the inferred type is a large intersection or a conditional, that derivation is repeated across the whole project — and it lands in the <code>.d.ts</code> too, where it is re-read by every downstream package. One annotation makes it a name.</p>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <section class="ch" id="check">
+      <h2 class="sec"><span class="num">6</span>Check yourself</h2>
+      <p class="sechint">Five questions.</p>
+
+      <div class="check">
+        <p class="q">1. Why is file count a poor predictor of check time?</p>
+        <button class="rev">Show answer</button>
+        <div class="ans">
+          <p>Because the work is dominated by type instantiations, not by parsing. Each application of a generic type to concrete arguments constructs and caches a new type, so 300 files using a deeply generic component library can ask the compiler to build far more intermediate types than 3,000 files of straightforward code. That is why <code>--extendedDiagnostics</code> reports instantiations as a headline number and why it is the one to write down before changing anything: it correlates with time in a way that lines of source does not.</p>
+        </div>
+      </div>
+
+      <div class="check">
+        <p class="q">2. What does <code>--generateTrace</code> give you that <code>--extendedDiagnostics</code> does not?</p>
+        <button class="rev">Show answer</button>
+        <div class="ans">
+          <p>Attribution. <code>--extendedDiagnostics</code> tells you that checking took eleven seconds and made forty million instantiations; the trace tells you <em>which types and which files</em> those were. Load the output in Chrome's profiler viewer and the top few entries are usually the whole answer — a recursive utility being instantiated thousands of times, or one over-generic component. It is the difference between knowing you have a problem and knowing where it is, and it turns a day of bisecting into ten minutes.</p>
+        </div>
+      </div>
+
+      <div class="check">
+        <p class="q">3. Why separate type checking from emitting?</p>
+        <button class="rev">Show answer</button>
+        <div class="ans">
+          <p>Because they have wildly different costs and only one of them blocks you. Transpiling is a per-file transformation that esbuild or SWC does one to two orders of magnitude faster than <code>tsc</code>; type checking is a whole-program analysis that has to be slow. Splitting them means your dev server and build stop waiting for the checker, and <code>tsc --noEmit</code> runs in parallel in CI and continuously in your editor. The requirement is <code>isolatedModules: true</code>, which rejects the few constructs a single-file transpiler cannot handle correctly — worth enabling regardless.</p>
+        </div>
+      </div>
+
+      <div class="check">
+        <p class="q">4. What is the trade with project references?</p>
+        <button class="rev">Show answer</button>
+        <div class="ans">
+          <p>Referenced projects are consumed through their emitted <code>.d.ts</code> files rather than their source, so a change in a dependency is not visible to its dependents until that dependency is rebuilt. That indirection is exactly what buys the speed — <code>tsc --build</code> can skip any project whose inputs are unchanged — and it is also what confuses people on the first day, when an edit appears to have no effect. Add <code>declarationMap</code> so go-to-definition still lands in source, and expect to reach for <code>--build --clean</code> occasionally when a <code>.tsbuildinfo</code> goes stale.</p>
+        </div>
+      </div>
+
+      <div class="check">
+        <p class="q">5. Why annotate return types on exported functions?</p>
+        <button class="rev">Show answer</button>
+        <div class="ans">
+          <p>Because an inferred return type has to be re-derived at every consumer, and if it is a large intersection or a conditional type, that derivation is repeated across the whole project — and written into the <code>.d.ts</code>, where every downstream package re-reads it. An explicit annotation turns the computation into a name that is looked up once. It also improves error locality: a mistake inside the function is reported at the function rather than at whichever call site first noticed the return type was wrong. It sounds like busywork and it is one of the higher-value items on the checklist.</p>
+        </div>
+      </div>
+
+      <hr class="soft">
+      <p class="small">Last chapter: consolidating all of it. <a href="ch24.html">Chapter 24 &mdash; Practice</a>.</p>
+    </section>
+
+    <nav class="pagenav" aria-label="Chapter navigation"></nav>
+  </main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div>
+      <h2>In this chapter</h2>
+      <p>Type instantiations as the number that matters, and the two diagnostics that report them; seven causes ranked by frequency with a detection method for each; a six-package dependency graph showing what a change forces you to recheck under three strategies; separating the type check from the emit; and a seven-step checklist in order.</p>
+    </div>
+    <div>
+      <h2>Carry forward</h2>
+      <p>Instantiations, not files. <code>--generateTrace</code> gives attribution and almost nobody uses it. Move emit to esbuild and run <code>tsc --noEmit</code> alongside. Annotate exported return types. Project references last, and only at real scale.</p>
+    </div>
+    <div>
+      <h2>Next</h2>
+      <p><a href="ch24.html">Chapter 24 — Practice</a>: a working checklist, a symptom-to-cause lookup covering the whole unit, the glossary, and a quiz scored by part.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Demo 1 — the usual causes
+   ============================================================ */
+(function () {
+  "use strict";
+
+  var C = [
+    { n: "Using tsc to emit your bundle", impact: 95, sev: 3, quick: true,
+      d: "Not a type-system problem at all, and by far the most common reason a project feels slow. <code>tsc</code> is doing whole-program analysis on every build when a per-file transpiler would do.",
+      how: "Time <code>tsc --noEmit</code> against <code>tsc</code>. If the gap is large, the emit is the cost." },
+    { n: "Recursive or deeply generic types", impact: 85, sev: 3, quick: false,
+      d: "A type-level utility instantiated thousands of times, or a component library whose props are computed through several conditional layers. Chapter 16.",
+      how: "<code>--generateTrace</code>, then look at the top few entries by self time. They are almost always named after the culprit." },
+    { n: "Large union or template expansions", impact: 70, sev: 3, quick: false,
+      d: "Chapter 15. A few hundred thousand members is computed eagerly and held in memory, and every comparison against it walks the union.",
+      how: "The instantiation count jumps and error messages become enormous. Both symptoms arrive together." },
+    { n: "<code>skipLibCheck</code> off", impact: 55, sev: 2, quick: true,
+      d: "Checking every <code>.d.ts</code> in <code>node_modules</code> is frequently a large fraction of total time, and the errors it finds are in code you cannot change.",
+      how: "Toggle it and re-time. One line, immediate answer." },
+    { n: "Inferred return types on exported functions", impact: 45, sev: 2, quick: true,
+      d: "Every consumer re-derives the type, and it is written into the <code>.d.ts</code> for downstream packages to re-read. Worst when the inferred type is a large intersection.",
+      how: "Look for exported functions with no return annotation whose inferred type is long in a hover." },
+    { n: "No <code>incremental</code>", impact: 35, sev: 2, quick: true,
+      d: "Every run redoes everything. Cheap to fix and easy to forget, especially in CI where the cache also needs configuring.",
+      how: "Check for <code>.tsbuildinfo</code>. If there is not one, you are not incremental." },
+    { n: "Sheer size", impact: 20, sev: 1, quick: false,
+      d: "Real, and much less often the answer than people assume. A genuinely large program does take longer; it takes longer roughly linearly, which is not what a performance complaint usually describes.",
+      how: "Instantiations per file. If it is ordinary and the total is high, the project is simply big \u2014 which is when project references start to earn their complexity." }
+  ];
+
+  var host = document.getElementById("cz-rows");
+  var q = 0;
+  C.forEach(function (c) {
+    if (c.quick) q++;
+    var colour = c.sev === 3 ? "#C24C42" : c.sev === 2 ? "#D9A93A" : "#7C9CB5";
+    host.insertAdjacentHTML("beforeend",
+      '<div class="cause sev' + c.sev + '">' +
+      '<div class="causetop"><span class="nm2">' + c.n + "</span>" +
+      '<span class="bar2"><i style="width:' + c.impact + '%;background:' + colour + '"></i></span>' +
+      '<span class="pc2">' + (c.quick ? "quick fix" : "structural") + "</span></div>" +
+      '<div class="causebody">' + c.d +
+      '<b class="dtc">how to detect it</b>' + c.how + "</div></div>");
+  });
+
+  document.getElementById("cz-q").innerHTML = q + "<small> of 7</small>";
+  document.getElementById("cz-r").textContent = 7 - q;
+  document.getElementById("cz-c").textContent = "tsc emitting";
+  document.getElementById("cz-f").textContent = "extendedDiagnostics";
+  document.getElementById("cz-q").parentNode.className = "tile ok";
+  document.getElementById("cz-r").parentNode.className = "tile mid";
+  document.getElementById("cz-c").parentNode.className = "tile hot";
+  document.getElementById("cz-f").parentNode.className = "tile ok";
+
+  document.getElementById("cz-note").innerHTML =
+    "<b>Four of the seven are configuration changes you can make in an hour</b>, and they are the four to try first \u2014 " +
+    "including the top one, which is not a type-system problem at all. " +
+    "A great many projects that feel slow are simply asking <code>tsc</code> to produce their bundle, which means paying for " +
+    "whole-program analysis on every build when a per-file transpiler would do. " +
+    "<b>The two structural causes are the interesting ones</b>, and they share a detection method: " +
+    "<code>--generateTrace</code> names them directly, which turns a day of bisecting into ten minutes of reading a flame chart. " +
+    "<b>And note the last row.</b> Sheer size is real and it is much less often the answer than people assume \u2014 a large " +
+    "program gets slower roughly linearly, which is not what a performance complaint usually describes. " +
+    "If instantiations per file are ordinary and the total is merely high, the project is genuinely big, and <i>that</i> is when " +
+    "project references start to be worth their complexity.";
+})();
+
+/* ============================================================
+   Demo 2 — what a change forces you to recheck
+   ============================================================ */
+(function () {
+  "use strict";
+
+  /* deps[p] = packages that p directly depends on */
+  var PKGS = ["utils", "types", "api", "ui", "web", "docs"];
+  var DEPS = {
+    utils: [],
+    types: [],
+    api:   ["utils", "types"],
+    ui:    ["types"],
+    web:   ["api", "ui", "utils"],
+    docs:  []
+  };
+  var COST = { utils: 1, types: 1, api: 3, ui: 4, web: 6, docs: 1 };  /* relative check units */
+  var TOTAL = PKGS.reduce(function (a, p) { return a + COST[p]; }, 0);
+
+  /* transitive dependents of `p`, including p itself */
+  function affected(p) {
+    var out = {}, changed = true;
+    out[p] = true;
+    while (changed) {
+      changed = false;
+      PKGS.forEach(function (q) {
+        if (out[q]) return;
+        if (DEPS[q].some(function (d) { return out[d]; })) { out[q] = true; changed = true; }
+      });
+    }
+    return PKGS.filter(function (q) { return out[q]; });
+  }
+
+  var pick = "types";
+
+  function render() {
+    var ph = document.getElementById("pr-pick");
+    ph.textContent = "";
+    PKGS.forEach(function (p) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.textContent = "edit " + p;
+      b.setAttribute("aria-pressed", String(p === pick));
+      b.addEventListener("click", function () { pick = p; render(); });
+      ph.appendChild(b);
+    });
+
+    var aff = affected(pick);
+    var affCost = aff.reduce(function (a, p) { return a + COST[p]; }, 0);
+
+    document.getElementById("pr-graph").innerHTML =
+      PKGS.map(function (p) {
+        var deps = DEPS[p].length ? DEPS[p].join(", ") : "\u2014";
+        var hit = aff.indexOf(p) !== -1;
+        return (hit ? '<span class="hl2">' : "") + p.padEnd(7) +
+          '<span class="cm6">depends on </span>' + deps +
+          (hit ? "   \u2190 must recheck" : "") + (hit ? "</span>" : "");
+      }).join("\n");
+
+    var STRATS = [
+      { n: "single tsconfig", cost: TOTAL, cls: "work",
+        set: PKGS, why: "one program, so any edit rechecks the whole thing" },
+      { n: "project references", cost: affCost, cls: "workl",
+        set: aff, why: "only the edited project and its transitive dependents" },
+      { n: "refs + incremental", cost: affCost, cls: "workl",
+        set: aff, why: "same set, and each project skips unchanged files within itself" }
+    ];
+
+    var host = document.getElementById("pr-rows");
+    host.textContent = "";
+    STRATS.forEach(function (s) {
+      var bars = PKGS.map(function (p) {
+        var on = s.set.indexOf(p) !== -1;
+        return '<span class="' + (on ? s.cls : "skip") + '" style="width:' +
+          (COST[p] / TOTAL * 100) + '%">' + (on ? p : "") + "</span>";
+      }).join("");
+      host.insertAdjacentHTML("beforeend",
+        '<div class="srow"><span class="sn">' + s.n + "</span>" +
+        '<span class="strack">' + bars + "</span>" +
+        '<span class="sval">' + s.cost + " / " + TOTAL + "</span></div>");
+    });
+
+    var saved = Math.round((1 - affCost / TOTAL) * 100);
+    document.getElementById("pr-a").innerHTML = TOTAL + "<small> units</small>";
+    document.getElementById("pr-b").innerHTML = affCost + "<small> units</small>";
+    document.getElementById("pr-s").textContent = saved + "%";
+    document.getElementById("pr-w").textContent = saved >= 50 ? "clearly" : "marginal";
+    document.getElementById("pr-b").parentNode.className = "tile " + (saved >= 50 ? "ok" : "mid");
+    document.getElementById("pr-s").parentNode.className = "tile " + (saved >= 50 ? "ok" : saved > 0 ? "mid" : "hot");
+    document.getElementById("pr-w").parentNode.className = "tile " + (saved >= 50 ? "ok" : "mid");
+
+    var note;
+    if (pick === "docs") {
+      note = "<b>Nothing depends on <code>docs</code>, so a change there is free under references and costs the entire project " +
+        "under a single tsconfig.</b> " +
+        "This is the best case, and it is also the most common shape in a real repository: leaf packages \u2014 docs sites, " +
+        "example apps, scripts \u2014 that everyone edits and nothing imports. " +
+        "<b>If most of your churn is in leaves, references pay for themselves quickly.</b>";
+    } else if (pick === "web") {
+      note = "<b>The application at the top of the graph, so only it needs rechecking</b> \u2014 nothing imports " +
+        "<code>web</code>. " +
+        "Note the asymmetry this reveals: <b>editing the thing everyone depends on is expensive; editing the thing that depends " +
+        "on everyone is cheap.</b> " +
+        "Since most day-to-day work happens in the application layer, references often help more than the graph's shape " +
+        "suggests at first glance.";
+    } else if (pick === "types" || pick === "utils") {
+      note = "<b>A shared foundation package, and almost everything downstream must be rechecked.</b> " +
+        "References save the packages that do not transitively depend on it \u2014 here that is only <code>docs</code> and one " +
+        "sibling \u2014 so the win is modest. " +
+        "<b>This is the case worth designing around:</b> if your <code>types</code> package changes constantly, references will " +
+        "not rescue you, and the real fix is to stop putting unrelated things in one shared package. " +
+        "A foundation that changes daily is not a foundation.";
+    } else {
+      note = "<b>A middle-of-graph package: itself plus whatever sits above it.</b> " +
+        "The saving is real but partial, which is the honest general case \u2014 references help in proportion to how much of " +
+        "your graph is <i>not</i> downstream of the thing you usually edit. " +
+        "<b>Two caveats before adopting them.</b> Dependents see a referenced project through its emitted <code>.d.ts</code>, so " +
+        "an edit is invisible until that project rebuilds \u2014 which is what buys the speed and what confuses everyone on day " +
+        "one. And the third row is worth reading: <b>incremental checking within a project is a separate and much cheaper win</b>, " +
+        "so try <code>incremental</code> alone before restructuring anything.";
+    }
+    document.getElementById("pr-note").innerHTML = note;
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

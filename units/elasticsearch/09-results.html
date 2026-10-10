@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Controlling the results — Elasticsearch</title>
+<meta name="description" content="Pagination that does not fall over at page 1000, sorting, source filtering, highlighting, and why deep paging is a design smell.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 09 · Searching</div>
+    <h1>Controlling the results</h1>
+    <p class="standfirst">A distributed search cannot know which ten documents rank highest without asking every shard for its own top ten. That one fact explains why deep pagination is expensive, why there is a hard limit on it, and why the fix is a cursor rather than a page number.</p>
+    <div class="chap-meta">
+      <span class="tagpill">search_after</span>
+      <span class="tagpill">pit</span>
+      <span class="tagpill">sorting</span>
+      <span class="tagpill">highlighting</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Why deep paging is expensive</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">query then fetch, in two phases</span><button class="copy">Copy</button></div>
+<pre><code>You ask for results 10,000 to 10,010 across an index with 5 shards.
+
+QUERY PHASE
+  The coordinating node sends the query to all 5 shards.
+  Each shard must return its own top 10,010 — because any of them could
+  hold all of the globally top-ranked documents.
+  Each returns 10,010 (doc id, score) pairs.
+
+  The coordinating node now holds 50,050 entries. It sorts them, discards
+  50,040, and keeps 10.
+
+FETCH PHASE
+  It asks the relevant shards for the _source of those 10 documents.
+  Those come back and are returned to you.
+
+THE COST OF PAGE N IS PROPORTIONAL TO N × SHARDS, and all of it lands in
+memory on ONE node — the coordinating node. Ten users deep-paging
+simultaneously is a coordinated attack on a single JVM heap.
+
+That is why:
+  index.max_result_window: 10000          # the default hard limit
+  # from + size > 10000 -> 400 Bad Request
+
+RAISING IT IS THE WRONG FIX. The limit exists to stop a query taking down
+a node, and a cluster where it has been raised to 1,000,000 is a cluster
+with an outage scheduled for whenever someone builds a link to page 50,000.
+
+WHAT DOES NOT HAVE THIS PROBLEM: aggregations, which are computed per shard
+and combined, and search_after, which carries a position rather than an
+offset.</code></pre>
+</div>
+
+<div class="demo" id="pg">
+  <div class="demo-head">
+    <b>Three ways to paginate</b>
+    <span>Same index, same page size. Drag to a deep page and watch what each approach has to do.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="p-mode">Approach</label>
+        <select id="p-mode">
+          <option value="from" selected>from / size</option>
+          <option value="after">search_after + PIT</option>
+          <option value="scroll">scroll</option>
+        </select>
+      </div>
+      <div>
+        <label for="p-page">Page — <span id="p-pagev">1</span></label>
+        <input type="range" id="p-page" min="1" max="20" step="1" value="1">
+      </div>
+      <div>
+        <label for="p-shards">Shards — <span id="p-shardsv">5</span></label>
+        <input type="range" id="p-shards" min="1" max="10" step="1" value="5">
+      </div>
+    </div>
+    <div id="p-bars"></div>
+    <div class="stat">
+      <div><b id="p-docs">—</b><span>entries the coordinator sorts</span></div>
+      <div><b id="p-mem">—</b><span>relative memory</span></div>
+      <div><b id="p-jump">—</b><span>random page access</span></div>
+      <div><b id="p-state">—</b><span>server state</span></div>
+    </div>
+    <div class="out" id="p-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">search_after, the one to use</span><button class="copy">Copy</button></div>
+<pre><code># 1. Open a point in time — a frozen view of the index, so the results are
+#    consistent even as documents are written underneath you
+POST /products/_pit?keep_alive=2m
+# -> { "id": "46ToAwMDaWR5..." }
+
+# 2. First page. The sort MUST be a total order — include a tiebreaker
+POST /_search
+{ "size": 20,
+  "pit": { "id": "46ToAwMDaWR5...", "keep_alive": "2m" },
+  "query": { "match": { "name": "wireless" } },
+  "sort": [ { "price": "asc" }, { "_shard_doc": "asc" } ] }
+
+#    _shard_doc is a free implicit tiebreaker available with a PIT. Without
+#    one, documents with equal sort values can appear on two pages or on
+#    none, because the order between them is undefined.
+
+# 3. Every subsequent page: pass the LAST hit's sort values back
+POST /_search
+{ "size": 20,
+  "pit": { "id": "46ToAwMDaWR5...", "keep_alive": "2m" },
+  "query": { "match": { "name": "wireless" } },
+  "sort": [ { "price": "asc" }, { "_shard_doc": "asc" } ],
+  "search_after": [ 349.99, 4294967298 ] }
+
+DELETE /_pit  { "id": "46ToAwMDaWR5..." }
+
+# EACH SHARD NOW SKIPS DIRECTLY to its position in the sorted term data and
+# returns only `size` results. The cost is CONSTANT per page, whether it is
+# page 2 or page 20,000.
+#
+# WHAT YOU GIVE UP: you cannot jump to an arbitrary page. You can only go
+# forward one page at a time, because the cursor IS the previous page's last
+# row. That is why infinite scroll is the natural interface for it and
+# numbered pagination is not.
+#
+# WITHOUT A PIT it still works, and results can shift as the index changes —
+# a document indexed between two page requests can push things across the
+# boundary. Use a PIT whenever consistency matters.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Nobody visits page 500</span>
+  <p>Deep pagination is almost always a symptom rather than a requirement. When a user is on page 40 of search results, the search failed — they should have refined it, and the interface should have helped. <b>The three legitimate needs are export, migration and background processing</b>, and all three want <code>search_after</code> or a scroll rather than page numbers, because they read everything in order and never jump. If a product requirement genuinely demands numbered pages into the tens of thousands, the honest response is that Elasticsearch is being asked to be a paginated table and something with a stable ordered index — a relational database with a keyset cursor — is a better fit for that specific screen.</p>
+</div>
+
+<h2><span class="h-rule"></span>Sorting</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">and what it costs you</span><button class="copy">Copy</button></div>
+<pre><code>{ "sort": [
+    { "price": { "order": "asc" } },
+    { "released": { "order": "desc" } },
+    "_score",                                   # relevance as a tiebreaker
+    { "_doc": "asc" }                           # cheapest possible tiebreak
+]}
+
+# SORTING TURNS OFF SCORING unless _score is in the sort list. That is a
+# small performance win and a real behavioural change — track_scores: true
+# brings the scores back if you need to display them.
+
+# ARRAYS need a mode, since a document has several values:
+{ "sort": [ { "prices": { "order": "asc", "mode": "min" } } ] }
+#   min | max | sum | avg | median
+
+# MISSING VALUES:
+{ "sort": [ { "price": { "order": "asc", "missing": "_last" } } ] }
+#   _last | _first | a literal value
+
+# NESTED FIELDS need the path, or you sort on an unrelated element:
+{ "sort": [ { "members.joined": {
+    "order": "asc",
+    "nested": { "path": "members",
+                "filter": { "term": { "members.role": "admin" } } } } } ]}
+
+# YOU CANNOT SORT ON A text FIELD. Use the .keyword sub-field. The error
+# suggests enabling fielddata; do not (chapter 3).
+
+# GEO DISTANCE:
+{ "sort": [ { "_geo_distance": {
+    "location": { "lat": 51.5, "lon": -0.12 },
+    "order": "asc", "unit": "km" } } ]}
+
+# INDEX SORTING — pre-sort the segments on disk at index time:
+PUT /events { "settings": { "index": {
+    "sort.field": [ "@timestamp" ],
+    "sort.order": [ "desc" ] }}}
+# Queries sorted the same way can stop early instead of scanning every
+# matching document, which on a large time-series index is a very large win.
+# The cost is slower indexing. For append-mostly log data it is usually
+# worth it, and it must be set at index creation.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>What comes back</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">source filtering, fields, and highlighting</span><button class="copy">Copy</button></div>
+<pre><code># RETURN ONLY WHAT YOU RENDER. _source is fetched and decompressed per hit,
+# so returning a 40 KB document to display a title is real, avoidable cost.
+{ "_source": [ "name", "price", "thumbnail" ] }
+{ "_source": { "includes": [ "user.*" ], "excludes": [ "user.internal_*" ] } }
+{ "_source": false }                       # ids and scores only
+
+# THE fields PARAMETER — formatted values, and it understands runtime fields
+# and multi-fields in a way _source does not:
+{ "fields": [ "name", "price", { "field": "released", "format": "yyyy-MM-dd" } ],
+  "_source": false }
+# _source gives you what was SENT. fields gives you what was INDEXED, after
+# coercion and formatting. For dates and numbers that distinction matters.
+
+# HIGHLIGHTING — the matched fragments, marked up
+{ "highlight": {
+    "pre_tags":  [ "<mark>" ],
+    "post_tags": [ "</mark>" ],
+    "fields": {
+      "name": {},
+      "description": { "fragment_size": 150, "number_of_fragments": 3 }
+    }
+}}
+
+#   THREE HIGHLIGHTERS, and the default is usually right:
+#     unified   default. Uses the Lucene highlighter, handles most cases
+#     plain     re-analyses the field at query time. Accurate, slow on big
+#               fields, and the one to avoid on large documents
+#     fvh       fast vector highlighter. Needs term_vector: with_positions_offsets
+#               in the mapping, which costs index size. Worth it only for
+#               genuinely large fields you highlight constantly
+#
+#   Highlighting reads _source and re-analyses by default, so it is one of
+#   the more expensive things you can add to a search. Measure it.
+
+# COLLAPSE — one result per group, without an aggregation
+{ "collapse": {
+    "field": "brand",
+    "inner_hits": { "name": "top_3", "size": 3, "sort": [ { "price": "asc" } ] }
+}}
+# "show the best match per brand, with three examples each". Far cheaper
+# than a terms aggregation with top_hits, and it paginates properly —
+# which top_hits does not.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Scroll is legacy, and still the right answer occasionally</span>
+  <p><code>scroll</code> holds a search context open on every shard for the duration, pinning the segments so the view stays consistent. That is expensive — open scrolls prevent segment merges from freeing space, and a forgotten scroll with a long <code>keep_alive</code> quietly holds disk and memory until it expires. Elastic's own documentation now recommends <code>search_after</code> with a point in time for deep pagination, and PIT is genuinely lighter. <b>Scroll remains reasonable for one case</b>: a single-pass export of an entire index where you want <code>slice</code> to parallelise across workers, and you control the lifetime. Anything user-facing should be <code>search_after</code>.</p>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Three settings that make searches predictable</span>
+  <p><code>"timeout": "2s"</code> on the request bounds how long each shard may spend, returning partial results rather than hanging — and note it is per shard, not per request. <code>"terminate_after": 1000</code> stops each shard after collecting that many matches, which is a blunt instrument that turns an unbounded scan into a bounded one when you only need "are there some of these". And <code>"allow_partial_search_results": false</code> makes a search <em>fail</em> when a shard is unavailable instead of quietly returning fewer documents — the default is <code>true</code>, which means a yellow cluster silently returns incomplete results, and for anything where correctness matters more than availability that default is wrong.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Every shard returns <code>from + size</code> results</b>, and the coordinating node sorts and discards. Deep paging costs memory on one node.</li>
+    <li><b><code>max_result_window</code> is 10,000 for a reason.</b> Raising it schedules an outage.</li>
+    <li><b><code>search_after</code> with a PIT is the answer</b> — constant cost per page, forward only.</li>
+    <li><b>Always include a tiebreaker in the sort</b>, or documents appear twice or not at all. <code>_shard_doc</code> is free with a PIT.</li>
+    <li><b>Sorting disables scoring</b> unless <code>_score</code> is in the sort list.</li>
+    <li><b>Index sorting lets time-series queries stop early</b>, at the cost of slower indexing. Set at creation.</li>
+    <li><b>Return only the fields you render.</b> <code>_source</code> is fetched and decompressed per hit.</li>
+    <li><b><code>collapse</code> beats a terms aggregation with <code>top_hits</code></b> for one-result-per-group, and it paginates.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("09-results.html");
+
+(function(){
+  const root = document.getElementById("pg");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const SIZE = 20;
+
+  function render(){
+    const mode   = $("p-mode").value;
+    const page   = parseInt($("p-page").value, 10);
+    const shards = parseInt($("p-shards").value, 10);
+    $("p-pagev").textContent   = page;
+    $("p-shardsv").textContent = shards;
+
+    const from = (page - 1) * SIZE;
+    let entries, mem, jump, state;
+
+    if(mode === "from"){
+      entries = (from + SIZE) * shards;
+      mem = entries;
+      jump = "yes";
+      state = "none";
+    } else if(mode === "after"){
+      entries = SIZE * shards;
+      mem = entries;
+      jump = "no — forward only";
+      state = "PIT, ~2 min";
+    } else {
+      entries = SIZE * shards;
+      mem = entries;
+      jump = "no — forward only";
+      state = "search context per shard";
+    }
+
+    const overLimit = mode === "from" && (from + SIZE) > 10000;
+
+    $("p-docs").textContent  = entries.toLocaleString();
+    $("p-mem").textContent   = overLimit ? "rejected" : (entries / (SIZE * shards)).toFixed(0) + "×";
+    $("p-jump").textContent  = jump;
+    $("p-state").textContent = state;
+    $("p-docs").style.color  = overLimit ? "#E2574C" : "";
+
+    const fromEntries = (from + SIZE) * shards;
+    const max = Math.max(fromEntries, SIZE * shards);
+
+    const bars = [
+      ["from / size", fromEntries, mode === "from" ? "#E2574C" : "#CFD8E0"],
+      ["search_after", SIZE * shards, mode === "after" ? "#3FB984" : "#CFD8E0"],
+      ["scroll", SIZE * shards, mode === "scroll" ? "#F2A03D" : "#CFD8E0"]
+    ];
+
+    $("p-bars").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin:16px 0 8px">Entries the coordinating node must sort · page ' + page +
+      ', ' + shards + ' shards</div>' +
+      bars.map(([lab, v, col]) =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">' +
+        '<span style="min-width:110px;font-size:13px;font-weight:' +
+        (col === "#CFD8E0" ? "400" : "600") + '">' + lab + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' +
+        Math.max(1.5, v/max*100).toFixed(1) + '%;background:' + col + '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:66px;text-align:right">' +
+        v.toLocaleString() + '</span></div>').join("") +
+      (overLimit
+        ? '<div style="background:#FBEDEC;border:1px solid #E2574C;border-radius:5px;padding:9px 12px;' +
+          'margin-top:10px;font-family:var(--mono);font-size:11.5px;color:#A8382F">' +
+          'Result window is too large, from + size must be less than or equal to 10000 but was ' +
+          (from + SIZE) + '</div>'
+        : "");
+
+    const notes = [];
+
+    if(mode === "from"){
+      notes.push("Page " + page + " means from=" + from + ", size=" + SIZE +
+        ". Each of the " + shards + " shards must return its own top " + (from + SIZE) +
+        " results, because any one of them could hold all of the globally highest-ranked documents.\n\nThe coordinating node receives " +
+        entries.toLocaleString() + " (id, score) pairs, sorts them, discards " +
+        (entries - SIZE).toLocaleString() + " and keeps " + SIZE + ".\n\nAll of that lands in memory on ONE node. Ten users deep-paging at once is a coordinated attack on a single JVM heap, which is why the limit exists.");
+      if(overLimit)
+        notes.push("This request is rejected. index.max_result_window defaults to 10,000 and from + size exceeds it.\n\nThe tempting fix is raising the setting. Do not: it exists to stop one query taking down a node, and a cluster where it has been set to a million has an outage scheduled for whenever someone builds a link to page 50,000.\n\nSwitch to search_after above and watch the cost.");
+      else if(page > 5)
+        notes.push("Note the shape of the growth: the cost of page N is proportional to N × shards, so it climbs linearly and the pain arrives gradually. Page 3 is fine, page 30 is noticeable, page 300 is a problem — and nothing warns you on the way.\n\nAdding shards makes it worse, which is a genuinely counter-intuitive property: a wider cluster is SLOWER at deep pagination, because every shard contributes another full page-worth of candidates.");
+    }
+
+    if(mode === "after"){
+      notes.push("search_after carries the previous page's last sort values as a cursor, so each shard skips directly to its position in the sorted data and returns exactly " +
+        SIZE + " results.\n\nThe coordinating node sorts " + entries + " entries regardless of which page this is. Page 2 and page 20,000 cost the same.\n\nThat is the whole difference: from/size expresses a position as an OFFSET, which must be counted to; search_after expresses it as a VALUE, which can be sought to.");
+      notes.push("Two requirements. The sort must be a total order — include a tiebreaker, or documents with equal sort values can appear on two pages or on none. With a point in time you get _shard_doc for free, which is the cheapest possible tiebreaker.\n\nAnd you cannot jump. The cursor IS the previous page's last row, so there is no way to construct the cursor for page 47 without having read pages 1 to 46. That is why infinite scroll is the natural interface for this and numbered pagination is not.");
+      notes.push("The PIT is what makes it consistent. It freezes a view of the index, so documents written while the user is paging do not shift results across page boundaries. It costs a keep_alive's worth of held segments, so keep the window short and delete it when done.\n\nWithout a PIT, search_after still works and results can drift.");
+    }
+
+    if(mode === "scroll"){
+      notes.push("scroll takes a snapshot and holds a search context open on every shard for the duration, returning a scroll_id you pass back for each batch. Cost per batch is constant, like search_after.\n\nThe difference is where the state lives. A PIT is a lightweight reference to a set of segments; a scroll context is heavier, and holding it PREVENTS SEGMENT MERGES from freeing space for as long as it exists.\n\nA forgotten scroll with a long keep_alive quietly holds disk and memory until it expires. On a busy index a handful of those is a real capacity problem, and it shows up as disk usage that will not come down.");
+      notes.push("Elastic's own guidance now points at search_after with a PIT for deep pagination, and scroll is best treated as legacy.\n\nIt remains reasonable for one case: a single-pass export of an entire index, where you want the slice parameter to parallelise across workers and you control the lifetime. Anything user-facing should be search_after.");
+    }
+
+    if(shards >= 8 && mode === "from")
+      notes.push("With " + shards + " shards the multiplier is severe — every additional shard adds another " +
+        (from + SIZE) + " candidates for the coordinator to hold and sort at this depth.\n\nThis is one of the quieter arguments against oversharding (chapter 2). The per-shard overhead people usually talk about is memory and cluster state; this is a query-time cost that scales with both shard count and page depth simultaneously.");
+
+    $("p-note").textContent = notes.join("\n\n");
+  }
+
+  ["p-mode","p-page","p-shards"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

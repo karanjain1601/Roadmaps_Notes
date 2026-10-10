@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · RAG part one: getting your data in — AI Engineer</title>
+<meta name="description" content="Loading and parsing real documents, chunking strategies with worked numbers, metadata design, and incremental re-indexing that does not melt down.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 11 · Knowledge and retrieval</div>
+    <h1>RAG part one: getting your data in</h1>
+    <p class="standfirst">Retrieval-augmented generation is the most common thing AI engineers build, and almost every failure traces back to ingestion. The quality ceiling of the entire system is set here — before a single query is ever run.</p>
+    <div class="chap-meta">
+      <span class="tagpill">parsing</span>
+      <span class="tagpill">chunking</span>
+      <span class="tagpill">metadata</span>
+      <span class="tagpill">contextualisation</span>
+      <span class="tagpill">incremental</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>What RAG is, and what it is not</h2>
+
+<p>The model does not know your company's refund policy. Three ways to fix that: fine-tune it in (expensive, slow to update, and it teaches style better than facts — chapter 14), put everything in the prompt (works beautifully up to a point, then costs too much and dilutes attention), or <b>look up the relevant parts at query time and put those in the prompt</b>. That third option is RAG.</p>
+
+<div class="flow stack">
+  <div class="step"><b>Ingest — offline, once per document change</b><span>Load → parse → chunk → enrich → embed → index</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Retrieve — online, once per query</b><span>Rewrite query → hybrid search → rerank → pack context</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Generate — online</b><span>Grounded prompt → answer with citations → verify</span></div>
+</div>
+
+<p>This chapter is the top box. Chapter 12 is the other two, chapter 13 is how you tell whether any of it works.</p>
+
+<div class="note key">
+  <span class="note-t">Long context has not made RAG obsolete</span>
+  <p>A million-token window tempts you to skip retrieval and paste everything. Sometimes you should — if your whole corpus is 30 pages, retrieval is pointless complexity. But at scale you still want RAG, for four reasons that do not go away: <b>cost</b> (you pay per token, on every request), <b>latency</b> (prefill time scales with input), <b>accuracy</b> (models genuinely degrade at locating one fact in a haystack), and <b>permissions</b> (you cannot paste a corpus that different users are allowed different slices of). Long context changes the ideal chunk size and how much you retrieve — it does not remove the need to retrieve.</p>
+</div>
+
+<h2><span class="h-rule"></span>Step one: loading and parsing</h2>
+
+<p>This is unglamorous and it is where most of the real engineering time goes. A PDF is not text; it is drawing instructions. Getting clean text out of the formats real organisations use is the difference between a system that works and one that retrieves navigation menus.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Source</th><th>Approach</th><th>What goes wrong</th></tr></thead>
+<tbody>
+<tr><td><b>Plain text, Markdown</b></td><td>Read it. Keep the heading structure — it is free metadata</td><td>Nothing. Be grateful</td></tr>
+<tr><td><b>HTML</b></td><td>Extract the main content region, drop nav, footers, cookie banners, sidebars. Convert to Markdown to preserve headings, lists and tables</td><td>Boilerplate dominates the index; the same nav bar embeds into every chunk and matches everything</td></tr>
+<tr><td><b>PDF (digital)</b></td><td>A layout-aware library. Extract text with reading order, keep page numbers for citations</td><td>Two-column layouts interleaved line by line into nonsense; headers and footers repeated in every chunk; tables flattened into unreadable strings</td></tr>
+<tr><td><b>PDF (scanned)</b></td><td>OCR, or a vision model page by page. Slower and costlier — check whether you actually need it</td><td>OCR noise embeds badly; the failure is silent</td></tr>
+<tr><td><b>Word, PowerPoint</b></td><td>Extract text plus structure; slide decks need speaker notes too</td><td>Text boxes come out in creation order rather than reading order</td></tr>
+<tr><td><b>Spreadsheets</b></td><td>Usually <em>not</em> a RAG problem. Load into a database and let the model query it with a tool (chapter 07)</td><td>Embedding rows of numbers produces nothing useful — this is the most common misuse of RAG</td></tr>
+<tr><td><b>Code</b></td><td>Parse into syntactic units — function, class, module — never fixed character windows</td><td>A chunk that starts mid-function is useless to both retrieval and the model</td></tr>
+<tr><td><b>Tickets, chats, email</b></td><td>Thread-aware: keep a conversation together, strip signatures and quoted replies</td><td>Every chunk ends up being an email footer</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Read fifty parsed chunks with your own eyes</span>
+  <p>Before building anything downstream, dump a random sample of parsed chunks and read them. Not summary statistics — the actual text. You will find repeated page headers, broken tables, navigation menus, and passages that were split mid-sentence. Every one of those defects is about to be embedded and retrieved for the rest of the system's life. This half-hour is the highest-leverage half-hour in the whole project.</p>
+</div>
+
+<h3>Vision models as parsers</h3>
+
+<p>For complex layouts — financial reports, forms, scientific papers with figures — rendering each page to an image and asking a multimodal model to transcribe it into Markdown now often beats traditional extraction, especially for tables. It costs a few cents a page and is slow, so it is a one-off ingestion cost rather than a per-query one. Chapter 16 covers the mechanics.</p>
+
+<h2><span class="h-rule"></span>Step two: chunking</h2>
+
+<p>Chunks are the unit of retrieval. Too large and you retrieve one relevant sentence wrapped in 900 tokens of noise, diluting both the embedding and the model's attention. Too small and you retrieve a sentence that has lost the context needed to interpret it.</p>
+
+<div class="demo" id="chunk">
+  <div class="demo-head">
+    <b>Chunking simulator</b>
+    <span>A real policy document, chunked live. Watch what falls off the edges — and what a query would actually retrieve.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="cstrat">Strategy</label>
+        <select id="cstrat">
+          <option value="fixed">Fixed size — split every N characters</option>
+          <option value="recursive" selected>Recursive — prefer paragraph, then sentence breaks</option>
+          <option value="structural">Structural — split on headings, then size</option>
+        </select>
+      </div>
+      <div>
+        <label for="csize">Target size — <span id="csizev">400</span> chars (~<span id="ctok">100</span> tokens)</label>
+        <input type="range" id="csize" min="120" max="1400" step="20" value="400">
+      </div>
+      <div>
+        <label for="cover">Overlap — <span id="coverv">15</span>%</label>
+        <input type="range" id="cover" min="0" max="40" step="5" value="15">
+      </div>
+    </div>
+    <label style="margin-top:12px" for="cq">Test query</label>
+    <select id="cq">
+      <option value="sale">Can I return something I bought in the sale?</option>
+      <option value="window">How long do I have to return an item?</option>
+      <option value="faulty">The item arrived broken — who pays postage?</option>
+      <option value="refundtime">When will I actually get my money back?</option>
+    </select>
+
+    <div class="stat">
+      <div><b id="c-n">—</b><span>chunks</span></div>
+      <div><b id="c-avg">—</b><span>avg tokens</span></div>
+      <div><b id="c-split">—</b><span>split mid-sentence</span></div>
+      <div><b id="c-cost">—</b><span>embed cost / 10k docs</span></div>
+    </div>
+    <div id="cout"></div>
+    <div class="out" id="cnote"></div>
+  </div>
+</div>
+
+<h3>The strategies, in order of how often they are right</h3>
+
+<div class="tw">
+<table>
+<thead><tr><th>Strategy</th><th>How it works</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><td><b>Structural</b></td><td>Split on the document's own boundaries — headings, sections, list items, slides — then subdivide anything still too large</td><td>Almost always, when structure exists. Markdown, HTML, Confluence, docs sites. Sections were written as coherent units by a human; respect that</td></tr>
+<tr><td><b>Recursive character</b></td><td>Try to split on <code>\n\n</code>, then <code>\n</code>, then <code>. </code>, then space, taking the largest break that fits the size limit</td><td>The workhorse default for prose without reliable structure. Cheap, deterministic, rarely cuts mid-sentence</td></tr>
+<tr><td><b>Fixed size</b></td><td>Every N characters or tokens, with overlap</td><td>Rarely the right answer, but a reasonable baseline and it never fails on weird input</td></tr>
+<tr><td><b>Sentence window</b></td><td>Embed single sentences; at retrieval time return the sentences either side too</td><td>Precise retrieval over dense reference material. Excellent precision, more storage</td></tr>
+<tr><td><b>Parent–child</b></td><td>Embed small chunks; return the larger parent section they belong to</td><td>When small pieces retrieve well but the model needs surrounding context to answer. Very effective, and my usual recommendation after structural</td></tr>
+<tr><td><b>Semantic</b></td><td>Embed sentences, split where consecutive similarity drops — a topic change</td><td>Unstructured transcripts and long narrative text. Costs an embedding pass over every sentence; measure before assuming it beats recursive</td></tr>
+<tr><td><b>Agentic</b></td><td>Ask an LLM where the natural boundaries are</td><td>Small, high-value, awkward corpora. Too slow and expensive at volume</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">chunk.py — structural first, recursive as the fallback</span><button class="copy">Copy</button></div>
+<pre><code>import re
+from dataclasses import dataclass, field
+
+TARGET = 500          # tokens, not characters
+OVERLAP = 75
+HARD_MIN = 40         # below this, merge forward rather than index noise
+
+@dataclass
+class Chunk:
+    text: str
+    section_path: str                       # "Returns > Sale items"
+    index: int
+    meta: dict = field(default_factory=dict)
+
+
+def split_by_headings(markdown: str) -> list[tuple[str, str]]:
+    """Returns (section_path, body) preserving the heading hierarchy."""
+    sections, stack, buf = [], [], []
+    for line in markdown.splitlines():
+        m = re.match(r"^(#{1,6})\s+(.*)", line)
+        if m:
+            if buf:
+                sections.append((" > ".join(stack), "\n".join(buf).strip()))
+                buf = []
+            level = len(m.group(1))
+            stack = stack[: level - 1] + [m.group(2).strip()]
+        else:
+            buf.append(line)
+    if buf:
+        sections.append((" > ".join(stack), "\n".join(buf).strip()))
+    return [(p, b) for p, b in sections if b]
+
+
+def recursive_split(text: str, target: int, overlap: int) -> list[str]:
+    """Take the largest separator that keeps pieces under target."""
+    for sep in ["\n\n", "\n", ". ", "; ", " "]:
+        parts = text.split(sep)
+        if len(parts) == 1:
+            continue
+        out, cur = [], ""
+        for p in parts:
+            candidate = (cur + sep + p) if cur else p
+            if count_tokens(candidate) > target and cur:
+                out.append(cur)
+                tail = cur[-overlap * 4:]                  # ~4 chars per token
+                cur = tail + sep + p
+            else:
+                cur = candidate
+        if cur:
+            out.append(cur)
+        if all(count_tokens(o) <= target * 1.3 for o in out):
+            return out
+    return [text[i:i + target * 4] for i in range(0, len(text), target * 4)]
+
+
+def chunk_document(markdown: str, doc_meta: dict) -> list[Chunk]:
+    chunks: list[Chunk] = []
+    for path, body in split_by_headings(markdown):
+        pieces = ([body] if count_tokens(body) <= TARGET
+                  else recursive_split(body, TARGET, OVERLAP))
+        for piece in pieces:
+            if count_tokens(piece) < HARD_MIN and chunks:
+                chunks[-1].text += "\n" + piece          # absorb orphans
+                continue
+            chunks.append(Chunk(text=piece.strip(), section_path=path,
+                                index=len(chunks), meta=dict(doc_meta)))
+    return chunks</code></pre>
+</div>
+
+<h3>Sizing, concretely</h3>
+
+<div class="tw">
+<table>
+<thead><tr><th>Content</th><th>Chunk size</th><th>Overlap</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>FAQ, knowledge base articles</td><td>200–400 tokens</td><td>0 — split per Q&amp;A</td><td>Each entry is already an atomic answer</td></tr>
+<tr><td>Policy and reference docs</td><td>400–800 tokens</td><td>10–15%</td><td>Sections are self-contained; overlap saves boundary-straddling rules</td></tr>
+<tr><td>Long-form prose, books</td><td>600–1,000 tokens</td><td>15%</td><td>Argument needs room to develop</td></tr>
+<tr><td>Technical documentation</td><td>500–1,000 tokens</td><td>10%</td><td>Keep a code example with its explanation, never apart</td></tr>
+<tr><td>Source code</td><td>One function or class</td><td>signature + docstring</td><td>Syntactic units are the only sensible boundary</td></tr>
+<tr><td>Transcripts, meetings</td><td>500–800 tokens</td><td>20%</td><td>Speaker turns straddle topics; more overlap protects context</td></tr>
+<tr><td>Legal contracts</td><td>Per clause</td><td>0, but keep the clause number</td><td>Clauses are the citable unit and must not be blended</td></tr>
+</tbody>
+</table>
+<caption>Start at 500 tokens with 15% overlap and a structural splitter. Then change it based on evaluation numbers (chapter 13), not on taste.</caption>
+</div>
+
+<h2><span class="h-rule"></span>Step three: enrich before you embed</h2>
+
+<p>A raw chunk from the middle of a document is often uninterpretable on its own. "This does not apply to items marked final sale." What does not apply? The embedding has no idea, so it matches poorly and the model receives a fragment it cannot use.</p>
+
+<h3>Contextual prefixing</h3>
+
+<p>Prepend the document title and section path to the chunk text <em>before embedding it</em>. This one change routinely produces double-digit percentage improvements in retrieval accuracy and costs nothing.</p>
+
+<div class="cols">
+  <div class="col bad">
+    <h4>Embedded as-is</h4>
+    <p style="font-family:var(--mono);font-size:12.5px">"This does not apply to items marked final sale. Postage is not refunded."</p>
+    <p>Matches queries about postage. Loses to any chunk that says "returns" for a returns query.</p>
+  </div>
+  <div class="col good">
+    <h4>Contextually prefixed</h4>
+    <p style="font-family:var(--mono);font-size:12.5px">"Northwind Returns Policy › Refunds › Exceptions — This does not apply to items marked final sale. Postage is not refunded."</p>
+    <p>Now matches "can I return sale items?" and the model knows which policy it is reading.</p>
+  </div>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">python — three levels of enrichment</span><button class="copy">Copy</button></div>
+<pre><code># Level 1 - free, do this always.
+embed_text = f"{doc.title} › {chunk.section_path}\n\n{chunk.text}"
+
+# Level 2 - cheap, generate once per document at ingest.
+embed_text = f"{doc.title} › {chunk.section_path}\n{doc.one_line_summary}\n\n{chunk.text}"
+
+# Level 3 - "contextual retrieval": an LLM writes a bespoke situating sentence per
+# chunk. Costly at volume, but prompt caching makes it viable because the document
+# is the cached prefix and only the chunk changes.
+SITUATE = """<document>{doc}</document>
+Here is a chunk from that document:
+<chunk>{chunk}</chunk>
+Write one short sentence situating this chunk within the document, to improve
+search retrieval. Answer with the sentence only."""
+
+context = llm(SITUATE.format(doc=doc.text, chunk=chunk.text), max_tokens=80)
+embed_text = f"{context}\n\n{chunk.text}"
+
+# Note what is stored where:
+#   embed_text -> the vector          (enriched, for matching)
+#   chunk.text -> shown to the model  (clean, for reading)
+# Keeping them separate matters. Do not put the situating sentence in the prompt.</code></pre>
+</div>
+
+<h3>Generated questions</h3>
+
+<p>The mismatch from chapter 9 — questions do not look like answers — has a direct fix. At ingest, ask a cheap model to write three questions each chunk answers, and index those alongside. Now query embeddings are compared against question embeddings, which is a like-for-like comparison.</p>
+
+<h2><span class="h-rule"></span>Step four: metadata</h2>
+
+<p>Metadata is what lets you filter, cite, permission and expire. It is also the thing people under-invest in and then have to re-ingest a corpus to add. Decide it before the first full run.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Field</th><th>Why you will need it</th></tr></thead>
+<tbody>
+<tr><td><code>tenant_id</code>, <code>acl_groups</code></td><td>Correctness and security. Filter at query time, always server-side (chapter 10)</td></tr>
+<tr><td><code>source_url</code>, <code>page</code>, <code>section_path</code></td><td>Citations. Users trust an answer they can click through and verify; without this you cannot offer that</td></tr>
+<tr><td><code>updated_at</code>, <code>effective_from/to</code></td><td>Recency boosting, and excluding superseded policies. The most common cause of confidently wrong answers is retrieving last year's document</td></tr>
+<tr><td><code>doc_type</code>, <code>lang</code>, <code>product</code></td><td>Routing and filtering. Users usually mean one product area, not all of them</td></tr>
+<tr><td><code>content_hash</code></td><td>Skip re-embedding unchanged chunks on re-ingest. Turns a four-hour job into four minutes</td></tr>
+<tr><td><code>embed_model</code>, <code>chunker_version</code></td><td>Knowing what is stale when you change either. You will change both</td></tr>
+<tr><td><code>token_count</code></td><td>Packing the context window without a second tokenisation pass at query time</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Permissions must be enforced at retrieval, not by the model</span>
+  <p>Never retrieve documents the user cannot see and instruct the model to ignore them. That is not a security boundary — it is a suggestion to a text generator, and prompt injection defeats it trivially (chapter 17). Apply access control as a filter in the query, derived from the session's identity, before any vector is compared.</p>
+</div>
+
+<h2><span class="h-rule"></span>Step five: the pipeline that survives contact with reality</h2>
+
+<p>Ingestion is not a script you run once. Documents change, parsers get fixed, models get swapped. Build it to be re-runnable from the start.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">ingest.py — incremental, idempotent, resumable</span><button class="copy">Copy</button></div>
+<pre><code>import hashlib
+
+PIPELINE_VERSION = "2026-04-parser3-chunk500-bge768"
+
+def hash_text(s: str) -> str:
+    return hashlib.sha256(s.encode()).hexdigest()
+
+def ingest(source_doc) -> dict:
+    raw = load(source_doc)                      # bytes -> text/markdown
+    doc_hash = hash_text(raw)
+
+    existing = db.get_document(source_doc.id)
+    if existing and existing.doc_hash == doc_hash \
+                and existing.pipeline_version == PIPELINE_VERSION:
+        return {"status": "unchanged"}          # the common case; costs nothing
+
+    chunks = chunk_document(raw, doc_meta=source_doc.meta)
+
+    # Re-embed only what actually changed. A typo fix in paragraph 40 of a
+    # 200-chunk manual should not re-embed 200 chunks.
+    old = {c.content_hash: c for c in db.get_chunks(source_doc.id)}
+    to_embed, reused = [], []
+    for c in chunks:
+        h = hash_text(c.text + c.section_path)
+        c.content_hash = h
+        (reused if h in old else to_embed).append(c)
+
+    if to_embed:
+        vectors = embed_texts([enrich(c) for c in to_embed])
+        for c, v in zip(to_embed, vectors):
+            c.embedding = v
+    for c in reused:
+        c.embedding = old[c.content_hash].embedding
+
+    with db.transaction():                      # atomic swap: never a half-indexed doc
+        db.delete_chunks(source_doc.id)
+        db.insert_chunks(chunks)
+        db.upsert_document(source_doc.id, doc_hash=doc_hash,
+                           pipeline_version=PIPELINE_VERSION,
+                           chunk_count=len(chunks))
+
+    return {"status": "reindexed", "embedded": len(to_embed), "reused": len(reused)}</code></pre>
+</div>
+
+<ul class="check">
+  <li><b>Deletions propagate.</b> When a source document disappears, its chunks must go. A cascade foreign key does this for free in Postgres; a separate vector store needs explicit handling and it is the most commonly forgotten path.</li>
+  <li><b>Re-indexing is a blue-green operation.</b> Changing the embedding model or chunker means building a new index version and swapping, not mutating live data. Users should never see a half-rebuilt corpus.</li>
+  <li><b>Failures are per-document.</b> One malformed PDF must not abort the run. Record the failure, continue, report at the end.</li>
+  <li><b>Log the funnel.</b> Documents in, parsed, chunks produced, chunks embedded, failures by reason. When retrieval quality drops, this is where you look first.</li>
+  <li><b>Alert on shape changes.</b> A parser regression usually shows up as chunk count per document tripling, or median chunk length collapsing — long before anyone complains about answers.</li>
+</ul>
+
+<h2><span class="h-rule"></span>Ingestion smells</h2>
+
+<div class="terms">
+  <div><dt>Every chunk starts with the same 40 words</dt><dd>You are indexing page headers or navigation. Strip boilerplate in the parser.</dd></div>
+  <div><dt>Median chunk is 60 tokens</dt><dd>The splitter is fragmenting on formatting artefacts. Merge orphans forward.</dd></div>
+  <div><dt>Tables retrieve but are unreadable</dt><dd>Convert tables to Markdown, or serialise each row as a sentence with column names.</dd></div>
+  <div><dt>Retrieval returns the table of contents</dt><dd>Index-like pages match everything weakly. Exclude them by structure or by a length-versus-link-density heuristic.</dd></div>
+  <div><dt>Answers cite documents from 2019</dt><dd>No recency handling. Add <code>effective_to</code> and filter, or boost by <code>updated_at</code>.</dd></div>
+  <div><dt>Correct fact exists but is never retrieved</dt><dd>Usually a chunking boundary splitting the fact from its heading. Check the specific chunk containing it.</dd></div>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>RAG's quality ceiling is set at ingestion. <b>Long context does not remove the need for it</b> — cost, latency, accuracy and permissions all still apply.</li>
+    <li>Parsing is most of the real work. <b>Read fifty parsed chunks by hand</b> before building anything downstream.</li>
+    <li><b>Split on the document's own structure</b> first, recursive splitting second. Fixed-size windows are a baseline, not a plan.</li>
+    <li>Start at <b>500 tokens with 15% overlap</b>, then change it because of evaluation numbers.</li>
+    <li><b>Prefix chunks with title and section path before embedding.</b> Free, and one of the largest wins available.</li>
+    <li>Embed the enriched text; <b>show the model the clean text</b>. They are not the same string.</li>
+    <li>Decide metadata before the first full run — <b>tenancy, citations, recency, hashes and versions</b> — or you will re-ingest to add them.</li>
+    <li>Make the pipeline <b>incremental, idempotent and atomic</b>. You will run it hundreds of times.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("11-rag-ingestion.html");
+
+(function(){
+  const root = document.getElementById("chunk");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const DOC =
+"# Northwind Returns Policy\n\n" +
+"## Standard returns\n\n" +
+"You may return most items within 30 days of delivery for a full refund. Items must be unused and in their original packaging. Proof of purchase is required, though an order number is sufficient and we can look this up for you.\n\n" +
+"Return postage for a change of mind is paid by the customer. We provide a prepaid label on request and deduct the cost from the refund.\n\n" +
+"## Sale items\n\n" +
+"Items purchased during a sale event may be returned within 14 days rather than 30. This does not apply to items marked final sale, which cannot be returned unless faulty.\n\n" +
+"## Faulty items\n\n" +
+"If an item is faulty or arrives damaged, we cover return postage in every case, including sale and final sale items. Report the fault within 48 hours of delivery where possible, though your statutory rights are not limited by this. Photographs of the damage speed up the process considerably.\n\n" +
+"## Refund timing\n\n" +
+"Once we receive the returned item, inspection takes up to 3 working days. Refunds are issued to the original payment method and typically appear within 5 to 10 working days depending on your bank. We will email you when the refund is issued.\n";
+
+  const QUERIES = {
+    sale:       {terms:["sale","final sale","14 days","return"],       need:"the 14-day sale window AND the final-sale exception"},
+    window:     {terms:["30 days","14 days","within","return"],        need:"the 30-day standard window"},
+    faulty:     {terms:["faulty","damaged","postage","cover"],         need:"that Northwind pays postage for faults"},
+    refundtime: {terms:["refund","working days","bank","inspection"],  need:"the 3-day inspection plus 5-10 day bank delay"}
+  };
+
+  const toks = s => Math.max(1, Math.round(s.length / 4));
+
+  function fixed(text, size, ov){
+    const step = Math.max(20, size - Math.round(size * ov));
+    const out = [];
+    for(let i = 0; i < text.length; i += step) out.push(text.slice(i, i + size));
+    return out;
+  }
+
+  function recursive(text, size, ov){
+    const paras = text.split(/\n\n+/);
+    const out = [];
+    let cur = "";
+    const push = () => { if(cur.trim()) out.push(cur.trim()); };
+    for(const p of paras){
+      const units = p.length > size ? p.split(/(?<=\. )/) : [p];
+      for(const u of units){
+        if((cur + " " + u).length > size && cur){
+          push();
+          const tail = Math.round(size * ov);
+          cur = tail > 0 ? cur.slice(-tail) + " " + u : u;
+        } else {
+          cur = cur ? cur + (cur.endsWith(" ") ? "" : " ") + u : u;
+        }
+      }
+    }
+    push();
+    return out;
+  }
+
+  function structural(text, size, ov){
+    const out = [];
+    const secs = text.split(/\n(?=#{1,6}\s)/);
+    for(const s of secs){
+      const m = s.match(/^(#{1,6})\s+(.*)/);
+      const path = m ? m[2].trim() : "";
+      const body = m ? s.slice(m[0].length).trim() : s.trim();
+      if(!body) continue;
+      const pieces = body.length <= size ? [body] : recursive(body, size, ov);
+      pieces.forEach(p => out.push((path ? "› " + path + " — " : "") + p));
+    }
+    return out;
+  }
+
+  function score(chunk, terms){
+    const low = chunk.toLowerCase();
+    return terms.reduce((n,t) => n + (low.includes(t.toLowerCase()) ? 1 : 0), 0);
+  }
+
+  function render(){
+    const size = parseInt($("csize").value, 10);
+    const ov   = parseInt($("cover").value, 10) / 100;
+    const st   = $("cstrat").value;
+    $("csizev").textContent = size;
+    $("ctok").textContent = Math.round(size / 4);
+    $("coverv").textContent = Math.round(ov * 100);
+
+    const chunks = st === "fixed" ? fixed(DOC, size, ov)
+                 : st === "recursive" ? recursive(DOC, size, ov)
+                 : structural(DOC, size, ov);
+
+    const clean = chunks.filter(c => c.trim().length > 0);
+    const avg = clean.reduce((s,c) => s + toks(c), 0) / (clean.length || 1);
+    const midSentence = clean.filter(c => /[a-z,]$/.test(c.trim()) ||
+                                          /^[a-z]/.test(c.trim())).length;
+
+    $("c-n").textContent   = clean.length;
+    $("c-avg").textContent = Math.round(avg);
+    $("c-split").textContent = midSentence;
+    // 10k docs of this size, at $0.02 per 1M tokens
+    $("c-cost").textContent = "$" + (clean.length * avg * 10000 / 1e6 * 0.02).toFixed(2);
+
+    const q = QUERIES[$("cq").value];
+    const ranked = clean.map((c,i) => ({i, c, s: score(c, q.terms)}))
+                        .sort((a,b) => b.s - a.s).slice(0, 3);
+
+    $("cout").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">Top 3 retrieved</div>' +
+      ranked.map(r =>
+        '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid ' +
+        (r.s >= 2 ? "#3FB984" : r.s === 1 ? "#F2A03D" : "#E2574C") +
+        ';border-radius:4px;padding:9px 11px;margin-bottom:7px">' +
+        '<div style="font-size:11.5px;color:#8FA0AF;margin-bottom:4px;font-family:var(--mono)">chunk ' +
+        r.i + ' · ' + toks(r.c) + ' tokens · ' + r.s + '/' + q.terms.length + ' terms</div>' +
+        '<div style="font-size:13.5px;line-height:1.45">' +
+        r.c.replace(/[<>&]/g, ch => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[ch])) + '</div></div>'
+      ).join("");
+
+    const notes = [];
+    const best = ranked[0] ? ranked[0].s : 0;
+    if(best < q.terms.length)
+      notes.push("This query needs " + q.need + ". No single chunk carries all of it, so the model is assembling an answer from partial evidence — the classic cause of a confidently incomplete reply.");
+    else
+      notes.push("One chunk carries the whole answer. This is what you are aiming for: the retrieval unit matches the answer unit.");
+
+    if(st === "fixed" && midSentence > 0)
+      notes.push(midSentence + " chunks begin or end mid-sentence. Fixed-size splitting has no idea what a sentence is; each broken edge is a fact that may no longer be retrievable.");
+    if(st === "structural")
+      notes.push("Structural splitting prefixes each chunk with its heading, so 'This does not apply to items marked final sale' arrives labelled 'Sale items' — the embedding and the model both benefit.");
+    if(size < 220)
+      notes.push("At " + Math.round(size/4) + " tokens, chunks are too small to hold a complete rule. Precise retrieval, insufficient context.");
+    if(size > 1000)
+      notes.push("At " + Math.round(size/4) + " tokens, one relevant sentence arrives wrapped in a lot of unrelated policy. Both the embedding and the model's attention get diluted.");
+    if(ov === 0)
+      notes.push("Zero overlap: any rule that straddles a boundary is now split across two chunks and may never be retrieved whole.");
+
+    $("cnote").textContent = notes.join("\n\n");
+  }
+
+  ["csize","cover","cstrat","cq"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

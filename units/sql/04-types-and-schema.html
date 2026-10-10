@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Types and schema design — SQL</title>
+<meta name="description" content="Choosing types that prevent bad data, normalisation to the point it helps, keys, and the decisions that are expensive to reverse.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 04 · Foundations</div>
+    <h1>Types and schema design</h1>
+    <p class="standfirst">The schema is the one part of a system that outlives every rewrite. Application code gets replaced; the data stays, and so does every decision encoded in the columns holding it. This chapter is about the decisions that are cheap now and expensive later.</p>
+    <div class="chap-meta">
+      <span class="tagpill">types</span>
+      <span class="tagpill">keys</span>
+      <span class="tagpill">normalisation</span>
+      <span class="tagpill">reversibility</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>A type is a constraint</h2>
+
+<p>Its job is not to store your data — it is to <b>refuse data that should not exist</b>. A column typed <code>date</code> cannot hold "next Tuesday", and that rejection is the feature. Every value the type excludes is a class of bug that can never reach production.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Need</th><th>Use</th><th>Not</th></tr></thead>
+<tbody>
+<tr><td>Money</td><td><code>numeric(12,2)</code> or integer minor units</td><td><b><code>float</code></b> — 0.1 + 0.2 ≠ 0.3, and accounting will find it</td></tr>
+<tr><td>A point in time</td><td><code>timestamptz</code></td><td><code>timestamp</code> without a zone, or a string</td></tr>
+<tr><td>A calendar date with no time</td><td><code>date</code></td><td>A timestamp at midnight in an unstated zone</td></tr>
+<tr><td>A duration</td><td><code>interval</code>, or an integer of stated units</td><td>A bare number called <code>duration</code></td></tr>
+<tr><td>A fixed set of states</td><td><code>enum</code>, or text with a <code>CHECK</code>, or a lookup table</td><td>Free text</td></tr>
+<tr><td>Yes/no</td><td><code>boolean</code></td><td><code>char(1)</code> holding 'Y'/'N'/'y'/''/NULL</td></tr>
+<tr><td>Text</td><td><code>text</code>, with a length <code>CHECK</code> if there is a real limit</td><td><code>varchar(255)</code> chosen for no reason</td></tr>
+<tr><td>An identifier</td><td><code>bigint</code> identity, or <code>uuid</code></td><td><code>int</code> — see below</td></tr>
+<tr><td>Structured but schemaless</td><td><code>jsonb</code></td><td>A text column containing JSON</td></tr>
+<tr><td>An IP address, a MAC, a range</td><td>The dedicated type where the engine has one</td><td>Text</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Never store money in a float</span>
+  <p>Binary floating point cannot represent 0.10 exactly. Sum enough of them and the total drifts, comparisons that should be equal are not, and a reconciliation report is off by pennies in a way nobody can explain. Use <code>numeric</code>/<code>decimal</code> with an explicit scale, or store integer minor units — 1099 rather than 10.99 — and format at the edge. This is a one-line decision at table-creation time and a multi-week migration afterwards.</p>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the timestamp decision, which is really a timezone decision</span><button class="copy">Copy</button></div>
+<pre><code>-- timestamptz stores an absolute instant (as UTC) and converts on the way out.
+-- timestamp stores wall-clock digits with no zone — two different events at
+-- the same "time" are indistinguishable, and DST makes some values ambiguous.
+CREATE TABLE events (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    occurred_at  timestamptz NOT NULL DEFAULT now(),   -- an instant
+    local_date   date        NOT NULL                  -- a calendar day
+);
+
+-- Use timestamptz for anything that happened. Use date for anything that is
+-- genuinely a calendar concept — a birthday is the same date everywhere, and
+-- storing it as an instant introduces a timezone question that has no answer.
+--
+-- MySQL: DATETIME has no zone; TIMESTAMP converts but has a 2038 limit.
+-- SQL Server: datetimeoffset is the closest equivalent to timestamptz.
+-- SQLite: no date types at all — store ISO 8601 text or Unix epoch integers.</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">varchar(255) is cargo cult</span>
+  <p>The number comes from old MySQL index-prefix limits and means nothing today. In PostgreSQL <code>varchar(n)</code> and <code>text</code> have identical performance, and a length limit chosen arbitrarily will eventually reject a legitimate value — a German company name, a long address, an email at the RFC limit. Use <code>text</code>, and add a <code>CHECK (length(col) &lt;= n)</code> only where the limit is a genuine business rule. That way the limit is documented, intentional, and changeable without rewriting the column.</p>
+</div>
+
+<h2><span class="h-rule"></span>Keys</h2>
+
+<div class="demo" id="keys">
+  <div class="demo-head">
+    <b>Choosing a primary key</b>
+    <span>The trade-offs are real and they pull in different directions. Pick your constraints and see what falls out.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="k-scale">Rows expected — <span id="k-scalev">10 million</span></label>
+        <input type="range" id="k-scale" min="1" max="6" step="1" value="4">
+      </div>
+      <div>
+        <label for="k-dist">Written from</label>
+        <select id="k-dist">
+          <option value="one" selected>One database</option>
+          <option value="many">Several databases or offline clients</option>
+        </select>
+      </div>
+      <div>
+        <label for="k-expose">Ids appear in</label>
+        <select id="k-expose">
+          <option value="internal" selected>Internal use only</option>
+          <option value="url">Public URLs or APIs</option>
+        </select>
+      </div>
+    </div>
+    <div id="k-out"></div>
+    <div class="out" id="k-note"></div>
+  </div>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Key type</th><th>Good</th><th>Bad</th></tr></thead>
+<tbody>
+<tr><td><b>bigint identity</b></td><td>Small, fast, sequential so inserts append to the index</td><td>Guessable and enumerable; needs coordination across databases</td></tr>
+<tr><td><b>int identity</b></td><td>Smaller still</td><td><b>Overflows at 2.1 billion.</b> A famous class of outage. Use bigint</td></tr>
+<tr><td><b>UUID v4</b></td><td>Generated anywhere, no coordination, not guessable</td><td>16 bytes, and <em>random</em> — every insert lands in a different index page</td></tr>
+<tr><td><b>UUID v7 / ULID</b></td><td>Time-ordered, so inserts stay local. Most of both benefits</td><td>Leaks creation time; still 16 bytes</td></tr>
+<tr><td><b>Natural key</b> (email, ISBN)</td><td>No extra column; meaningful</td><td>Changes. Emails change. Then every foreign key must change with it</td></tr>
+<tr><td><b>Composite</b></td><td>Correct for join tables</td><td>Every referencing table needs all the columns</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">Random UUIDs and index locality</span>
+  <p>A sequential key means every insert goes into the rightmost index page, which stays in memory — cheap. A random UUID v4 means every insert goes to a random page, so a large table's index cannot be cached and each write becomes a disk read. On a table of tens of millions of rows this is a measurable throughput difference, and it is the main technical argument against v4. <b>UUID v7 fixes it</b> by putting a timestamp in the high bits, giving you distributed generation with sequential locality. If you want UUIDs, want v7.</p>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Surrogate primary key plus a unique constraint on the natural one</span>
+  <p>The usual right answer. A stable, meaningless <code>id</code> is what foreign keys point at, so nothing breaks when a business value changes. A <code>UNIQUE</code> constraint on the natural key still enforces the real rule. You get referential stability and data integrity, and the two concerns stay separate — which is what makes each of them changeable.</p>
+</div>
+
+<h2><span class="h-rule"></span>Normalisation, to the point it helps</h2>
+
+<p>The formal normal forms are worth knowing once and rarely worth reciting. In practice three rules cover the value.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Rule</th><th>Means</th><th>Violation looks like</th></tr></thead>
+<tbody>
+<tr><td><b>1NF</b></td><td>One value per cell</td><td><code>tags</code> holding <code>'red,blue,green'</code>; <code>phone1</code>, <code>phone2</code>, <code>phone3</code></td></tr>
+<tr><td><b>2NF</b></td><td>Non-key columns depend on the <em>whole</em> key</td><td>In a table keyed by (order_id, product_id), a <code>customer_name</code> column</td></tr>
+<tr><td><b>3NF</b></td><td>Non-key columns depend on <em>nothing but</em> the key</td><td><code>city</code> and <code>country</code> alongside <code>postcode</code>, which determines both</td></tr>
+</tbody>
+</table>
+<caption>The single test that catches most of it: <b>can the same fact be stored in two places and disagree?</b> If yes, it is not normalised, and eventually it will disagree.</caption>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">what denormalisation actually costs</span><button class="copy">Copy</button></div>
+<pre><code>-- Denormalised: the customer's name copied onto every order.
+CREATE TABLE orders (
+    id             bigint PRIMARY KEY,
+    customer_id    bigint NOT NULL,
+    customer_name  text   NOT NULL,      -- a copy
+    amount         numeric(12,2) NOT NULL
+);
+
+-- Reads are faster: no join to show an order list. The costs:
+--   * a name change must update every order, in one transaction
+--   * miss one and the same customer has two names in your data
+--   * "which is right" now has no answer the database can give
+--   * every consumer must know which copy is authoritative
+--
+-- Sometimes correct anyway. Two cases where it genuinely is:
+--   1. The copy is a HISTORICAL RECORD, not a cache — an invoice should show
+--      the name and address as they were at the time. That is not duplication;
+--      it is a different fact that happens to look similar.
+--   2. Measured performance requires it, the source of truth is unambiguous,
+--      and the copy is maintained by a trigger or a materialised view rather
+--      than by whichever application code remembers.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">"Denormalise for performance" is usually premature</span>
+  <p>A join on an indexed foreign key is fast — often faster than people assume, because the index is small and cached. Denormalise when you have measured a specific query, tried an index, and found the join genuinely dominant. Doing it upfront trades a certain, permanent correctness risk against a speculative performance gain, and that is a bad trade at design time. Chapter 14 covers the cases where it is the right answer.</p>
+</div>
+
+<h2><span class="h-rule"></span>The patterns that go wrong</h2>
+
+<div class="terms">
+  <div><dt>Entity-attribute-value</dt><dd>A generic <code>(entity_id, attribute, value)</code> table so "we can add fields without migrations". You lose types, constraints, indexes, foreign keys and readable queries, and every read becomes a pivot. Where genuine flexibility is needed, a <code>jsonb</code> column gives it with far less damage.</dd></div>
+  <div><dt>Comma-separated lists</dt><dd><code>tags = 'red,blue'</code>. Cannot be indexed usefully, cannot be joined, cannot be constrained, and every query needs string splitting. Use a join table, or an array or <code>jsonb</code> column if the engine supports one properly.</dd></div>
+  <div><dt>Numbered columns</dt><dd><code>phone1</code>, <code>phone2</code>, <code>phone3</code>. The moment someone needs a fourth, you are altering the table. It is a one-to-many relationship pretending not to be.</dd></div>
+  <div><dt>Nullable columns encoding a state</dt><dd>Where "if <code>cancelled_at</code> is NULL and <code>shipped_at</code> is not NULL then…" becomes the business logic. An explicit <code>status</code> column with a <code>CHECK</code> makes the state machine visible and constrainable.</dd></div>
+  <div><dt>Booleans that become three states</dt><dd><code>is_approved</code> works until you need "pending". Now it is nullable and NULL means pending — undocumented, and chapter 3 applies. An enum from the start costs nothing.</dd></div>
+  <div><dt>Soft deletes everywhere</dt><dd>A <code>deleted_at</code> column means every query in the system must remember to filter it, and one that forgets shows deleted data. If you need it, enforce it with a view or row-level security rather than discipline.</dd></div>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">a table that constrains itself</span><button class="copy">Copy</button></div>
+<pre><code>CREATE TABLE orders (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_id  bigint      NOT NULL REFERENCES customers(id),
+    status       text        NOT NULL DEFAULT 'pending',
+    amount       numeric(12,2) NOT NULL,
+    currency     char(3)     NOT NULL DEFAULT 'GBP',
+    placed_at    timestamptz NOT NULL DEFAULT now(),
+    shipped_at   timestamptz,
+    cancelled_at timestamptz,
+
+    CONSTRAINT status_valid CHECK (
+        status IN ('pending','paid','shipped','cancelled','refunded')),
+    CONSTRAINT amount_positive CHECK (amount > 0),
+    CONSTRAINT currency_iso    CHECK (currency ~ '^[A-Z]{3}$'),
+
+    -- Cross-column rules the type system cannot express:
+    CONSTRAINT shipped_after_placed CHECK (shipped_at IS NULL OR shipped_at >= placed_at),
+    CONSTRAINT cancelled_xor_shipped CHECK (
+        NOT (cancelled_at IS NOT NULL AND shipped_at IS NOT NULL)),
+    CONSTRAINT status_matches_timestamps CHECK (
+        (status = 'shipped')   = (shipped_at   IS NOT NULL) AND
+        (status = 'cancelled') = (cancelled_at IS NOT NULL))
+);
+
+-- Every one of these is a bug that can now never reach the table, from any
+-- code path, including a migration script someone runs by hand at 2am.
+-- Note the last constraint in particular: it stops status and timestamps
+-- drifting apart, which is the failure mode of the two-representations design.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Which decisions are expensive to reverse</h2>
+
+<div class="cols">
+  <div class="col good">
+    <h4>Cheap to change later</h4>
+    <ul>
+      <li>Adding a nullable column</li>
+      <li>Adding an index</li>
+      <li>Widening a type — <code>int</code> to <code>bigint</code> is still a rewrite, but a mechanical one</li>
+      <li>Adding a constraint, if the data already complies</li>
+      <li>Adding a table</li>
+    </ul>
+  </div>
+  <div class="col bad">
+    <h4>Expensive, or effectively permanent</h4>
+    <ul>
+      <li>The primary key type, once other tables reference it</li>
+      <li>Splitting one table into two, once code depends on the shape</li>
+      <li>Changing what a column <em>means</em> without renaming it</li>
+      <li>Adding <code>NOT NULL</code> to a column that already has NULLs nobody can interpret</li>
+      <li>Removing a denormalised copy that consumers now read</li>
+      <li>Timezone semantics, once data is stored ambiguously</li>
+    </ul>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Spend the design time on the right-hand column</span>
+  <p>You do not need the schema to be perfect. You need the <em>irreversible</em> parts to be right, and everything else can be iterated on. Before creating a table, look only at the second list: is the key type right, is the timezone semantics unambiguous, does every column mean exactly one thing? Get those, and the rest is ordinary maintenance rather than an archaeology project.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>A type's job is to <b>refuse data that should not exist</b>. Every value it excludes is a bug that cannot happen.</li>
+    <li><b>Never money in a float.</b> <code>numeric</code> with an explicit scale, or integer minor units.</li>
+    <li><b><code>timestamptz</code> for instants, <code>date</code> for calendar days.</b> A birthday is not an instant.</li>
+    <li><code>varchar(255)</code> is cargo cult. Use <code>text</code> plus a <code>CHECK</code> where the limit is a real rule.</li>
+    <li><b>Surrogate key plus a unique constraint on the natural key</b> — referential stability and integrity, kept separate.</li>
+    <li><code>bigint</code>, not <code>int</code>. If you want UUIDs, <b>want v7</b>, because random keys destroy index locality.</li>
+    <li>The normalisation test that matters: <b>can the same fact be stored twice and disagree?</b></li>
+    <li>Spend design time only on the <b>irreversible</b> decisions — key type, timezone semantics, what each column means.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("04-types-and-schema.html");
+
+(function(){
+  const root = document.getElementById("keys");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const ROWS = [10000, 100000, 1000000, 10000000, 100000000, 1000000000];
+  const LBL  = ["10 thousand","100 thousand","1 million","10 million","100 million","1 billion"];
+
+  function render(){
+    const ri = parseInt($("k-scale").value, 10) - 1;
+    const n = ROWS[ri];
+    const dist = $("k-dist").value;
+    const expose = $("k-expose").value;
+    $("k-scalev").textContent = LBL[ri];
+
+    const opts = [
+      {k:"bigint", n:"bigint identity", bytes:8,
+       fit: (dist === "one" ? 3 : 0) + (expose === "internal" ? 2 : 0)},
+      {k:"v7", n:"UUID v7 / ULID", bytes:16,
+       fit: 3 + (dist === "many" ? 2 : 0) + (expose === "url" ? 1 : 0)},
+      {k:"v4", n:"UUID v4 (random)", bytes:16,
+       fit: (dist === "many" ? 2 : 0) + (expose === "url" ? 2 : 0) - (n > 1e7 ? 3 : 0)},
+      {k:"natural", n:"Natural key (email, code)", bytes:32,
+       fit: -2}
+    ];
+    const best = opts.reduce((a,b) => a.fit >= b.fit ? a : b);
+
+    $("k-out").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">Options</div>' +
+      opts.map(o => {
+        const pkBytes = o.bytes * n;
+        // assume ~3 referencing indexes carrying the key
+        const total = pkBytes * 4;
+        return '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid ' +
+          (o === best ? "#3FB984" : "#E1E7EC") + ';border-radius:4px;padding:9px 12px;margin-bottom:5px;' +
+          'display:flex;gap:12px;align-items:center' + (o === best ? ';font-weight:600' : '') + '">' +
+          '<span style="flex:1;font-size:13.5px">' + o.n + (o === best ? ' ★' : '') + '</span>' +
+          '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A">' + o.bytes + ' bytes</span>' +
+          '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:86px;text-align:right">' +
+          (total/1e9 >= 1 ? (total/1e9).toFixed(1) + " GB" : (total/1e6).toFixed(0) + " MB") + ' in keys</span></div>';
+      }).join("");
+
+    const notes = [];
+    notes.push("Recommended here: " + best.n + ". The \"in keys\" figure is the primary key plus roughly three referencing indexes carrying it — " +
+               "key width is paid for repeatedly, not once.");
+
+    if(dist === "many")
+      notes.push("Writing from several databases or offline clients rules out a plain identity column: two nodes would allocate the same number. " +
+                 "That is the case UUIDs exist for — generate anywhere, no coordination, no central sequence to become a bottleneck or a single point of failure.");
+    else
+      notes.push("A single writer means a sequence works fine, and bigint is 8 bytes rather than 16 with perfect insert locality. " +
+                 "Do not adopt UUIDs for a distributed problem you do not have.");
+
+    if(expose === "url")
+      notes.push("Sequential ids in public URLs let anyone enumerate your data and estimate your volumes — /orders/1041 tells them roughly how many orders exist. " +
+                 "Either use a UUID as the key, or keep bigint internally and expose a separate random public token. The second option keeps your indexes small.");
+
+    if(n > 1e7)
+      notes.push("At " + LBL[ri] + " rows, UUID v4 becomes a real problem: random keys scatter inserts across the whole index, so the pages you need are never the pages in memory " +
+                 "and each write turns into a read. v7 puts a timestamp in the high bits, so inserts land together at the right-hand edge like a sequence — " +
+                 "the distributed-generation benefit without the locality cost.");
+
+    notes.push("A natural key is almost never the right primary key: emails change, product codes get reissued, and every foreign key referencing one must change with it. " +
+               "Use a surrogate key and put a UNIQUE constraint on the natural one — you keep the business rule and lose the fragility.");
+
+    if(n >= 1e9)
+      notes.push("At this scale also check the sequence type itself. An int identity overflows at 2.1 billion, and the failure mode is every insert erroring at once. " +
+                 "bigint costs four extra bytes and removes the problem permanently.");
+
+    $("k-note").textContent = notes.join("\n\n");
+  }
+
+  ["k-scale","k-dist","k-expose"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

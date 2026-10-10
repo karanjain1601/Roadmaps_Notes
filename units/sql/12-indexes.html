@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Indexes — SQL</title>
+<meta name="description" content="What a B-tree index is, composite column order, covering and partial indexes, and the cost every index imposes on writes.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 12 · Making it fast</div>
+    <h1>Indexes</h1>
+    <p class="standfirst">An index is a sorted copy of some columns with pointers back to the rows. Everything else — which ones to create, what order the columns go in, why the one you added did nothing — follows from taking that description literally.</p>
+    <div class="chap-meta">
+      <span class="tagpill">b-tree</span>
+      <span class="tagpill">column order</span>
+      <span class="tagpill">covering</span>
+      <span class="tagpill">write cost</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>What an index is</h2>
+
+<p>A B-tree index holds the indexed columns <b>in sorted order</b>, in a shallow tree, with each leaf entry pointing at a row in the table. Because it is sorted, the database can binary-search it — a few page reads instead of scanning every row.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Because it is sorted, an index can serve</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td>Equality</td><td><code>WHERE email = 'a@b.com'</code></td></tr>
+<tr><td>Range</td><td><code>WHERE placed_at &gt;= '2026-01-01'</code></td></tr>
+<tr><td>Prefix match</td><td><code>WHERE name LIKE 'Smi%'</code> — leading wildcard, no</td></tr>
+<tr><td>Ordering</td><td><code>ORDER BY placed_at</code> with no sort step</td></tr>
+<tr><td>Min and max</td><td>Read the first or last entry</td></tr>
+<tr><td>Uniqueness</td><td>The mechanism behind <code>UNIQUE</code> (chapter 11)</td></tr>
+<tr><td>Joins</td><td>Look up the matching row on the other side</td></tr>
+</tbody>
+</table>
+<caption>Everything a B-tree index can do is a consequence of sorted order. If an operation cannot be expressed as "find a position in a sorted list", the index cannot help.</caption>
+</div>
+
+<div class="note key">
+  <span class="note-t">Two lookups, not one</span>
+  <p>An index scan usually costs <em>two</em> reads per row: find the entry in the index, then follow the pointer to fetch the row itself. That second step is random I/O, and it is why the planner sometimes refuses your index — if a query will return 30% of the table, doing 30% of the rows as random reads is slower than reading the whole thing sequentially. <b>A sequential scan is often the correct plan</b>, and seeing one is not automatically a problem.</p>
+</div>
+
+<h2><span class="h-rule"></span>Composite indexes and column order</h2>
+
+<div class="demo" id="idx">
+  <div class="demo-head">
+    <b>Which index serves which query</b>
+    <span>Pick an index and a query. Column order is not a detail — it decides whether the index is used at all.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="x-index">Index</label>
+        <select id="x-index">
+          <option value="none">— no index —</option>
+          <option value="c">(customer_id)</option>
+          <option value="cs" selected>(customer_id, status)</option>
+          <option value="sc">(status, customer_id)</option>
+          <option value="csd">(customer_id, status, placed_at)</option>
+          <option value="cover">(customer_id, status) INCLUDE (amount)</option>
+          <option value="partial">(customer_id) WHERE status = 'paid'</option>
+        </select>
+      </div>
+      <div>
+        <label for="x-query">Query</label>
+        <select id="x-query">
+          <option value="c" selected>WHERE customer_id = 42</option>
+          <option value="cs">WHERE customer_id = 42 AND status = 'paid'</option>
+          <option value="s">WHERE status = 'paid'</option>
+          <option value="csd">WHERE customer_id = 42 AND status = 'paid' ORDER BY placed_at</option>
+          <option value="range">WHERE customer_id = 42 AND placed_at &gt; '2026-01-01'</option>
+          <option value="sum">SELECT sum(amount) WHERE customer_id = 42 AND status = 'paid'</option>
+          <option value="func">WHERE lower(email) = 'a@b.com'</option>
+        </select>
+      </div>
+      <div>
+        <label for="x-rows">Rows in table — <span id="x-rowsv">5 million</span></label>
+        <input type="range" id="x-rows" min="1" max="6" step="1" value="4">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="x-plan">—</b><span>plan</span></div>
+      <div><b id="x-read">—</b><span>rows examined</span></div>
+      <div><b id="x-time">—</b><span>estimated time</span></div>
+      <div><b id="x-heap">—</b><span>table lookups</span></div>
+    </div>
+    <div class="out" id="x-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the left-prefix rule</span><button class="copy">Copy</button></div>
+<pre><code>CREATE INDEX ON orders (customer_id, status, placed_at);
+
+-- An index on (a, b, c) is sorted by a, then b within equal a, then c within
+-- equal (a, b). So it can serve any LEFT PREFIX of the columns:
+--     (customer_id)                         yes
+--     (customer_id, status)                 yes
+--     (customer_id, status, placed_at)      yes
+--     (status)                              NO — the index is not sorted by
+--                                           status at the top level
+--     (status, placed_at)                   NO
+--
+-- Think of a phone book sorted by surname, then first name. You can find every
+-- "Okafor", and every "Okafor, Amara". You cannot find every "Amara" without
+-- reading the whole book.
+
+-- One consequence: an index on (a, b) makes a separate index on (a) redundant.
+-- Extra single-column indexes on the leading column are pure write cost.</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">A range on an earlier column stops the later ones being useful</span>
+  <p>With <code>(customer_id, placed_at, status)</code> and a query filtering <code>customer_id = 42 AND placed_at &gt; X AND status = 'paid'</code>, the index seeks to customer 42, then scans forward through the date range — but within that range the rows are ordered by <code>placed_at</code>, not by <code>status</code>, so the status filter cannot be a seek. It becomes a filter applied to every row scanned. <b>Put equality columns first, range columns last.</b> One range column can be used efficiently; anything after it in the index is only a filter.</p>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the ordering rule, stated fully</span><button class="copy">Copy</button></div>
+<pre><code>-- For a query with:  a = ?  AND  b = ?  AND  c > ?  ORDER BY d
+-- the ideal index is: (a, b, c, d)   -- equality, then range, then sort
+--
+-- Rules of thumb, in priority order:
+--   1. Equality predicates first
+--   2. Then the column you ORDER BY (if the range allows it)
+--   3. Then range predicates
+--   4. Among equality columns, most selective first is a weak preference —
+--      it barely matters for seeks, and matters for which other queries the
+--      index can also serve
+--
+-- Rule 4 is the one people over-think. Choosing the order so that ONE index
+-- serves THREE queries is worth more than optimising the selectivity of one.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Covering indexes</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">avoiding the second lookup entirely</span><button class="copy">Copy</button></div>
+<pre><code>-- This query needs amount, which is not in the index, so every matching entry
+-- requires a trip to the table.
+SELECT sum(amount) FROM orders WHERE customer_id = 42 AND status = 'paid';
+
+-- Put amount in the index and the query never touches the table: an
+-- index-only scan.
+CREATE INDEX ON orders (customer_id, status) INCLUDE (amount);
+
+-- INCLUDE columns are stored in the leaf pages but are NOT part of the sort
+-- key, so they do not affect ordering, cannot be searched, and make the index
+-- only slightly larger. Postgres 11+, SQL Server.
+-- Elsewhere, append them to the key columns: (customer_id, status, amount).
+
+-- Caveat in PostgreSQL: an index-only scan still consults the visibility map
+-- to check whether a row is visible to your transaction. On a table with heavy
+-- recent writes the map is stale and the scan falls back to fetching rows —
+-- so index-only scans work best on tables that are vacuumed regularly.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Partial and expression indexes</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">indexing less, and indexing something else</span><button class="copy">Copy</button></div>
+<pre><code>-- PARTIAL: index only the rows you query. If 2% of jobs are pending, this
+-- index is 2% of the size, stays in memory, and is not touched when the other
+-- 98% are written.
+CREATE INDEX ON jobs (created_at) WHERE status = 'pending';
+-- The planner uses it only when it can prove the WHERE clause is implied by
+-- the query's predicate — so the query must also say status = 'pending'.
+
+-- EXPRESSION: index the value you actually search by.
+CREATE INDEX ON users (lower(email));
+-- Now WHERE lower(email) = 'a@b.com' can seek. Without it, the function must
+-- be evaluated for every row and no index applies.
+
+-- The general rule this illustrates:
+--     WHERE f(col) = value      cannot use an index on col
+--     WHERE col = g(value)      can
+-- Keep the column bare on one side of the comparison. This is called making
+-- the predicate SARGable, and it is the single most common reason an index
+-- that "should" be used is not.</code></pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Not SARGable</th><th>Rewrite</th></tr></thead>
+<tbody>
+<tr><td><code>WHERE year(placed_at) = 2026</code></td><td><code>WHERE placed_at &gt;= '2026-01-01' AND placed_at &lt; '2027-01-01'</code></td></tr>
+<tr><td><code>WHERE upper(name) = 'SMITH'</code></td><td>Index <code>upper(name)</code>, or store normalised</td></tr>
+<tr><td><code>WHERE amount * 1.2 &gt; 100</code></td><td><code>WHERE amount &gt; 100 / 1.2</code></td></tr>
+<tr><td><code>WHERE name LIKE '%smith%'</code></td><td>A trigram or full-text index — a B-tree cannot help</td></tr>
+<tr><td><code>WHERE id::text = '42'</code></td><td><code>WHERE id = 42</code> — the cast disables the index</td></tr>
+<tr><td><code>WHERE col + 0 = 5</code></td><td><code>WHERE col = 5</code></td></tr>
+<tr><td><code>WHERE coalesce(x, 0) = 0</code></td><td><code>WHERE x = 0 OR x IS NULL</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>Index types beyond the B-tree</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Type</th><th>For</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><b>B-tree</b></td><td>Equality, ranges, ordering</td><td>The default, and right ~95% of the time</td></tr>
+<tr><td><b>Hash</b></td><td>Equality only</td><td>Rarely worth it — B-tree does equality nearly as well and much more besides</td></tr>
+<tr><td><b>GIN</b></td><td>Arrays, <code>jsonb</code>, full-text</td><td>"Which rows contain this element". Slow to update</td></tr>
+<tr><td><b>GiST</b></td><td>Geometry, ranges, nearest-neighbour</td><td>Backs exclusion constraints (chapter 11)</td></tr>
+<tr><td><b>BRIN</b></td><td>Huge tables with physically correlated values</td><td>Tiny. Perfect for append-only time series indexed by timestamp</td></tr>
+<tr><td><b>Trigram (pg_trgm)</b></td><td><code>LIKE '%x%'</code>, fuzzy matching</td><td>The answer to substring search</td></tr>
+<tr><td><b>Full-text</b></td><td>Natural-language search</td><td>Stemming and ranking, unlike <code>LIKE</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>What indexes cost</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the write amplification nobody accounts for</span><button class="copy">Copy</button></div>
+<pre><code>-- Every INSERT writes the row plus one entry per index.
+-- Every DELETE removes the row plus one entry per index.
+-- Every UPDATE that changes an indexed column updates that index; in
+-- PostgreSQL a non-HOT update rewrites entries in ALL indexes on the table.
+--
+-- A table with 8 indexes does roughly 9 units of write work per insert.
+-- Indexes also consume memory that would otherwise cache table pages, and
+-- they lengthen every VACUUM and every backup.
+
+-- Find the ones nobody uses (PostgreSQL):
+SELECT schemaname, relname, indexrelname,
+       idx_scan,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes
+WHERE idx_scan < 50                         -- nearly never used
+  AND indexrelid NOT IN (SELECT conindid FROM pg_constraint)  -- keep constraints
+ORDER BY pg_relation_size(indexrelid) DESC;
+
+-- Find duplicates and redundant prefixes: an index on (a) is redundant when
+-- (a, b) exists. Drop the narrower one.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Unused indexes are pure cost</span>
+  <p>They slow every write, consume memory that could cache real data, lengthen maintenance, and give the planner more options to consider. Check <code>idx_scan</code> on a production replica after a full business cycle — a month, so that monthly reports are included — and drop the ones nobody touches. On a mature schema this routinely removes a third of the indexes with no measurable read regression. Drop them one at a time, and keep the DDL to recreate them.</p>
+</div>
+
+<h2><span class="h-rule"></span>Creating indexes on live tables</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">without blocking writes</span><button class="copy">Copy</button></div>
+<pre><code>-- Plain CREATE INDEX takes a lock that blocks all writes for the duration.
+-- On a large table that is an outage.
+CREATE INDEX ON orders (customer_id, status);
+
+-- CONCURRENTLY does two passes and never blocks writes. Slower, and worth it.
+CREATE INDEX CONCURRENTLY idx_orders_customer_status ON orders (customer_id, status);
+
+-- Three things to know:
+--   * it cannot run inside a transaction, so most migration frameworks need
+--     an explicit escape hatch for it
+--   * if it fails it leaves an INVALID index behind, which is not used by the
+--     planner but is still maintained on every write. Check for these:
+--       SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
+--     then DROP INDEX CONCURRENTLY and try again
+--   * DROP INDEX CONCURRENTLY exists too, and should be your default
+
+-- MySQL: most index changes are online since 5.6. SQL Server: ONLINE = ON,
+-- Enterprise edition only.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Which indexes to create</h2>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Every foreign key</b><span>The most common omission (chapter 5). Do this before anything else</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Columns in the WHERE of your slowest real queries</b><span>From the slow log, not from guessing</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Composite indexes matching whole query shapes</b><span>Equality first, then sort, then range</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Partial indexes where the query always filters the same way</b><span>Small, cached, cheap to maintain</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Covering columns for the hottest read path</b><span>Only after measuring — it widens the index</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>6 · Then delete the ones nobody uses</b><span>A quarterly job. Expect to remove a third</span></div>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Index the query, not the column</span>
+  <p>The habit that separates useful indexing from cargo cult. Instead of asking "should I index <code>status</code>?", take an actual slow query and design one index that serves the whole of it — its equality predicates, its sort, its range, and if worthwhile its output columns. One well-shaped composite index frequently replaces four single-column ones and does more. And it starts from evidence: the slow query log, not intuition about which column "feels" searched.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>An index is a <b>sorted copy with pointers back</b>. Everything it can do follows from sorted order.</li>
+    <li>An index scan is usually <b>two reads per row</b>, which is why a sequential scan is often the correct plan.</li>
+    <li><b>Left-prefix rule:</b> an index on (a, b, c) serves a, (a, b), (a, b, c) — never (b) alone.</li>
+    <li><b>Equality columns first, range columns last.</b> A range stops later columns being seekable.</li>
+    <li><b>Keep the column bare</b> in a predicate. <code>WHERE f(col) = x</code> cannot use an index on <code>col</code>.</li>
+    <li><b>Partial indexes</b> are small, stay cached, and are untouched by writes to the rows they exclude.</li>
+    <li>Every index <b>taxes every write</b> and consumes cache. Audit <code>idx_scan</code> and expect to drop a third.</li>
+    <li>On a live table, <b><code>CREATE INDEX CONCURRENTLY</code></b> — and check afterwards for invalid indexes.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("12-indexes.html");
+
+(function(){
+  const root = document.getElementById("idx");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const ROWS = [10000, 100000, 1000000, 5000000, 20000000, 100000000];
+  const RLBL = ["10 thousand","100 thousand","1 million","5 million","20 million","100 million"];
+
+  // selectivity assumptions
+  const SEL_CUST = 1/2000;      // one customer
+  const SEL_STATUS = 0.35;      // 'paid'
+  const SEL_DATE = 0.25;
+
+  function time(s){
+    if(s < 0.001) return "<1ms";
+    if(s < 1) return (s*1000).toFixed(0) + "ms";
+    if(s < 90) return s.toFixed(1) + "s";
+    return (s/60).toFixed(1) + " min";
+  }
+  function fmt(n){
+    n = Math.round(n);
+    if(n < 1000) return n.toString();
+    if(n < 1e6) return (n/1e3).toFixed(1) + "k";
+    return (n/1e6).toFixed(1) + "M";
+  }
+
+  function render(){
+    const n = ROWS[parseInt($("x-rows").value, 10) - 1];
+    const idx = $("x-index").value;
+    const q = $("x-query").value;
+    $("x-rowsv").textContent = RLBL[parseInt($("x-rows").value, 10) - 1];
+
+    let seek = 1, filterAfter = 1, sorts = false, indexOnly = false, used = true, why = "";
+
+    if(idx === "none"){ used = false; }
+
+    if(used){
+      switch(q){
+        case "c":
+          if(idx === "c" || idx === "cs" || idx === "csd" || idx === "cover") { seek = SEL_CUST; }
+          else if(idx === "partial") { used = false; why = "The partial index only covers rows where status = 'paid', and this query does not say so — the planner cannot prove the rows it needs are all in the index."; }
+          else if(idx === "sc") { used = false; why = "The index is sorted by status first, so customer_id is not a left prefix. Same reason you cannot look up a first name in a phone book sorted by surname."; }
+          break;
+        case "cs":
+          if(idx === "cs" || idx === "csd" || idx === "cover") seek = SEL_CUST * SEL_STATUS;
+          else if(idx === "c") { seek = SEL_CUST; filterAfter = SEL_STATUS; }
+          else if(idx === "sc") seek = SEL_CUST * SEL_STATUS;
+          else if(idx === "partial") seek = SEL_CUST;
+          break;
+        case "s":
+          if(idx === "sc") seek = SEL_STATUS;
+          else if(idx === "partial") { used = false; why = "The partial index contains only paid rows but is keyed on customer_id, and this query has no customer_id predicate — there is nothing to seek on, so a full scan of the table is cheaper."; }
+          else { used = false; why = "status is not the leading column of this index, so it cannot be used for a seek. Only an index led by status can serve this."; }
+          break;
+        case "csd":
+          if(idx === "csd") { seek = SEL_CUST * SEL_STATUS; sorts = false; }
+          else if(idx === "cs" || idx === "cover") { seek = SEL_CUST * SEL_STATUS; sorts = true; }
+          else if(idx === "c") { seek = SEL_CUST; filterAfter = SEL_STATUS; sorts = true; }
+          else if(idx === "sc") { seek = SEL_CUST * SEL_STATUS; sorts = true; }
+          else if(idx === "partial") { seek = SEL_CUST; sorts = true; }
+          break;
+        case "range":
+          if(idx === "csd") { seek = SEL_CUST; filterAfter = SEL_DATE; }
+          else if(idx === "c" || idx === "cs" || idx === "cover") { seek = SEL_CUST; filterAfter = SEL_DATE; }
+          else if(idx === "sc") { used = false; why = "No leading customer_id, and no status predicate either — nothing to seek on."; }
+          else if(idx === "partial") { used = false; why = "The partial index requires status = 'paid' in the query to be usable."; }
+          break;
+        case "sum":
+          if(idx === "cover") { seek = SEL_CUST * SEL_STATUS; indexOnly = true; }
+          else if(idx === "cs" || idx === "csd") seek = SEL_CUST * SEL_STATUS;
+          else if(idx === "c") { seek = SEL_CUST; filterAfter = SEL_STATUS; }
+          else if(idx === "sc") seek = SEL_CUST * SEL_STATUS;
+          else if(idx === "partial") seek = SEL_CUST;
+          break;
+        case "func":
+          used = false;
+          why = "The predicate is lower(email) = …, and no index here is on email at all — but even an index on email would not help. A function applied to the column means the stored values are not the values being compared, so the sorted order is useless. This needs CREATE INDEX ON users (lower(email)).";
+          break;
+      }
+    }
+
+    const examined = used ? n * seek : n;
+    const returned = used ? n * seek * filterAfter : n * (q === "func" ? 1/2000 : SEL_CUST);
+    const heap = indexOnly ? 0 : examined;
+
+    // cost model
+    const seqCost = n * 0.00000012;
+    const idxCost = Math.log2(Math.max(2,n)) * 0.000004 + examined * 0.0000004 + heap * 0.0000022
+                    + (sorts ? returned * 0.0000009 * Math.log2(Math.max(2, returned)) : 0);
+    const chosen = used && idxCost < seqCost ? "index" : "seq";
+    const cost = chosen === "index" ? idxCost : seqCost;
+
+    $("x-plan").textContent = chosen === "index"
+      ? (indexOnly ? "index-only scan" : "index scan")
+      : "sequential scan";
+    $("x-read").textContent = fmt(chosen === "index" ? examined : n);
+    $("x-time").textContent = time(cost);
+    $("x-heap").textContent = chosen === "index" ? fmt(heap) : fmt(n);
+
+    const notes = [];
+    if(!used && idx !== "none"){
+      notes.push("The index cannot be used. " + why);
+    } else if(chosen === "seq" && used){
+      notes.push("The index COULD be used and the planner chose not to. At " + n.toLocaleString() +
+                 " rows this query matches " + fmt(examined) + " of them — enough that following that many pointers back to the table costs more than reading the table sequentially. " +
+                 "This is the correct decision, and it is why a sequential scan in a plan is not automatically a problem.");
+    } else if(indexOnly){
+      notes.push("An index-only scan: every column the query needs is in the index, so the table is never touched. " +
+                 "That removes " + fmt(examined) + " random reads — usually the dominant cost of an index scan. " +
+                 "This is what INCLUDE buys, and it is the difference between a fast query and a very fast one.");
+    } else if(used){
+      notes.push("Index scan: seek to the matching entries, then " + fmt(heap) +
+                 " lookups back to the table to fetch the rows. " +
+                 (filterAfter < 1 ? "Note that " + Math.round((1-filterAfter)*100) + "% of the rows fetched are then discarded by a filter the index could not apply — a wider index would avoid that work. " : ""));
+    }
+
+    if(sorts && used && chosen === "index")
+      notes.push("A separate sort step is needed because the index does not provide the requested order. Adding placed_at as the last index column removes it — the rows come out of the index already sorted, which also means the query can stop early under a LIMIT.");
+
+    if(q === "csd" && idx === "csd")
+      notes.push("This index matches the query shape exactly: equality on customer_id and status, then placed_at supplying the ORDER BY. No filter, no sort. This is what \"index the query, not the column\" produces.");
+
+    if(idx === "sc" && q === "cs")
+      notes.push("Both column orders work here, because the query has equality on both columns — order between equality predicates barely matters for a seek. It matters enormously for which OTHER queries the index can serve: (customer_id, status) also handles a customer-only lookup, and (status, customer_id) does not.");
+
+    if(idx === "partial" && used)
+      notes.push("The partial index only holds rows where status = 'paid', so it is a fraction of the size of a full index — it stays in memory, and writes to non-paid rows never touch it at all.");
+
+    if(idx === "none")
+      notes.push("No index, so every query is a full sequential scan of " + n.toLocaleString() + " rows. At small table sizes that is genuinely fine; drag the slider and watch when it stops being fine.");
+
+    notes.push("Cost figures are a simplified model (≈0.12µs per sequentially scanned row, ≈2.2µs per random table lookup). Real planners use table statistics and are far more sophisticated — chapter 13 shows how to read what they decided.");
+    $("x-note").textContent = notes.join("\n\n");
+  }
+
+  ["x-index","x-query","x-rows"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

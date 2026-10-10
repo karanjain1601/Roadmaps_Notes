@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Data validation and drift — MLOps</title>
+<meta name="description" content="Schema checks, distribution tests and the failure that actually happens: an upstream field silently changing meaning.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 06 · Data</div>
+    <h1>Data validation and drift</h1>
+    <p class="standfirst">The failure worth designing against is not a missing column — that raises an exception and someone fixes it. It is a column that keeps its name, keeps its type, passes every schema check, and now means something different.</p>
+    <div class="chap-meta">
+      <span class="tagpill">great expectations</span>
+      <span class="tagpill">schema</span>
+      <span class="tagpill">drift</span>
+      <span class="tagpill">nulls</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>What each layer of validation catches</h2>
+
+<div class="demo" id="val">
+  <div class="demo-head">
+    <b>Six upstream changes, three levels of checking</b>
+    <span>The interesting cases are the ones that pass everything.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="v-change">What changed upstream</label>
+        <select id="v-change">
+          <option value="drop" selected>A column was removed</option>
+          <option value="type">A numeric column now arrives as a string</option>
+          <option value="null">A field that was never null is 30% null</option>
+          <option value="unit">Amounts switched from cents to units</option>
+          <option value="enum">A status enum gained a new value</option>
+          <option value="volume">Only 40% of the usual rows arrived</option>
+        </select>
+      </div>
+      <div>
+        <label for="v-level">Validation in place</label>
+        <select id="v-level">
+          <option value="none">None</option>
+          <option value="schema">Schema checks</option>
+          <option value="stats" selected>Schema plus distribution checks</option>
+        </select>
+      </div>
+    </div>
+    <div id="v-grid"></div>
+    <div class="stat">
+      <div><b id="v-caught">—</b><span>caught?</span></div>
+      <div><b id="v-when">—</b><span>when you find out</span></div>
+      <div><b id="v-harm">—</b><span>damage</span></div>
+    </div>
+    <div class="out" id="v-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Schema checks are necessary and catch the easy half</span>
+  <p>Types, nullability, required columns and allowed values are cheap to assert and they catch the failures that would have raised an exception anyway — just earlier and with a better message. What they cannot catch is <b>a value that is still the right type and the right range and is now wrong</b>: cents becoming units, a currency conversion applied twice, an identifier space that was renumbered, a timestamp that switched from UTC to local. Every one of those produces valid data. The layer that catches them is distributional — compare this batch's summary statistics against the training baseline and alert on movement — and it is the layer most teams do not have.</p>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">the checks worth having, in order of value</span><button class="copy">Copy</button></div>
+<pre><code># 1. VOLUME AND FRESHNESS. The cheapest and the most valuable, because a
+#    short batch is the commonest silent failure (chapter 4).
+assert len(df) > 0.7 * expected_rows, f"only {len(df)} rows, expected ~{expected_rows}"
+assert df["event_time"].max() > run_date - timedelta(hours=2), "data is stale"
+
+# 2. SCHEMA. Types, required columns, nullability, allowed values.
+import pandera as pa
+schema = pa.DataFrameSchema({
+    "customer_id": pa.Column(str, nullable=False, unique=False),
+    "amount":      pa.Column(float, pa.Check.in_range(0, 100_000)),
+    "status":      pa.Column(str, pa.Check.isin(["new","paid","refunded"])),
+    "created_at":  pa.Column("datetime64[ns]", nullable=False),
+})
+schema.validate(df, lazy=True)      # lazy: report ALL failures, not the first
+
+# 3. DISTRIBUTIONS, against a stored baseline from the training data.
+#    This is the layer that catches semantic changes.
+for col in NUMERIC:
+    assert_within(df[col].mean(),   baseline[col]["mean"],   tol=0.25)
+    assert_within(df[col].std(),    baseline[col]["std"],    tol=0.35)
+    assert_within(df[col].isna().mean(), baseline[col]["null_rate"], tol=0.05)
+for col in CATEGORICAL:
+    unseen = set(df[col].unique()) - baseline[col]["categories"]
+    assert not unseen, f"unseen categories in {col}: {unseen}"
+
+# 4. RELATIONSHIPS between columns, which single-column checks miss.
+assert (df["ship_date"] >= df["order_date"]).all()
+assert (df["total"] - df["subtotal"] - df["tax"]).abs().max() < 0.01
+assert df.groupby("order_id").size().max() == 1, "duplicate order ids"
+
+# TOOLS: Great Expectations is the most complete and the heaviest;
+# Pandera is a good fit if you are already in pandas or Polars; dbt tests
+# cover the warehouse layer well and are close to free if you use dbt;
+# TFDV computes and compares schemas and statistics automatically, which is
+# specifically designed for this problem. Any of them beats none.
+
+# WHERE TO PUT THE CHECKS: before the transformation on the way in, and
+# before the write on the way out. A check after the write tells you the
+# damage is already downstream.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Three kinds of drift</h2>
+
+<div class="terms">
+  <div><dt>Data drift — the inputs move</dt><dd>P(X) changes. A marketing campaign brings in younger customers, so the age distribution shifts. The relationship between features and label may be unaffected, and the model is now extrapolating into a region it saw little of. <b>Detectable without labels</b>, which is why it is the practical thing to monitor.</dd></div>
+  <div><dt>Concept drift — the relationship moves</dt><dd>P(y|X) changes. The same customer profile now means something different — fraudsters adapted, a competitor changed prices, a regulation changed behaviour. The inputs may look identical. <b>Only detectable with labels</b>, which is the whole difficulty (chapter 15).</dd></div>
+  <div><dt>Prediction drift — the outputs move</dt><dd>The distribution of your model's own predictions shifts. A useful early proxy for both of the above, available immediately, requiring no labels and no baseline beyond your own history — and the cheapest ML-specific monitor to add.</dd></div>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">measuring drift, and the arithmetic</span><button class="copy">Copy</button></div>
+<pre><code># POPULATION STABILITY INDEX — the industry standard in credit and
+# insurance, and a good default. Bin the baseline, bin the new data,
+# compare the proportions.
+#
+#     PSI = Σ (actual% − expected%) × ln(actual% / expected%)
+#
+#     < 0.1   no meaningful shift
+#     0.1-0.2 moderate — investigate
+#     > 0.2   significant — act
+#
+def psi(baseline, current, bins=10):
+    edges = np.quantile(baseline, np.linspace(0, 1, bins + 1))
+    edges[0], edges[-1] = -np.inf, np.inf
+    e = np.histogram(baseline, edges)[0] / len(baseline)
+    a = np.histogram(current,  edges)[0] / len(current)
+    e, a = np.clip(e, 1e-6, None), np.clip(a, 1e-6, None)
+    return float(np.sum((a - e) * np.log(a / e)))
+
+# KOLMOGOROV-SMIRNOV — max distance between the two CDFs. Gives a p-value,
+# which is its problem: on a million rows every trivial difference is
+# "significant", so the p-value tells you nothing useful and you end up
+# thresholding on the statistic anyway. Prefer PSI or Wasserstein.
+#
+# WASSERSTEIN DISTANCE (earth mover's) — how far the mass has to move.
+# Interpretable in the units of the feature, which is genuinely useful:
+# "the mean transaction moved by £14" is actionable, "D = 0.04" is not.
+#
+# FOR CATEGORICAL FEATURES: PSI works on category proportions directly.
+# Also watch for unseen categories, which are a different failure — a new
+# value the model has literally never encountered, usually one-hot-encoded
+# into all zeros or an error depending on your pipeline.
+
+# THE PRACTICAL SETUP:
+#   * store a baseline profile with the model: per feature, the quantile
+#     edges, mean, std, null rate and category set of the TRAINING data
+#   * on a schedule, profile recent production inputs the same way
+#   * compute PSI per feature, alert on the ones that matter
+#
+# WEIGHT BY FEATURE IMPORTANCE. A large shift in a feature the model barely
+# uses is noise; a small shift in the top feature is worth a look. Alerting
+# on unweighted per-feature drift across 200 features produces an alert
+# every day and trains everyone to ignore it — which is the most common way
+# drift monitoring fails in practice.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Drift is a signal, not a verdict</span>
+  <p>A drift alert says the world has changed. It does not say your model has got worse, and acting on drift alone leads to retraining on a schedule that has nothing to do with performance. <b>Two things are commonly true and worth separating.</b> Drift with no degradation: the shift happened in a region where the model's decision boundary is unaffected, or in a feature it barely uses — no action needed, and retraining costs money and risk for nothing. Degradation with no drift: concept drift, where inputs look identical and the relationship changed — the case drift monitoring cannot see, and the reason you also need delayed-label performance tracking. Treat drift as the trigger for <em>investigation</em>, and treat measured performance as the trigger for <em>retraining</em>.</p>
+</div>
+
+<h2><span class="h-rule"></span>What to do about an alert</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Finding</th><th>Likely cause</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td>One feature shifted sharply, overnight</td><td>An upstream change, not the world</td><td>Talk to the source owner. Do not retrain on it</td></tr>
+<tr><td>Null rate jumped</td><td>A join broke, or an optional field stopped being sent</td><td>Fix the pipeline. Retraining bakes the bug in</td></tr>
+<tr><td>Many features shifted gradually over months</td><td>Genuine population change</td><td>Retrain, and consider a shorter training window</td></tr>
+<tr><td>Unseen category appeared</td><td>A new product, region or status</td><td>Check the encoding handles it, then retrain</td></tr>
+<tr><td>Prediction distribution shifted, inputs stable</td><td>A model was deployed, or a feature is stale</td><td>Check what changed on your side first</td></tr>
+<tr><td>Drift alert, performance flat</td><td>Shift in an unimportant region</td><td>Nothing. Raise the threshold</td></tr>
+<tr><td>Performance dropped, no drift</td><td>Concept drift</td><td>Retrain on recent data; investigate what changed in the world</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note tip">
+  <span class="note-t">The single most valuable check is a row count</span>
+  <p>Before PSI, before schema frameworks, before drift dashboards: <b>assert that today's batch has roughly the number of rows you expect, compared against the same weekday last week.</b> A partial load is the most common data failure there is, it produces perfectly valid data, it passes every schema check, and it silently retrains your model on a biased subset — because the rows that are missing are rarely random. They are one region whose export failed, or one event type whose producer was down, so the shortfall is systematic and the model learns the wrong distribution. One assertion, no dependencies, and it catches more real incidents than anything else in this chapter.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>The dangerous failure keeps the schema and changes the meaning.</b> Cents to units, UTC to local, a renumbered id space.</li>
+    <li><b>Schema checks catch the easy half</b> and are still worth having — earlier failure, better message.</li>
+    <li><b>Distribution checks against a stored training baseline</b> are the layer that catches semantic change.</li>
+    <li><b>Check volume and freshness first.</b> A partial load is the commonest silent failure and produces valid data.</li>
+    <li><b>Three drifts</b>: data (inputs), concept (relationship), prediction (outputs). Only the first and third are visible without labels.</li>
+    <li><b>PSI over KS.</b> A p-value on a million rows makes every trivial difference significant.</li>
+    <li><b>Weight drift by feature importance</b>, or you will get an alert a day and learn to ignore it.</li>
+    <li><b>Drift triggers investigation; measured performance triggers retraining.</b> Retraining on a broken pipeline bakes in the bug.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("06-data-validation.html");
+
+(function(){
+  const root = document.getElementById("val");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const CH = {
+    drop: {name:"A column was removed",
+      caught:{none:false, schema:true, stats:true},
+      when:{none:"immediately — an exception", schema:"at validation", stats:"at validation"},
+      harm:{none:"low", schema:"none", stats:"none"},
+      note:"The benign case, and the one people design for. A missing column raises a KeyError in the transformation whether you validate or not, so the pipeline fails, someone is paged, and it is fixed.\n\nSchema validation improves this rather than saving it: instead of a KeyError three functions deep, you get \"required column 'amount' not found\" at the boundary, with the batch identified.\n\nWorth noting that this is the failure most validation effort is aimed at, and it is the least dangerous one on the list. The others below are the reason to keep reading."},
+    type: {name:"A numeric column now arrives as a string",
+      caught:{none:false, schema:true, stats:true},
+      when:{none:"maybe never", schema:"at validation", stats:"at validation"},
+      harm:{none:"high", schema:"none", stats:"none"},
+      note:"With no validation this one is genuinely nasty, because whether it fails depends on the language and the library.\n\nIn pandas, a column of numeric strings becomes dtype object. Arithmetic on it may raise, or may silently do string concatenation — \"12\" + \"5\" is \"125\". A model receiving that either errors on fit or, if the pipeline coerces with errors='coerce', receives NaN for every row and trains on nothing but the imputed value.\n\nThe failure mode depends on the specific chain of operations, which is exactly why it is worth a boundary check rather than trusting the downstream code to notice.\n\nA type assertion catches it in one line."},
+    null: {name:"A field that was never null is 30% null",
+      caught:{none:false, schema:true, stats:true},
+      when:{none:"weeks later, as degraded performance", schema:"at validation", stats:"at validation"},
+      harm:{none:"high", schema:"none", stats:"none"},
+      note:"The usual cause is a broken join or an optional upstream field that stopped being populated for some segment. It is common and it does real damage quietly.\n\nWhat happens with no validation: your imputation step does its job. Median-fills 30% of the column, the pipeline succeeds, and the model trains on a feature that is now 30% constant. The feature's predictive power collapses, the model leans harder on the others, and the metric drops by an amount nobody attributes to a join.\n\nWorse, the nulls are almost never random. They are one region, one product line, one client — so the imputed value is systematically wrong for exactly that segment, and the model's failure is concentrated rather than spread.\n\nA nullability assertion catches it. A null-RATE comparison against the baseline catches the softer version, where a field that was 2% null becomes 12% null."},
+    unit: {name:"Amounts switched from cents to units",
+      caught:{none:false, schema:false, stats:true},
+      when:{none:"never, until someone notices the money", schema:"never", stats:"at validation"},
+      harm:{none:"severe", schema:"severe", stats:"none"},
+      note:"This is the case that motivates the whole chapter.\n\nThe column is still called amount. It is still a float. It is still non-null. It is still within any sane range check you would have written — 4999 became 49.99, and both are plausible transaction amounts. Every schema check passes. The pipeline is green.\n\nAnd every value is now 1/100th of what the model was trained on. A model with a learned threshold around \"transactions over 200\" now sees almost nothing above it. Predictions collapse toward one class, and the only signal is that the output distribution moved — which is prediction drift, and only visible if you are monitoring it.\n\nDistribution checks catch this instantly: the mean of the column fell by two orders of magnitude, which no tolerance band permits. That is the entire argument for having them.\n\nThe same shape appears as UTC becoming local time, a currency conversion applied twice, an id space renumbered, and a percentage switching from 0-100 to 0-1. All valid, all wrong."},
+    enum: {name:"A status enum gained a new value",
+      caught:{none:false, schema:true, stats:true},
+      when:{none:"silently, as a degraded segment", schema:"at validation, if you enumerated the values", stats:"at validation"},
+      harm:{none:"medium", schema:"none", stats:"none"},
+      note:"A new status appears — \"partially_refunded\" alongside \"paid\" and \"refunded\". Nothing is malformed; there is simply a category the model has never seen.\n\nWhat happens depends on your encoding, and none of the options are good. A one-hot encoder fitted on the old categories either raises, or with handle_unknown='ignore' encodes the row as all zeros — which is not \"unknown\", it is \"none of the above\", a vector the model has never encountered and will extrapolate from arbitrarily. A label encoder may map it to an unused integer that happens to sit next to an unrelated category in the model's learned geometry.\n\nThe damage is concentrated on whatever fraction of traffic carries the new value, so the aggregate metric barely moves while that segment is handled badly. Chapter 10's slice-based evaluation is what makes this visible.\n\nSchema validation catches it only if you actually enumerated the allowed values — Check.isin([...]) rather than just \"is a string\". That is a real habit to build: constrain categorical columns to their known set, and let a new value be a loud failure rather than a quiet one."},
+    volume: {name:"Only 40% of the usual rows arrived",
+      caught:{none:false, schema:false, stats:true},
+      when:{none:"never", schema:"never", stats:"at validation"},
+      harm:{none:"severe", schema:"severe", stats:"none"},
+      note:"The commonest data failure there is, and schema validation is completely blind to it. Every row present is perfectly valid — there are just far fewer of them.\n\nAn upstream export failed for one region. A producer was down for six hours. A partition was still being written when the pipeline read it. The transformation runs happily on what it found, writes a short partition, and exits zero. The orchestrator reports success (chapter 4).\n\nThe reason this is severe rather than merely annoying: the missing rows are not a random sample. They are one region, one event type, one client — so the model retrains on a systematically biased subset and learns a distribution that does not exist.\n\nThe check is one line and needs no framework:\n\n    assert len(df) > 0.7 * rows_same_weekday_last_week\n\nThat single assertion catches more real incidents than anything else in this chapter, and it belongs in every pipeline before anything else is added."}
+  };
+
+  function render(){
+    const c = CH[$("v-change").value];
+    const lv = $("v-level").value;
+    const caught = c.caught[lv];
+
+    $("v-caught").textContent = caught ? "yes" : "NO";
+    $("v-caught").style.color = caught ? "#3FB984" : "#E2574C";
+    $("v-when").textContent   = c.when[lv];
+    $("v-harm").textContent   = c.harm[lv];
+    $("v-harm").style.color   = c.harm[lv] === "none" ? "#3FB984" :
+                                c.harm[lv] === "low" ? "#F2A03D" : "#E2574C";
+
+    const LEVELS = [["none","No validation"],["schema","Schema checks"],["stats","Schema + distributions"]];
+    $("v-grid").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin:16px 0 8px">' + c.name + '</div>' +
+      '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px">' +
+      LEVELS.map(([k, lab]) => {
+        const on = c.caught[k];
+        const active = k === lv;
+        return '<div style="background:' + (active ? "#fff" : "#FAFBFC") + ';border:2px solid ' +
+          (active ? (on ? "#3FB984" : "#E2574C") : "#E9EDF0") + ';border-radius:6px;padding:11px 9px;' +
+          'text-align:center;' + (active ? "" : "opacity:.72") + '">' +
+          '<div style="font-size:10.5px;color:#8FA0AF;margin-bottom:5px">' + lab + '</div>' +
+          '<div style="font-family:var(--mono);font-size:12px;font-weight:700;color:' +
+          (on ? "#1F7A52" : "#A8382F") + '">' + (on ? "caught" : "missed") + '</div></div>';
+      }).join("") + '</div>';
+
+    const notes = [c.note];
+
+    if(!caught && lv === "stats")
+      notes.push("Even with distribution checks this slips through, which is worth knowing about — the layer is not complete either.");
+    if(!caught && lv === "schema")
+      notes.push("This is the gap that matters. Schema validation is necessary and it is not sufficient, because the failure produces data that is the right type, in the right range, and non-null.\n\nThe layer that catches it compares this batch's summary statistics against a baseline stored with the model: per-feature mean, standard deviation, null rate, quantile edges and category set from the TRAINING data. Then PSI per feature, weighted by importance.\n\nThat baseline is a few kilobytes and belongs alongside the model artefact in the registry (chapter 9), so a model always carries the profile of the data it was trained on.");
+    if(caught && lv !== "none")
+      notes.push("Caught at the boundary, which is the whole point of putting checks there rather than trusting downstream code to notice.\n\nTwo placement rules worth following. Validate on the way IN, before the transformation, so a bad input fails before it is processed. And validate on the way OUT, before the write, so a bug in your own transformation does not reach downstream consumers. A check that runs after the write tells you the damage has already propagated.");
+
+    $("v-note").textContent = notes.join("\n\n");
+  }
+
+  ["v-change","v-level"].forEach(id => $(id).addEventListener("change", render));
+  render();
+})();
+</script>
+</body>
+</html>

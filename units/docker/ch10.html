@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Resource limits and the OOM killer — Docker</title>
+<meta name="description" content="Choosing limits from measurement, memory accounting and why docker stats looks alarming, swap semantics, CPU quota versus shares under contention, runtime tuning, and OOM diagnosis.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Crect x='6' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='19' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='10' width='5' height='5' fill='%23fff'/%3E%3Cpath d='M4 22h22a5 5 0 004-4' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch10">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Docker
+    </a>
+    <div class="chno"><b>Chapter 10</b><span>Running containers</span></div>
+    <h1>Resource limits and the OOM killer</h1>
+    <p class="lede">Chapter 2 showed the kernel mechanisms. This chapter is about using them without producing either a container that dies at 3am or a host that falls over because nothing was limited at all. <b>Two things cause most of the confusion: memory accounting counts things you did not expect, and CPU shares do nothing at all most of the time.</b></p>
+    <div class="meta"><span>28 min</span><span>2 demos</span><span>8 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="measure">
+      <h2 data-nav="Measure first">Measure before you limit</h2>
+      <p class="sub">A limit chosen from intuition is a scheduled outage.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">what the container actually uses</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker stats --no-stream
+NAME   CPU %   MEM USAGE / LIMIT     MEM %   NET I/O      BLOCK I/O   PIDS
+api    142%    418.2MiB / 512MiB     81.7%   1.2GB/840MB  0B/12MB     47
+db     18%     1.104GiB / 2GiB       55.2%   400MB/1.1GB  2.1GB/8GB   31
+
+$ docker stats --no-stream --format \
+    'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.PIDs}}'
+
+# the peak, which is what actually matters for sizing
+$ cat /sys/fs/cgroup/system.slice/docker-*.scope/memory.peak</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Column</th><th>Read it as</th></tr></thead>
+          <tbody>
+            <tr><td><code>CPU %</code></td><td>Percentage of <b>one</b> CPU, so 142% means 1.42 cores. It can exceed 100%</td></tr>
+            <tr><td><code>MEM USAGE</code></td><td><code>memory.current</code> minus inactive file cache — <b>not</b> the raw cgroup figure</td></tr>
+            <tr><td><code>MEM %</code></td><td>That figure against the limit; without a limit it is against host memory and meaningless</td></tr>
+            <tr><td><code>PIDS</code></td><td>Threads as well as processes. A runaway thread pool shows here first</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>Size from the peak under realistic load, not the steady state.</strong> A service idling at 180&nbsp;MB that reaches 430&nbsp;MB during a batch import needs a limit above 430, and <code>memory.peak</code> is the honest number — <code>docker stats</code> samples, so it misses spikes shorter than its interval.</p>
+    </section>
+
+    <section id="memory">
+      <h2 data-nav="Memory accounting">Memory accounting</h2>
+      <p class="sub">The limit counts more than your heap, and that is fine until you misread it.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Counted in <code>memory.current</code></th><th>Reclaimable?</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Anonymous</strong> — heap, stacks, anything not backed by a file</td><td class="no">no, only swappable</td></tr>
+            <tr><td><strong>File cache</strong> — pages read from or written to files</td><td class="yes">yes, this is the key point</td></tr>
+            <tr><td><strong>Kernel</strong> — socket buffers, dentries, page tables for this cgroup</td><td>Partly</td></tr>
+            <tr><td><strong>tmpfs</strong> content, including <code>/dev/shm</code></td><td class="no">no — it is memory pretending to be a disk</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Memory accounting explorer</h3>
+          <span class="hint">What the kernel counts, what <code>docker stats</code> reports, and when the OOM killer fires</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <label for="m-anon" style="min-width:150px">anonymous <b id="m-anonv">300</b> MB</label>
+            <input type="range" id="m-anon" min="0" max="2048" step="16" value="300" style="width:130px">
+          </div>
+          <div class="ctrl tight">
+            <label for="m-cache" style="min-width:150px">file cache <b id="m-cachev">180</b> MB</label>
+            <input type="range" id="m-cache" min="0" max="2048" step="16" value="180" style="width:130px">
+          </div>
+          <div class="ctrl tight">
+            <label for="m-limit" style="min-width:150px">--memory <b id="m-limitv">512</b> MB</label>
+            <input type="range" id="m-limit" min="64" max="2048" step="16" value="512" style="width:130px">
+          </div>
+          <div class="ctrl">
+            <label for="m-swap" style="min-width:150px">swap allowance <b id="m-swapv">0</b> MB</label>
+            <input type="range" id="m-swap" min="0" max="1024" step="16" value="0" style="width:130px">
+            <span class="sep"></span>
+            <button class="btn mono" id="m-shm">128 MB in /dev/shm</button>
+          </div>
+          <div id="m-bar" style="margin:6px 0 10px"></div>
+          <div class="term" id="m-term"></div>
+          <div class="rgrid" id="m-out"></div>
+          <p class="readout" id="m-note"></p>
+        </div>
+      </div>
+
+      <div class="key">
+        <span class="lbl">Why a container sits at 99% of its memory limit and is perfectly healthy</span>
+        <p>File cache counts toward <code>memory.current</code> and the kernel has no reason to evict it until the limit is reached — so a process that reads files will always drift up to the limit and stay there. <strong>That is the cache doing its job, not a leak.</strong> The number that predicts an OOM kill is the <em>anonymous</em> portion, which is what <code>docker stats</code> approximates by subtracting inactive file cache. Read <code>memory.stat</code> to separate them before concluding anything.</p>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">the fields that matter in memory.stat</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ CG=/sys/fs/cgroup/system.slice/docker-3f9c2a….scope
+$ grep -E '^(anon|file|kernel|slab|sock|shmem|inactive_file|active_file) ' $CG/memory.stat
+anon           314572800      # the heap. This is what can OOM you
+file           188743680      # page cache. Reclaimable
+inactive_file  132120576      # what docker stats subtracts
+shmem            8388608      # tmpfs and /dev/shm. NOT reclaimable
+$ cat $CG/memory.current $CG/memory.max $CG/memory.peak
+$ cat $CG/memory.events            # low high max oom oom_kill counters</pre>
+      </div>
+    </section>
+
+    <section id="swap">
+      <h2 data-nav="Swap">The <code>--memory-swap</code> table</h2>
+      <p class="sub">The most confusing flag in Docker, because it is a total rather than an amount.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th><code>--memory</code></th><th><code>--memory-swap</code></th><th>Swap available</th></tr></thead>
+          <tbody>
+            <tr><td><code>512m</code></td><td>unset</td><td><b>512 MB</b> — the default is twice the memory value in total</td></tr>
+            <tr><td><code>512m</code></td><td><code>512m</code></td><td><b>None.</b> Equal values disable swap — the usual production choice</td></tr>
+            <tr><td><code>512m</code></td><td><code>1g</code></td><td>512 MB (the total minus the memory limit)</td></tr>
+            <tr><td><code>512m</code></td><td><code>-1</code></td><td>Unlimited, up to what the host has</td></tr>
+            <tr><td>unset</td><td>anything</td><td>Rejected — swap cannot be set without a memory limit</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Swap turns a fast, obvious OOM kill into slow, mysterious latency, which is why most production setups disable it inside containers and let the process die honestly. Keep it if the workload has genuinely cold pages and you would rather be slow than dead.</p>
+      <div class="warn">
+        <span class="lbl"><code>--oom-kill-disable</code> is almost never what you want</span>
+        <p>It does not give the container more memory; it makes the kernel <em>pause</em> the offending process instead of killing it when the limit is hit. The container then hangs forever — no logs, no exit, no restart, and the only cure is killing it from the host. Use it only with a memory limit set and a plan for who notices, which in practice means: do not.</p>
+      </div>
+    </section>
+
+    <section id="cpu">
+      <h2 data-nav="CPU">CPU: quota, shares and pinning</h2>
+      <p class="sub">Three controls that people use interchangeably and should not.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Flag</th><th>Kind</th><th>Applies</th></tr></thead>
+          <tbody>
+            <tr><td><code>--cpus 1.5</code></td><td>A hard ceiling — quota per 100&nbsp;ms period</td><td><b>Always</b>, even on a completely idle host</td></tr>
+            <tr><td><code>--cpu-shares 512</code></td><td>A relative weight (default 1024)</td><td><b>Only under contention.</b> Otherwise it does nothing</td></tr>
+            <tr><td><code>--cpuset-cpus 0,1</code></td><td>Which physical CPUs it may use</td><td>Always, and it is visible to <code>nproc</code> (chapter 2)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>CPU contention simulator</h3>
+          <span class="hint">Four containers on one host — what each one actually gets</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <label for="c-hosts" style="min-width:132px">host CPUs <b id="c-hostsv">4</b></label>
+            <input type="range" id="c-hosts" min="1" max="16" value="4" style="width:130px">
+          </div>
+          <div class="ctrl">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:132px">who is busy</span>
+            <span id="c-busy" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div id="c-table" style="overflow-x:auto"></div>
+          <div class="rgrid" id="c-out"></div>
+          <p class="readout" id="c-note"></p>
+        </div>
+      </div>
+
+      <div class="code">
+        <div class="code-top"><span class="tag">and the raw form, if you need a different period</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run --cpus 1.5 …                        # equivalent to the two below
+$ docker run --cpu-period 100000 --cpu-quota 150000 …
+
+# a shorter period reduces latency jitter at the cost of scheduler overhead
+$ docker run --cpu-period 10000 --cpu-quota 15000 …    # still 1.5 CPUs
+
+$ cat /sys/fs/cgroup/…/cpu.stat
+nr_periods 5821  nr_throttled 1204  throttled_usec 18442000</pre>
+      </div>
+      <div class="key">
+        <span class="lbl">Throttling is a latency problem, not a throughput problem</span>
+        <p>When a container exhausts its quota the scheduler stops <em>every</em> thread until the next 100&nbsp;ms period begins. Average CPU usage looks fine and the host looks idle; what you see is a tail-latency cliff, because unlucky requests wait out the remainder of a period. If <code>nr_throttled</code> is climbing, raise the quota or reduce concurrency — and consider a shorter <code>--cpu-period</code>, which spreads the same allowance into smaller, more frequent slices.</p>
+      </div>
+    </section>
+
+    <section id="runtimes">
+      <h2 data-nav="Telling the app">Telling the application about its limits</h2>
+      <p class="sub">Chapter 2's trap, with the specific fixes.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Runtime</th><th>Set this</th><th>Because</th></tr></thead>
+          <tbody>
+            <tr><td>Go</td><td><code>GOMEMLIMIT=450MiB</code>, <code>GOMAXPROCS</code></td><td>The GC otherwise assumes host memory and collects too late; <code>NumCPU</code> ignores quota</td></tr>
+            <tr><td>JVM</td><td><code>-XX:MaxRAMPercentage=75</code>, <code>-XX:ActiveProcessorCount=N</code></td><td>Container-aware since 8u191, but the default heap fraction is conservative and the CPU count still reads affinity</td></tr>
+            <tr><td>Node.js</td><td><code>--max-old-space-size=384</code>, <code>UV_THREADPOOL_SIZE</code></td><td>V8 sizes the heap from host memory; <code>os.cpus()</code> reports host CPUs</td></tr>
+            <tr><td>Python</td><td>Explicit worker counts</td><td><code>os.cpu_count()</code> is the host's</td></tr>
+            <tr><td>nginx</td><td><code>worker_processes 2;</code></td><td><code>auto</code> means one per host CPU</td></tr>
+            <tr><td>Postgres</td><td><code>shared_buffers</code>, <code>max_connections</code></td><td>Defaults are tuned for a dedicated machine</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">the pattern: derive the app's limits from the container's</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">#!/bin/sh
+# entrypoint.sh — read the cgroup and configure the runtime from it
+LIMIT=$(cat /sys/fs/cgroup/memory.max 2&gt;/dev/null || echo max)
+if [ "$LIMIT" != "max" ]; then
+  export GOMEMLIMIT=$(( LIMIT * 90 / 100 ))          # 90% of the hard limit
+fi
+QUOTA=$(cut -d' ' -f1 /sys/fs/cgroup/cpu.max)
+PERIOD=$(cut -d' ' -f2 /sys/fs/cgroup/cpu.max)
+[ "$QUOTA" != "max" ] &amp;&amp; export GOMAXPROCS=$(( (QUOTA + PERIOD - 1) / PERIOD ))
+exec "$@"</pre>
+      </div>
+      <p><strong>Leave headroom below the hard limit.</strong> A Go service with <code>GOMEMLIMIT</code> equal to <code>--memory</code> will still be OOM-killed, because the limit also counts stacks, the page cache and kernel memory that the GC does not manage. Ninety percent is a reasonable starting point, and the same reasoning applies to <code>MaxRAMPercentage</code> and <code>--max-old-space-size</code>.</p>
+    </section>
+
+    <section id="other">
+      <h2 data-nav="The other limits">The other limits</h2>
+      <p class="sub">Three that are only noticed when they bite.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Flag</th><th>Default</th><th>Symptom when wrong</th></tr></thead>
+          <tbody>
+            <tr><td><code>--shm-size</code></td><td><b>64 MB</b></td><td>Chrome and Puppeteer crash; Postgres parallel workers fail</td></tr>
+            <tr><td><code>--pids-limit</code></td><td>Unlimited on most setups</td><td>A fork bomb or thread leak takes down the host, not just the container</td></tr>
+            <tr><td><code>--ulimit nofile</code></td><td>Inherited from the daemon</td><td>"Too many open files" under load at a suspiciously round number</td></tr>
+            <tr><td><code>--device-write-bps</code></td><td>Unlimited</td><td>One container's batch write starves everything else on the disk</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">setting them</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run --shm-size 1g --pids-limit 512 \
+    --ulimit nofile=65536:65536 \
+    --device-write-bps /dev/sda:50mb app</pre>
+      </div>
+      <p>The 64&nbsp;MB <code>/dev/shm</code> default is the one worth remembering, because the failure it produces looks like anything but a memory limit — a headless browser exiting with a cryptic renderer crash, hours before anyone checks the shared-memory size. It also counts toward <code>--memory</code>, since tmpfs is memory.</p>
+    </section>
+
+    <section id="diagnose">
+      <h2 data-nav="Diagnosing an OOM">Diagnosing an OOM kill</h2>
+      <p class="sub">A short, ordered checklist.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">was it the OOM killer, and whose?</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># 1. confirm
+$ docker inspect -f '{{.State.ExitCode}} {{.State.OOMKilled}}' api
+137 true
+
+# 2. the cgroup's own counter — did it happen more than once?
+$ cat /sys/fs/cgroup/…/memory.events
+oom 3
+oom_kill 3
+
+# 3. the kernel's record, which names the process and the cgroup
+$ dmesg -T | grep -i -A3 'killed process'
+
+# 4. how close was it, historically?
+$ cat /sys/fs/cgroup/…/memory.peak
+
+# 5. watch for the next one
+$ docker events --filter event=oom</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Finding</th><th>Means</th><th>Do</th></tr></thead>
+          <tbody>
+            <tr><td><code>OOMKilled: true</code></td><td>The container exceeded its own limit</td><td>Raise the limit, or find why it grew</td></tr>
+            <tr><td><code>OOMKilled: false</code>, exit 137</td><td>A stop timed out (chapter 9), or something else sent SIGKILL</td><td>Check the stop timeout and the shutdown path</td></tr>
+            <tr><td>Kernel OOM naming a different cgroup</td><td>The <b>host</b> ran out; your container was collateral</td><td>Limit everything, and stop overcommitting</td></tr>
+            <tr><td><code>anon</code> rising steadily across restarts</td><td>A genuine leak</td><td>Profile the application; a bigger limit only delays it</td></tr>
+            <tr><td><code>anon</code> flat, <code>file</code> at the limit</td><td>Normal cache behaviour</td><td>Nothing</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="trap">
+        <span class="lbl">Unlimited containers are how a single bug takes down a host</span>
+        <p>Without <code>--memory</code>, a container can consume all host memory, and the kernel's OOM killer then picks a victim by score across the whole machine — frequently not the container at fault, and sometimes the database or the daemon. Setting a limit on everything converts "the host died" into "one container died and restarted", which is the entire point. The sum of limits may exceed host memory (overcommit is normal), but each individual limit must exist.</p>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 10 in eight lines</h2>
+        <ul>
+          <li>Size limits from <b><code>memory.peak</code> under load</b>, not from the steady state and not from intuition.</li>
+          <li><code>memory.current</code> counts anonymous memory, <b>file cache</b>, kernel memory and tmpfs — so sitting near the limit is usually the cache working.</li>
+          <li><code>docker stats</code> shows <code>memory.current</code> <b>minus inactive file cache</b>, so it and the cgroup file disagree on purpose.</li>
+          <li>The number that predicts an OOM kill is the <b>anonymous</b> portion, from <code>memory.stat</code>.</li>
+          <li><code>--memory-swap</code> is a <b>total</b>, not an amount: equal to <code>--memory</code> means no swap; unset means an equal amount of swap.</li>
+          <li><code>--cpus</code> is a ceiling that <b>always</b> applies; <code>--cpu-shares</code> is a weight that applies <b>only under contention</b>.</li>
+          <li>Throttling shows up as tail latency, not as high load — watch <code>nr_throttled</code>.</li>
+          <li><code>/dev/shm</code> defaults to <b>64 MB</b> and counts toward the memory limit.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary><code>docker stats</code> shows 38% memory while <code>memory.current</code> is at 99% of the limit. Which is wrong?</summary>
+        <div class="ans"><p>Neither — they measure different things deliberately. <code>memory.current</code> includes file cache, and the kernel fills cache up to the limit because there is no reason not to; <code>docker stats</code> subtracts inactive file cache to approximate "memory that would be hard to reclaim". The container is healthy: 38% is anonymous plus active cache, and the remaining 61% is evictable. Confirm by reading <code>anon</code> and <code>inactive_file</code> in <code>memory.stat</code>. What would worry you is <code>anon</code> alone approaching the limit, or a rising <code>oom_kill</code> counter in <code>memory.events</code>.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A container has <code>--cpu-shares 2048</code> and still runs slowly, on a host that is 90% idle. Explain.</summary>
+        <div class="ans"><p>Shares only take effect when the CPUs are contended — they divide <em>contested</em> time proportionally. On an idle host every container gets whatever it asks for, so doubling the weight changes nothing. If it is slow anyway, the cause is elsewhere: a <code>--cpus</code> quota (which applies regardless of contention), a <code>--cpuset-cpus</code> pinning it to two busy cores, single-threaded application code, or I/O rather than CPU. Check <code>nr_throttled</code> in <code>cpu.stat</code> first — if it is climbing, it is quota, not shares.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A Go service with <code>--memory 512m</code> and <code>GOMEMLIMIT=512MiB</code> is still OOM-killed. Why?</summary>
+        <div class="ans"><p>Because <code>GOMEMLIMIT</code> governs only the memory the Go runtime manages, while the cgroup limit counts everything: goroutine stacks beyond the heap, the page cache from files the process reads, socket buffers, and anything in <code>/dev/shm</code>. Setting them equal leaves the GC no reason to collect until the container is already at its hard limit. Set <code>GOMEMLIMIT</code> to roughly 90% of the container limit so the GC works harder before the kernel intervenes — and the same reasoning applies to <code>MaxRAMPercentage</code> and Node's <code>--max-old-space-size</code>.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A headless-Chrome container crashes under load with no useful error, well below its 2&nbsp;GB memory limit. First thing to check?</summary>
+        <div class="ans"><p><code>--shm-size</code>. Chrome puts renderer shared memory in <code>/dev/shm</code>, which Docker defaults to <b>64&nbsp;MB</b> regardless of the container's memory limit — so it exhausts a limit that has nothing to do with the one you set, and the renderer dies with a message that names neither. Raise it (<code>--shm-size 1g</code>) or run Chrome with <code>--disable-dev-shm-usage</code> so it uses <code>/tmp</code> instead. Note the raised <code>/dev/shm</code> is tmpfs and therefore counts toward <code>--memory</code>, so budget for both.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Chapter 11 turns to storage: the ephemeral writable layer, named volumes against bind mounts, and the UID mismatch that makes a mounted directory unwritable.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li><code>docker stats --no-stream</code> and compare with <code>memory.current</code>.</li>
+        <li><code>docker run --rm -m 64m alpine sh -c 'yes | head -c 200m | tail'</code> — watch for 137.</li>
+        <li><code>docker run --rm alpine df -h /dev/shm</code>.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>Docker's runtime resource-constraints reference, the kernel cgroup v2 memory and CPU controller documentation, and the Go, JVM and Node container-awareness notes.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — memory accounting
+   ============================================================ */
+(function () {
+  var shm = false;
+  var KERNEL = 24;            /* socket buffers, page tables, slab */
+  var INACTIVE_FRAC = 0.72;   /* share of file cache that is inactive */
+
+  var shmBtn = document.getElementById("m-shm");
+  var bar = document.getElementById("m-bar");
+  var term = document.getElementById("m-term");
+  var out = document.getElementById("m-out");
+  var note = document.getElementById("m-note");
+
+  shmBtn.addEventListener("click", function () {
+    shm = !shm;
+    shmBtn.classList.toggle("on", shm);
+    render();
+  });
+
+  function val(k) { return parseInt(document.getElementById("m-" + k).value, 10); }
+
+  function model() {
+    var anon = val("anon"), cache = val("cache"), limit = val("limit"), swap = val("swap");
+    var shmem = shm ? 128 : 0;
+
+    /* unreclaimable = anon + kernel + tmpfs. Cache can be evicted under pressure. */
+    var hard = anon + KERNEL + shmem;
+    var current = hard + cache;
+
+    var swapped = 0, oom = false, reclaimed = 0;
+    if (current > limit) {
+      /* the kernel reclaims file cache first */
+      reclaimed = Math.min(cache, current - limit);
+    }
+    var afterReclaim = hard + (cache - reclaimed);
+    if (afterReclaim > limit) {
+      /* then swap out anonymous pages, if there is any allowance */
+      swapped = Math.min(swap, afterReclaim - limit);
+      if (afterReclaim - swapped > limit) oom = true;
+    }
+
+    var inactive = Math.round((cache - reclaimed) * INACTIVE_FRAC);
+    var statsShows = Math.max(0, Math.min(current, limit) - inactive);
+
+    return { anon: anon, cache: cache, limit: limit, swap: swap, shmem: shmem,
+             kernel: KERNEL, hard: hard, current: current, reclaimed: reclaimed,
+             swapped: swapped, oom: oom, statsShows: statsShows, inactive: inactive,
+             resident: Math.min(current, limit) };
+  }
+
+  function render() {
+    ["anon", "cache", "limit", "swap"].forEach(function (k) {
+      document.getElementById("m-" + k + "v").textContent = val(k);
+    });
+    var m = model();
+
+    var W = 470, H = 42, padL = 8;
+    var span = Math.max(m.current, m.limit) * 1.06;
+    var x = function (v) { return padL + (v / span) * (W - padL - 8); };
+    var seg = [
+      { v: m.anon, c: "#3D4CC0", l: "anon" },
+      { v: m.shmem, c: "#B3372F", l: "shm" },
+      { v: m.kernel, c: "#7C8CF8", l: "kern" },
+      { v: m.cache, c: "#BFC9F5", l: "cache" }
+    ];
+    var svg = ['<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;max-width:' + W + 'px;height:auto;font-family:var(--mono)">'];
+    var acc = 0;
+    seg.forEach(function (s) {
+      if (s.v <= 0) return;
+      svg.push('<rect x="' + x(acc) + '" y="12" width="' + Math.max(0.6, x(acc + s.v) - x(acc)) +
+        '" height="16" fill="' + s.c + '"/>');
+      acc += s.v;
+    });
+    svg.push('<line x1="' + x(m.limit) + '" y1="6" x2="' + x(m.limit) + '" y2="34" stroke="#B3372F" stroke-width="2.5"/>');
+    svg.push('<text x="' + x(m.limit) + '" y="40" font-size="8.5" fill="#B3372F" text-anchor="middle">--memory ' + m.limit + "</text>");
+    svg.push('<text x="' + padL + '" y="9" font-size="8.5" fill="#54677A">anon ' + m.anon +
+      "  ·  kernel " + m.kernel + (m.shmem ? "  ·  shm " + m.shmem : "") + "  ·  cache " + m.cache + " MB</text>");
+    svg.push("</svg>");
+    bar.innerHTML = svg.join("");
+
+    var lines = [];
+    lines.push('<span class="p">$</span> cat memory.current memory.max');
+    lines.push(m.resident + " MB   " + m.limit + " MB");
+    lines.push("");
+    lines.push('<span class="p">$</span> grep -E \'^(anon|file|shmem|inactive_file) \' memory.stat');
+    lines.push("anon           " + m.anon + " MB");
+    lines.push("file           " + (m.cache - m.reclaimed) + " MB" + (m.reclaimed ? '<span class="y">   (' + m.reclaimed + " MB reclaimed under pressure)</span>" : ""));
+    if (m.shmem) lines.push('<span class="r">shmem          ' + m.shmem + " MB   (tmpfs — NOT reclaimable)</span>");
+    lines.push("inactive_file  " + m.inactive + " MB");
+    lines.push("");
+    lines.push('<span class="p">$</span> docker stats --no-stream');
+    lines.push("MEM USAGE / LIMIT     MEM %");
+    lines.push((m.statsShows + "MiB / " + m.limit + "MiB").padEnd(22, "\u00a0") +
+      ((m.statsShows / m.limit) * 100).toFixed(1) + "%");
+    lines.push("");
+    if (m.oom) {
+      lines.push('<span class="r">memory.events: oom_kill 1</span>');
+      lines.push('<span class="r">container exits 137, State.OOMKilled = true</span>');
+    } else if (m.swapped) {
+      lines.push('<span class="y">' + m.swapped + " MB swapped out — alive, and slower</span>");
+    } else if (m.reclaimed) {
+      lines.push('<span class="y">' + m.reclaimed + " MB of cache evicted to stay under the limit — healthy</span>");
+    } else {
+      lines.push('<span class="g">comfortably under the limit</span>');
+    }
+    term.innerHTML = lines.join("\n");
+
+    out.innerHTML = "";
+    tile("memory.current", m.resident + " MB", ((m.resident / m.limit) * 100).toFixed(0) + "% of limit", !m.oom);
+    tile("docker stats", m.statsShows + " MB", ((m.statsShows / m.limit) * 100).toFixed(0) + "% shown", !m.oom);
+    tile("Unreclaimable", m.hard + " MB", "anon + kernel + shm", m.hard < m.limit);
+    tile("Outcome", m.oom ? "OOM 137" : m.swapped ? "swapping" : m.reclaimed ? "reclaiming" : "fine", "", !m.oom);
+
+    var gap = m.resident - m.statsShows;
+    var msgs = [];
+    if (m.oom) {
+      msgs.push("<b>Unreclaimable memory (" + m.hard + " MB) exceeds the " + m.limit +
+        " MB limit</b>, so no amount of cache eviction helps and the kernel kills the process. Note what caused it: " +
+        (m.shmem ? "the " + m.shmem + " MB in <code>/dev/shm</code> counts as memory and cannot be reclaimed, " : "") +
+        "the heap alone is " + m.anon + " MB. Cache was never the problem.");
+    } else if (m.reclaimed && !m.swapped) {
+      msgs.push("<b>The container is at its limit and completely healthy.</b> " + m.reclaimed +
+        " MB of file cache was evicted to stay under it — exactly what cache is for. <code>memory.current</code> reads " +
+        m.resident + " MB against a " + m.limit + " MB limit, which looks alarming on a dashboard and is not.");
+    } else if (m.swapped) {
+      msgs.push(m.swapped + " MB of anonymous memory has been swapped out. The container survives, and every access to those pages now costs a disk round trip — which is why disabling swap and letting it die honestly is usually the better production choice.");
+    }
+    if (gap > 20 && !m.oom) {
+      msgs.push("Note the <b>" + gap + " MB gap</b> between <code>memory.current</code> and what <code>docker stats</code> reports: stats subtracts inactive file cache (" +
+        m.inactive + " MB here) to approximate memory that would be hard to reclaim. Two tools, two numbers, both correct.");
+    }
+    if (m.shmem && !m.oom) {
+      msgs.push("The 128 MB in <code>/dev/shm</code> is tmpfs — it is memory wearing a filesystem, it counts toward the limit, and it is <b>not</b> reclaimable. Raising <code>--shm-size</code> without raising <code>--memory</code> just moves where you run out.");
+    }
+    if (!msgs.length) {
+      msgs.push("Everything fits. Push the anonymous slider up to see an OOM kill, or the cache slider up to see the kernel reclaim rather than kill — the difference between those two responses is the whole subject of this section.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13.5px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  ["anon", "cache", "limit", "swap"].forEach(function (k) {
+    document.getElementById("m-" + k).addEventListener("input", render);
+  });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — CPU contention, by weighted max-min fair share
+   ============================================================ */
+(function () {
+  var C = [
+    { name: "api", shares: 1024, quota: null, demand: 4, busy: true },
+    { name: "worker", shares: 512, quota: null, demand: 4, busy: true },
+    { name: "cron", shares: 2048, quota: 0.5, demand: 4, busy: false },
+    { name: "db", shares: 1024, quota: 2, demand: 4, busy: true }
+  ];
+
+  var busyHost = document.getElementById("c-busy");
+  var table = document.getElementById("c-table");
+  var out = document.getElementById("c-out");
+  var note = document.getElementById("c-note");
+
+  C.forEach(function (c) {
+    var b = document.createElement("button");
+    b.className = "btn mono" + (c.busy ? " on" : "");
+    b.textContent = c.name;
+    b.addEventListener("click", function () { c.busy = !c.busy; b.classList.toggle("on", c.busy); render(); });
+    busyHost.appendChild(b);
+  });
+
+  /* progressive filling: distribute by weight, cap at min(demand, quota),
+     redistribute the surplus from capped containers */
+  function allocate(list, capacity) {
+    var alloc = {}, active = [];
+    list.forEach(function (c) {
+      alloc[c.name] = 0;
+      var ceil = Math.min(c.demand, c.quota === null ? Infinity : c.quota);
+      if (c.busy && ceil > 0) active.push({ c: c, ceil: ceil });
+    });
+    var left = capacity, guard = 0;
+    while (active.length && left > 1e-9 && guard++ < 50) {
+      var totalW = active.reduce(function (a, x) { return a + x.c.shares; }, 0);
+      var anyCapped = false;
+      var portion = {};
+      active.forEach(function (x) { portion[x.c.name] = left * (x.c.shares / totalW); });
+      /* find those that would exceed their ceiling */
+      var still = [];
+      active.forEach(function (x) {
+        var want = portion[x.c.name];
+        var room = x.ceil - alloc[x.c.name];
+        if (want >= room - 1e-9) {
+          alloc[x.c.name] += room;
+          left -= room;
+          anyCapped = true;
+        } else {
+          still.push(x);
+        }
+      });
+      if (!anyCapped) {
+        active.forEach(function (x) { alloc[x.c.name] += portion[x.c.name]; });
+        left = 0;
+        break;
+      }
+      active = still;
+    }
+    return alloc;
+  }
+
+  function render() {
+    var hosts = parseInt(document.getElementById("c-hosts").value, 10);
+    document.getElementById("c-hostsv").textContent = hosts;
+
+    var busy = C.filter(function (c) { return c.busy; });
+    var demandTotal = busy.reduce(function (a, c) { return a + Math.min(c.demand, c.quota === null ? Infinity : c.quota); }, 0);
+    var contended = demandTotal > hosts + 1e-9;
+    var alloc = allocate(C, hosts);
+
+    /* the same allocation with every share equal, to isolate what shares did */
+    var flat = C.map(function (c) { return { name: c.name, shares: 1024, quota: c.quota, demand: c.demand, busy: c.busy }; });
+    var allocFlat = allocate(flat, hosts);
+
+    table.innerHTML = '<table class="tbl"><thead><tr><th>container</th><th>--cpu-shares</th><th>--cpus</th><th>wants</th><th>gets</th><th>if shares were equal</th></tr></thead><tbody>' +
+      C.map(function (c) {
+        var got = alloc[c.name];
+        var pct = hosts ? (got / hosts) * 100 : 0;
+        return "<tr" + (c.busy ? "" : " style='opacity:.5'") + "><td><b>" + c.name + "</b></td><td>" + c.shares +
+          "</td><td>" + (c.quota === null ? "—" : c.quota) + "</td><td>" +
+          (c.busy ? c.demand + " CPU" : "idle") + "</td><td>" +
+          '<span style="display:inline-block;height:7px;width:' + Math.max(1, pct).toFixed(1) +
+          '%;max-width:80px;background:var(--acc);border-radius:3px;vertical-align:middle"></span> <b>' +
+          got.toFixed(2) + "</b></td><td style='color:var(--text-2)'>" + allocFlat[c.name].toFixed(2) + "</td></tr>";
+      }).join("") + "</tbody></table>";
+
+    var used = Object.keys(alloc).reduce(function (a, k) { return a + alloc[k]; }, 0);
+    var sharesMattered = C.some(function (c) { return Math.abs(alloc[c.name] - allocFlat[c.name]) > 0.01; });
+
+    out.innerHTML = "";
+    tile("Host CPUs", String(hosts), "capacity");
+    tile("Demand", demandTotal.toFixed(1), contended ? "exceeds capacity" : "fits", !contended);
+    tile("Allocated", used.toFixed(2), ((used / hosts) * 100).toFixed(0) + "% of host");
+    tile("Shares matter?", sharesMattered ? "yes" : "no", contended ? "contended" : "idle host", sharesMattered);
+
+    var msgs = [];
+    if (!contended) {
+      msgs.push("<b>Total demand fits within the host, so shares change nothing</b> — the \"gets\" and \"if shares were equal\" columns are identical. Every container receives what it asks for, capped only by its <code>--cpus</code> quota. This is the state a host spends most of its time in, and the reason people conclude that <code>--cpu-shares</code> does not work.");
+    } else {
+      msgs.push("<b>Demand exceeds capacity, so shares finally do something:</b> the contested CPU is divided in proportion to weight. Compare the last two columns to see exactly what the weighting bought each container.");
+    }
+    /* a container is quota-capped only if the quota actually binds — its
+       weighted share would otherwise have been larger */
+    function capped(c) {
+      if (!c.busy || c.quota === null) return false;
+      return Math.abs(alloc[c.name] - c.quota) < 0.01 && c.demand > c.quota + 0.01;
+    }
+    var cappedOnes = C.filter(capped);
+    var cron = C.filter(function (c) { return c.name === "cron"; })[0];
+    if (capped(cron)) {
+      msgs.push("<b><code>cron</code> is the instructive one.</b> It has the highest weight (2048) and a 0.5-CPU quota, and it gets <b>" +
+        alloc.cron.toFixed(2) + "</b> — the quota wins. A ceiling applies whether or not anyone else is busy, while a weight only ever redistributes what is contested.");
+    }
+    if (cappedOnes.length && contended) {
+      var names = cappedOnes.map(function (c) { return "<code>" + c.name + "</code>"; }).join(" and ");
+      msgs.push(names + " " + (cappedOnes.length > 1 ? "are" : "is") +
+        " held at " + (cappedOnes.length > 1 ? "their quotas" : "its quota") +
+        " rather than by contention, so the surplus " + (cappedOnes.length > 1 ? "their" : "its") +
+        " weight would have claimed is redistributed to the uncapped containers.");
+    } else if (contended) {
+      msgs.push("No container is quota-bound here: every ceiling is above the share contention alone would give it, so the split is pure weighting. Raise the host CPU count and watch the quotas start to bind instead.");
+    }
+    msgs.push("<b>Model:</b> weighted max-min fair share with per-container ceilings — allocate in proportion to weight, cap anyone at their quota or demand, then redistribute the surplus. That is the shape of what the Linux scheduler does over time, not an instantaneous simulation of it.");
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13.5px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  document.getElementById("c-hosts").addEventListener("input", render);
+  render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Context engineering — AI Agents</title>
+<meta name="description" content="What occupies the window at step nine, compaction and summarisation, result truncation, externalising state, and why long runs decay.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 07 · Context and memory</div>
+    <h1>Context engineering</h1>
+    <p class="standfirst">At step one the model sees a clean prompt and a question. At step nine it sees that plus eight rounds of tool output, most of which no longer matters. Managing what occupies that window is the difference between an agent that gets sharper as it learns and one that gets vaguer as it fills.</p>
+    <div class="chap-meta">
+      <span class="tagpill">budget</span>
+      <span class="tagpill">truncation</span>
+      <span class="tagpill">compaction</span>
+      <span class="tagpill">externalising</span>
+      <span class="tagpill">decay</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>What is in there</h2>
+
+<p>Five components, with very different growth behaviour. Knowing which is which tells you where to intervene.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Component</th><th>Typical size</th><th>Growth</th><th>Cacheable</th></tr></thead>
+<tbody>
+<tr><td><b>System prompt</b></td><td>400–1,500 tokens</td><td>Fixed</td><td>Yes — keep byte-identical</td></tr>
+<tr><td><b>Tool schemas</b></td><td>100–250 per tool</td><td>Fixed per run</td><td>Yes — do not vary mid-run</td></tr>
+<tr><td><b>Goal and user turns</b></td><td>50–500 tokens</td><td>Occasional</td><td>Prefix only</td></tr>
+<tr><td><b>Assistant messages</b></td><td>100–300 per step</td><td>Linear</td><td>Becomes prefix once written</td></tr>
+<tr><td><b>Tool observations</b></td><td>50–5,000 per call</td><td><b>Linear and unbounded</b></td><td>Becomes prefix once written</td></tr>
+</tbody>
+</table>
+<caption>Observations are the only component you do not control the size of at design time, and they are almost always the largest. Nearly all context work is observation work.</caption>
+</div>
+
+<div class="demo" id="ctx">
+  <div class="demo-head">
+    <b>Watch the window fill</b>
+    <span>A twenty-step run against a fixed budget. Change the strategy and see what survives to step twenty.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="x-limit">Working budget — <span id="x-limitv">32</span>k tokens</label>
+        <input type="range" id="x-limit" min="8" max="200" step="4" value="32">
+      </div>
+      <div>
+        <label for="x-obs">Avg observation — <span id="x-obsv">900</span> tokens</label>
+        <input type="range" id="x-obs" min="100" max="4000" step="100" value="900">
+      </div>
+      <div>
+        <label for="x-steps">Steps — <span id="x-stepsv">20</span></label>
+        <input type="range" id="x-steps" min="4" max="40" step="1" value="20">
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div>
+        <label for="x-strat">Strategy</label>
+        <select id="x-strat">
+          <option value="none">None — let it grow until it breaks</option>
+          <option value="trunc">Truncate observations to 600 tokens</option>
+          <option value="window" selected>Sliding window — keep the last 6 steps in full</option>
+          <option value="compact">Compact — summarise older steps at 70% full</option>
+          <option value="extern">Externalise — write findings to a scratchpad, keep references</option>
+        </select>
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="x-final">—</b><span>final context</span></div>
+      <div><b id="x-status">—</b><span>outcome</span></div>
+      <div><b id="x-keep">—</b><span>early findings retained</span></div>
+      <div><b id="x-cost">—</b><span>cost of the run</span></div>
+    </div>
+    <div id="x-bars"></div>
+    <div class="out" id="x-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Why bigger windows did not solve this</h2>
+
+<p>A million-token window removes the hard failure — the run no longer crashes at step fourteen. It does not remove the soft one. Three things degrade well before you hit the limit:</p>
+
+<div class="terms">
+  <div><dt>Attention dilutes</dt><dd>The rule you wrote in the system prompt now competes with 40,000 tokens of tool output for the model's attention. Instruction adherence measurably falls with context depth, and it falls fastest for constraints stated once, early.</dd></div>
+  <div><dt>Stale facts persist</dt><dd>Step three found a draft record; step nine updated it. Both are in the context, both look equally authoritative, and nothing marks the first as superseded.</dd></div>
+  <div><dt>Cost and latency scale with it</dt><dd>Prefill time and price grow with every token you carry. A 200k-token context on step twenty of a run you resend each step is expensive in both.</dd></div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Treat the window as a working set, not a log</span>
+  <p>The instinct is to preserve everything in case the model needs it. The better instinct is the opposite: the context should hold <b>what is needed to decide the next action</b>, and nothing else. Everything else belongs in storage the agent can query. A tidy 12,000-token context beats a complete 90,000-token one on accuracy, latency and cost simultaneously — which is a rare combination and worth exploiting.</p>
+</div>
+
+<h2><span class="h-rule"></span>Truncating observations</h2>
+
+<p>The first and cheapest intervention. Most tool results contain far more than the next decision requires.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">truncate.py — cut with a marker, never silently</span><button class="copy">Copy</button></div>
+<pre><code>def truncate(text: str, max_tokens: int, hint: str | None = None) -> str:
+    n = count_tokens(text)
+    if n <= max_tokens:
+        return text
+
+    # Keep the head and a little of the tail: structure lives at the start,
+    # totals and conclusions often at the end.
+    head = take_tokens(text, int(max_tokens * 0.8))
+    tail = take_tokens_from_end(text, int(max_tokens * 0.15))
+    return (f"{head}\n\n…[truncated: {n:,} tokens, showing first {int(max_tokens*0.8):,} "
+            f"and last {int(max_tokens*0.15):,}"
+            + (f". {hint}" if hint else "") + "]\n\n" + tail)
+
+
+# Row-oriented results deserve a better cut than character truncation.
+def truncate_rows(rows: list[dict], max_rows: int, total: int, hint: str) -> str:
+    shown = rows[:max_rows]
+    body = "\n".join(compact_row(r) for r in shown)
+    if total > max_rows:
+        body += f"\n…[{total:,} rows total, {max_rows} shown. {hint}]"
+    return body
+
+# Used as:
+truncate_rows(orders, 20, 147, "Narrow with since= or status= to see the rest.")
+# The hint matters: without it the model either assumes it saw everything or
+# gives up. With it, it knows there is more and how to reach it.</code></pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Result type</th><th>Cap</th><th>Cut strategy</th></tr></thead>
+<tbody>
+<tr><td>Record lookup</td><td>200–400 tokens</td><td>Shape it at the source (chapter 4) rather than truncating</td></tr>
+<tr><td>List or search</td><td>600–1,200</td><td>Cap rows, state the total, say how to narrow</td></tr>
+<tr><td>File contents</td><td>1,500–3,000</td><td>Return line ranges; let the agent request more by offset</td></tr>
+<tr><td>Web page</td><td>2,000–4,000</td><td>Extract main content first, then truncate</td></tr>
+<tr><td>Logs or stack traces</td><td>800–1,500</td><td>Head plus tail — the error is usually at one end or the other</td></tr>
+<tr><td>Command output</td><td>1,000–2,000</td><td>Head plus tail; always include the exit code</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>Compaction</h2>
+
+<p>When truncation is not enough, replace old detail with a summary. The critical design decision is what the summary must never lose.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">compact.py — summarise the middle, preserve the ends</span><button class="copy">Copy</button></div>
+<pre><code>COMPACT_AT = 0.70          # fraction of the working budget
+
+COMPACT_PROMPT = """Summarise this portion of an in-progress investigation so it
+can replace the original messages. You are writing for yourself, to continue the
+work with less context.
+
+Preserve exactly and completely:
+- Every concrete fact established, with its identifiers, figures and dates
+- Every tool call made and what it returned, in one line each
+- Anything that failed, and why — so it is not retried
+- Open questions and what was about to be tried next
+
+Discard: reasoning that led nowhere, restatements, formatting, pleasantries.
+Never invent, round, or generalise a specific value. Under 400 words."""
+
+def maybe_compact(messages: list[dict], budget: Budget) -> list[dict]:
+    used = count_messages(messages)
+    if used < budget.max_tokens * COMPACT_AT:
+        return messages
+
+    head = messages[:2]                      # system + goal: never touch
+    tail = messages[-6:]                     # recent steps: keep verbatim
+    middle = messages[2:-6]
+    if not middle:
+        return messages
+
+    # Do not split a tool call from its result, or the next request is invalid.
+    middle, tail = realign_tool_pairs(middle, tail)
+
+    summary = model.complete(
+        [{"role": "user", "content": COMPACT_PROMPT + "\n\n" + render(middle)}],
+        tools=None, max_tokens=600, temperature=0).text
+
+    log.info("compacted", run=budget.run_id, from_tokens=used,
+             replaced_messages=len(middle))
+
+    return head + [{"role": "assistant",
+                    "content": f"[Earlier steps, compacted]\n{summary}"}] + tail</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Compaction destroys your prompt cache</span>
+  <p>Rewriting the middle of the array changes the prefix, so every cached token after that point is invalidated and the next call pays full price. That is usually still worth it — you are trading one expensive step for many cheaper ones — but it means compaction should happen <em>rarely and decisively</em>, not incrementally every step. Compact once at 70% rather than trimming continuously, and expect a visible cost spike on that step.</p>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Realign tool pairs or the next call fails</span>
+  <p>If your slice leaves an assistant message containing tool calls in the summarised region while its matching <code>tool</code> results are in the kept region — or vice versa — the provider rejects the request. This is the single most common bug in home-grown compaction, and it appears only on long runs, which means it appears in production. Slice on step boundaries, never on message indices.</p>
+</div>
+
+<h2><span class="h-rule"></span>Externalising state</h2>
+
+<p>The strongest technique, and the least used. Instead of carrying findings in the conversation, have the agent write them somewhere and carry only a reference.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">a scratchpad turns context pressure into a storage problem</span><button class="copy">Copy</button></div>
+<pre><code>NOTES = {
+  "name": "record_finding",
+  "description": ("Record an established fact so you do not need to keep it in mind. "
+                  "Use after any tool call that produced something you will need later. "
+                  "Findings persist for the whole task and are shown to you in summary. "
+                  "Retrieve full detail with read_finding(key)."),
+  "input_schema": {"type":"object","required":["key","fact"],"properties":{
+      "key":  {"type":"string","pattern":"^[a-z0-9_]{3,40}$"},
+      "fact": {"type":"string","maxLength":500},
+      "source": {"type":"string","description":"Which tool call established this"}}}
+}
+
+# The system prompt then carries a compact index that is rebuilt each step:
+#
+#   Findings so far:
+#   - duplicate_captures: two £48 captures on NW-8842, 10:14 and 10:16 (list_payments)
+#   - policy_threshold: refunds over £25 need agent approval (search_policy)
+#   - customer_id: c_991 (find_orders)
+#
+# Three lines instead of three full tool observations. The agent can read any of
+# them back in full if it needs to, and the working set stays small.</code></pre>
+</div>
+
+<p>This is what long-running coding agents do with files: the repository is the memory, and the context holds only the current working set plus a map. It generalises well beyond code — a findings table, a scratch document, a task list the agent maintains.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Technique</th><th>Cost</th><th>Best for</th></tr></thead>
+<tbody>
+<tr><td><b>Shape at the source</b></td><td>None — design time</td><td>Always. The cheapest token is the one never returned</td></tr>
+<tr><td><b>Truncate with a marker</b></td><td>None</td><td>Always. Every tool needs a cap</td></tr>
+<tr><td><b>Sliding window</b></td><td>None, but loses early detail</td><td>Runs where only recent state matters — monitoring, chat</td></tr>
+<tr><td><b>Compaction</b></td><td>One model call, plus a cache reset</td><td>Long investigative runs where early findings matter</td></tr>
+<tr><td><b>Externalise to a scratchpad</b></td><td>One tool call per finding</td><td>Long tasks with many discrete facts. The most scalable option</td></tr>
+<tr><td><b>Sub-agent isolation</b></td><td>A whole extra run</td><td>Subtasks that produce a lot of intermediate noise (chapter 10)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>Ordering within the window</h2>
+
+<p>Position matters, and you control it. Three rules, in tension, resolved in this order:</p>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Stable first, for caching</b><span>System prompt, then tool schemas. Byte-identical across every step of the run</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Goal early and restated late</b><span>Models drift from the objective on long runs. A one-line restatement in the last user turn is cheap insurance</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Most recent observations last</b><span>Natural ordering, and the end of the context is where attention is strongest</span></div>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">restating the objective without breaking the cache</span><button class="copy">Copy</button></div>
+<pre><code># WRONG: editing the system prompt invalidates the cache for the rest of the run.
+messages[0]["content"] = SYSTEM + f"\n\nREMINDER: the goal is {goal}"
+
+# RIGHT: append at the end, where nothing downstream is cached anyway.
+if step > 6 and step % 4 == 0:
+    messages.append({"role": "user", "content":
+        f"Reminder — the objective is: {goal}. "
+        f"You have {budget.max_steps - step} steps left. "
+        f"If you cannot complete it, say what you established and stop."})
+
+# Note this also arrives at the position the model attends to most strongly,
+# which is why it works better than the version that feels more correct.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Diagnosing context problems</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Follows rules early, ignores them by step 10</td><td>Attention dilution</td><td>Restate constraints in a late turn; compact; shorten observations</td></tr>
+<tr><td>Repeats a lookup it already did</td><td>The earlier result is buried or was truncated away</td><td>Externalise findings; per-run tool cache</td></tr>
+<tr><td>Reports superseded information</td><td>Stale facts still present and unmarked</td><td>Compaction that explicitly notes what changed; findings that overwrite by key</td></tr>
+<tr><td>Hard failure mid-run</td><td>Overflow with no strategy</td><td>Any strategy. Overflow should be impossible, not handled</td></tr>
+<tr><td>Cost per step climbing steeply</td><td>Unbounded observations plus no caching</td><td>Caps on every tool; stable prefix</td></tr>
+<tr><td>Loses the objective, wanders</td><td>Goal is 40,000 tokens back</td><td>Periodic restatement with remaining budget</td></tr>
+<tr><td>Latency creeping up per step</td><td>Prefill on a growing context</td><td>Compaction; prompt caching; shorter observations</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Dump the context at step ten and read it</span>
+  <p>Not the summary, not the trace view — the literal string that went to the model on a real long run. It is a striking exercise. You will find a 3,000-token HTML dump nobody needed, the same customer record fetched three times, a tool schema for something that was never going to be called, and a critical constraint buried 40,000 tokens from the decision it was meant to govern. Every one of those is a fix you can make this afternoon, and together they usually matter more than any architectural change.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Five components; only <b>observations grow without bound</b>. Almost all context work is observation work.</li>
+    <li>Big windows removed the crash, not the decay: <b>attention dilutes, stale facts persist, cost scales</b>.</li>
+    <li>Treat the window as a <b>working set, not a log</b>. Tidy and small beats complete and large on accuracy, latency and cost at once.</li>
+    <li><b>Cap every tool result</b>, and truncate with a marker that says how much is missing and how to get it.</li>
+    <li>Compact <b>rarely and decisively</b> at a threshold — it resets your prompt cache, so incremental trimming is the wrong shape.</li>
+    <li><b>Realign tool pairs</b> when slicing, or long runs fail with a confusing provider error.</li>
+    <li><b>Externalising findings to a scratchpad</b> is the most scalable technique and the least used.</li>
+    <li>Restate the objective in a <b>late turn, never by editing the system prompt</b>.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("07-context.html");
+
+(function(){
+  const root = document.getElementById("ctx");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  function render(){
+    const limit = parseInt($("x-limit").value, 10) * 1000;
+    const obs   = parseInt($("x-obs").value, 10);
+    const steps = parseInt($("x-steps").value, 10);
+    const strat = $("x-strat").value;
+    $("x-limitv").textContent = parseInt($("x-limit").value, 10);
+    $("x-obsv").textContent = obs;
+    $("x-stepsv").textContent = steps;
+
+    const BASE = 1200 + 8 * 180;      // system prompt + 8 tool schemas
+    const ASSIST = 180;
+
+    let ctx = BASE + 120;
+    let cost = 0, overflowed = 0, compactions = 0;
+    let earlyRetained = true;
+    const series = [];
+
+    const obsSize = strat === "trunc" ? Math.min(obs, 600)
+                  : strat === "extern" ? Math.min(obs, 500)
+                  : obs;
+
+    const perStep = [];   // token cost of each retained step, for windowing
+
+    for(let i = 1; i <= steps; i++){
+      const added = ASSIST + obsSize + (strat === "extern" ? 90 : 0);
+      ctx += added;
+      perStep.push(added);
+
+      if(strat === "window" && perStep.length > 6){
+        // Evict the oldest step beyond the last six.
+        const dropped = perStep.shift();
+        ctx -= dropped;
+        if(i > 7) earlyRetained = false;
+      }
+
+      if(strat === "extern"){
+        // Findings index grows slowly; the bulk of the observation is dropped
+        // two steps after it was produced.
+        if(perStep.length > 3){
+          const dropped = perStep.shift();
+          ctx -= dropped - 40;      // 40 tokens stay as an index line
+        }
+      }
+
+      if(strat === "compact" && ctx > limit * 0.70){
+        const before = ctx;
+        ctx = BASE + 120 + 700 + perStep.slice(-6).reduce((a,b)=>a+b, 0);
+        perStep.splice(0, Math.max(0, perStep.length - 6));
+        compactions++;
+        cost += 0.012;               // the summarisation call
+        series.push([i, before, "compact"]);
+      }
+
+      if(ctx > limit){
+        overflowed = i;
+        series.push([i, ctx, "overflow"]);
+        break;
+      }
+
+      cost += ctx / 1e6 * 3 + ASSIST / 1e6 * 15;
+      series.push([i, ctx, "ok"]);
+    }
+
+    $("x-final").textContent  = (ctx / 1000).toFixed(1) + "k";
+    $("x-status").textContent = overflowed ? "failed @ " + overflowed : "completed";
+    $("x-keep").textContent   = strat === "window" && steps > 7 ? "no"
+                              : strat === "compact" ? "summarised"
+                              : strat === "extern" ? "yes, indexed" : "yes";
+    $("x-cost").textContent   = "$" + cost.toFixed(3);
+
+    const max = Math.max.apply(null, series.map(s => s[1]));
+    $("x-bars").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">Context size per step</div>' +
+      series.filter((_, i) => steps <= 22 || i % 2 === 0).map(([i, v, kind]) =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">' +
+        '<span style="min-width:56px;font-size:12.5px;color:#54677A">step ' + i + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + Math.min(100, v/Math.max(max,limit)*100).toFixed(0) +
+        '%' + (kind === "overflow" ? ';background:#E2574C' : kind === "compact" ? ';background:#F2A03D' : '') +
+        '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:52px;text-align:right">' +
+        (v/1000).toFixed(1) + 'k</span></div>').join("");
+
+    const notes = [];
+    if(overflowed)
+      notes.push("The run failed at step " + overflowed + " — the context exceeded " + (limit/1000) +
+                 "k and the provider rejected the request. Note this happens mid-task, after real work was done and paid for, and returns nothing. " +
+                 "Overflow should be structurally impossible, not an error you handle.");
+
+    if(strat === "none")
+      notes.push("No strategy: every observation is carried forever. This is the default if you write the loop from chapter 2 and stop there, " +
+                 "and it works fine until the day someone asks a question that takes fifteen steps.");
+    if(strat === "trunc")
+      notes.push("Truncating observations to 600 tokens is the cheapest intervention and often enough on its own. " +
+                 "The marker matters as much as the cut: the model needs to know something was omitted and how to retrieve it.");
+    if(strat === "window")
+      notes.push("A six-step sliding window keeps the context flat, but findings from step 2 are gone by step 9 — " +
+                 "so the agent re-looks-up things it already knew, or worse, concludes they do not exist. " +
+                 "Suits monitoring and chat; poor for investigations.");
+    if(strat === "compact")
+      notes.push(compactions + " compaction" + (compactions === 1 ? "" : "s") +
+                 " triggered at 70% of budget. Each costs a model call and resets the prompt cache — visible as the orange spike. " +
+                 "That is why it should fire rarely and decisively rather than trimming every step.");
+    if(strat === "extern")
+      notes.push("Externalising keeps the working set nearly flat while retaining every finding, because the bulk of each observation is dropped " +
+                 "two steps after producing a 40-token index line. The cost is one extra tool call per finding, and a scratchpad to store them. " +
+                 "This is the technique that scales furthest.");
+
+    if(obs > 2000)
+      notes.push("At " + obs + " tokens per observation, the tool returns are the whole problem. Before choosing a context strategy, " +
+                 "go back to chapter 4 and shape those results — the cheapest token is the one never returned.");
+
+    $("x-note").textContent = notes.join("\n\n");
+  }
+
+  ["x-limit","x-obs","x-steps","x-strat"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

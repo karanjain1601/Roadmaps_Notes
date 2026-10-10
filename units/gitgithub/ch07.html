@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Diffs and patches — Git &amp; GitHub</title>
+<meta name="description" content="Unified diff anatomy, diff algorithms compared with real implementations, word diffs, rename detection, format-patch and am and apply, and range-diff.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M8 24V11a3 3 0 013-3h10' stroke='%237C8CF8' stroke-width='2.5' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='8' cy='24' r='3' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='23' cy='8' r='3' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch07">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Git &amp; GitHub
+    </a>
+    <div class="chno"><b>Chapter 07</b><span>Everyday Git</span></div>
+    <h1>Diffs and patches</h1>
+    <p class="lede">Chapter 2 established that Git stores no diffs — every one you see was computed on demand, by an algorithm, with choices. <b>Different algorithms produce different diffs of the same change</b>, one of them much easier to read. And a diff written to a file becomes a patch, which is how code moved between people for twenty years before pull requests existed.</p>
+    <div class="meta"><span>26 min</span><span>2 demos</span><span>7 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="anatomy">
+      <h2 data-nav="Diff anatomy">Anatomy of a unified diff</h2>
+      <p class="sub">Six kinds of line, each meaning exactly one thing.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">git diff, annotated</span><button class="copy">Copy</button></div>
+<pre data-lang="diff">diff --git a/src/auth/token.js b/src/auth/token.js
+index a45bd4f..7d9f3c2 100644
+--- a/src/auth/token.js
++++ b/src/auth/token.js
+@@ -14,7 +14,8 @@ function validateToken(raw) {
+   const parsed = parse(raw)
+-  if (parsed.exp &lt; now()) {
+-    throw new Error("bad token")
++  if (!parsed) return null
++  if (parsed.exp &lt; now()) {
++    throw new ExpiredToken()
+   }
+   return parsed
+ }</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Line</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>diff --git a/… b/…</code></td><td>Git's own header. <code>a/</code> is the old side, <code>b/</code> the new; they are prefixes, not directories.</td></tr>
+            <tr><td><code>index a45bd4f..7d9f3c2 100644</code></td><td>The <em>blob hashes</em> of both sides and the file mode. This is what makes a Git patch applicable with three-way merging later.</td></tr>
+            <tr><td><code>--- </code> / <code>+++</code></td><td>Old and new paths. <code>/dev/null</code> on either side means the file was added or deleted.</td></tr>
+            <tr><td><code>@@ -14,7 +14,8 @@</code></td><td>Hunk header: old side starts at line 14 and spans 7 lines; new side starts at 14 and spans 8.</td></tr>
+            <tr><td>Text after <code>@@</code></td><td>The enclosing function, found by a heuristic (configurable per language with <code>diff.*.xfuncname</code>).</td></tr>
+            <tr><td>Leading space / <code>-</code> / <code>+</code></td><td>Context, removed, added. Context appears on both sides and is what makes the patch relocatable.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">changing what you get</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ git diff -U10                # ten lines of context instead of three
+$ git diff -U0                 # no context; compact, and much harder to apply
+$ git diff --no-prefix         # drop a/ and b/ — for tools that expect plain paths
+$ git diff --function-context  # expand each hunk to whole functions
+$ git diff --stat --summary    # counts, plus mode changes and renames</pre>
+      </div>
+      <p>Three lines of context is the default because it is the minimum that reliably lets a patch be applied to a file that has drifted slightly. <code>-U0</code> makes a patch that only applies to the exact file it came from.</p>
+    </section>
+
+    <section id="algorithms">
+      <h2 data-nav="Algorithms">Algorithms, and why your diff looks wrong</h2>
+      <p class="sub">Every diff is a guess about intent, and some guesses are better.</p>
+      <p>Given two versions of a file, there are many valid edit scripts that transform one into the other. Finding the <em>shortest</em> one is a well-defined problem — the longest common subsequence — and Git's default <code>myers</code> algorithm solves it. The trouble is that "shortest" and "most readable" are not the same thing: when a file contains many identical lines like <code>}</code> or blank lines, the shortest script happily matches your new closing brace with somebody else's, and the diff attributes your change to the wrong function.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Setting</th><th>Approach</th><th>Character</th></tr></thead>
+          <tbody>
+            <tr><td><code>myers</code></td><td>Shortest edit script (default)</td><td>Fast, optimal in size, occasionally nonsense on repetitive code</td></tr>
+            <tr><td><code>minimal</code></td><td>Myers, working harder for the smallest possible result</td><td>Slower, rarely more readable</td></tr>
+            <tr><td><code>patience</code></td><td>Match only lines that are <em>unique</em> on both sides, use them as anchors</td><td>Ignores noise lines; aligns real structure</td></tr>
+            <tr><td><code>histogram</code></td><td>Patience, extended to handle low-frequency repeated lines</td><td>Patience's readability at close to Myers' speed — the one to set</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Unified diff, computed live</h3>
+          <span class="hint">Two algorithms, both implemented here, with real hunk headers and a context width you control</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight" id="a-presets"></div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:11px">
+            <div>
+              <label for="a-old" style="display:block;font-size:13px;color:var(--text-2);margin-bottom:5px">before</label>
+              <textarea id="a-old" class="field" rows="9" spellcheck="false"></textarea>
+            </div>
+            <div>
+              <label for="a-new" style="display:block;font-size:13px;color:var(--text-2);margin-bottom:5px">after</label>
+              <textarea id="a-new" class="field" rows="9" spellcheck="false"></textarea>
+            </div>
+          </div>
+          <div class="ctrl" style="margin:12px 0 0">
+            <label for="a-ctx">context lines (<code>-U</code>) <b id="a-ctxv" style="font-variant-numeric:tabular-nums">3</b></label>
+            <input type="range" id="a-ctx" min="0" max="5" value="3" style="width:130px">
+          </div>
+          <div id="a-cols" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(255px,1fr));gap:11px;margin-top:10px"></div>
+          <div class="rgrid" id="a-out"></div>
+          <p class="readout" id="a-note"></p>
+        </div>
+      </div>
+
+      <div class="tip">
+        <span class="lbl">What to actually set</span>
+        <p><code>git config --global diff.algorithm histogram</code>. Every algorithm here produces a correct patch — this is purely about the human reading it, which is most of what a diff is for. Two honest caveats. Git's <code>myers</code> is not a textbook LCS: its tie-breaking, plus <code>--indent-heuristic</code> (on by default since 2.14), already avoids many of these artifacts, so the gap is smaller than older write-ups suggest. And the divergence grows with file size and repetition — on a six-line example the algorithms almost always agree, as the demo will show you.</p>
+      </div>
+    </section>
+
+    <section id="whitespace">
+      <h2 data-nav="Whitespace and words">Whitespace, words and moved code</h2>
+      <p class="sub">Four flags that turn an unreadable diff into a reviewable one.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">seeing through the noise</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ git diff -w                        # ignore all whitespace changes
+$ git diff --ignore-blank-lines      # ignore added/removed empty lines
+$ git diff --word-diff               # mark changes within a line, not whole lines
+$ git diff --word-diff-regex='\w+'   # define what a "word" is
+$ git diff --color-moved=zebra       # show moved blocks in a distinct colour
+$ git diff --color-moved-ws=allow-indentation-change   # ...even if re-indented</pre>
+      </div>
+      <p><code>--word-diff</code> is transformative for prose, YAML and long lines — a one-character change stops rendering as a removed line plus an added line:</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">--word-diff on a config change</span><button class="copy">Copy</button></div>
+<pre data-lang="diff">-timeout: 30
++timeout: 60
+</pre>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">the same change, word diff</span><button class="copy">Copy</button></div>
+<pre data-lang="text">timeout: [-30-]{+60+}</pre>
+      </div>
+      <p><code>--color-moved</code> is the one to reach for when reviewing a refactor. A pull request that moves 400 lines between files and changes three of them is unreviewable by default; with move detection on, the moved blocks are dimmed as a class and the three real changes stand out. Turn it on permanently with <code>diff.colorMoved = zebra</code>.</p>
+    </section>
+
+    <section id="renames">
+      <h2 data-nav="Renames">Rename and copy detection</h2>
+      <p class="sub">Git stores no rename information. Every rename you see was inferred.</p>
+      <p>Chapter 2 established that a blob has no name. So when a file appears at a new path and disappears from an old one, Git compares content and decides whether to call it a rename. The threshold is a similarity percentage:</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">a detected rename</span><button class="copy">Copy</button></div>
+<pre data-lang="diff">diff --git a/src/auth.js b/src/auth/token.js
+similarity index 91%
+rename from src/auth.js
+rename to src/auth/token.js
+index a45bd4f..7d9f3c2 100644</pre>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">tuning it</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ git diff -M                     # detect renames (on by default since 2.9)
+$ git diff --find-renames=40%     # be more willing to call it a rename
+$ git diff -C -C                  # also detect copies, searching all files
+$ git log --follow -- new/path    # follow one file's history back through renames
+$ git diff --no-renames           # show them as a delete plus an add</pre>
+      </div>
+      <p>Two consequences. First, a rename combined with heavy editing crosses below the threshold and shows up as an unrelated delete and add, losing the file's history in <code>--follow</code>; committing the rename separately from the edits avoids this entirely. Second, <code>git log --follow</code> only accepts a single path, because the inference is per-file — there is no repository-wide rename log to consult.</p>
+    </section>
+
+    <section id="patches">
+      <h2 data-nav="Patches">Patches: diffs as a transport</h2>
+      <p class="sub">Write a diff to a file and it becomes something you can email.</p>
+      <p>Two ways to produce one, and they are not interchangeable:</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th></th><th><code>git diff &gt; x.patch</code></th><th><code>git format-patch</code></th></tr></thead>
+          <tbody>
+            <tr><td>Contains</td><td>Just the changes</td><td>One file per commit, with author, date, message and a signature</td></tr>
+            <tr><td>Applied with</td><td><code>git apply</code></td><td><code>git am</code> — which recreates the commits</td></tr>
+            <tr><td>Preserves authorship</td><td class="no">no</td><td class="yes">yes</td></tr>
+            <tr><td>Use for</td><td>Moving uncommitted work; sharing a snippet</td><td>Contributing commits without a shared remote</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">producing patches</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ git diff &gt; wip.patch                    # unstaged changes
+$ git diff --staged &gt; staged.patch        # staged changes
+$ git format-patch -3                     # the last three commits, one file each
+$ git format-patch main..feature          # every commit the branch adds
+$ git format-patch --stdout main..feature &gt; series.mbox     # one mailbox file
+$ git format-patch --cover-letter -3      # plus a 0000-cover-letter.patch to fill in</pre>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">applying them</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ git apply --check wip.patch      # dry run: will this apply cleanly?
+$ git apply --stat wip.patch       # what does it claim to change?
+$ git apply wip.patch              # apply to the working tree only
+$ git apply --index wip.patch      # ...and stage it at the same time
+$ git apply --3way wip.patch       # fall back to a three-way merge, leaving conflicts
+$ git apply --reject wip.patch     # apply what fits, write the rest to .rej files
+
+$ git am 0001-fix-thing.patch      # recreate the commit, preserving authorship
+$ git am -3 series.mbox            # with three-way fallback
+$ git am --abort                   # give up and restore the branch
+$ git am --skip                    # skip this patch, continue the series</pre>
+      </div>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Patch application simulator</h3>
+          <span class="hint">Real context matching: exact, then offset search, then three-way fallback</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:96px">Target has drifted</span>
+            <span id="x-drift" style="display:flex;flex-wrap:wrap;gap:8px"></span>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(238px,1fr));gap:11px">
+            <div>
+              <div style="font-size:12px;color:var(--text-2);margin-bottom:5px">the patch (generated from the original file)</div>
+              <div class="term" id="x-patch" style="min-height:auto"></div>
+            </div>
+            <div>
+              <div style="font-size:12px;color:var(--text-2);margin-bottom:5px">src/app.js as it exists now</div>
+              <div class="term" id="x-file" style="min-height:auto"></div>
+            </div>
+          </div>
+          <div class="term" id="x-term" style="margin-top:11px"></div>
+          <div class="rgrid" id="x-out"></div>
+          <p class="readout" id="x-note"></p>
+        </div>
+      </div>
+
+      <div class="note">
+        <span class="lbl">Why three-way works when plain apply fails</span>
+        <p>The <code>index a45bd4f..7d9f3c2</code> line in a Git-generated patch names the blob the patch was made against. If your repository happens to contain that blob — likely, if you share history — <code>--3way</code> can perform a real merge between the original, the patched version and your current file, exactly like merging a branch. Plain <code>apply</code> has only text matching to work with, so it either finds the context or gives up. This is also why <code>git apply --3way</code> can leave conflict markers, while plain <code>apply</code> never does.</p>
+      </div>
+    </section>
+
+    <section id="rangediff">
+      <h2 data-nav="Comparing versions">Comparing two versions of a change</h2>
+      <p class="sub">The tool for reviewing a force-pushed branch.</p>
+      <p>Someone rewrites a branch and force-pushes. Every commit has a new hash, so a plain diff of the two tips tells you nothing about what actually changed between the two <em>versions of the work</em>. <code>git range-diff</code> compares two commit ranges pairwise and diffs the diffs:</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">git range-diff</span><button class="copy">Copy</button></div>
+<pre data-lang="text">$ git range-diff main old-feature main new-feature
+1:  a1b2c3d = 1:  9f8e7d6 Add token parser
+2:  b2c3d4e ! 2:  8e7d6c5 Return 401 for expired tokens
+    @@ -14,7 +14,7 @@ function validateToken(raw) {
+       const parsed = parse(raw)
+     -  if (parsed.exp < now()) {
+     -    throw new Error("bad token")
+     +  if (parsed.exp <= now()) {
+     +    throw new ExpiredToken()
+3:  --------- > 3:  7d6c5b4 Add regression test</pre>
+      </div>
+      <p>Read the markers: <code>=</code> means unchanged, <code>!</code> means this commit's content changed and shows how, <code>&gt;</code> means newly added, <code>&lt;</code> means dropped. In one screen you can see that commit 1 is untouched, commit 2 changed a comparison operator, and a test was added — which is precisely what a reviewer needs after a rewrite.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">shorthands</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ git range-diff @{u}...HEAD        # my branch before and after I rebased it
+$ git range-diff main old..new      # explicit bases
+
+# on GitHub, the "force-pushed" timeline entry links to the equivalent comparison</pre>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 07 in seven lines</h2>
+        <ul>
+          <li>A hunk header <code>@@ -14,7 +14,8 @@</code> gives start line and length on each side; the <code>index</code> line gives the <b>blob hashes</b>, which is what enables three-way application later.</li>
+          <li>Three lines of context is the default because it is the minimum that lets a patch survive a slightly drifted file. <code>-U0</code> produces a patch that applies nowhere else.</li>
+          <li>Diffs are computed, and the algorithm matters: set <code>diff.algorithm histogram</code> to stop your closing braces being matched with someone else's.</li>
+          <li><code>-w</code>, <code>--word-diff</code> and <code>--color-moved</code> turn a refactor from unreviewable into readable.</li>
+          <li>Renames are <b>inferred by similarity</b>, not recorded, so commit a rename separately from heavy edits or the history link is lost.</li>
+          <li><code>git diff</code> + <code>git apply</code> moves changes; <code>format-patch</code> + <code>am</code> moves <b>commits</b>, with authorship and messages intact.</li>
+          <li><code>git range-diff</code> compares two versions of the same series — the right tool after a force-push.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary>A colleague sends a patch file. <code>git apply</code> fails with "patch does not apply", but <code>git apply --3way</code> succeeds. What was different?</summary>
+        <div class="ans"><p>Plain <code>apply</code> is pure text matching: it needs the context lines to be present, at the stated position or a small offset away. Your file had drifted enough that the context no longer matched. <code>--3way</code> reads the blob hashes from the patch's <code>index</code> line, finds that original blob in your object store, and performs a genuine three-way merge between it, the patched result and your current file — which succeeds whenever the drift and the patch touch different lines, and leaves conflict markers when they overlap.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Why does a diff sometimes show a closing brace being removed and added in a place you didn't edit?</summary>
+        <div class="ans"><p>Because <code>}</code> appears many times in the file and a minimal edit script is free to pair any occurrence with any other. The algorithm optimises for the fewest changed lines, not for matching structure, so it can pick a pairing that is minimal and semantically wrong. Patience and histogram avoid it by anchoring only on lines that are <em>unique on both sides</em>, which repetitive syntax lines never are. The demo shows the ambiguity directly: on its constructed fixture the two algorithms emit different scripts for the same change, both valid, differing only in which repeated line they treat as unchanged.</p></div>
+      </details>
+      <details class="chk">
+        <summary>You want to send three commits to a project with no write access and no pull request workflow. Which commands, and why not <code>git diff</code>?</summary>
+        <div class="ans"><p><code>git format-patch -3</code> (or <code>--stdout</code> into one mailbox), then the maintainer runs <code>git am</code>. A plain <code>git diff</code> would flatten all three commits into one anonymous blob of changes: no messages, no separation, and you would not be recorded as the author — <code>am</code> recreates each commit with your name, date and message, and the maintainer appears only as committer.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A pull request you already reviewed gets force-pushed. What do you run to see what changed since your review?</summary>
+        <div class="ans"><p><code>git range-diff</code> between the two versions, for example <code>git range-diff main old-sha..new-sha</code> after saving the old tip (or using your reflog / <code>origin/feature@{1}</code>). It pairs up commits across the rewrite and shows a diff-of-diffs, so you see that four commits are identical and one changed a single line — rather than re-reviewing the whole branch because every hash is new.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Chapter 8 closes Part 2 with undoing: restore, reset, revert, clean and reflog recovery, plus what happens to your colleagues when you rewrite something you already pushed.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li><code>git diff --stat</code> then <code>git diff --stat --diff-algorithm=histogram</code> on a messy change.</li>
+        <li><code>git format-patch -1 --stdout | head -30</code>.</li>
+        <li><code>git diff --color-moved=zebra</code> on a refactor.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p><code>git help diff</code>, <code>git help apply</code>, <code>git help am</code>, <code>git help range-diff</code>; Bram Cohen's patience diff notes; Myers (1986) on the shortest edit script.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — two real diff algorithms on the same input
+   ============================================================ */
+(function () {
+  var FIXTURES = {
+    "insert a function": [
+      "function a() {\n  return 1;\n}\n\nfunction b() {\n  return 2;\n}",
+      "function a() {\n  return 1;\n}\n\nfunction c() {\n  return 3;\n}\n\nfunction b() {\n  return 2;\n}"
+    ],
+    "two edits, far apart": [
+      "server:\n  host: localhost\n  port: 8080\n  tls: off\n  workers: 2\n  logfile: app.log\ncache:\n  host: localhost\n  port: 6379",
+      "server:\n  host: 0.0.0.0\n  port: 8080\n  tls: off\n  workers: 2\n  logfile: app.log\ncache:\n  host: localhost\n  port: 6380"
+    ],
+    "repeated lines (constructed)": [
+      "  }\n  }\n  }\n",
+      "  }\n  }\n\n  }\nfinalise()"
+    ]
+  };
+
+  var oldBox = document.getElementById("a-old");
+  var newBox = document.getElementById("a-new");
+  var cols = document.getElementById("a-cols");
+  var out = document.getElementById("a-out");
+  var note = document.getElementById("a-note");
+
+  Object.keys(FIXTURES).forEach(function (k, i) {
+    var b = document.createElement("button");
+    b.className = "btn" + (i === 0 ? " on" : "");
+    b.textContent = k;
+    b.addEventListener("click", function () {
+      Array.prototype.forEach.call(document.querySelectorAll("#a-presets .btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      oldBox.value = FIXTURES[k][0];
+      newBox.value = FIXTURES[k][1];
+      render();
+    });
+    document.getElementById("a-presets").appendChild(b);
+  });
+  oldBox.value = FIXTURES["insert a function"][0];
+  newBox.value = FIXTURES["insert a function"][1];
+
+  /* ---- longest common subsequence, the classic dynamic program ---- */
+  function lcsOps(a, b) {
+    var n = a.length, m = b.length;
+    var dp = [];
+    for (var i = 0; i <= n; i++) dp.push(new Int32Array(m + 1));
+    for (i = n - 1; i >= 0; i--) {
+      for (var j = m - 1; j >= 0; j--) {
+        dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+    var ops = [];
+    i = 0; j = 0;
+    while (i < n && j < m) {
+      if (a[i] === b[j]) { ops.push({ t: " ", s: a[i] }); i++; j++; }
+      else if (dp[i + 1][j] >= dp[i][j + 1]) { ops.push({ t: "-", s: a[i] }); i++; }
+      else { ops.push({ t: "+", s: b[j] }); j++; }
+    }
+    while (i < n) { ops.push({ t: "-", s: a[i++] }); }
+    while (j < m) { ops.push({ t: "+", s: b[j++] }); }
+    return ops;
+  }
+
+  /* ---- patience: anchor on lines unique to both sides ---- */
+  function uniqueMatches(a, b, ai, aj, bi, bj) {
+    var ca = {}, cb = {}, pa = {}, pb = {};
+    for (var i = ai; i < aj; i++) { ca[a[i]] = (ca[a[i]] || 0) + 1; pa[a[i]] = i; }
+    for (var j = bi; j < bj; j++) { cb[b[j]] = (cb[b[j]] || 0) + 1; pb[b[j]] = j; }
+    var pairs = [];
+    Object.keys(ca).forEach(function (line) {
+      if (ca[line] === 1 && cb[line] === 1) pairs.push([pa[line], pb[line]]);
+    });
+    pairs.sort(function (x, y) { return x[0] - y[0]; });
+    return pairs;
+  }
+  function longestIncreasing(pairs) {
+    if (!pairs.length) return [];
+    var best = [], prev = [];
+    for (var i = 0; i < pairs.length; i++) {
+      best[i] = 1; prev[i] = -1;
+      for (var j = 0; j < i; j++) {
+        if (pairs[j][1] < pairs[i][1] && best[j] + 1 > best[i]) { best[i] = best[j] + 1; prev[i] = j; }
+      }
+    }
+    var end = 0;
+    for (i = 1; i < pairs.length; i++) if (best[i] > best[end]) end = i;
+    var seq = [];
+    while (end !== -1) { seq.unshift(pairs[end]); end = prev[end]; }
+    return seq;
+  }
+  function patienceOps(a, b) {
+    var ops = [];
+    walk(0, a.length, 0, b.length);
+    return ops;
+
+    function walk(ai, aj, bi, bj) {
+      /* common prefix */
+      while (ai < aj && bi < bj && a[ai] === b[bi]) { ops.push({ t: " ", s: a[ai] }); ai++; bi++; }
+      /* common suffix, held back until the middle is emitted */
+      var tail = [];
+      while (ai < aj && bi < bj && a[aj - 1] === b[bj - 1]) { tail.unshift({ t: " ", s: a[aj - 1] }); aj--; bj--; }
+
+      if (ai === aj) {
+        for (var j = bi; j < bj; j++) ops.push({ t: "+", s: b[j] });
+      } else if (bi === bj) {
+        for (var i = ai; i < aj; i++) ops.push({ t: "-", s: a[i] });
+      } else {
+        var anchors = longestIncreasing(uniqueMatches(a, b, ai, aj, bi, bj));
+        if (!anchors.length) {
+          /* no unique line to anchor on — fall back to LCS for this region */
+          lcsOps(a.slice(ai, aj), b.slice(bi, bj)).forEach(function (o) { ops.push(o); });
+        } else {
+          var pa2 = ai, pb2 = bi;
+          anchors.forEach(function (m) {
+            walk(pa2, m[0], pb2, m[1]);
+            ops.push({ t: " ", s: a[m[0]] });
+            pa2 = m[0] + 1; pb2 = m[1] + 1;
+          });
+          walk(pa2, aj, pb2, bj);
+        }
+      }
+      tail.forEach(function (o) { ops.push(o); });
+    }
+  }
+
+  /* ---- unified hunks with real line numbers ---- */
+  function toHunks(ops, ctx) {
+    var rows = [], oldLine = 1, newLine = 1;
+    ops.forEach(function (o) {
+      rows.push({ t: o.t, s: o.s, o: o.t !== "+" ? oldLine : null, n: o.t !== "-" ? newLine : null });
+      if (o.t !== "+") oldLine++;
+      if (o.t !== "-") newLine++;
+    });
+    var changed = rows.map(function (r, i) { return r.t !== " " ? i : -1; }).filter(function (i) { return i >= 0; });
+    if (!changed.length) return [];
+    var groups = [[changed[0]]];
+    for (var k = 1; k < changed.length; k++) {
+      if (changed[k] - groups[groups.length - 1][groups[groups.length - 1].length - 1] <= ctx * 2 + 1) {
+        groups[groups.length - 1].push(changed[k]);
+      } else groups.push([changed[k]]);
+    }
+    return groups.map(function (g) {
+      var from = Math.max(0, g[0] - ctx);
+      var to = Math.min(rows.length - 1, g[g.length - 1] + ctx);
+      var slice = rows.slice(from, to + 1);
+      var oldStart = null, newStart = null, oldCount = 0, newCount = 0;
+      slice.forEach(function (r) {
+        if (r.o !== null) { if (oldStart === null) oldStart = r.o; oldCount++; }
+        if (r.n !== null) { if (newStart === null) newStart = r.n; newCount++; }
+      });
+      return {
+        header: "@@ -" + (oldStart || 0) + "," + oldCount + " +" + (newStart || 0) + "," + newCount + " @@",
+        rows: slice
+      };
+    });
+  }
+
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+
+  function panel(title, sub, hunks, ops) {
+    var box = document.createElement("div");
+    box.style.cssText = "border:1px solid var(--rule-2);border-radius:5px;overflow:hidden";
+    var h = document.createElement("div");
+    h.style.cssText = "padding:8px 11px;background:#F4F6F8;border-bottom:1px solid var(--rule-2)";
+    var add = ops.filter(function (o) { return o.t === "+"; }).length;
+    var del = ops.filter(function (o) { return o.t === "-"; }).length;
+    h.innerHTML = '<div style="font-size:13px;font-weight:700">' + title + "</div>" +
+      '<div style="font-size:11.5px;color:var(--text-2);margin-top:2px">' + sub + " · " +
+      hunks.length + " hunk" + (hunks.length === 1 ? "" : "s") + ", +" + add + " −" + del + "</div>";
+    box.appendChild(h);
+    var pre = document.createElement("div");
+    pre.className = "term";
+    pre.style.cssText = "border-radius:0;min-height:auto";
+    var lines = [];
+    if (!hunks.length) lines.push('<span class="d">(no differences)</span>');
+    hunks.forEach(function (hk) {
+      lines.push('<span class="y">' + hk.header + "</span>");
+      hk.rows.forEach(function (r) {
+        var cls = r.t === "+" ? "g" : r.t === "-" ? "r" : "d";
+        lines.push('<span class="' + cls + '">' + r.t + esc(r.s) + "</span>");
+      });
+    });
+    pre.innerHTML = lines.join("\n");
+    box.appendChild(pre);
+    return box;
+  }
+
+  function render() {
+    var a = oldBox.value.split("\n");
+    var b = newBox.value.split("\n");
+    var ctx = parseInt(document.getElementById("a-ctx").value, 10);
+    document.getElementById("a-ctxv").textContent = ctx;
+    var l = lcsOps(a, b);
+    var p = patienceOps(a, b);
+    var lh = toHunks(l, ctx), ph = toHunks(p, ctx);
+
+    cols.innerHTML = "";
+    cols.appendChild(panel("myers / LCS", "shortest edit script", lh, l));
+    cols.appendChild(panel("patience / histogram", "anchored on unique lines", ph, p));
+
+    var lc = l.filter(function (o) { return o.t !== " "; }).length;
+    var pc = p.filter(function (o) { return o.t !== " "; }).length;
+    var sig = function (ops) { return ops.map(function (o) { return o.t + o.s; }).join("|"); };
+    var agree = sig(l) === sig(p);
+    var hunksAt = function (ops, u) { return toHunks(ops, u).length; };
+
+    /* verify both edit scripts actually reconstruct the new file */
+    var check = function (ops) {
+      return ops.filter(function (o) { return o.t !== "-"; }).map(function (o) { return o.s; }).join("\n") === b.join("\n") &&
+        ops.filter(function (o) { return o.t !== "+"; }).map(function (o) { return o.s; }).join("\n") === a.join("\n");
+    };
+    var valid = check(l) && check(p);
+
+    out.innerHTML = "";
+    tile("Changed lines", lc === pc ? String(lc) : lc + " / " + pc, lc === pc ? "both" : "LCS / patience");
+    tile("Hunks at U=" + ctx, lh.length === ph.length ? String(lh.length) : lh.length + " / " + ph.length, "", true);
+    tile("Hunks at U=0", String(hunksAt(l, 0)), "same change");
+    tile("Algorithms", agree ? "agree" : "differ", agree ? "same script" : "same file", !agree);
+    tile("Valid patches", valid ? "both" : "NO", "reconstruct the file", valid);
+
+    var ctxNote = hunksAt(l, 0) !== lh.length
+      ? " Note the hunk counts: this change is <b>" + hunksAt(l, 0) + " hunks at U=0</b> and <b>" + lh.length +
+        "</b> at U=" + ctx + " — widening the context merges nearby hunks, which is also what gives a patch something to match against when the target file has drifted."
+      : "";
+
+    note.innerHTML = (agree
+      ? "Both algorithms produced the <b>identical edit script</b> here, which is the usual outcome: when the lines around a change are distinct there is only one sensible way to pair them up. They can only diverge where a file contains repeated lines — load the <b>constructed</b> fixture for a case that does."
+      : "The two scripts <b>differ</b> while describing the same final file, and the change counts are " +
+        (lc === pc ? "identical (" + lc + " lines each)" : lc + " and " + pc) +
+        ". They disagree about <i>which occurrence</i> of a repeated line counts as unchanged. That ambiguity is the whole reason patience and histogram exist: on a large file full of <code>}</code> and blank lines, an arbitrary pairing is what makes a diff attribute your edit to the wrong block.") + ctxNote;
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  oldBox.addEventListener("input", render);
+  newBox.addEventListener("input", render);
+  document.getElementById("a-ctx").addEventListener("input", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — patch application: exact, offset, three-way
+   ============================================================ */
+(function () {
+  var ORIGINAL = [
+    "import { parse } from './jwt'",
+    "",
+    "export function validateToken(raw) {",
+    "  const parsed = parse(raw)",
+    "  if (parsed.exp < now()) {",
+    "    throw new Error('bad token')",
+    "  }",
+    "  return parsed",
+    "}"
+  ];
+  /* the patch: replace lines 5-6 with three new lines, 3 lines of context each side */
+  var PATCH = {
+    oldStart: 3,
+    pre: ["export function validateToken(raw) {", "  const parsed = parse(raw)"],
+    minus: ["  if (parsed.exp < now()) {", "    throw new Error('bad token')"],
+    plus: ["  if (!parsed) return null", "  if (parsed.exp < now()) {", "    throw new ExpiredToken()"],
+    post: ["  }", "  return parsed", "}"]
+  };
+
+  var DRIFTS = {
+    "not at all": function (f) { return f.slice(); },
+    "3 lines added above": function (f) {
+      return ["// Copyright 2025", "// SPDX-License-Identifier: MIT", ""].concat(f);
+    },
+    "a context line reworded": function (f) {
+      var g = f.slice();
+      g[3] = "  const parsed = parse(raw, { strict: true })";
+      return g;
+    },
+    "the patch is already applied": function (f) {
+      var g = f.slice(0, 4).concat(PATCH.plus, f.slice(6));
+      return g;
+    },
+    "the same lines rewritten": function (f) {
+      var g = f.slice();
+      g[4] = "  if (isExpired(parsed)) {";
+      g[5] = "    throw new TokenError('expired')";
+      return g;
+    }
+  };
+  var drift = "not at all";
+
+  var patchHost = document.getElementById("x-patch");
+  var fileHost = document.getElementById("x-file");
+  var term = document.getElementById("x-term");
+  var out = document.getElementById("x-out");
+  var note = document.getElementById("x-note");
+
+  Object.keys(DRIFTS).forEach(function (k, i) {
+    var b = document.createElement("button");
+    b.className = "btn" + (i === 0 ? " on" : "");
+    b.textContent = k;
+    b.addEventListener("click", function () {
+      drift = k;
+      Array.prototype.forEach.call(document.querySelectorAll("#x-drift .btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      render();
+    });
+    document.getElementById("x-drift").appendChild(b);
+  });
+
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+
+  /* the lines the patch expects to find, in order */
+  function expected() { return PATCH.pre.concat(PATCH.minus, PATCH.post); }
+  function replacement() { return PATCH.pre.concat(PATCH.plus, PATCH.post); }
+
+  function matchAt(file, start) {
+    var exp = expected();
+    if (start < 0 || start + exp.length > file.length) return false;
+    for (var i = 0; i < exp.length; i++) if (file[start + i] !== exp[i]) return false;
+    return true;
+  }
+  function alreadyApplied(file) {
+    var rep = replacement();
+    for (var s = 0; s + rep.length <= file.length; s++) {
+      var ok = true;
+      for (var i = 0; i < rep.length; i++) if (file[s + i] !== rep[i]) { ok = false; break; }
+      if (ok) return true;
+    }
+    return false;
+  }
+
+  function tryApply(file) {
+    var stated = PATCH.oldStart - 1;
+    if (matchAt(file, stated)) return { ok: true, offset: 0, at: stated };
+    for (var d = 1; d <= 25; d++) {
+      if (matchAt(file, stated + d)) return { ok: true, offset: d, at: stated + d };
+      if (matchAt(file, stated - d)) return { ok: true, offset: -d, at: stated - d };
+    }
+    return { ok: false };
+  }
+
+  /* three-way: succeeds when the drift does not touch the lines the patch changes */
+  function tryThreeWay(file) {
+    if (alreadyApplied(file)) return { state: "already" };
+    var region = PATCH.minus;
+    var found = -1;
+    for (var s = 0; s + region.length <= file.length; s++) {
+      var ok = true;
+      for (var i = 0; i < region.length; i++) if (file[s + i] !== region[i]) { ok = false; break; }
+      if (ok) { found = s; break; }
+    }
+    if (found >= 0) return { state: "clean", at: found };
+    return { state: "conflict" };
+  }
+
+  function render() {
+    var file = DRIFTS[drift](ORIGINAL);
+
+    /* the patch, rendered as a real unified diff */
+    var pl = ['<span class="d">--- a/src/app.js</span>', '<span class="d">+++ b/src/app.js</span>'];
+    pl.push('<span class="y">@@ -' + PATCH.oldStart + "," + expected().length + " +" + PATCH.oldStart + "," + replacement().length + " @@</span>");
+    PATCH.pre.forEach(function (l) { pl.push('<span class="d"> ' + esc(l) + "</span>"); });
+    PATCH.minus.forEach(function (l) { pl.push('<span class="r">-' + esc(l) + "</span>"); });
+    PATCH.plus.forEach(function (l) { pl.push('<span class="g">+' + esc(l) + "</span>"); });
+    PATCH.post.forEach(function (l) { pl.push('<span class="d"> ' + esc(l) + "</span>"); });
+    patchHost.innerHTML = pl.join("\n");
+
+    var exp = expected();
+    fileHost.innerHTML = file.map(function (l, i) {
+      var isCtx = exp.indexOf(l) !== -1;
+      return '<span class="d">' + String(i + 1).padStart(2, " ") + "  </span>" +
+        (isCtx ? esc(l) : '<span class="y">' + esc(l) + "</span>");
+    }).join("\n");
+
+    var plain = tryApply(file);
+    var three = tryThreeWay(file);
+    var lines = [];
+
+    lines.push('<span class="p">$</span> git apply --check patch.diff');
+    if (plain.ok) {
+      lines.push(plain.offset === 0
+        ? '<span class="g">(no output — it applies cleanly)</span>'
+        : '<span class="y">Hunk #1 succeeded at ' + (plain.at + 1) + " (offset " + plain.offset + " lines).</span>");
+    } else {
+      lines.push('<span class="r">error: patch failed: src/app.js:' + PATCH.oldStart + "</span>");
+      lines.push('<span class="r">error: src/app.js: patch does not apply</span>');
+    }
+
+    lines.push("");
+    lines.push('<span class="p">$</span> git apply --3way patch.diff');
+    if (plain.ok) {
+      lines.push('<span class="d">(not needed — plain apply already worked)</span>');
+    } else if (three.state === "already") {
+      lines.push('<span class="y">Falling back to three-way merge...</span>');
+      lines.push('<span class="d">Skipped patch \'src/app.js\' — already applied.</span>');
+    } else if (three.state === "clean") {
+      lines.push('<span class="y">Falling back to three-way merge...</span>');
+      lines.push('<span class="g">Applied patch to \'src/app.js\' cleanly.</span>');
+    } else {
+      lines.push('<span class="y">Falling back to three-way merge...</span>');
+      lines.push('<span class="r">error: patch failed: src/app.js:' + PATCH.oldStart + "</span>");
+      lines.push('<span class="r">Applied patch to \'src/app.js\' with conflicts.</span>');
+      lines.push('<span class="d">' + esc("<<<<<<< ours") + "</span>");
+      lines.push('<span class="d">  if (isExpired(parsed)) {</span>');
+      lines.push('<span class="d">' + esc("=======") + "</span>");
+      lines.push('<span class="d">  if (!parsed) return null</span>');
+      lines.push('<span class="d">' + esc(">>>>>>> theirs") + "</span>");
+    }
+    term.innerHTML = lines.join("\n");
+
+    out.innerHTML = "";
+    tile("git apply", plain.ok ? (plain.offset ? "offset " + plain.offset : "clean") : "fails", "", plain.ok);
+    tile("--3way", plain.ok ? "—" : three.state, "", three.state === "clean");
+    tile("Context lines", String(PATCH.pre.length + PATCH.post.length), "must match");
+    tile("File length", String(file.length), "lines");
+
+    var msgs = {
+      "not at all": "The context matches at exactly the line the hunk header states, so the patch applies with no searching at all.",
+      "3 lines added above": "Every line the patch expects is still present, just three lines lower. <code>git apply</code> searches outward from the stated position and reports the offset — this is why context exists and why <code>-U0</code> patches are so brittle.",
+      "a context line reworded": "One <b>context</b> line changed, so no position matches exactly and plain apply gives up. Three-way still succeeds: the lines the patch actually modifies are untouched, so the merge has no conflict to resolve.",
+      "the patch is already applied": "The file already contains the patched text. Plain apply fails because it cannot find the lines it wants to remove; <code>--3way</code> recognises the situation and skips rather than double-applying. <code>git am</code> reports \"Patch already applied\" and moves on.",
+      "the same lines rewritten": "Now the drift overlaps the lines the patch changes, so there is a genuine conflict of intent. Three-way applies what it can and leaves markers for you — exactly as a merge would, because it <b>is</b> a merge."
+    };
+    note.innerHTML = msgs[drift];
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

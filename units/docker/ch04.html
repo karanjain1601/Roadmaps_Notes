@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4 · The CLI and the object model — Docker</title>
+<meta name="description" content="The client-daemon split, contexts, the four object types Docker manages, the container lifecycle, and how to read docker inspect with Go templates.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Crect x='6' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='19' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='10' width='5' height='5' fill='%23fff'/%3E%3Cpath d='M4 22h22a5 5 0 004-4' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch04">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Docker
+    </a>
+    <div class="chno"><b>Chapter 4</b><span>Foundations</span></div>
+    <h1>The CLI and the object model</h1>
+    <p class="lede">The <code>docker</code> command does almost nothing. <b>It is an HTTP client for a daemon that holds all the state</b>, which is why it can drive a machine on the other side of the world with one environment variable, and why a hundred commands turn out to be four object types and a lifecycle. This chapter also covers the two flags — <code>--format</code> and <code>--filter</code> — that turn the CLI into something scriptable.</p>
+    <div class="meta"><span>24 min</span><span>2 demos</span><span>8 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="daemon">
+      <h2 data-nav="Client and daemon">Client and daemon</h2>
+      <p class="sub">Two programs, one socket, and a security consequence.</p>
+      <p><code>docker run</code> does not create a container. It sends <code>POST /containers/create</code> followed by <code>POST /containers/{id}/start</code> to <code>dockerd</code>, which does the work described in chapters 1 to 3. You can send those requests yourself:</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">talking to the daemon directly</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ curl -s --unix-socket /var/run/docker.sock http://localhost/v1.45/version | head -c 120
+$ curl -s --unix-socket /var/run/docker.sock http://localhost/v1.45/containers/json
+
+$ docker version -f '{{.Client.Version}} → {{.Server.Version}}'
+27.3.1 → 27.3.1                       # they can differ; the API negotiates</pre>
+      </div>
+      <p>Because the client is thin, "where does this command run" is entirely a matter of which daemon it reaches — and there are three ways to change that:</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">pointing the CLI somewhere else</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker -H ssh://deploy@build-01 ps          # one command, over SSH
+$ export DOCKER_HOST=ssh://deploy@build-01     # this shell
+$ docker context create build --docker host=ssh://deploy@build-01
+$ docker context use build                      # persistent, and named
+$ docker context ls                              # which one am I on?
+NAME       DESCRIPTION                    DOCKER ENDPOINT
+default *  Current DOCKER_HOST based       unix:///var/run/docker.sock
+build                                      ssh://deploy@build-01</pre>
+      </div>
+      <div class="warn">
+        <span class="lbl">The socket is the machine</span>
+        <p>Anything that can write to <code>/var/run/docker.sock</code> can start a container with <code>--privileged</code> and <code>-v /:/host</code>, which is unrestricted root on that host — no exploit required, just the API. That is why the <code>docker</code> group is root-equivalent (chapter 1), and why mounting the socket into a container to "let it manage containers" is the most consequential single line in many <code>compose.yaml</code> files. Chapter 18 covers the alternatives.</p>
+      </div>
+    </section>
+
+    <section id="objects">
+      <h2 data-nav="The objects">The objects</h2>
+      <p class="sub">Four types you manage, plus two you mostly ignore.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Object</th><th>Is</th><th>Lives until</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Image</strong></td><td>Read-only layers plus a config (chapter 3)</td><td>You delete it, or prune removes it as dangling</td></tr>
+            <tr><td><strong>Container</strong></td><td>An image plus a writable layer, plus runtime configuration</td><td><code>docker rm</code> — stopping is not removing</td></tr>
+            <tr><td><strong>Volume</strong></td><td>A directory managed by Docker, outside any image</td><td><code>docker volume rm</code>. <b>Survives container removal</b></td></tr>
+            <tr><td><strong>Network</strong></td><td>A virtual bridge plus DNS for the containers attached</td><td><code>docker network rm</code></td></tr>
+            <tr><td>Build cache</td><td>BuildKit's record of previous build steps</td><td><code>docker builder prune</code> only</td></tr>
+            <tr><td>Context</td><td>A named daemon endpoint, stored in your home directory</td><td>It is client-side config, not daemon state</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Every one of these has the same shape of commands — <code>ls</code>, <code>inspect</code>, <code>rm</code>, <code>prune</code> — which is the clearest argument for using the management form of the CLI:</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">the two spellings</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># the old top-level commands, kept for compatibility
+$ docker ps          $ docker images        $ docker rmi        $ docker rm
+
+# the management form: predictable, and discoverable with --help
+$ docker container ls    $ docker image ls    $ docker image rm    $ docker container rm
+$ docker volume ls       $ docker network ls  $ docker system df   $ docker builder prune</pre>
+      </div>
+      <div class="note">
+        <span class="lbl">Names, IDs and prefixes</span>
+        <p>Every object has a 64-character ID and accepts any unambiguous prefix, so <code>docker stop 3f9c</code> works. Containers also get a random two-word name unless you pass <code>--name</code>, and that name is what other containers resolve over DNS on a user-defined network (chapter 12) — which is the practical reason to always name them.</p>
+      </div>
+    </section>
+
+    <section id="inspect">
+      <h2 data-nav="docker inspect">Reading <code>docker inspect</code></h2>
+      <p class="sub">Three hundred lines of JSON, or one line of Go template.</p>
+      <p><code>docker inspect</code> returns everything the daemon knows about an object. Piping it to <code>grep</code> works badly; the <code>--format</code> flag takes a Go template and is the difference between reading output and using it:</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Inspect template playground</h3>
+          <span class="hint">A real container's inspect output, and a working subset of Go templates</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight" id="i-presets"></div>
+          <div class="ctrl">
+            <label for="i-in" style="min-width:52px">-f</label>
+            <input type="text" id="i-in" spellcheck="false" style="flex:1 1 300px;font-family:var(--mono);font-size:12.5px" value="{{.State.Status}} {{.State.Pid}}">
+          </div>
+          <div class="term" id="i-term"></div>
+          <div class="rgrid" id="i-out"></div>
+          <p class="readout" id="i-note"></p>
+        </div>
+      </div>
+
+      <div class="code">
+        <div class="code-top"><span class="tag">the one-liners worth keeping</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker inspect -f '{{.State.Pid}}' web                    # host PID (ch. 1)
+$ docker inspect -f '{{.State.ExitCode}} {{.State.OOMKilled}}' app   # why it died (ch. 2)
+$ docker inspect -f '{{.NetworkSettings.IPAddress}}' web
+$ docker inspect -f '{{range .Mounts}}{{.Source}}:{{.Destination}}{{println}}{{end}}' db
+$ docker inspect -f '{{json .Config.Env}}' web
+$ docker inspect -f '{{.HostConfig.Memory}}' app             # 0 means unlimited
+$ docker inspect -f '{{index .Config.Cmd 0}}' web
+
+# it works across several objects at once
+$ docker inspect -f '{{.Name}} {{.State.Status}}' $(docker ps -aq)</pre>
+      </div>
+      <div class="tip">
+        <span class="lbl">Where the fields differ from what you set</span>
+        <p><code>.Config</code> holds what came from the <em>image</em> plus your overrides; <code>.HostConfig</code> holds the runtime flags you passed (limits, mounts, restart policy); <code>.State</code> is live. So "why is this container using the wrong command" is a <code>.Config.Entrypoint</code> and <code>.Config.Cmd</code> question, while "why is it being killed" is <code>.HostConfig.Memory</code> and <code>.State</code>. Knowing which of the three to look in saves most of the scrolling.</p>
+      </div>
+    </section>
+
+    <section id="filters">
+      <h2 data-nav="Filters and formats">Filters and formats</h2>
+      <p class="sub">How the CLI becomes scriptable.</p>
+      <div class="demo">
+        <div class="demo-top">
+          <h3>ps filter and format builder</h3>
+          <span class="hint">Nine containers, and a real evaluation of the flags against them</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:52px">flags</span>
+            <span id="p-flags" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:52px">filters</span>
+            <span id="p-filters" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl">
+            <label for="p-fmt" style="min-width:52px">--format</label>
+            <input type="text" id="p-fmt" spellcheck="false" style="flex:1 1 260px;font-family:var(--mono);font-size:12.5px" value="table {{.Names}}\t{{.Status}}\t{{.Image}}">
+          </div>
+          <div class="term" id="p-term"></div>
+          <div class="rgrid" id="p-out"></div>
+          <p class="readout" id="p-note"></p>
+        </div>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Filter</th><th>Available on</th><th>Matches</th></tr></thead>
+          <tbody>
+            <tr><td><code>status=exited</code></td><td><code>ps</code></td><td>created, restarting, running, removing, paused, exited, dead</td></tr>
+            <tr><td><code>name=web</code></td><td><code>ps</code></td><td>Substring of the name, not an exact match</td></tr>
+            <tr><td><code>label=app=api</code></td><td>everything</td><td>Label presence, or a key=value pair</td></tr>
+            <tr><td><code>ancestor=node:22</code></td><td><code>ps</code></td><td>Containers built from that image, or any descendant of it</td></tr>
+            <tr><td><code>exited=137</code></td><td><code>ps</code></td><td>A specific exit code — OOM hunting (chapter 2)</td></tr>
+            <tr><td><code>health=unhealthy</code></td><td><code>ps</code></td><td>Requires a HEALTHCHECK (chapter 5)</td></tr>
+            <tr><td><code>dangling=true</code></td><td><code>image</code>, <code>volume</code></td><td>Untagged images; volumes with no container</td></tr>
+            <tr><td><code>until=24h</code></td><td><code>prune</code></td><td>Objects older than a duration</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">the piping patterns these enable</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker rm $(docker ps -aq --filter status=exited)          # tidy up
+$ docker rm -f $(docker ps -aq --filter label=stack=dev)      # everything in a stack
+$ docker stop $(docker ps -q --filter ancestor=node:22)
+$ docker image rm $(docker images -q --filter dangling=true)
+
+# -q prints IDs only, which is what makes all of the above work.
+# Guard against an empty list, or the outer command errors:
+$ ids=$(docker ps -aq --filter status=exited); [ -n "$ids" ] &amp;&amp; docker rm $ids</pre>
+      </div>
+    </section>
+
+    <section id="lifecycle">
+      <h2 data-nav="Lifecycle">The container lifecycle</h2>
+      <p class="sub">Six states, and the transitions people get wrong.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>State</th><th>Means</th><th>Reached by</th></tr></thead>
+          <tbody>
+            <tr><td><code>created</code></td><td>Exists, never started — writable layer allocated, no process</td><td><code>docker create</code></td></tr>
+            <tr><td><code>running</code></td><td>The main process is alive</td><td><code>docker start</code> / <code>run</code></td></tr>
+            <tr><td><code>paused</code></td><td>Frozen by the cgroup freezer; still holds memory</td><td><code>docker pause</code></td></tr>
+            <tr><td><code>restarting</code></td><td>Between attempts, under a restart policy</td><td>The process exited and the policy says try again</td></tr>
+            <tr><td><code>exited</code></td><td>The process finished. <b>The writable layer still exists</b></td><td>Process exit, or <code>docker stop</code></td></tr>
+            <tr><td><code>dead</code></td><td>Removal failed partway — rare, and needs cleanup</td><td>Daemon or storage trouble</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">lifecycle commands</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker create --name web nginx        # created, not running
+$ docker start -a web                    # start and attach to its output
+$ docker stop -t 30 web                   # SIGTERM, then SIGKILL after 30s
+$ docker kill -s HUP web                   # send any signal
+$ docker restart web
+$ docker pause web &amp;&amp; docker unpause web
+$ docker wait web                           # block, then print the exit code
+$ docker rm web                              # now the writable layer is gone
+
+$ docker update --memory 1g --cpus 2 web    # change limits without recreating
+$ docker rename web api</pre>
+      </div>
+      <div class="key">
+        <span class="lbl">Stopped is not removed, and it costs you disk</span>
+        <p><code>docker stop</code> ends the process; the container object and its writable layer remain, which is why <code>docker ps -a</code> fills up and <code>docker system df</code> shows containers consuming gigabytes. <code>docker start</code> then resumes the <em>same</em> container with its filesystem changes intact — genuinely useful for debugging, and the reason <code>--rm</code> exists for everything else.</p>
+      </div>
+      <h3>Restart policies</h3>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Policy</th><th>Restarts when</th><th>Use for</th></tr></thead>
+          <tbody>
+            <tr><td><code>no</code> (default)</td><td>Never</td><td>One-shot jobs</td></tr>
+            <tr><td><code>on-failure[:N]</code></td><td>Non-zero exit, up to N times</td><td>Jobs that should retry but not loop forever</td></tr>
+            <tr><td><code>unless-stopped</code></td><td>Always, unless you stopped it explicitly</td><td>Long-running services on a single host</td></tr>
+            <tr><td><code>always</code></td><td>Always, including after a daemon restart</td><td>Same, but it comes back even after you stopped it</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>A restart policy is per-container state, not a supervisor: the daemon applies backoff and there is no notion of health, dependency order or a maximum restart budget beyond <code>on-failure:N</code>. That gap is most of the argument for an orchestrator (chapter 20).</p>
+    </section>
+
+    <section id="poking">
+      <h2 data-nav="Getting inside">Getting inside a running container</h2>
+      <p class="sub">And the four commands that inspect its filesystem.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">exec, logs, cp, diff</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker exec -it web sh                    # a NEW process in its namespaces
+$ docker exec -u root -it web sh             # ...as a different user
+$ docker exec -e DEBUG=1 web env             # with extra environment
+
+$ docker logs -f --tail 100 --timestamps web
+$ docker logs --since 10m web
+
+$ docker cp web:/etc/nginx/nginx.conf .      # works on stopped containers too
+$ docker cp ./nginx.conf web:/etc/nginx/
+
+$ docker diff web                             # what changed vs the image
+C /run
+A /run/nginx.pid
+C /etc/nginx
+A /etc/nginx/conf.d/extra.conf</pre>
+      </div>
+      <p><code>docker diff</code> is a direct window onto chapter 3's upper layer: <code>A</code> added, <code>C</code> changed, <code>D</code> deleted, all relative to the image. It is the fastest way to answer "what has this container written", which matters because all of it disappears on <code>docker rm</code>.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Command</th><th>Produces</th><th>Note</th></tr></thead>
+          <tbody>
+            <tr><td><code>docker commit</code></td><td>A new image from a container's current state</td><td>Works, and produces an image nobody can rebuild. For debugging only</td></tr>
+            <tr><td><code>docker export</code></td><td>A tar of the filesystem, <b>flattened</b></td><td>No layers, no config, no history</td></tr>
+            <tr><td><code>docker save</code></td><td>A tar of an <em>image</em> — layers, config, manifest</td><td>The one that round-trips through <code>docker load</code></td></tr>
+            <tr><td><code>docker top</code> / <code>stats</code></td><td>Processes; live resource usage</td><td><code>stats</code> shows usage against the cgroup limits</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="trap">
+        <span class="lbl"><code>docker exec</code> does not run in the same process tree position</span>
+        <p><code>exec</code> starts a <em>new</em> process inside the container's namespaces — it is not a shell attached to PID 1. So environment variables set by the entrypoint script are absent, the working directory is the image's, and killing your shell does not affect the service. Also: on a distroless or scratch image there is no shell to exec at all, which is chapter 19's problem to solve.</p>
+      </div>
+    </section>
+
+    <section id="cheatsheet">
+      <h2 data-nav="The command map">The command map</h2>
+      <p class="sub">Everything above, arranged by what you are trying to do.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Task</th><th>Command</th></tr></thead>
+          <tbody>
+            <tr><td>What is running</td><td><code>docker ps</code> · <code>docker ps -a</code> · <code>docker stats --no-stream</code></td></tr>
+            <tr><td>What is on disk</td><td><code>docker system df -v</code> · <code>docker image ls</code> · <code>docker volume ls</code></td></tr>
+            <tr><td>Start something</td><td><code>docker run --rm -it &lt;image&gt; &lt;cmd&gt;</code></td></tr>
+            <tr><td>Look inside</td><td><code>docker exec -it &lt;c&gt; sh</code> · <code>docker logs -f &lt;c&gt;</code> · <code>docker diff &lt;c&gt;</code></td></tr>
+            <tr><td>Why did it die</td><td><code>docker inspect -f '{{.State.ExitCode}} {{.State.OOMKilled}}' &lt;c&gt;</code></td></tr>
+            <tr><td>Copy files</td><td><code>docker cp &lt;c&gt;:/path .</code></td></tr>
+            <tr><td>Change limits</td><td><code>docker update --memory 1g &lt;c&gt;</code></td></tr>
+            <tr><td>Clean up safely</td><td><code>docker container prune</code> · <code>docker image prune</code> · <code>docker builder prune</code></td></tr>
+            <tr><td>Watch what happens</td><td><code>docker events --filter type=container</code></td></tr>
+            <tr><td>Switch machines</td><td><code>docker context use &lt;name&gt;</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">two aliases worth having</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># a ps that fits on one line and tells you what you need
+alias dps='docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}"'
+
+# why did that container die?
+dwhy() { docker inspect -f '{{.Name}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} err={{.State.Error}}' "$1"; }</pre>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 4 in seven lines</h2>
+        <ul>
+          <li>The CLI is an <b>HTTP client</b>; <code>dockerd</code> holds all the state. <code>DOCKER_HOST</code> or a context repoints it at another machine.</li>
+          <li>Write access to the daemon socket is <b>root on that host</b> — no exploit needed, just the API.</li>
+          <li>Four objects: images, containers, volumes, networks. Each has <code>ls</code>, <code>inspect</code>, <code>rm</code>, <code>prune</code>.</li>
+          <li><code>--format</code> takes a Go template. <code>.Config</code> is image plus overrides, <code>.HostConfig</code> is your runtime flags, <code>.State</code> is live.</li>
+          <li><code>--filter</code> plus <code>-q</code> is what makes the CLI scriptable — and guard against an empty list before piping into <code>docker rm</code>.</li>
+          <li><b>Stopped is not removed:</b> an exited container keeps its writable layer, and its disk, until <code>docker rm</code>.</li>
+          <li><code>docker exec</code> starts a <b>new</b> process in the container's namespaces, so entrypoint-set environment variables are absent.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary><code>docker system df</code> reports 12 containers using 240&nbsp;MB, but only 2 are running. Where is the space?</summary>
+        <div class="ans"><p>In the writable layers of the ten exited containers. Stopping a container ends its process and leaves the container object and its upper overlay directory intact — which is what makes <code>docker start</code> able to resume with the filesystem changes still there. <code>docker container prune</code> removes all stopped containers and reclaims it; <code>--rm</code> on <code>docker run</code> prevents the accumulation in the first place. Note this is separate from the build cache, which <code>docker image prune</code> does not touch either.</p></div>
+      </details>
+      <details class="chk">
+        <summary>You need the host PID and exit code of every container, in one command. Write it.</summary>
+        <div class="ans"><p><code>docker inspect -f '{{.Name}} {{.State.Pid}} {{.State.ExitCode}}' $(docker ps -aq)</code>. Two things make it work: <code>inspect</code> accepts many objects and applies the template to each, and <code>-q</code> gives it bare IDs to consume. If the list can be empty, guard it — the command substitution collapses to nothing and <code>docker inspect</code> errors on no arguments. The playground above evaluates this template subset against a real inspect payload.</p></div>
+      </details>
+      <details class="chk">
+        <summary>An entrypoint script exports <code>APP_TOKEN</code>. Why is it missing when you <code>docker exec</code> in and echo it?</summary>
+        <div class="ans"><p>Because <code>exec</code> starts a brand-new process from the image's configured environment, not a shell inside the existing process. Variables exported by the entrypoint exist only in PID 1's environment and its children, and your exec'd shell is a sibling rather than a descendant. To see them, read PID 1's environment directly — <code>docker exec web cat /proc/1/environ | tr '\0' '\n'</code> — or pass what you need with <code>docker exec -e</code>. This also explains why a <code>WORKDIR</code> change made at runtime by the script does not apply to your shell.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A colleague proposes <code>docker commit</code> to capture a fix made inside a running container. What do you say?</summary>
+        <div class="ans"><p>It works and produces an image nobody can reproduce: there is no Dockerfile, no record of what changed beyond <code>docker diff</code>, and the next person who needs the same fix has to repeat the archaeology. Use it as a <em>diagnostic</em> — commit the broken container so you can poke at a copy — and then encode the actual fix in the Dockerfile. The related trap is <code>docker export</code>, which flattens the filesystem and discards layers, config and history; <code>docker save</code> is the one that round-trips an image intact.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Part 2 begins. Chapter 5 goes through every Dockerfile instruction, including the ENTRYPOINT and CMD combination that decides whether <code>docker stop</code> takes 50 milliseconds or ten seconds.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li><code>docker inspect -f '{{.State.Pid}}' &lt;name&gt;</code>.</li>
+        <li><code>docker ps -a --format 'table {{.Names}}\t{{.Status}}'</code>.</li>
+        <li><code>docker diff &lt;name&gt;</code> on something that has been running a while.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>Docker's CLI reference, the Engine API documentation, the <code>docker context</code> and <code>--format</code> guides, and Go's <code>text/template</code> package documentation.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — inspect template playground
+   A working subset of Go text/template: field paths, json,
+   index, len, range (with and without variables), println.
+   ============================================================ */
+var INSPECT = {
+  Id: "3f9c2a14b7e1d4a8b2c5f6019e8d7c6b5a4938271605f4e3d2c1b0a9f8e7d6c5",
+  Name: "/web",
+  Created: "2026-08-31T09:14:22.418Z",
+  State: {
+    Status: "running", Running: true, Paused: false, Restarting: false,
+    OOMKilled: false, Dead: false, Pid: 48213, ExitCode: 0, Error: "",
+    StartedAt: "2026-08-31T09:14:22.9Z", Health: { Status: "healthy", FailingStreak: 0 }
+  },
+  Config: {
+    Hostname: "3f9c2a14b7e1", User: "nginx", Image: "nginx:1.27-alpine",
+    Env: ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "NGINX_VERSION=1.27.3", "NODE_ENV=production"],
+    Entrypoint: ["/docker-entrypoint.sh"], Cmd: ["nginx", "-g", "daemon off;"],
+    WorkingDir: "/usr/share/nginx", Labels: { maintainer: "platform@acme.com", stack: "edge", tier: "web" }
+  },
+  HostConfig: {
+    Memory: 536870912, NanoCpus: 1500000000, RestartPolicy: { Name: "unless-stopped", MaximumRetryCount: 0 },
+    Privileged: false, NetworkMode: "bridge", CapDrop: ["ALL"], CapAdd: ["NET_BIND_SERVICE"]
+  },
+  NetworkSettings: { IPAddress: "172.17.0.4", Gateway: "172.17.0.1", Ports: { "80/tcp": "0.0.0.0:8080" } },
+  Mounts: [
+    { Type: "volume", Name: "web-cache", Source: "/var/lib/docker/volumes/web-cache/_data", Destination: "/var/cache/nginx", RW: true },
+    { Type: "bind", Source: "/srv/site/conf", Destination: "/etc/nginx/conf.d", RW: false }
+  ]
+};
+
+(function () {
+  var input = document.getElementById("i-in");
+  var term = document.getElementById("i-term");
+  var out = document.getElementById("i-out");
+  var note = document.getElementById("i-note");
+
+  [
+    "{{.State.Status}} {{.State.Pid}}",
+    "{{.State.ExitCode}} {{.State.OOMKilled}}",
+    "{{.NetworkSettings.IPAddress}}",
+    "{{json .State.Health}}",
+    "{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}",
+    "{{index .Config.Env 2}}",
+    "{{len .Config.Env}}",
+    "{{.HostConfig.Memory}}",
+    "{{range $k, $v := .Config.Labels}}{{$k}}={{$v}}{{println}}{{end}}",
+    "{{.Config.Cmd}}",
+    "{{json .HostConfig.CapAdd}}"
+  ].forEach(function (p) {
+    var b = document.createElement("button");
+    b.className = "btn mono";
+    b.textContent = p.length > 26 ? p.slice(0, 25) + "…" : p;
+    b.title = p;
+    b.addEventListener("click", function () { input.value = p; render(); });
+    document.getElementById("i-presets").appendChild(b);
+  });
+
+  /* Go's default rendering of composite values */
+  function goString(v) {
+    if (v === null || v === undefined) return "<no value>";
+    if (Array.isArray(v)) return "[" + v.map(goString).join(" ") + "]";
+    if (typeof v === "object") {
+      return "map[" + Object.keys(v).sort().map(function (k) { return k + ":" + goString(v[k]); }).join(" ") + "]";
+    }
+    if (typeof v === "boolean") return v ? "true" : "false";
+    return String(v);
+  }
+
+  function lookup(path, scope) {
+    if (path === "." ) return scope;
+    var parts = path.replace(/^\./, "").split(".");
+    var cur = scope;
+    for (var i = 0; i < parts.length; i++) {
+      if (cur === null || cur === undefined) return undefined;
+      if (!(parts[i] in cur)) throw new Error('can\'t evaluate field ' + parts[i]);
+      cur = cur[parts[i]];
+    }
+    return cur;
+  }
+
+  /* evaluate one {{ ... }} action against a scope and a variable map */
+  function action(body, scope, vars) {
+    body = body.trim();
+    if (body === "") return "";
+    if (body === "println") return "\n";
+    var m;
+    if ((m = /^json\s+(\S+)$/.exec(body))) {
+      return JSON.stringify(lookup(m[1], scope), null, 2);
+    }
+    if ((m = /^println\s+(\S+)$/.exec(body))) {
+      return goString(lookup(m[1], scope)) + "\n";
+    }
+    if ((m = /^print\s+(\S+)$/.exec(body))) {
+      return goString(lookup(m[1], scope));
+    }
+    if ((m = /^len\s+(\S+)$/.exec(body))) {
+      var v = lookup(m[1], scope);
+      return String(Array.isArray(v) ? v.length : (v && typeof v === "object") ? Object.keys(v).length : String(v).length);
+    }
+    if ((m = /^index\s+(\S+)\s+(.+)$/.exec(body))) {
+      var target = lookup(m[1], scope);
+      var key = m[2].trim().replace(/^"|"$/g, "");
+      var val = Array.isArray(target) ? target[parseInt(key, 10)] : target[key];
+      if (val === undefined) return "<no value>";
+      return goString(val);
+    }
+    if (body.charAt(0) === "$") {
+      if (!(body in vars)) throw new Error("undefined variable " + body);
+      return goString(vars[body]);
+    }
+    if (body.charAt(0) === ".") return goString(lookup(body, scope));
+    throw new Error('function "' + body.split(/\s+/)[0] + '" not defined');
+  }
+
+  function evaluate(tpl, scope, vars) {
+    var out2 = "", i = 0;
+    while (i < tpl.length) {
+      var open = tpl.indexOf("{{", i);
+      if (open === -1) { out2 += tpl.slice(i); break; }
+      out2 += tpl.slice(i, open);
+      var close = tpl.indexOf("}}", open);
+      if (close === -1) throw new Error("unclosed action");
+      var body = tpl.slice(open + 2, close).trim();
+
+      /* range needs its matching end, with nesting */
+      var rm = /^range\s+(?:(\$\w+)\s*,\s*(\$\w+)\s*:=\s*)?(\S+)$/.exec(body);
+      if (rm) {
+        var depth = 1, j = close + 2, endStart = -1;
+        while (j < tpl.length) {
+          var nextOpen = tpl.indexOf("{{", j);
+          if (nextOpen === -1) throw new Error("range without end");
+          var nextClose = tpl.indexOf("}}", nextOpen);
+          var inner = tpl.slice(nextOpen + 2, nextClose).trim();
+          if (/^range\b/.test(inner) || /^if\b/.test(inner) || /^with\b/.test(inner)) depth++;
+          if (inner === "end") { depth--; if (depth === 0) { endStart = nextOpen; break; } }
+          j = nextClose + 2;
+        }
+        if (endStart === -1) throw new Error("range without end");
+        var inner2 = tpl.slice(close + 2, endStart);
+        var coll = lookup(rm[3], scope);
+        var pieces = [];
+        if (Array.isArray(coll)) {
+          coll.forEach(function (item, idx) {
+            var v2 = Object.create(vars);
+            if (rm[1]) { v2[rm[1]] = idx; v2[rm[2]] = item; }
+            pieces.push(evaluate(inner2, item, v2));
+          });
+        } else if (coll && typeof coll === "object") {
+          Object.keys(coll).sort().forEach(function (k) {
+            var v2 = Object.create(vars);
+            if (rm[1]) { v2[rm[1]] = k; v2[rm[2]] = coll[k]; }
+            pieces.push(evaluate(inner2, coll[k], v2));
+          });
+        }
+        out2 += pieces.join("");
+        i = tpl.indexOf("}}", endStart) + 2;
+        continue;
+      }
+      if (body === "end") throw new Error("unexpected end");
+      out2 += action(body, scope, vars);
+      i = close + 2;
+    }
+    return out2;
+  }
+
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+
+  function render() {
+    var tpl = input.value;
+    var result, err = null;
+    try { result = evaluate(tpl, INSPECT, {}); }
+    catch (e) { err = e.message; }
+
+    term.innerHTML = '<span class="p">$</span> docker inspect -f ' + esc("'" + tpl + "'") + " web\n" +
+      (err ? '<span class="r">Template parsing error: ' + esc(err) + "</span>"
+           : '<span class="g">' + (esc(result).replace(/\n$/, "") || "<span class=\"d\">(empty)</span>") + "</span>");
+
+    var actions = (tpl.match(/\{\{/g) || []).length;
+    out.innerHTML = "";
+    tile("Actions", String(actions), "in the template");
+    tile("Output", err ? "error" : (result.replace(/\n$/, "").split("\n").length) + " line" +
+      (result.replace(/\n$/, "").split("\n").length === 1 ? "" : "s"), "", !err);
+    tile("Characters", err ? "—" : String(result.length), "returned");
+    tile("Valid", err ? "no" : "yes", "", !err);
+
+    var msgs = [];
+    if (err) {
+      msgs.push("Docker reports template errors exactly like this, <b>before contacting the daemon</b> — so a typo in a field name fails fast rather than returning empty output. Field names are the JSON keys with their original capitalisation: <code>.State.Pid</code>, not <code>.state.pid</code>.");
+    } else if (/^\{\{json/.test(tpl.trim())) {
+      msgs.push("<code>json</code> is a Docker addition rather than part of Go's template package, and it is the right tool when you want to pipe a subtree into <code>jq</code> instead of formatting it yourself.");
+    } else if (/range/.test(tpl)) {
+      msgs.push("<code>range</code> rebinds <code>.</code> to each element, which is why <code>{{.Source}}</code> inside the loop refers to the mount rather than the container. <code>{{println}}</code> emits the newline — without it the results run together, which is the most common surprise in these templates.");
+    } else if (/^\{\{\.Config\.Cmd\}\}$/.test(tpl.trim())) {
+      msgs.push("Printing a whole array gives Go's default rendering — <code>[nginx -g daemon off;]</code>, space-separated in brackets. That is fine for reading and useless for scripting, which is why <code>index</code> and <code>json</code> exist.");
+    } else if (/index/.test(tpl)) {
+      msgs.push("<code>index</code> takes a collection and a key: a number for arrays, a quoted string for maps. It is how you reach one element without a loop.");
+    } else {
+      msgs.push("Several actions and literal text can be mixed freely, so a template is also a tiny report format. Remember the three places to look: <code>.Config</code> for the image plus your overrides, <code>.HostConfig</code> for the flags you passed, <code>.State</code> for what is true now.");
+    }
+    msgs.push("<b>Supported here:</b> field paths, <code>json</code>, <code>index</code>, <code>len</code>, <code>print</code>, <code>println</code> and <code>range</code> with or without variables. Real Go templates also give you <code>if</code>, <code>with</code> and <code>printf</code>.");
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  input.addEventListener("input", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — ps filter and format builder
+   ============================================================ */
+(function () {
+  var CONTAINERS = [
+    { names: "web", image: "nginx:1.27-alpine", status: "Up 4 days", state: "running", ports: "0.0.0.0:8080->80/tcp", labels: { stack: "edge", app: "web" }, exited: null, health: "healthy", id: "3f9c2a14b7e1" },
+    { names: "api", image: "node:22-alpine", status: "Up 4 days", state: "running", ports: "0.0.0.0:3000->3000/tcp", labels: { stack: "core", app: "api" }, exited: null, health: "healthy", id: "7d6c5b4a3928" },
+    { names: "worker", image: "node:22-alpine", status: "Up 2 hours", state: "running", ports: "", labels: { stack: "core", app: "worker" }, exited: null, health: null, id: "1a2b3c4d5e6f" },
+    { names: "db", image: "postgres:16", status: "Up 4 days (healthy)", state: "running", ports: "5432/tcp", labels: { stack: "core", app: "db" }, exited: null, health: "healthy", id: "9f8e7d6c5b4a" },
+    { names: "cache", image: "redis:7-alpine", status: "Up 4 days (unhealthy)", state: "running", ports: "6379/tcp", labels: { stack: "core", app: "cache" }, exited: null, health: "unhealthy", id: "2b3c4d5e6f70" },
+    { names: "migrate", image: "node:22-alpine", status: "Exited (0) 4 days ago", state: "exited", ports: "", labels: { stack: "core", app: "migrate" }, exited: 0, health: null, id: "4d5e6f708192" },
+    { names: "importer", image: "node:22-alpine", status: "Exited (137) 6 hours ago", state: "exited", ports: "", labels: { stack: "core", app: "importer" }, exited: 137, health: null, id: "5e6f708192a3" },
+    { names: "smoke-test", image: "curlimages/curl", status: "Exited (1) 3 days ago", state: "exited", ports: "", labels: { stack: "dev" }, exited: 1, health: null, id: "6f708192a3b4" },
+    { names: "old-web", image: "nginx:1.25-alpine", status: "Created", state: "created", ports: "", labels: { stack: "edge", app: "web" }, exited: null, health: null, id: "708192a3b4c5" }
+  ];
+
+  var FILTERS = [
+    { id: "st-run", label: "status=running", on: false, fn: function (c) { return c.state === "running"; } },
+    { id: "st-exit", label: "status=exited", on: false, fn: function (c) { return c.state === "exited"; } },
+    { id: "ex137", label: "exited=137", on: false, fn: function (c) { return c.exited === 137; } },
+    { id: "lbl", label: "label=stack=core", on: false, fn: function (c) { return c.labels.stack === "core"; } },
+    { id: "anc", label: "ancestor=node:22-alpine", on: false, fn: function (c) { return c.image === "node:22-alpine"; } },
+    { id: "nm", label: "name=web", on: false, fn: function (c) { return c.names.indexOf("web") !== -1; } },
+    { id: "hlth", label: "health=unhealthy", on: false, fn: function (c) { return c.health === "unhealthy"; } }
+  ];
+  var showAll = false, quiet = false;
+
+  var flagHost = document.getElementById("p-flags");
+  var filtHost = document.getElementById("p-filters");
+  var fmtIn = document.getElementById("p-fmt");
+  var term = document.getElementById("p-term");
+  var out = document.getElementById("p-out");
+  var note = document.getElementById("p-note");
+
+  [["-a", function (v) { showAll = v; }, function () { return showAll; }],
+   ["-q", function (v) { quiet = v; }, function () { return quiet; }]].forEach(function (f) {
+    var b = document.createElement("button");
+    b.className = "btn mono";
+    b.textContent = f[0];
+    b.addEventListener("click", function () { f[1](!f[2]()); b.classList.toggle("on", f[2]()); render(); });
+    flagHost.appendChild(b);
+  });
+  FILTERS.forEach(function (f) {
+    var b = document.createElement("button");
+    b.className = "btn mono";
+    b.textContent = f.label;
+    b.addEventListener("click", function () { f.on = !f.on; b.classList.toggle("on", f.on); render(); });
+    filtHost.appendChild(b);
+  });
+
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+
+  function applyFormat(fmt, rows) {
+    var isTable = /^table\s+/.test(fmt);
+    var body = isTable ? fmt.replace(/^table\s+/, "") : fmt;
+    var FIELDS = { Names: "names", Image: "image", Status: "status", Ports: "ports", ID: "id", State: "state", Labels: null };
+    var unknown = [];
+    var renderRow = function (c) {
+      return body.replace(/\\t/g, "\t").replace(/\{\{\.(\w+)\}\}/g, function (m, f) {
+        if (f === "Labels") return Object.keys(c.labels).sort().map(function (k) { return k + "=" + c.labels[k]; }).join(",");
+        if (!(f in FIELDS)) { unknown.push(f); return "<no value>"; }
+        return c[FIELDS[f]] || "";
+      });
+    };
+    var lines = rows.map(renderRow);
+    if (isTable) {
+      var header = body.replace(/\\t/g, "\t").replace(/\{\{\.(\w+)\}\}/g, function (m, f) {
+        return f === "ID" ? "CONTAINER ID" : f.toUpperCase();
+      });
+      lines.unshift(header);
+    }
+    /* column-align tabs, as the CLI does */
+    var cells = lines.map(function (l) { return l.split("\t"); });
+    var widths = [];
+    cells.forEach(function (row) {
+      row.forEach(function (cell, i) { widths[i] = Math.max(widths[i] || 0, cell.length); });
+    });
+    return {
+      text: cells.map(function (row) {
+        return row.map(function (cell, i) {
+          return i === row.length - 1 ? cell : cell + " ".repeat(Math.max(0, widths[i] - cell.length + 3));
+        }).join("");
+      }).join("\n"),
+      unknown: unknown, isTable: isTable
+    };
+  }
+
+  function render() {
+    var active = FILTERS.filter(function (f) { return f.on; });
+    var pool = showAll ? CONTAINERS : CONTAINERS.filter(function (c) { return c.state === "running"; });
+    var rows = pool.filter(function (c) { return active.every(function (f) { return f.fn(c); }); });
+
+    var cmd = "docker ps" + (showAll ? " -a" : "") + (quiet ? " -q" : "") +
+      active.map(function (f) { return " --filter " + f.label; }).join("") +
+      (quiet ? "" : " --format '" + fmtIn.value + "'");
+
+    var body;
+    var res = { unknown: [] };
+    if (!rows.length) {
+      body = '<span class="d">(no containers matched)</span>';
+    } else if (quiet) {
+      body = rows.map(function (c) { return c.id; }).join("\n");
+    } else {
+      res = applyFormat(fmtIn.value, rows);
+      body = esc(res.text).split("\n").map(function (l, i) {
+        return res.isTable && i === 0 ? '<span class="d">' + l + "</span>" : l;
+      }).join("\n");
+    }
+    term.innerHTML = '<span class="p">$</span> ' + esc(cmd) + "\n" + body;
+
+    out.innerHTML = "";
+    tile("Matched", String(rows.length), "of " + CONTAINERS.length + " containers", rows.length > 0);
+    tile("Filters", String(active.length), "ANDed together");
+    tile("Default pool", showAll ? "all" : "running", showAll ? "with -a" : "without -a");
+    tile("Output", quiet ? "IDs only" : res.isTable ? "table" : "raw", quiet ? "pipeable" : "");
+
+    var msgs = [];
+    if (!showAll && active.some(function (f) { return f.id === "st-exit" || f.id === "ex137"; })) {
+      msgs.push("<b>Nothing matched, and the filter is not the reason.</b> <code>docker ps</code> shows only running containers unless you pass <code>-a</code>, so an exit-status filter without it can never match. This is the single most common confusion with these flags — add <code>-a</code>.");
+    }
+    if (active.length > 1) {
+      msgs.push("Multiple <code>--filter</code> flags are <b>ANDed</b>. There is no OR: for that you run two commands, or filter with <code>--format</code> and a shell. Repeating the <em>same</em> key is the exception — <code>--filter status=running --filter status=exited</code> ORs within that key.");
+    }
+    if (quiet) {
+      msgs.push("<code>-q</code> prints bare IDs, which is what makes <code>docker rm $(docker ps -aq --filter …)</code> work. Guard it: if nothing matches, the substitution is empty and the outer command errors.");
+    }
+    if (res.unknown && res.unknown.length) {
+      msgs.push("<code>{{." + res.unknown[0] + "}}</code> is not a field <code>ps</code> exposes, so it renders as <code>&lt;no value&gt;</code> — the placeholders here are a small fixed set (<code>.Names</code>, <code>.Image</code>, <code>.Status</code>, <code>.Ports</code>, <code>.ID</code>, <code>.State</code>, <code>.Labels</code>), not the full inspect tree.");
+    }
+    if (!msgs.length) {
+      msgs.push("The <code>table</code> prefix adds a header row and aligns the columns; without it you get raw text, which is what you want when piping. Tabs in the format string become the column separators.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  fmtIn.addEventListener("input", render);
+  render();
+})();
+</script>
+</body>
+</html>

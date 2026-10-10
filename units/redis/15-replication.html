@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Replication and Sentinel — Redis</title>
+<meta name="description" content="Asynchronous replication and what it means for durability, automatic failover with Sentinel, and the writes you will lose.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 15 · Running it</div>
+    <h1>Replication and Sentinel</h1>
+    <p class="standfirst">One command sets up a replica. The consequences take a chapter, because Redis replication is asynchronous by design — which means a failover loses acknowledged writes, and no configuration available to you closes that gap entirely.</p>
+    <div class="chap-meta">
+      <span class="tagpill">replicas</span>
+      <span class="tagpill">async</span>
+      <span class="tagpill">sentinel</span>
+      <span class="tagpill">wait</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Setting it up</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">one command, and what happens next</span><button class="copy">Copy</button></div>
+<pre><code># On the replica:
+REPLICAOF primary.internal 6379
+# or in the config file:
+replicaof primary.internal 6379
+masterauth <password>
+replica-read-only yes           # the default. Keep it
+
+REPLICAOF NO ONE                # promote to a standalone primary
+INFO replication
+
+# THE HANDSHAKE:
+#   1. the replica connects and asks to synchronise
+#   2. PARTIAL RESYNC if the replica has seen this primary before and the
+#      primary's backlog still covers the gap — it just sends the missing
+#      commands
+#   3. FULL RESYNC otherwise — the primary forks, produces an RDB, ships it,
+#      and streams everything since
+#
+# A full resync is expensive: a fork on the primary with all of chapter 13's
+# copy-on-write cost, plus transferring the whole dataset. The backlog is
+# what avoids it after a brief disconnection:
+repl-backlog-size 64mb          # default 1mb — RAISE THIS
+repl-backlog-ttl 3600
+
+# 1 MB of backlog on an instance writing 10 MB/s covers 0.1 seconds. Any
+# network blip longer than that forces a full resync, which forks the
+# primary — so an undersized backlog turns a momentary hiccup into a
+# latency incident. Size it for your longest plausible disconnection.
+
+# DISKLESS REPLICATION avoids writing the RDB to disk at all:
+repl-diskless-sync yes          # default in 7.0+
+repl-diskless-sync-delay 5      # wait, to batch several replicas into one fork
+repl-diskless-load on-empty-db  # on the replica side
+
+# After a full resync the replica applies the ongoing command stream. It is
+# byte-compatible rather than command-compatible for nondeterministic
+# operations — SPOP and EXPIRE are replicated by effect, so replicas never
+# diverge from the primary through their own randomness.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Asynchronous, and what that costs</h2>
+
+<div class="demo" id="rep">
+  <div class="demo-head">
+    <b>The write you lose</b>
+    <span>Redis acknowledges before replicating. Step through what happens when the primary dies.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="r-step">Step — <span id="r-stepv">1</span> of 6</label>
+        <input type="range" id="r-step" min="1" max="6" step="1" value="1">
+      </div>
+      <div>
+        <label for="r-wait">Using WAIT after the write?</label>
+        <select id="r-wait">
+          <option value="no" selected>No</option>
+          <option value="yes">WAIT 1 100</option>
+        </select>
+      </div>
+    </div>
+    <div id="r-nodes"></div>
+    <div class="stat">
+      <div><b id="r-client">—</b><span>client believes</span></div>
+      <div><b id="r-truth">—</b><span>actually durable on</span></div>
+      <div><b id="r-lost">—</b><span>lost if the primary dies now</span></div>
+    </div>
+    <div class="out" id="r-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">The acknowledgement happens before replication</span>
+  <p>Redis replies to a write as soon as it has applied it locally — it does not wait for any replica. That is why writes are fast, and it means <b>a primary that dies immediately after acknowledging has lost data that the client was told was saved</b>. There is no <code>synchronous_commit</code>, no <code>w: "majority"</code>, no configuration that makes an acknowledgement mean "a majority holds this". <code>WAIT</code> gets you closer and is not a guarantee (below). This is the single largest architectural difference from the PostgreSQL and MongoDB units, and it decides what Redis should be trusted with.</p>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">WAIT, and its limits</span><button class="copy">Copy</button></div>
+<pre><code>SET order:8842 "..."
+WAIT 1 100              # block until 1 replica has it, or 100 ms elapse
+# (integer) 1           # how many replicas acknowledged — CHECK THIS
+
+# WAIT does not make the write synchronous retroactively. The write already
+# happened; WAIT just blocks you until replicas confirm receipt.
+#
+# WHAT IT DOES NOT GIVE YOU:
+#   * a rollback if the timeout expires. The write is applied on the primary
+#     either way — you simply learn that it did not replicate in time
+#   * a guarantee that the acknowledging replica will win an election
+#   * protection against a primary that dies between the SET and the WAIT
+#
+# So WAIT converts "I do not know whether this replicated" into "I know it
+# did, or I know it might not have". That is genuinely useful for deciding
+# whether to proceed, and it is not the same as a majority commit.
+
+# WAITAOF (7.0+) is the stronger relative — it waits for the write to be
+# FSYNCED, locally and on replicas:
+WAITAOF 1 1 100         # numlocal, numreplicas, timeout
+# (integer) 1) 1  2) 1
+# Requires appendonly yes. This is the closest Redis comes to a durable
+# acknowledgement, and it costs a disk sync per call.
+
+# THE MINIMUM-REPLICAS SETTING — refuse writes when replication is unhealthy:
+min-replicas-to-write 1
+min-replicas-max-lag 10
+# The primary stops accepting writes if fewer than 1 replica has been in
+# contact within 10 seconds. It converts "silently accumulating unreplicated
+# writes" into a visible error, which is usually the better failure — and it
+# means a network problem becomes a write outage, so decide deliberately.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Reading from replicas</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">useful, with the usual caveats</span><button class="copy">Copy</button></div>
+<pre><code># Replicas are read-only by default and serve reads at full speed. Sending
+# analytics, reporting or heavy scans there keeps them off the primary —
+# which matters more in Redis than elsewhere, because one slow command on
+# the primary blocks every client (chapter 1).
+
+INFO replication
+#   on the primary:  slave0:ip=...,port=...,state=online,offset=...,lag=0
+#   on the replica:  master_link_status:up
+#                    master_repl_offset       — compare with the primary's
+#                    master_last_io_seconds_ago
+
+# WHAT YOU GIVE UP:
+#   * READ-YOUR-WRITES. Write to the primary, read from a replica, and the
+#     value may not be there yet. Usually milliseconds; occasionally much
+#     more. This is the commonest bug introduced by enabling replica reads
+#   * expired keys. A replica does not expire keys on its own — it waits for
+#     the primary's DEL. Modern Redis returns nil for logically-expired keys
+#     on a replica, so reads are CORRECT, but DBSIZE and memory will differ
+#     from the primary and that is expected
+#
+# Also note every write still happens on every replica, so replicas add read
+# capacity and nothing else. A write-heavy workload gains nothing.
+
+replica-serve-stale-data yes    # default: serve possibly-stale data when the
+                                # link to the primary is down
+                                # `no` returns an error instead — safer for
+                                # correctness, worse for availability
+
+# A REPLICA IS NOT A BACKUP. It applies your FLUSHALL within milliseconds.
+# Keep RDB copies elsewhere (chapter 13).</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Sentinel</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">automatic failover for a non-clustered setup</span><button class="copy">Copy</button></div>
+<pre><code># sentinel.conf
+port 26379
+sentinel monitor mymaster 10.0.1.10 6379 2
+#                                          ^ QUORUM: how many sentinels must
+#                                            agree the primary is down
+sentinel down-after-milliseconds mymaster 5000
+sentinel failover-timeout mymaster 60000
+sentinel parallel-syncs mymaster 1
+sentinel auth-pass mymaster <password>
+
+# RUN AN ODD NUMBER, AT LEAST THREE, on separate hosts from the Redis nodes.
+# Sentinels must form a majority among THEMSELVES to authorise a failover —
+# the quorum setting only controls how many must agree the primary is down.
+# Both conditions apply, and confusing them is the commonest misconfiguration:
+#
+#   3 sentinels, quorum 2  ->  2 must agree it is down, and 2 must be
+#                              reachable to elect a leader. Correct.
+#   2 sentinels, quorum 1  ->  a single sentinel can declare failure, and
+#                              cannot form a majority. It will never fail over.
+
+# WHAT SENTINEL DOES:
+#   monitors primaries and replicas
+#   notifies via a script or pub/sub
+#   promotes a replica when the primary is judged down
+#   reconfigures the other replicas to follow the new primary
+#   acts as a DISCOVERY SERVICE — clients ask it who the primary is
+
+# CLIENTS MUST BE SENTINEL-AWARE. They connect to the sentinels, ask for the
+# current primary, and subscribe to +switch-master to learn about failovers.
+# A client configured with a hard-coded primary address will not follow one:
+#
+#   redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
+#   SENTINEL replicas mymaster
+#   SENTINEL sentinels mymaster
+#   SENTINEL failover mymaster        # force one, for testing
+
+# The alternative to a Sentinel-aware client is a proxy or a virtual IP that
+# something else moves. Both work; both are one more thing to operate.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Every failover loses writes, by design</span>
+  <p>Because replication is asynchronous, the promoted replica is missing whatever the primary acknowledged but had not yet sent. Sentinel picks the replica with the highest replication offset, which minimises the loss — it cannot eliminate it. Worse, when the old primary returns it is reconfigured as a replica of the new one and <b>discards its own extra writes</b> to resynchronise, so those acknowledged writes are gone with no record anywhere. This is unavoidable in an asynchronous system and it is why the question "what happens if we lose a few seconds of this data" has to be answered before choosing Redis for it, not after a failover.</p>
+</div>
+
+<h2><span class="h-rule"></span>Split brain</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">the partition case</span><button class="copy">Copy</button></div>
+<pre><code>1. A network partition isolates the primary from the sentinels and replicas.
+2. Clients on the primary's side keep writing to it. It is healthy and has
+   no idea it has been cut off.
+3. The sentinels on the majority side promote a replica.
+4. Two primaries now accept writes.
+5. The partition heals. The old primary is demoted and RESYNCHRONISES from
+   the new one, discarding everything written during the partition.
+
+The writes accepted by the old primary during step 2 are gone. The clients
+that made them were told they succeeded.
+
+WHAT LIMITS THE DAMAGE:
+
+  min-replicas-to-write 1
+  min-replicas-max-lag 10
+
+  The isolated primary sees no replicas in contact and stops accepting
+  writes after 10 seconds. That bounds the divergence to roughly that
+  window instead of the whole partition.
+
+  This is the closest Redis comes to the self-demotion property that keeps
+  MongoDB and Patroni-managed PostgreSQL safe (see those units' chapters on
+  failover). It is weaker: a time-based heuristic rather than consensus, and
+  the primary continues serving for the lag window before it stops.
+
+WHAT DOES NOT HELP:
+  * more sentinels — they are on the other side of the partition
+  * a shorter down-after-milliseconds — it makes unnecessary failovers more
+    likely without addressing this
+  * WAIT — the isolated primary has no replicas to wait for, so WAIT returns
+    0, which your code has to actually check</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Operating it</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">what to watch</span><button class="copy">Copy</button></div>
+<pre><code>INFO replication
+#   role, connected_slaves
+#   master_repl_offset       compare between primary and replicas — the
+#                            difference IS your data-loss window
+#   slave0:...,lag=0         seconds since the replica last responded
+
+INFO stats
+#   sync_full                full resyncs. Each one forks the primary
+#   sync_partial_ok / sync_partial_err
+#   A rising sync_full with a low sync_partial_ok means the backlog is too
+#   small for your disconnection pattern — raise repl-backlog-size.
+
+# FOUR THINGS TO ALERT ON:
+#   1. connected_slaves dropping below expected
+#   2. replication offset lag, in bytes, sustained
+#   3. sync_full increasing — full resyncs fork the primary
+#   4. master_link_status:down on any replica
+
+# PLANNED FAILOVER, for maintenance:
+SENTINEL failover mymaster        # sentinel coordinates it cleanly
+# Do this regularly. A failover path that is never exercised is a failover
+# path that does not work, and the thing that usually breaks is not Redis —
+# it is a client library that was never configured for Sentinel.
+
+# CHAINED REPLICATION, when many replicas would overload the primary:
+replicaof replica-1 6379          # a replica of a replica
+replica-announce-ip / replica-announce-port    # behind NAT
+# Each level adds lag. Two levels is reasonable; three is a smell.
+
+# Sentinel does NOT shard. It provides availability for a single primary,
+# and one primary's capacity is one thread and one machine's memory. When
+# you outgrow that, the answer is cluster mode (chapter 16) — and note that
+# cluster has its own failover built in, so the two are alternatives rather
+# than layers.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Test the failover, and test the client</span>
+  <p>Trigger <code>SENTINEL failover</code> monthly against production with traffic running, and measure end to end: how long until writes succeed again, and how many failed in between. The component that usually breaks is not Redis or Sentinel — it is a client library that was configured with a direct address instead of the sentinel set, or one whose reconnection logic was never exercised. That failure is invisible until the day it matters, and it converts a ten-second failover into a total outage until someone redeploys. <b>A failover path you have not exercised is not a failover path.</b></p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Replication is asynchronous.</b> The write is acknowledged before any replica has it.</li>
+    <li><b>Raise <code>repl-backlog-size</code></b> — 1 MB is seconds of coverage, and a full resync forks the primary.</li>
+    <li><b><code>WAIT</code> is not a majority commit.</b> It tells you whether replication happened; it cannot roll anything back.</li>
+    <li><b><code>WAITAOF</code></b> (7.0+) is the closest Redis comes to a durable acknowledgement, at the cost of a disk sync.</li>
+    <li><b>Sentinel needs an odd number, at least three</b>, on separate hosts — and a majority among themselves, not just the quorum.</li>
+    <li><b>Every failover loses writes</b>, and the old primary discards its extras when it rejoins.</li>
+    <li><b><code>min-replicas-to-write</code> bounds split-brain divergence</b> and turns a partition into a write outage. Decide deliberately.</li>
+    <li><b>Test the failover monthly.</b> The thing that breaks is usually the client library.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("15-replication.html");
+
+(function(){
+  const root = document.getElementById("rep");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const STEPS = [
+    {
+      title:"Client sends the write",
+      primary:"receiving", replica:"idle",
+      client:"waiting", truth:"nowhere", lost:"nothing",
+      note:"The command is in flight. Nothing has happened yet.\n\nWorth noting where the client's expectation is about to be set: the reply it receives will be the only signal it gets, and what that reply means is the subject of this whole demo."
+    },
+    {
+      title:"Primary applies it",
+      primary:"applied", replica:"idle",
+      client:"waiting", truth:"the primary only", lost:"this write",
+      note:"The primary has the value in memory. It has not been sent to the replica and, depending on your persistence configuration, may not be on disk either (chapter 13).\n\nThis is the moment of maximum exposure and it lasts microseconds — but a crash here loses the write with the client still waiting, which at least means the client knows something went wrong."
+    },
+    {
+      title:"Primary replies OK",
+      primary:"applied", replica:"idle",
+      client:"SAVED", truth:"the primary only", lost:"this write, SILENTLY",
+      note:"This is the important step, and it is the architectural difference from the PostgreSQL and MongoDB units.\n\nRedis replies as soon as it has applied the write locally. It does NOT wait for any replica. The client has been told the write succeeded and exactly one machine holds it.\n\nIf the primary dies right now, the write is gone and the client believes it exists. There is no error, no rollback, no record — the acknowledgement was simply premature.\n\nThat is not a bug or a misconfiguration. It is the design, and it is why writes are fast. There is no synchronous_commit and no w: majority to turn on."
+    },
+    {
+      title:"Command streams to the replica",
+      primary:"applied", replica:"receiving",
+      client:"SAVED", truth:"the primary only", lost:"this write",
+      note:"The write is propagating. Under normal conditions this is sub-millisecond on a local network, which is why the exposure window is usually small enough to ignore.\n\nIt is not always small. A replica doing a full resync, a saturated network, or a replica on slow storage can all widen it to seconds. INFO replication's master_repl_offset compared between primary and replica is the size of that window in bytes, and it is the number to alert on."
+    },
+    {
+      title:"Replica has it",
+      primary:"applied", replica:"applied",
+      client:"SAVED", truth:"both nodes", lost:"nothing",
+      note:"Two copies now exist. A primary failure from here promotes a replica that has the write, and nothing is lost.\n\nThe client was told this several steps ago. The gap between the acknowledgement and this moment is the entire durability question in Redis replication, and nothing in the protocol tells the client when it closes.\n\nWAIT is how you find out — see the toggle above."
+    },
+    {
+      title:"Primary dies · Sentinel promotes",
+      primary:"DEAD", replica:"PROMOTED",
+      client:"SAVED", truth:"the new primary", lost:"anything after the last replicated offset",
+      note:"Sentinel detects the failure after down-after-milliseconds, the sentinels agree, and the replica with the highest replication offset is promoted.\n\nChoosing the most-advanced replica minimises the loss. It cannot eliminate it: whatever the primary acknowledged and had not yet sent is gone.\n\nAnd when the old primary comes back it is reconfigured as a replica of the new one, which means it DISCARDS its own extra writes to resynchronise. Those acknowledged writes vanish with no record on either node.\n\nThe realistic mitigation is min-replicas-to-write, which stops the primary accepting writes when no replica has been in contact recently. It converts silent accumulation of unreplicated writes into a visible error — and it means a network problem becomes a write outage, so it is a deliberate trade rather than a free improvement."
+    }
+  ];
+
+  function render(){
+    const i = parseInt($("r-step").value, 10) - 1;
+    const s = STEPS[i];
+    const wait = $("r-wait").value === "yes";
+    $("r-stepv").textContent = i + 1;
+
+    const COL = {receiving:"#F2A03D", applied:"#3FB984", idle:"#CFD8E0",
+                 DEAD:"#E2574C", PROMOTED:"#3FB984"};
+
+    $("r-nodes").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin:16px 0 8px">' + s.title + '</div>' +
+      '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:9px">' +
+      [["primary", s.primary], ["replica", s.replica]].map(([n, st]) =>
+        '<div style="background:#fff;border:2px solid ' + COL[st] + ';border-radius:6px;padding:12px;text-align:center">' +
+        '<div style="font-family:var(--mono);font-size:13px;font-weight:700;color:#16232F">' + n + '</div>' +
+        '<div style="font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;font-weight:700;color:' +
+        COL[st] + ';margin-top:6px">' + st + '</div></div>').join("") + '</div>';
+
+    // WAIT shifts when the client learns
+    let clientState = s.client;
+    let lost = s.lost;
+    if(wait && (i === 2 || i === 3)){
+      clientState = "still waiting";
+      lost = "this write — but the client will find out";
+    }
+    if(wait && i === 5) lost = "bounded by what WAIT confirmed";
+
+    $("r-client").textContent = clientState;
+    $("r-truth").textContent  = s.truth;
+    $("r-lost").textContent   = lost;
+
+    const notes = [s.note];
+
+    if(wait && i >= 2 && i <= 4)
+      notes.push("WITH WAIT 1 100 the client does not return at this point — it blocks until one replica acknowledges the offset, or 100 ms elapse.\n\nThat closes the ignorance, not the exposure. The write was already applied on the primary; WAIT cannot undo it. What you get is knowledge: a return value of 1 means a replica has it, and 0 means it did not replicate within the timeout and you should decide what to do about that.\n\nMost code that uses WAIT ignores the return value entirely, which makes it a latency cost with no benefit. Check it.");
+    else if(wait && i === 5)
+      notes.push("Because WAIT confirmed replication before the client proceeded, the writes it knows about are on the promoted replica. Writes made without WAIT, or where WAIT returned 0 and the code ignored it, are still at risk.\n\nWAITAOF (7.0+) goes further and waits for the write to be FSYNCED locally and on replicas, which is the closest Redis comes to a durable acknowledgement. It costs a disk sync per call, so reserve it for the small number of writes that warrant it.");
+    else if(!wait && i === 2)
+      notes.push("Turn on the WAIT toggle above to see the difference. It is not a majority commit and it is the strongest tool available — it converts \"I do not know whether this replicated\" into \"I know it did, or I know it might not have\", which is enough to decide whether to proceed.");
+
+    $("r-note").textContent = notes.join("\n\n");
+  }
+
+  ["r-step","r-wait"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

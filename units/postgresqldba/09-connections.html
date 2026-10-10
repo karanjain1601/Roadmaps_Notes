@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Connections and pooling — PostgreSQL</title>
+<meta name="description" content="Why a process per connection makes pooling mandatory, PgBouncer's three modes, and what each one breaks.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 09 · Configuring</div>
+    <h1>Connections and pooling</h1>
+    <p class="standfirst">Because a connection is an operating-system process, adding more of them past a point makes the database slower rather than faster. That fact makes pooling a requirement rather than an optimisation, and it is the most common thing to get wrong on a growing system.</p>
+    <div class="chap-meta">
+      <span class="tagpill">the knee</span>
+      <span class="tagpill">pgbouncer</span>
+      <span class="tagpill">pool modes</span>
+      <span class="tagpill">sizing</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Throughput does not increase with connections</h2>
+
+<div class="demo" id="pool">
+  <div class="demo-head">
+    <b>The knee</b>
+    <span>Throughput rises with concurrency until the cores are busy, then falls. Latency does the opposite of what people expect.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="n-cores">CPU cores — <span id="n-coresv">8</span></label>
+        <input type="range" id="n-cores" min="1" max="8" step="1" value="4">
+      </div>
+      <div>
+        <label for="n-conn">Active connections — <span id="n-connv">50</span></label>
+        <input type="range" id="n-conn" min="1" max="500" step="1" value="50">
+      </div>
+      <div>
+        <label for="n-io">Time each query spends waiting on I/O — <span id="n-iov">30</span>%</label>
+        <input type="range" id="n-io" min="0" max="90" step="5" value="30">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="n-tps">—</b><span>throughput</span></div>
+      <div><b id="n-lat">—</b><span>p50 latency</span></div>
+      <div><b id="n-best">—</b><span>optimal pool size</span></div>
+      <div><b id="n-loss">—</b><span>vs. optimal</span></div>
+    </div>
+    <div id="n-curve"></div>
+    <div class="out" id="n-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">More connections is not more capacity</span>
+  <p>Eight cores can execute eight things at once. Beyond enough concurrency to keep them busy through I/O waits, extra connections do not add throughput — they add context switching, lock contention, cache pressure and memory use. Throughput <b>falls</b> past the knee and latency climbs sharply. The standard starting formula is <code>cores × 2 + effective_spindles</code>, which for modern hardware usually lands between <b>10 and 40 active connections</b>, not the several hundred people configure. If the database is slow and the pool is saturated, the fix is very rarely a bigger pool.</p>
+</div>
+
+<h2><span class="h-rule"></span>Why a pooler at all</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Problem</th><th>Without a pooler</th><th>With one</th></tr></thead>
+<tbody>
+<tr><td>Connection cost</td><td>A fork plus several MB, per client</td><td>Backends are reused; clients connect to the pooler</td></tr>
+<tr><td>Idle connections</td><td>Hold memory and a process each</td><td>Idle clients hold no backend</td></tr>
+<tr><td>Bursty traffic</td><td>A spike forks hundreds of processes at once</td><td>Requests queue for a backend instead</td></tr>
+<tr><td>Serverless or short-lived workers</td><td>A fresh connection per invocation</td><td>The pooler absorbs the churn</td></tr>
+<tr><td>Too many app instances</td><td>Instances × pool size can exceed <code>max_connections</code></td><td>One shared limit, enforced in one place</td></tr>
+<tr><td>Failover</td><td>Every client reconnects at once</td><td>The pooler reconnects; clients may not notice</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Application pools multiply</span>
+  <p>The arithmetic that catches teams during a scale-up: twenty application instances, each with a framework connection pool of twenty, is four hundred connections — and the number grows every time you add a pod. Autoscaling makes it worse, because the peak instance count is exactly when the database is already busy. Either size the per-instance pool so that <code>instances × pool</code> stays under your target, which is fragile as the instance count changes, or put a pooler in front and let it enforce one number. The second is the only version that survives autoscaling.</p>
+</div>
+
+<h2><span class="h-rule"></span>PgBouncer's three modes</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Mode</th><th>Backend held for</th><th>Reuse</th><th>Breaks</th></tr></thead>
+<tbody>
+<tr><td><b>session</b></td><td>The whole client connection</td><td>Poor — mostly just saves the fork cost</td><td>Nothing</td></tr>
+<tr><td><b>transaction</b></td><td>One transaction</td><td><b>Excellent.</b> The mode you want</td><td>Session state — see below</td></tr>
+<tr><td><b>statement</b></td><td>One statement</td><td>Maximum</td><td>Multi-statement transactions entirely. Almost never usable</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">pgbouncer.ini — a working starting point</span><button class="copy">Copy</button></div>
+<pre><code>[databases]
+orders = host=10.0.1.10 port=5432 dbname=orders
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 6432
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+
+pool_mode = transaction          ; the whole point
+
+max_client_conn = 2000           ; how many CLIENTS may connect to pgbouncer
+default_pool_size = 25           ; backends per (database, user) pair
+min_pool_size = 5                ; keep a few warm
+reserve_pool_size = 5            ; emergency headroom
+reserve_pool_timeout = 3
+
+server_idle_timeout = 600
+server_lifetime = 3600           ; recycle backends so memory does not creep
+query_wait_timeout = 30          ; fail rather than queue forever
+
+ignore_startup_parameters = extra_float_digits,options
+
+; max_client_conn is the number that lets you accept a burst; default_pool_size
+; is the number that protects the database. Those are different problems, and
+; separating them is the main thing a pooler buys you.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>What transaction mode breaks</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">anything that assumes the same backend next time</span><button class="copy">Copy</button></div>
+<pre><code>-- In transaction mode, consecutive statements from one client may land on
+-- DIFFERENT backends. Anything that lives in session state is unreliable.
+
+-- BROKEN: the SET may apply to one backend and the query run on another.
+SET work_mem = '256MB';
+SELECT …;
+
+-- FINE: SET LOCAL is scoped to the transaction, so it travels with it.
+BEGIN;
+SET LOCAL work_mem = '256MB';
+SELECT …;
+COMMIT;
+
+-- Also affected:
+--   session-level advisory locks   -> use transaction-level: pg_advisory_xact_lock()
+--   LISTEN / NOTIFY                -> needs session mode, or a separate connection
+--   WITH HOLD cursors              -> not usable
+--   temporary tables               -> may not exist on the next backend
+--   PREPARE / EXECUTE              -> PgBouncer 1.21+ handles protocol-level
+--                                     prepared statements; older versions need
+--                                     the driver's prepared statements disabled
+--   SET ROLE, and RLS via SET      -> use SET LOCAL (SQL chapter 15)
+
+-- The RLS case deserves emphasis: plain SET app.tenant_id persists on the
+-- backend and WILL leak to the next client that borrows it. SET LOCAL resets
+-- at COMMIT and is safe. Test it explicitly with two tenants through one
+-- pooled connection — it never fails in development, where each request gets
+-- its own connection.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Prepared statements and PgBouncer</span>
+  <p>Historically the sharpest edge. Many drivers use protocol-level prepared statements by default, and in transaction mode the <code>PREPARE</code> happened on one backend while the <code>EXECUTE</code> landed on another — producing "prepared statement does not exist" errors that appear only under load, only in production, and only sometimes. <b>PgBouncer 1.21 added proper support</b> and this is largely solved on current versions. On anything older, disable driver-side prepared statements: <code>prepareThreshold=0</code> for JDBC, <code>prepare_threshold=None</code> for psycopg, <code>statement_cache_size=0</code> for asyncpg.</p>
+</div>
+
+<h2><span class="h-rule"></span>Choosing a pooler</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Option</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><b>PgBouncer</b></td><td>Single-threaded, tiny, extremely well proven. The default choice. Run several instances behind a load balancer if one CPU becomes the bottleneck</td></tr>
+<tr><td><b>pgcat</b></td><td>Multi-threaded, adds load balancing across replicas and sharding. Younger, actively developed</td></tr>
+<tr><td><b>Odyssey</b></td><td>Multi-threaded, from Yandex. Good at scale, smaller community</td></tr>
+<tr><td><b>Supavisor</b></td><td>Elixir, built for very large client counts and multi-tenant hosting</td></tr>
+<tr><td><b>Application-side pool</b></td><td>Necessary and <em>not sufficient</em> — it cannot coordinate across instances</td></tr>
+<tr><td><b>Managed service pooler</b></td><td>RDS Proxy, Cloud SQL and others. Convenient; check which pool mode and which features are supported</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note tip">
+  <span class="note-t">You want both pools, doing different jobs</span>
+  <p>The application-side pool avoids a TCP connect and a round trip per request — real latency, worth keeping. The server-side pooler enforces one global limit on actual backends regardless of how many instances exist. They are not alternatives. The usual configuration is a small per-instance pool (5–10) pointing at PgBouncer, with PgBouncer's <code>default_pool_size</code> set to the number the database can actually use well. Clients connect instantly, and the database sees a stable, small number of backends.</p>
+</div>
+
+<h2><span class="h-rule"></span>Monitoring the pool</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">PgBouncer's admin console, and the columns that matter</span><button class="copy">Copy</button></div>
+<pre><code>psql -p 6432 -U pgbouncer pgbouncer
+
+SHOW POOLS;
+--  cl_active  clients currently attached to a backend
+--  cl_waiting WAITING FOR ONE   <- the number to alert on
+--  sv_active  backends in use
+--  sv_idle    backends free
+--  maxwait    seconds the longest-waiting client has waited  <- and this one
+--
+-- cl_waiting consistently above zero with maxwait climbing means the pool is
+-- saturated. Before raising default_pool_size, check WHY: usually queries got
+-- slower, or a transaction is being held open across a network call.
+
+SHOW STATS;      -- queries and transactions per second, average times
+SHOW SERVERS;    -- individual backend connections and their state
+SHOW CLIENTS;    -- who is connected, and what they are waiting for
+
+-- From the database side, the corresponding view:
+SELECT state, count(*), max(now() - state_change) AS longest
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+GROUP BY state;
+-- A large "idle in transaction" count here is the classic cause of pool
+-- exhaustion: those backends are checked out and doing nothing (chapter 8).</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Sizing the pool</h2>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Start at <code>cores × 2</code></b><span>Eight cores → about 16 backends. Genuinely</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Load test and watch throughput, not connection count</b><span>Raise the pool until throughput stops improving. That is the knee</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Set <code>default_pool_size</code> at or just below the knee</b><span>Past it you lose throughput and gain latency</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Set <code>max_client_conn</code> generously</b><span>This is cheap. It absorbs bursts by queueing rather than by overloading</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Set <code>max_connections</code> above the pool with headroom</b><span>Pool size + reserve + superuser slots + replication + monitoring</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>6 · Alert on <code>cl_waiting</code> and <code>maxwait</code></b><span>Not on connection count, which tells you nothing on its own</span></div>
+</div>
+
+<div class="note key">
+  <span class="note-t">When the pool saturates, look at query duration first</span>
+  <p>A saturated pool is nearly always a symptom. Backends are held for as long as each transaction runs, so if transactions got slower — a missing index after a deploy, a plan change, a lock wait, a transaction holding open across an HTTP call — the same traffic now needs more concurrent backends. <b>Raising the pool size treats the symptom and usually makes it worse</b>, because more concurrency past the knee reduces throughput further. Check <code>pg_stat_statements</code> for what changed, and check for <code>idle in transaction</code>, before touching the pool.</p>
+</div>
+
+<h2><span class="h-rule"></span>Reserve connections</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">so you can still log in when it is on fire</span><button class="copy">Copy</button></div>
+<pre><code>-- max_connections includes everything. Reserve slots so an incident does not
+-- also lock you out of the database.
+max_connections = 200
+superuser_reserved_connections = 5        -- always available to superusers
+reserved_connections = 10                 -- PG16+, for a designated role
+max_wal_senders = 10                      -- replication uses connection slots
+                                          -- and is counted separately
+
+-- Grant the monitoring role pg_monitor so it can read the statistics views
+-- without being a superuser, and give it its own reserved capacity:
+CREATE ROLE monitoring LOGIN;
+GRANT pg_monitor TO monitoring;
+ALTER ROLE monitoring CONNECTION LIMIT 5;
+
+-- Per-role and per-database limits are a useful blunt instrument:
+ALTER ROLE batch_jobs CONNECTION LIMIT 10;
+ALTER DATABASE analytics CONNECTION LIMIT 40;
+-- One misbehaving service then cannot consume every slot.</code></pre>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>A connection is an <b>OS process</b>. Past the knee, more connections means <b>less</b> throughput and more latency.</li>
+    <li>Start at <b><code>cores × 2</code></b> — usually 10 to 40 active backends, not hundreds.</li>
+    <li><b>Application pools multiply</b> across instances. Only a server-side pooler enforces one global limit.</li>
+    <li><b>Transaction mode</b> is the point of PgBouncer. Session mode mostly just saves the fork cost.</li>
+    <li>Transaction mode breaks <b>session state</b>: use <code>SET LOCAL</code>, transaction-level advisory locks, and no session temp tables.</li>
+    <li><b><code>SET</code> for RLS tenant context will leak</b> through a pooled connection. <code>SET LOCAL</code> will not — test it with two tenants.</li>
+    <li>Prepared statements work in transaction mode from <b>PgBouncer 1.21</b>; disable driver-side prepares on older versions.</li>
+    <li><b>Alert on <code>cl_waiting</code> and <code>maxwait</code></b> — and when the pool saturates, check query duration before raising it.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("09-connections.html");
+
+(function(){
+  const root = document.getElementById("pool");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const CORES = [1, 2, 4, 8, 16, 32, 64, 96];
+
+  // Universal Scalability Law: C(N) = N / (1 + a(N-1) + bN(N-1))
+  function usl(n, a, b){ return n / (1 + a*(n-1) + b*n*(n-1)); }
+
+  function render(){
+    const cores = CORES[parseInt($("n-cores").value,10)-1];
+    const conn  = parseInt($("n-conn").value,10);
+    const io    = parseInt($("n-io").value,10) / 100;
+    $("n-coresv").textContent = cores;
+    $("n-connv").textContent  = conn;
+    $("n-iov").textContent    = Math.round(io*100);
+
+    // contention and coherency penalties
+    const a = 0.03 + 0.02 * (1 - io);
+    const b = 0.0016 / Math.sqrt(cores);
+    const capacity = cores / (1 - io * 0.85);       // effective parallelism
+
+    const base = 1400 * cores;                       // tps at perfect scaling per core
+    function tps(n){
+      const scaled = usl(Math.min(n, n), a, b);
+      return base * scaled / Math.max(1, capacity) * Math.min(1, capacity / 1);
+    }
+
+    // find the peak
+    let best = 1, bestT = 0;
+    for(let n = 1; n <= 500; n++){
+      const t = usl(n, a, b);
+      if(t > bestT){ bestT = t; best = n; }
+    }
+
+    const cur = usl(conn, a, b);
+    const throughput = base * cur / Math.max(1, cores) * (1 / (1 - io * 0.6));
+    const peakThroughput = base * bestT / Math.max(1, cores) * (1 / (1 - io * 0.6));
+    const latency = conn / Math.max(0.001, throughput) * 1000;
+
+    $("n-tps").textContent  = Math.round(throughput).toLocaleString() + " tps";
+    $("n-lat").textContent  = latency < 1 ? "<1ms" : latency.toFixed(1) + "ms";
+    $("n-best").textContent = best;
+    const loss = 100 * (1 - throughput / peakThroughput);
+    $("n-loss").textContent = loss < 1 ? "at peak" : "−" + loss.toFixed(0) + "%";
+
+    // curve
+    const pts = [];
+    for(let n = 1; n <= 200; n += 2){
+      pts.push([n, base * usl(n, a, b) / Math.max(1, cores) * (1 / (1 - io * 0.6))]);
+    }
+    const maxT = Math.max.apply(null, pts.map(p => p[1]));
+    const W = 100, H = 90;
+    const path = pts.map((p, i) =>
+      (i ? "L" : "M") + (p[0]/200*W).toFixed(2) + "," + (H - p[1]/maxT*H).toFixed(2)).join(" ");
+    const curX = Math.min(200, conn)/200*W;
+    const bestX = Math.min(200, best)/200*W;
+
+    $("n-curve").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 6px">' +
+      'Throughput against concurrency</div>' +
+      '<div style="background:#fff;border:1px solid #E1E7EC;border-radius:5px;padding:10px">' +
+      '<svg viewBox="0 0 100 100" preserveAspectRatio="none" style="width:100%;height:150px;display:block">' +
+      '<line x1="' + bestX.toFixed(2) + '" y1="0" x2="' + bestX.toFixed(2) + '" y2="' + H + '" stroke="#3FB984" stroke-width="0.4" stroke-dasharray="1.5,1.5"/>' +
+      '<line x1="' + curX.toFixed(2) + '" y1="0" x2="' + curX.toFixed(2) + '" y2="' + H + '" stroke="#25B7C4" stroke-width="0.6"/>' +
+      '<path d="' + path + '" fill="none" stroke="#0F7A85" stroke-width="0.9" vector-effect="non-scaling-stroke"/>' +
+      '<line x1="0" y1="' + H + '" x2="100" y2="' + H + '" stroke="#CFD8E0" stroke-width="0.4"/>' +
+      '</svg>' +
+      '<div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10.5px;color:#8FA0AF;margin-top:2px">' +
+      '<span>1</span><span style="color:#166B47">peak at ' + best + '</span><span>200 connections</span></div></div>';
+
+    const notes = [];
+    if(conn <= best)
+      notes.push("At " + conn + " connections the cores are not yet saturated, so throughput is still rising. Peak is around " + best + " for " + cores + " cores at this I/O ratio.");
+    else
+      notes.push("Past the peak. " + conn + " connections delivers " + loss.toFixed(0) + "% less throughput than " + best +
+                 " would, and latency is higher — each request now queues behind more concurrent work. Adding connections here is strictly worse in both dimensions, which is the opposite of what the intuition says.");
+
+    notes.push("The shape is the Universal Scalability Law: throughput rises, flattens as contention grows, then FALLS as coherency costs — lock contention, cache-line bouncing, scheduler overhead — start to dominate. " +
+               "It is not a ceiling you push against; it is a curve you fall off.");
+
+    if(io >= 0.5)
+      notes.push("At " + Math.round(io*100) + "% I/O wait, more concurrency genuinely helps: while one query waits on disk another can use the CPU. That is why the optimal pool is larger than the core count — the classic formula is cores × 2 + effective spindles, and the I/O term is exactly this effect.");
+    else if(io <= 0.1)
+      notes.push("With almost no I/O wait — everything cached — extra connections buy very little, because there is no idle CPU to fill. The optimal pool here is close to the core count.");
+
+    if(conn > 200)
+      notes.push("Above 200 connections you are also paying for " + conn + " operating-system processes: several gigabytes of private memory, a scheduler run queue that long, and per-backend catalogue caches. " +
+                 "This is where the answer is a pooler rather than a bigger max_connections.");
+
+    notes.push("Illustrative model, not measured. Run pgbench against your own workload and find your knee — the number that matters is where YOUR throughput curve turns over, and it is usually lower than people expect.");
+    $("n-note").textContent = notes.join("\n\n");
+  }
+
+  ["n-cores","n-conn","n-io"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

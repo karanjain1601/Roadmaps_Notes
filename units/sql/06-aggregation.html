@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Aggregation and GROUP BY — SQL</title>
+<meta name="description" content="What grouping does to the shape of a result, HAVING against WHERE, counting correctly, and the join-then-aggregate double-counting bug.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 06 · Combining data</div>
+    <h1>Aggregation and GROUP BY</h1>
+    <p class="standfirst">Grouping changes the shape of a result: many rows become one, and the individual rows stop being addressable. Almost every confusion about <code>GROUP BY</code> — and the worst reporting bug in SQL — follows from that one change.</p>
+    <div class="chap-meta">
+      <span class="tagpill">group by</span>
+      <span class="tagpill">having</span>
+      <span class="tagpill">counting</span>
+      <span class="tagpill">double counting</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Grouping changes the shape</h2>
+
+<p>Before <code>GROUP BY</code>, the result has one row per source row. After it, one row per <em>group</em>. A column that had one value per row now has many values per output row — so you can only reference it through a function that reduces many values to one.</p>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the error everyone meets first</span><button class="copy">Copy</button></div>
+<pre><code>SELECT customer_id, status, sum(amount)
+FROM orders
+GROUP BY customer_id;
+-- ERROR: column "orders.status" must appear in the GROUP BY clause
+--        or be used in an aggregate function
+
+-- The message is precise. This customer's group holds three orders with three
+-- different statuses. Which one should the single output row show? There is no
+-- answer, so the database refuses rather than guessing.
+
+-- Three legitimate resolutions, depending on what you meant:
+SELECT customer_id, status, sum(amount)
+FROM orders GROUP BY customer_id, status;        -- finer groups
+
+SELECT customer_id, max(status), sum(amount)
+FROM orders GROUP BY customer_id;                -- pick one deterministically
+
+SELECT customer_id,
+       string_agg(DISTINCT status, ', ' ORDER BY status) AS statuses,
+       sum(amount)
+FROM orders GROUP BY customer_id;                -- collapse them into one value</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">The rule, and why it is not arbitrary</span>
+  <p>Every column in the <code>SELECT</code> list must either appear in <code>GROUP BY</code> or be wrapped in an aggregate. This is not a syntax quirk to be worked around — it is the database telling you that your question is ambiguous. When you hit this error, the useful move is to decide <em>what you actually want for that column</em>, not to reach for whatever makes the error go away.</p>
+</div>
+
+<div class="note trap">
+  <span class="note-t">MySQL used to guess, and plenty of code still relies on it</span>
+  <p>Older MySQL allowed the first query above and returned an arbitrary status from each group — no error, no warning, and a different answer if the plan changed. <code>ONLY_FULL_GROUP_BY</code> is on by default in MySQL 5.7+ and disables it, but legacy code and older tutorials are full of the pattern. If a query works in MySQL and errors in Postgres, this is usually why. MySQL also offers <code>ANY_VALUE(col)</code> to say "I genuinely do not care", which at least documents the intent.</p>
+</div>
+
+<h2><span class="h-rule"></span>The aggregate functions</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Function</th><th>Ignores NULL?</th><th>On zero rows</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><code>count(*)</code></td><td>n/a — counts rows</td><td>0</td><td>The only count that includes NULL-filled rows</td></tr>
+<tr><td><code>count(col)</code></td><td>Yes</td><td>0</td><td>Counts non-NULL values. Differs from <code>count(*)</code> exactly when the column is nullable</td></tr>
+<tr><td><code>count(DISTINCT col)</code></td><td>Yes</td><td>0</td><td>Expensive — needs a sort or hash of every value</td></tr>
+<tr><td><code>sum</code></td><td>Yes</td><td><b>NULL</b></td><td>Wrap in <code>coalesce(…, 0)</code></td></tr>
+<tr><td><code>avg</code></td><td>Yes</td><td>NULL</td><td>Divides by the non-NULL count. Chapter 3</td></tr>
+<tr><td><code>min</code>, <code>max</code></td><td>Yes</td><td>NULL</td><td>Work on text and dates too</td></tr>
+<tr><td><code>bool_and</code>, <code>bool_or</code></td><td>Yes</td><td>NULL</td><td>"All of them" / "any of them". Underused</td></tr>
+<tr><td><code>string_agg</code> / <code>group_concat</code></td><td>Yes</td><td>NULL</td><td>Give it an <code>ORDER BY</code> or the order is arbitrary</td></tr>
+<tr><td><code>array_agg</code>, <code>jsonb_agg</code></td><td>No</td><td>NULL</td><td>Collect a group into one structured value</td></tr>
+<tr><td><code>percentile_cont</code></td><td>Yes</td><td>NULL</td><td>Medians and percentiles. Uses <code>WITHIN GROUP</code> syntax</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">conditional aggregation — one pass, many answers</span><button class="copy">Copy</button></div>
+<pre><code>-- The pattern that replaces running four separate queries.
+SELECT
+    date_trunc('month', placed_at)                          AS month,
+    count(*)                                                AS orders,
+    count(*) FILTER (WHERE status = 'paid')                 AS paid,
+    count(*) FILTER (WHERE status = 'refunded')             AS refunded,
+    coalesce(sum(amount) FILTER (WHERE status = 'paid'), 0) AS revenue,
+    round(100.0 * count(*) FILTER (WHERE status = 'refunded')
+                / nullif(count(*), 0), 1)                   AS refund_pct
+FROM orders
+GROUP BY 1
+ORDER BY 1;
+
+-- FILTER is standard SQL and supported by Postgres and SQLite. The portable
+-- version, which works everywhere:
+--     count(CASE WHEN status = 'paid' THEN 1 END)
+--     sum(CASE WHEN status = 'paid' THEN amount ELSE 0 END)
+--
+-- Note the two different ELSE choices: count() needs NULL for non-matches
+-- (so no ELSE), sum() needs 0. Writing count(CASE ... ELSE 0 END) counts
+-- every row, and the number looks plausible.
+--
+-- Note also nullif(count(*), 0) guarding the division, and 100.0 rather
+-- than 100 to force floating-point division — integer division silently
+-- truncates to 0 in most engines.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Percentiles, not averages, for latency</span>
+  <p><code>avg(duration_ms)</code> is the wrong summary for anything with a long tail, which is every latency distribution. One 30-second request among a thousand fast ones moves the average and tells you nothing about what users experience. Use <code>percentile_cont(0.5)</code> and <code>percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms)</code>. The syntax is awkward and the number is worth it.</p>
+</div>
+
+<h2><span class="h-rule"></span>The double-counting bug</h2>
+
+<div class="demo" id="agg">
+  <div class="demo-head">
+    <b>Join then aggregate</b>
+    <span>Three orders, with line items and shipments. Add each join and watch the revenue total inflate.</span>
+  </div>
+  <div class="demo-body">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:6px 18px;margin-bottom:12px">
+      <label><input type="checkbox" class="ag" value="li"> JOIN line_items</label>
+      <label><input type="checkbox" class="ag" value="sh"> JOIN shipments</label>
+      <label><input type="checkbox" class="ag" value="fix"> Aggregate before joining</label>
+    </div>
+    <div id="a-sql"></div>
+    <div class="stat">
+      <div><b id="a-rows">—</b><span>rows before grouping</span></div>
+      <div><b id="a-rev">—</b><span>sum(o.amount)</span></div>
+      <div><b id="a-true">—</b><span>true revenue</span></div>
+      <div><b id="a-err">—</b><span>error</span></div>
+    </div>
+    <div id="a-table"></div>
+    <div class="out" id="a-note"></div>
+  </div>
+</div>
+
+<div class="note warn">
+  <span class="note-t">This is the most damaging bug in this unit</span>
+  <p>It does not error, it does not look wrong, and the number it produces is plausible enough to survive review and reach a board deck. The mechanism is chapter 5's fan-out: the join multiplies rows, then <code>sum()</code> faithfully adds the duplicates. Every aggregate in the query is affected — revenue, counts, averages — and <code>DISTINCT</code> fixes only the visible duplication while leaving the numbers wrong. <b>Any time you aggregate over a join, check the pre-grouping row count against what you expect.</b></p>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">three ways to aggregate safely across a one-to-many</span><button class="copy">Copy</button></div>
+<pre><code>-- 1. Pre-aggregate each side to one row per key, then join. Clearest, and
+--    usually the best plan because each subquery groups independently.
+SELECT o.id, o.amount, coalesce(li.qty, 0) AS qty, coalesce(s.n, 0) AS shipments
+FROM orders o
+LEFT JOIN (SELECT order_id, sum(quantity) AS qty
+           FROM line_items GROUP BY order_id) li ON li.order_id = o.id
+LEFT JOIN (SELECT order_id, count(*) AS n
+           FROM shipments  GROUP BY order_id) s  ON s.order_id  = o.id;
+
+-- 2. Correlated scalar subqueries. Fine for two or three columns; verbose
+--    beyond that, and each one is a separate lookup.
+SELECT o.id, o.amount,
+       (SELECT coalesce(sum(quantity), 0) FROM line_items li
+        WHERE li.order_id = o.id) AS qty
+FROM orders o;
+
+-- 3. count(DISTINCT ...) as a rescue when you cannot restructure. Works for
+--    counts, does NOT work for sums — there is no sum(DISTINCT row).
+SELECT o.id,
+       count(DISTINCT li.id) AS line_items,
+       count(DISTINCT s.id)  AS shipments,
+       min(o.amount)         AS amount      -- min() over identical copies
+FROM orders o
+LEFT JOIN line_items li ON li.order_id = o.id
+LEFT JOIN shipments  s  ON s.order_id  = o.id
+GROUP BY o.id;
+-- The min(o.amount) trick works because every duplicate row carries the same
+-- amount. It is correct and it is a smell — option 1 says what you mean.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>WHERE against HAVING</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">not interchangeable, and the difference is the answer</span><button class="copy">Copy</button></div>
+<pre><code>-- WHERE drops ROWS before grouping. HAVING drops GROUPS after aggregating.
+SELECT customer_id, count(*) AS n, sum(amount) AS total
+FROM orders
+WHERE status = 'paid'          -- unpaid orders never enter a group
+GROUP BY customer_id
+HAVING count(*) >= 3;          -- customers with fewer than 3 PAID orders go
+
+-- Move the status test into HAVING and it is a different question entirely:
+HAVING count(*) FILTER (WHERE status = 'paid') >= 3
+-- now all orders form the groups, and the threshold counts only paid ones.
+-- A customer with 2 paid and 8 refunded orders is excluded by the first and
+-- also by the second — but their 'total' differs, because the first summed
+-- only paid amounts and the second summed everything.
+
+-- Rule of thumb: if the condition is about ONE ROW, it belongs in WHERE.
+-- If it is about the GROUP as a whole, it belongs in HAVING. Putting a
+-- row-level condition in HAVING also costs performance — you grouped rows
+-- you were always going to discard.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Counting correctly</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>You want</th><th>Write</th><th>Not</th></tr></thead>
+<tbody>
+<tr><td>How many rows</td><td><code>count(*)</code></td><td><code>count(1)</code> — identical, and <code>count(id)</code> which skips NULLs</td></tr>
+<tr><td>How many have a value</td><td><code>count(col)</code></td><td><code>count(*)</code></td></tr>
+<tr><td>How many distinct values</td><td><code>count(DISTINCT col)</code></td><td><code>count(col)</code></td></tr>
+<tr><td>How many match a condition</td><td><code>count(*) FILTER (WHERE …)</code></td><td><code>count(CASE … ELSE 0 END)</code>, which counts everything</td></tr>
+<tr><td>Groups with zero rows</td><td>A <code>LEFT JOIN</code> from the full list, or <code>generate_series</code></td><td><code>GROUP BY</code> alone — <b>it cannot produce a group that has no rows</b></td></tr>
+<tr><td>An approximate distinct count on a huge table</td><td>HyperLogLog, where available</td><td><code>count(DISTINCT)</code>, which sorts everything</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the missing-zeros problem</span><button class="copy">Copy</button></div>
+<pre><code>-- A month with no orders produces no row. The chart then draws a straight line
+-- between the surrounding months and nobody notices the gap.
+SELECT date_trunc('month', placed_at) AS month, count(*)
+FROM orders GROUP BY 1 ORDER BY 1;
+
+-- Generate the axis, then LEFT JOIN the data onto it.
+SELECT m.month, count(o.id) AS orders          -- count(o.id), not count(*):
+FROM generate_series(                          -- count(*) would return 1 for
+        date_trunc('month', current_date - interval '11 months'),
+        date_trunc('month', current_date),     -- an unmatched month, because
+        interval '1 month') AS m(month)        -- the LEFT JOIN produced a row
+LEFT JOIN orders o
+       ON date_trunc('month', o.placed_at) = m.month
+GROUP BY m.month
+ORDER BY m.month;
+
+-- The count(o.id) detail is the point. On a LEFT JOIN with no match there is
+-- still one output row, so count(*) says 1 and count(o.id) says 0. The second
+-- is what you meant, and this is the commonest way a zero becomes a one.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Grouping sets, rollup and cube</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">subtotals without unions</span><button class="copy">Copy</button></div>
+<pre><code>-- ROLLUP adds progressively coarser subtotals plus a grand total.
+SELECT region, product, sum(amount)
+FROM sales
+GROUP BY ROLLUP (region, product);
+--  by (region, product), then by (region), then the overall total.
+--  The rolled-up columns are NULL in subtotal rows.
+
+-- CUBE gives every combination: (region, product), (region), (product), ().
+SELECT region, product, sum(amount) FROM sales GROUP BY CUBE (region, product);
+
+-- GROUPING SETS lets you name exactly the ones you want.
+SELECT region, product, sum(amount)
+FROM sales
+GROUP BY GROUPING SETS ((region, product), (region), ());
+
+-- Distinguishing a subtotal's NULL from a real NULL in the data:
+SELECT
+    CASE WHEN grouping(region) = 1 THEN 'ALL REGIONS' ELSE region END AS region,
+    sum(amount)
+FROM sales GROUP BY ROLLUP (region);
+-- grouping() returns 1 when the column was rolled up. Without it, a genuine
+-- NULL region and the grand-total row are indistinguishable.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Performance notes</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Point</th><th>Detail</th></tr></thead>
+<tbody>
+<tr><td><b>Filter before grouping</b></td><td><code>WHERE</code> reduces the rows that need hashing or sorting. A row-level test in <code>HAVING</code> does the work then throws it away</td></tr>
+<tr><td><b><code>count(DISTINCT)</code> is expensive</b></td><td>It must materialise every distinct value. Several of them in one query multiply that cost</td></tr>
+<tr><td><b>Index the grouping column</b></td><td>An index can supply pre-sorted input and let the engine group by streaming rather than hashing</td></tr>
+<tr><td><b><code>count(*)</code> is not free</b></td><td>In PostgreSQL an exact count scans the table or an index. For a dashboard, an estimate from the statistics is usually enough</td></tr>
+<tr><td><b>Grouping on an expression</b></td><td><code>GROUP BY date_trunc('month', ts)</code> cannot use a plain index on <code>ts</code>. Index the expression, or store the truncated value</td></tr>
+<tr><td><b>Pre-aggregate the heavy path</b></td><td>A materialised view or a summary table, refreshed on a schedule. Chapter 14</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">Check every aggregate query against a known number</span>
+  <p>The habit that catches all of this: before shipping a report, verify one figure you can compute another way. Total revenue for one small customer, order count for one day, a single group you can check by eye. Aggregates fail silently — no error, plausible output — so the only reliable defence is an independent check. Doing it once per query, at the time you write it, is the difference between a report you trust and one you merely hope about.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Grouping changes the shape</b>: many rows become one, and non-grouped columns stop being addressable.</li>
+    <li>The "must appear in GROUP BY" error means <b>your question is ambiguous</b> — decide what you want, do not silence it.</li>
+    <li><b><code>sum()</code> over zero rows is NULL</b>, and <code>count(*)</code> over a LEFT JOIN with no match is 1. Both turn into wrong dashboard numbers.</li>
+    <li><b>Aggregating over a one-to-many join double-counts</b>, plausibly and silently. Pre-aggregate each side, then join.</li>
+    <li><code>count()</code> wants NULL for non-matches and <code>sum()</code> wants 0 — <b>getting that backwards counts every row</b>.</li>
+    <li><b><code>WHERE</code> for row conditions, <code>HAVING</code> for group conditions.</b> Wrong choice, wrong answer and slower.</li>
+    <li><code>GROUP BY</code> <b>cannot produce a group with no rows</b> — generate the axis and left-join onto it.</li>
+    <li><b>Verify one figure independently</b> before trusting any aggregate query. There is no other defence against silent failure.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("06-aggregation.html");
+
+(function(){
+  const root = document.getElementById("agg");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const ORDERS = [
+    {id:101, amount:120},
+    {id:102, amount:600},
+    {id:103, amount:80}
+  ];
+  const ITEMS = [
+    {id:1, order_id:101, qty:2}, {id:2, order_id:101, qty:1}, {id:3, order_id:101, qty:4},
+    {id:4, order_id:102, qty:3},
+    {id:5, order_id:103, qty:1}, {id:6, order_id:103, qty:2}
+  ];
+  const SHIPS = [
+    {id:9001, order_id:101}, {id:9002, order_id:101},
+    {id:9003, order_id:102},
+    {id:9004, order_id:103}
+  ];
+
+  const TRUE_REV = ORDERS.reduce((a,o) => a + o.amount, 0);
+
+  function render(){
+    const on = new Set([].slice.call(document.querySelectorAll(".ag:checked")).map(c => c.value));
+    const li = on.has("li"), sh = on.has("sh"), fix = on.has("fix");
+
+    // build the joined row set
+    let rows = [];
+    ORDERS.forEach(o => {
+      const items = li ? ITEMS.filter(x => x.order_id === o.id) : [null];
+      const ships = sh ? SHIPS.filter(x => x.order_id === o.id) : [null];
+      items.forEach(it => ships.forEach(s => rows.push({o, it, s})));
+    });
+
+    const perOrder = {};
+    rows.forEach(r => { perOrder[r.o.id] = (perOrder[r.o.id] || 0) + 1; });
+
+    const naiveRev = fix ? TRUE_REV : rows.reduce((a,r) => a + r.o.amount, 0);
+    const err = naiveRev / TRUE_REV;
+
+    $("a-rows").textContent = fix ? ORDERS.length : rows.length;
+    $("a-rev").textContent  = "£" + naiveRev.toLocaleString();
+    $("a-true").textContent = "£" + TRUE_REV.toLocaleString();
+    $("a-err").textContent  = err === 1 ? "none" : "+" + Math.round((err-1)*100) + "%";
+
+    const esc = s => s.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]));
+    let sql;
+    if(fix){
+      sql = "SELECT o.id, o.amount" +
+        (li ? ",\n       coalesce(li.qty, 0) AS qty" : "") +
+        (sh ? ",\n       coalesce(s.n, 0)    AS shipments" : "") +
+        "\nFROM orders o" +
+        (li ? "\nLEFT JOIN (SELECT order_id, sum(qty) AS qty\n           FROM line_items GROUP BY order_id) li ON li.order_id = o.id" : "") +
+        (sh ? "\nLEFT JOIN (SELECT order_id, count(*) AS n\n           FROM shipments  GROUP BY order_id) s  ON s.order_id  = o.id" : "") + ";";
+    } else {
+      sql = "SELECT sum(o.amount) AS revenue" +
+        (li ? ",\n       sum(li.qty)    AS units" : "") +
+        (sh ? ",\n       count(s.id)    AS shipments" : "") +
+        "\nFROM orders o" +
+        (li ? "\nJOIN line_items li ON li.order_id = o.id" : "") +
+        (sh ? "\nJOIN shipments  s  ON s.order_id  = o.id" : "") + ";";
+    }
+    $("a-sql").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid ' +
+      (fix || (!li && !sh) ? "#3FB984" : "#E2574C") +
+      ';border-radius:5px;padding:11px 13px;margin:0 0 12px;font-family:var(--mono);font-size:12.5px;line-height:1.6;overflow-x:auto">' +
+      esc(sql) + '</pre>';
+
+    $("a-table").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      'Rows per order, before grouping</div>' +
+      '<div class="tw" style="margin:0"><table><thead><tr><th>order</th><th>amount</th>' +
+      '<th>rows produced</th><th>amount counted</th></tr></thead><tbody>' +
+      ORDERS.map(o => {
+        const n = fix ? 1 : (perOrder[o.id] || 0);
+        const counted = o.amount * n;
+        const bad = n > 1;
+        return '<tr><td style="font-family:var(--mono);font-size:12.5px">' + o.id + '</td>' +
+          '<td style="font-family:var(--mono);font-size:12.5px">£' + o.amount + '</td>' +
+          '<td style="font-family:var(--mono);font-size:12.5px' + (bad ? ';color:#B0453B;font-weight:700' : '') + '">' + n + '</td>' +
+          '<td style="font-family:var(--mono);font-size:12.5px' + (bad ? ';color:#B0453B;font-weight:700' : '') + '">£' + counted +
+          (bad ? ' <span style="font-size:11px">(×' + n + ')</span>' : '') + '</td></tr>';
+      }).join("") + '</tbody></table></div>';
+
+    const notes = [];
+    if(!li && !sh)
+      notes.push("No joins yet. One row per order, revenue £" + TRUE_REV + " — correct. Tick a join and watch what happens.");
+    else if(fix)
+      notes.push("Each side is aggregated to one row per order_id BEFORE the join, so nothing multiplies. " +
+                 "Revenue is £" + TRUE_REV + " again, and the per-order quantities and shipment counts are still available. " +
+                 "This is the fix worth defaulting to: it is explicit about the grain of each subquery.");
+    else {
+      const parts = [];
+      if(li) parts.push("line items");
+      if(sh) parts.push("shipments");
+      notes.push("Joining " + parts.join(" and ") + " produced " + rows.length + " rows from " + ORDERS.length +
+                 " orders. sum(o.amount) now reports £" + naiveRev + " against a true £" + TRUE_REV +
+                 " — inflated by " + Math.round((err-1)*100) + "%.");
+      if(li && sh)
+        notes.push("Order 101 has 3 line items and 2 shipments, so it appears 3 × 2 = 6 times. The two joins multiply each other — " +
+                   "this is why adding a second one-to-many join to a working query can suddenly triple a number that was previously only doubled.");
+      notes.push("Nothing about this errors or looks wrong. The query runs, the number is plausible, and it reaches a dashboard. " +
+                 "Adding DISTINCT would remove the duplicate rows from view and leave sum() exactly as wrong as it is now.");
+      notes.push("The ten-second check: run the query without GROUP BY and count the rows. " +
+                 rows.length + " rows for " + ORDERS.length + " orders means something multiplied by about " +
+                 (rows.length/ORDERS.length).toFixed(1) + "×, and that is your signal to restructure.");
+    }
+    $("a-note").textContent = notes.join("\n\n");
+  }
+
+  [].slice.call(document.querySelectorAll(".ag")).forEach(c => c.addEventListener("change", render));
+  render();
+})();
+</script>
+</body>
+</html>

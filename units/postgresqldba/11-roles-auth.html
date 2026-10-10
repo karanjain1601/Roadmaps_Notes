@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Roles and authentication — PostgreSQL</title>
+<meta name="description" content="Roles, membership, pg_hba.conf, the authentication methods, SSL, and the default privileges that surprise people.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 11 · Running it</div>
+    <h1>Roles and authentication</h1>
+    <p class="standfirst">Two separate systems that people conflate: <code>pg_hba.conf</code> decides whether you may connect at all, and the privilege system decides what you may do once inside. Getting the first wrong locks you out; getting the second wrong is quieter and worse.</p>
+    <div class="chap-meta">
+      <span class="tagpill">pg_hba</span>
+      <span class="tagpill">roles</span>
+      <span class="tagpill">privileges</span>
+      <span class="tagpill">ssl</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>pg_hba.conf</h2>
+
+<p>Host-based authentication. A list of rules matched <b>top to bottom, first match wins</b> — and if the matched rule rejects you, Postgres does not continue looking for a later rule that would have let you in.</p>
+
+<div class="demo" id="hba">
+  <div class="demo-head">
+    <b>Which rule matches</b>
+    <span>A realistic pg_hba.conf. Describe a connection attempt and see which line decides it — and why the order matters.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="b-user">Connecting as</label>
+        <select id="b-user">
+          <option value="app" selected>app</option>
+          <option value="postgres">postgres</option>
+          <option value="replicator">replicator</option>
+          <option value="analyst">analyst</option>
+        </select>
+      </div>
+      <div>
+        <label for="b-db">To database</label>
+        <select id="b-db">
+          <option value="orders" selected>orders</option>
+          <option value="replication">replication (a stream)</option>
+        </select>
+      </div>
+      <div>
+        <label for="b-host">From</label>
+        <select id="b-host">
+          <option value="local" selected>a Unix socket on the server</option>
+          <option value="10.0.1.20">10.0.1.20 (app subnet)</option>
+          <option value="10.0.9.7">10.0.9.7 (replica subnet)</option>
+          <option value="203.0.113.5">203.0.113.5 (the internet)</option>
+        </select>
+      </div>
+      <div>
+        <label for="b-ssl">Connection</label>
+        <select id="b-ssl">
+          <option value="yes" selected>TLS</option>
+          <option value="no">plaintext</option>
+        </select>
+      </div>
+    </div>
+    <div id="b-file"></div>
+    <div class="stat">
+      <div><b id="b-result">—</b><span>outcome</span></div>
+      <div><b id="b-line">—</b><span>matched line</span></div>
+      <div><b id="b-method">—</b><span>method</span></div>
+    </div>
+    <div class="out" id="b-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">the format, and the methods worth using</span><button class="copy">Copy</button></div>
+<pre><code># TYPE  DATABASE  USER  ADDRESS         METHOD          [OPTIONS]
+local   all       all                   peer
+hostssl orders    app   10.0.1.0/24     scram-sha-256
+host    all       all   0.0.0.0/0       reject
+
+# TYPE:
+#   local     Unix socket
+#   host      TCP, with or without TLS
+#   hostssl   TCP, TLS required          <- use this, not `host`
+#   hostnossl TCP, TLS forbidden
+#
+# METHOD:
+#   scram-sha-256  the default and correct choice for passwords
+#   md5            legacy, weak. Migrate off it
+#   peer           local only: the OS username must match the database role
+#   cert           client TLS certificate. Strong, more to manage
+#   ldap / gss     enterprise directory integration
+#   trust          NO AUTHENTICATION AT ALL
+#   reject         refuse, and stop matching
+
+SELECT * FROM pg_hba_file_rules;    -- the parsed file, with any errors
+SELECT pg_reload_conf();            -- reload; no restart needed</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Two entries to check on every cluster you inherit</span>
+  <p><b><code>trust</code></b> means anyone who can reach the port becomes any role they name, with no password. It appears in default configurations for local connections and in a great many Docker images and quickstart guides, and it survives into production more often than anyone would like. <b><code>md5</code></b> is the old password method and is weak by modern standards; <code>scram-sha-256</code> has been the default since PostgreSQL 14 and migrating requires each user to set their password again after changing <code>password_encryption</code>. Grep for both, today.</p>
+</div>
+
+<h2><span class="h-rule"></span>Roles</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">there are no users, only roles</span><button class="copy">Copy</button></div>
+<pre><code>-- CREATE USER is CREATE ROLE ... LOGIN. That is the only difference.
+-- A role with LOGIN is what you might call a user; one without is a group.
+
+CREATE ROLE readonly NOLOGIN;                          -- a group
+CREATE ROLE analyst LOGIN PASSWORD '…' IN ROLE readonly;
+
+GRANT USAGE ON SCHEMA public TO readonly;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO readonly;
+
+-- The pattern worth adopting: grant privileges to GROUP roles, and grant
+-- group membership to login roles. Then onboarding is one GRANT and
+-- offboarding is one REVOKE, rather than an audit of every table.
+
+-- Attributes:
+--   LOGIN / NOLOGIN         may connect
+--   SUPERUSER               bypasses all permission checks. Almost never
+--   CREATEDB / CREATEROLE   CREATEROLE was dangerously broad before PG16
+--   REPLICATION             may start a replication connection
+--   BYPASSRLS               ignores row-level security policies
+--   CONNECTION LIMIT n      cap concurrent connections (chapter 9)
+--   VALID UNTIL '2026-12-31'  password expiry
+
+-- Predefined roles, which remove most reasons to hand out SUPERUSER:
+--   pg_monitor            read all the statistics views
+--   pg_read_all_data      SELECT on everything (PG14+)
+--   pg_write_all_data     INSERT/UPDATE/DELETE on everything
+--   pg_signal_backend     cancel and terminate other backends
+--   pg_maintain           VACUUM, ANALYZE, REINDEX (PG17+)
+GRANT pg_monitor TO monitoring;</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">The application should not own its schema</span>
+  <p>The SQL unit made this point; here is the Postgres-specific reason it matters. The role that owns a table can <code>DROP</code> it, <code>ALTER</code> it and change its permissions — and most applications connect as the owner because that is what the quickstart did. Separate them: an <b>owner</b> role that runs migrations from CI, and a <b>read-write</b> role the application uses which has <code>SELECT, INSERT, UPDATE, DELETE</code> and nothing else. Then no injection, no compromised dependency and no accidental script can alter the schema, and the blast radius of an application compromise is bounded by DML.</p>
+</div>
+
+<h2><span class="h-rule"></span>The default privileges trap</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">why the grant you ran last month does not cover the new table</span><button class="copy">Copy</button></div>
+<pre><code>-- This grants on tables that exist RIGHT NOW. It is not a standing rule.
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO readonly;
+
+-- The next migration creates a table, and readonly cannot see it. The symptom
+-- is a permission error in production hours after a deploy, on one endpoint.
+
+-- The standing rule. Note FOR ROLE: default privileges apply to objects
+-- created BY A PARTICULAR ROLE, so this must name whoever runs migrations.
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public
+    GRANT SELECT ON TABLES TO readonly;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_rw;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO app_rw;
+
+-- Getting FOR ROLE wrong is the commonest mistake here: the defaults are
+-- recorded against the creating role, so a rule set without FOR ROLE applies
+-- only to objects YOU create.
+SELECT * FROM pg_default_acl;
+
+-- And the one people miss entirely: on PostgreSQL 14 and earlier, PUBLIC can
+-- CREATE objects in the public schema. Anyone who can connect can create a
+-- table there. Fixed by default in PG15; revoke it explicitly on older ones.
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON DATABASE orders FROM PUBLIC;</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>What a role can actually do</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">auditing privileges, which is harder than granting them</span><button class="copy">Copy</button></div>
+<pre><code>-- Everything a role has been granted, transitively through group membership:
+SELECT table_schema, table_name, privilege_type
+FROM information_schema.table_privileges
+WHERE grantee = 'analyst'
+ORDER BY table_schema, table_name;
+
+-- Ask directly, which accounts for inheritance and is the reliable check:
+SELECT has_table_privilege('analyst', 'orders', 'SELECT');
+SELECT has_schema_privilege('analyst', 'public', 'USAGE');
+SELECT pg_has_role('analyst', 'readonly', 'MEMBER');
+
+-- Who is a member of what:
+SELECT r.rolname AS role, m.rolname AS member_of
+FROM pg_auth_members am
+JOIN pg_roles r ON r.oid = am.member
+JOIN pg_roles m ON m.oid = am.roleid
+ORDER BY 1, 2;
+
+-- Roles with attributes worth reviewing:
+SELECT rolname, rolsuper, rolcreaterole, rolcreatedb,
+       rolreplication, rolbypassrls, rolconnlimit, rolvaliduntil
+FROM pg_roles
+WHERE rolsuper OR rolcreaterole OR rolreplication OR rolbypassrls
+ORDER BY rolname;
+-- Run this quarterly. Superuser and BYPASSRLS accumulate quietly.
+
+\du+       -- the psql shorthand for the same overview</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Schema USAGE is a separate privilege and it is easy to miss</span>
+  <p><code>GRANT SELECT ON ALL TABLES</code> is not enough on its own. Without <code>USAGE</code> on the containing schema the role cannot reach the tables at all, and the error — "permission denied for schema" — reads like a table problem to anyone in a hurry. The same applies to sequences: a role with <code>INSERT</code> on a table using an identity column also needs <code>USAGE</code> on its sequence, or every insert fails. Both are one extra <code>GRANT</code>, and both are the reason a permissions change "did not work".</p>
+</div>
+
+<h2><span class="h-rule"></span>TLS</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">encrypt everything, and verify the server</span><button class="copy">Copy</button></div>
+<pre><code># postgresql.conf
+ssl = on
+ssl_cert_file = '/etc/ssl/certs/server.crt'
+ssl_key_file  = '/etc/ssl/private/server.key'
+ssl_ca_file   = '/etc/ssl/certs/ca.crt'      # required for client certs
+ssl_min_protocol_version = 'TLSv1.2'
+
+# pg_hba.conf — hostssl, so a plaintext attempt is refused rather than allowed
+hostssl  orders  app  10.0.1.0/24  scram-sha-256
+
+# Client side, and this is the part that is usually wrong:
+#   sslmode=disable      no TLS
+#   sslmode=allow        TLS only if the server insists
+#   sslmode=prefer       DEFAULT — TLS if available, silently falls back
+#   sslmode=require      TLS, but the certificate is NOT checked
+#   sslmode=verify-ca    checks the certificate chain
+#   sslmode=verify-full  checks the chain AND the hostname   <- use this
+#
+# `require` encrypts against passive eavesdropping and does nothing against an
+# active attacker, because it accepts any certificate. Only verify-full
+# authenticates the server you are actually talking to.
+
+SELECT ssl, version, cipher, client_dn
+FROM pg_stat_ssl JOIN pg_stat_activity USING (pid)
+WHERE backend_type = 'client backend';
+-- Anything with ssl = false is a client to fix.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">sslmode=require is not verification</span>
+  <p>It is the setting most people reach for and it stops at encryption: the client accepts whatever certificate it is offered, so anything that can intercept the connection can present its own and read everything. <code>verify-full</code> checks the chain against a CA <em>and</em> that the hostname matches. The reason <code>require</code> is so common is that <code>verify-full</code> fails loudly when the CA bundle is not configured, and <code>require</code> does not — so it gets chosen to make an error go away. Configure the CA bundle and use <code>verify-full</code>, including inside your private network.</p>
+</div>
+
+<h2><span class="h-rule"></span>Passwords and rotation</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">managing credentials without downtime</span><button class="copy">Copy</button></div>
+<pre><code>-- Make sure new passwords use SCRAM before you set any.
+SHOW password_encryption;                 -- want scram-sha-256
+ALTER SYSTEM SET password_encryption = 'scram-sha-256';
+SELECT pg_reload_conf();
+-- Existing md5 passwords stay md5 until each is set again:
+ALTER ROLE app PASSWORD 'new-password';
+
+-- Find who is still on the old scheme:
+SELECT rolname, CASE WHEN rolpassword LIKE 'SCRAM-SHA-256%' THEN 'scram'
+                     WHEN rolpassword LIKE 'md5%' THEN 'md5' ELSE 'none' END
+FROM pg_authid WHERE rolcanlogin;
+
+-- Never type a password into psql: it lands in ~/.psql_history and in the
+-- server log if statement logging is on. Use \password, which computes the
+-- hash client-side and sends only the hash:
+\password app
+
+-- Zero-downtime rotation, since ALTER ROLE ... PASSWORD takes effect at once
+-- and breaks anything still holding the old one:
+--   1. create app_v2 with the new password, IN ROLE the same groups
+--   2. roll the application over to app_v2
+--   3. confirm no sessions remain as app in pg_stat_activity
+--   4. DROP ROLE app
+-- Better still: short-lived credentials from a secrets manager, or IAM
+-- authentication where your platform supports it — then rotation is automatic
+-- and there is no long-lived secret to leak.
+
+-- Expiry, so a forgotten credential does not live forever:
+ALTER ROLE contractor VALID UNTIL '2026-06-30';</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>A working role layout</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the whole thing, in one place</span><button class="copy">Copy</button></div>
+<pre><code>-- Groups: privileges attach here.
+CREATE ROLE app_owner NOLOGIN;                 -- owns the schema
+CREATE ROLE app_rw    NOLOGIN;                 -- DML only
+CREATE ROLE app_ro    NOLOGIN;                 -- SELECT only
+
+-- Logins: no privileges of their own, only membership.
+CREATE ROLE svc_orders  LOGIN PASSWORD '…' IN ROLE app_rw;
+CREATE ROLE svc_reports LOGIN PASSWORD '…' IN ROLE app_ro;
+CREATE ROLE migrations  LOGIN PASSWORD '…' IN ROLE app_owner;
+CREATE ROLE monitoring  LOGIN PASSWORD '…';
+GRANT pg_monitor TO monitoring;
+
+-- Ownership and grants.
+ALTER SCHEMA public OWNER TO app_owner;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON DATABASE orders FROM PUBLIC;
+
+GRANT USAGE ON SCHEMA public TO app_rw, app_ro;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_rw;
+GRANT SELECT                          ON ALL TABLES IN SCHEMA public TO app_ro;
+GRANT USAGE, SELECT ON ALL SEQUENCES  IN SCHEMA public TO app_rw;
+
+-- The standing rules, so tomorrow's tables are covered.
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_rw;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public
+    GRANT SELECT ON TABLES TO app_ro;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO app_rw;
+
+-- Per-role settings, which is the right scope for most of chapter 8.
+ALTER ROLE svc_orders  SET statement_timeout = '30s';
+ALTER ROLE svc_reports SET statement_timeout = '30min';
+ALTER ROLE svc_reports SET work_mem = '256MB';
+ALTER ROLE monitoring  SET CONNECTION LIMIT 5;</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>A review checklist</h2>
+
+<ul class="check">
+  <li><b>No <code>trust</code> in <code>pg_hba.conf</code></b>, including for local connections.</li>
+  <li><b>No <code>md5</code></b>; <code>password_encryption = scram-sha-256</code> and every password reset.</li>
+  <li><b><code>hostssl</code>, not <code>host</code></b>, and clients using <code>verify-full</code>.</li>
+  <li><b>A final <code>reject</code> rule</b>, so an unmatched connection is refused explicitly rather than by luck.</li>
+  <li><b>The application does not own its schema</b>, and migrations run as a different role from CI.</li>
+  <li><b><code>ALTER DEFAULT PRIVILEGES … FOR ROLE</code></b> set, naming whoever runs migrations.</li>
+  <li><b><code>REVOKE CREATE ON SCHEMA public FROM PUBLIC</code></b> on anything before PostgreSQL 15.</li>
+  <li><b>Superuser, <code>CREATEROLE</code>, <code>REPLICATION</code> and <code>BYPASSRLS</code> audited quarterly.</b></li>
+  <li><b>Monitoring uses <code>pg_monitor</code></b>, not superuser.</li>
+</ul>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><code>pg_hba.conf</code> is matched <b>top to bottom, first match wins</b> — a matching reject stops the search.</li>
+    <li><b>Grep for <code>trust</code> and <code>md5</code> today.</b> Both survive from quickstarts into production.</li>
+    <li>There are no users, only roles. <b>Privileges on groups, membership on logins.</b></li>
+    <li><b>The application should not own its schema.</b> Migrations run as a separate role from CI.</li>
+    <li><code>GRANT … ON ALL TABLES</code> covers today's tables. <b><code>ALTER DEFAULT PRIVILEGES … FOR ROLE</code></b> covers tomorrow's.</li>
+    <li><b>Schema <code>USAGE</code> and sequence <code>USAGE</code></b> are separate grants, and their absence looks like a table problem.</li>
+    <li><b><code>sslmode=require</code> does not verify anything.</b> Use <code>verify-full</code>, including internally.</li>
+    <li>Rotate by <b>creating a new role and switching</b>, not by changing a password in place.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("11-roles-auth.html");
+
+(function(){
+  const root = document.getElementById("hba");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const RULES = [
+    {n:1, type:"local",    db:"all",         user:"all",        addr:"",             method:"peer"},
+    {n:2, type:"hostssl",  db:"replication", user:"replicator", addr:"10.0.9.0/24",  method:"scram-sha-256"},
+    {n:3, type:"hostssl",  db:"orders",      user:"app",        addr:"10.0.1.0/24",  method:"scram-sha-256"},
+    {n:4, type:"hostssl",  db:"orders",      user:"analyst",    addr:"10.0.1.0/24",  method:"scram-sha-256"},
+    {n:5, type:"host",     db:"all",         user:"all",        addr:"0.0.0.0/0",    method:"reject"}
+  ];
+
+  function inSubnet(ip, cidr){
+    if(!cidr) return false;
+    if(cidr === "0.0.0.0/0") return true;
+    const prefix = cidr.split("/")[0].split(".").slice(0,3).join(".");
+    return ip.split(".").slice(0,3).join(".") === prefix;
+  }
+
+  function match(user, db, host, ssl){
+    for(const r of RULES){
+      const isLocal = host === "local";
+      if(r.type === "local" && !isLocal) continue;
+      if(r.type !== "local" && isLocal) continue;
+      if(r.type === "hostssl" && ssl !== "yes") continue;
+      if(r.user !== "all" && r.user !== user) continue;
+      if(r.db !== "all" && r.db !== db) continue;
+      if(r.type !== "local" && !inSubnet(host, r.addr)) continue;
+      return r;
+    }
+    return null;
+  }
+
+  function render(){
+    const user = $("b-user").value, db = $("b-db").value;
+    const host = $("b-host").value, ssl = $("b-ssl").value;
+    const m = match(user, db, host, ssl);
+
+    $("b-file").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-radius:5px;padding:11px 13px;margin:14px 0 12px;' +
+      'font-family:var(--mono);font-size:11.5px;line-height:1.75;overflow-x:auto">' +
+      '<span style="color:#8FA0AF"># TYPE     DATABASE      USER         ADDRESS         METHOD</span>\n' +
+      RULES.map(r => {
+        const hit = m && m.n === r.n;
+        const line = r.type.padEnd(9) + r.db.padEnd(14) + r.user.padEnd(13) +
+                     (r.addr || "").padEnd(16) + r.method;
+        return '<span style="display:block;' +
+          (hit ? 'background:#EEFAFB;border-left:3px solid #25B7C4;margin-left:-13px;padding-left:10px;font-weight:700;color:#0F7A85' : 'color:#25323E') +
+          '">' + line + (hit ? '   ← matched' : '') + '</span>';
+      }).join("") + '</pre>';
+
+    const ok = m && m.method !== "reject";
+    $("b-result").textContent = !m ? "rejected" : m.method === "reject" ? "rejected" : "allowed";
+    $("b-line").textContent   = m ? "line " + m.n : "none";
+    $("b-method").textContent = m ? m.method : "implicit reject";
+
+    const notes = [];
+    if(!m)
+      notes.push("No rule matched, so the connection is refused. An unmatched connection is always rejected — but relying on that is poor practice, which is why line 5 exists: an explicit final reject makes the intent visible and gives a clearer error.");
+    else if(m.method === "reject")
+      notes.push("Line 5 matched and it rejects. Note that matching STOPS here — Postgres does not continue looking for a later rule that might have allowed this. That first-match-wins behaviour is why rule order is the thing to get right, and why a broad rule placed too early silently disables everything below it.");
+    else if(m.method === "peer")
+      notes.push("Line 1: a local Unix socket connection authenticated by peer. The operating-system username must match the database role name, so this works for the postgres user administering the cluster and not for arbitrary logins.\n\nCheck this line on clusters you inherit — many distributions and almost every Docker quickstart ship it as `trust`, which means anyone with shell access on the box becomes any role they name with no password at all.");
+    else
+      notes.push("Line " + m.n + " matched: hostssl, so TLS is required, with scram-sha-256 for the password exchange. Using hostssl rather than host means a plaintext attempt is refused outright rather than quietly accepted.");
+
+    if(ssl === "no" && host !== "local")
+      notes.push("This attempt is plaintext. Every hostssl rule was skipped because it cannot match a non-TLS connection, so it fell through to the final reject. That is the correct outcome, and it is the reason to write hostssl rather than host — with `host`, this same attempt would have been allowed unencrypted.");
+
+    if(host === "203.0.113.5")
+      notes.push("A public address. It reaches line 5 and is refused — but note that the database is still listening and still accepting TCP connections from the internet, which it should not be. pg_hba is the last line of defence, not the first: put the database on a private network with a firewall that defaults to deny.");
+
+    if(db === "replication")
+      notes.push("Replication connections match a special DATABASE value of `replication` — they do not connect to a normal database. A replica cannot stream without a matching rule, and forgetting it is one of the standard reasons a newly built standby will not start (chapter 13).");
+
+    if(user === "postgres" && host !== "local")
+      notes.push("The postgres superuser connecting over the network. There is no rule permitting it here, which is deliberate: superuser access should be local, over a socket, from the host itself. If you need remote administrative access, go through a bastion rather than adding a rule.");
+
+    if(user === "analyst" && ok)
+      notes.push("The analyst role is allowed to connect. What it can then DO is an entirely separate question, decided by the privilege system — pg_hba governs the door, not the rooms. Chapter 15 of the SQL unit covers restricting what an analyst can read.");
+
+    $("b-note").textContent = notes.join("\n\n");
+  }
+
+  ["b-user","b-db","b-host","b-ssl"].forEach(id => $(id).addEventListener("change", render));
+  render();
+})();
+</script>
+</body>
+</html>

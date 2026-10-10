@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Structured output and tool calling — AI Engineer</title>
+<meta name="description" content="JSON schemas and constrained decoding, schema design rules, validation and repair, and the full tool-calling loop with its failure modes.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 07 · Working with models</div>
+    <h1>Structured output and tool calling</h1>
+    <p class="standfirst">The moment a model's output has to be consumed by code rather than read by a person, prose becomes a liability. Schemas turn a fuzzy generator into a typed function — and the same mechanism, pointed the other way, is how a model calls into your systems.</p>
+    <div class="chap-meta">
+      <span class="tagpill">json schema</span>
+      <span class="tagpill">constrained decoding</span>
+      <span class="tagpill">validation</span>
+      <span class="tagpill">tool loop</span>
+      <span class="tagpill">tool design</span>
+      <span class="tagpill">failure modes</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Three levels of guarantee</h2>
+
+<p>There are three ways to get JSON out of a model, and they are not equivalent. Know which one you are using, because the failure rate differs by orders of magnitude.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Level</th><th>Mechanism</th><th>Guarantees</th><th>Failure rate</th></tr></thead>
+<tbody>
+<tr><td><b>1. Ask nicely</b></td><td>"Return JSON matching this shape" in the prompt</td><td>Nothing</td><td>1–10% depending on model and input weirdness. Markdown fences, preambles, trailing commentary, invented fields</td></tr>
+<tr><td><b>2. JSON mode</b></td><td>A provider flag that forces syntactically valid JSON</td><td>It parses</td><td>Near zero parse failures, but the <em>shape</em> is still unconstrained: missing fields, extra fields, wrong types</td></tr>
+<tr><td><b>3. Constrained decoding</b></td><td>A schema supplied to the API; the sampler is restricted at each token to only those that can still satisfy it</td><td>It parses <em>and</em> matches the schema</td><td>Effectively zero structural failures. Semantic errors remain — a valid schema can hold a wrong answer</td></tr>
+</tbody>
+</table>
+<caption>Level 3 goes by names like structured outputs, strict schema, or response format with a JSON schema. On open models the same effect is achieved with grammar-constrained sampling (chapter 8).</caption>
+</div>
+
+<div class="note key">
+  <span class="note-t">The distinction that matters</span>
+  <p>Constrained decoding removes an entire class of production bug: you will never again see a 3am page for a trailing comma. It does <em>not</em> make the content correct. A schema guarantees <code>{"refund_amount": 40000.00}</code> is well-formed; only validation, business rules and evals catch that it should have been 40.00.</p>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">python — a typed model, a schema, and a parsed object</span><button class="copy">Copy</button></div>
+<pre><code>from typing import Literal
+from pydantic import BaseModel, Field
+
+class TicketAnalysis(BaseModel):
+    reasoning: str = Field(description="One sentence of justification. Written FIRST so "
+                                       "the fields below are conditioned on it.")
+    category: Literal["billing", "shipping", "technical", "account", "other"]
+    urgency: Literal["low", "normal", "high"]
+    order_id: str | None = Field(description="The order reference if the customer stated "
+                                             "one, otherwise null. Never infer or invent it.")
+    refund_requested: bool
+    customer_language: str = Field(description="BCP-47 code, e.g. en-GB, de-DE")
+
+result = client.chat.completions.parse(
+    model=MODEL,
+    messages=[{"role": "system", "content": SYSTEM},
+              {"role": "user",   "content": ticket_text}],
+    response_format=TicketAnalysis,          # schema is derived and enforced
+    temperature=0,
+)
+
+analysis: TicketAnalysis = result.choices[0].message.parsed
+if analysis.refund_requested and analysis.order_id:
+    route_to_refunds(analysis.order_id)</code></pre>
+</div>
+
+<div class="code" data-lang="typescript">
+<div class="code-head"><span class="lang">typescript — the same thing with zod</span><button class="copy">Copy</button></div>
+<pre><code>import { z } from "zod";
+
+const TicketAnalysis = z.object({
+  reasoning:        z.string(),
+  category:         z.enum(["billing", "shipping", "technical", "account", "other"]),
+  urgency:          z.enum(["low", "normal", "high"]),
+  orderId:          z.string().nullable(),
+  refundRequested:  z.boolean(),
+  customerLanguage: z.string(),
+});
+
+const res = await client.chat.completions.parse({
+  model: MODEL,
+  messages,
+  response_format: zodResponseFormat(TicketAnalysis, "ticket_analysis"),
+  temperature: 0,
+});
+
+const analysis = res.choices[0].message.parsed;   // fully typed</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Designing a schema the model can actually fill</h2>
+
+<p>A schema that is valid JSON Schema can still be one the model fills badly. These rules come from watching extraction tasks fail.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Rule</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><b>Make every uncertain field nullable, and say when null is correct</b></td><td>The single biggest cause of invented data. A non-nullable <code>order_id</code> forces the model to produce something; it will produce a plausible-looking reference number</td></tr>
+<tr><td><b>Use enums, not free strings, wherever the set is closed</b></td><td>Constrained decoding then makes an out-of-set value impossible, rather than merely unlikely</td></tr>
+<tr><td><b>Put reasoning fields before the fields they justify</b></td><td>Generation is sequential: a field can only be conditioned on what precedes it. <code>reasoning</code> after <code>category</code> is post-hoc rationalisation and does not improve accuracy</td></tr>
+<tr><td><b>Keep it shallow</b></td><td>Deeply nested objects have higher error rates and are harder to validate meaningfully. Two levels is usually plenty; flatten or split into two calls</td></tr>
+<tr><td><b>Write real descriptions</b></td><td>Field descriptions are part of the prompt. <code>"amount"</code> versus <code>"the refund amount in the order's original currency, as a decimal number, without a currency symbol"</code> is a large accuracy difference</td></tr>
+<tr><td><b>Name fields for meaning, not storage</b></td><td><code>delivery_estimate_days</code> beats <code>val2</code>. The name is a hint the model reads</td></tr>
+<tr><td><b>Avoid unions and polymorphism</b></td><td>Support varies, error rates rise, and validation gets complicated. Prefer a discriminator field plus optional fields</td></tr>
+<tr><td><b>Bound your arrays</b></td><td>An unbounded list invites a model to keep going. State a maximum in the description and enforce it in validation</td></tr>
+<tr><td><b>Numbers as numbers, dates as strings with a stated format</b></td><td>Ask for ISO-8601 explicitly. "Next Tuesday" is a legitimate string and a useless date</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>When it is still wrong: validate and repair</h3>
+
+<p>Even with constrained decoding you need a validation layer, because business rules are not expressible in a schema. Give the model the validation error and let it try once more — this fixes the large majority of remaining failures.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">repair.py — one retry, with the error as feedback</span><button class="copy">Copy</button></div>
+<pre><code>from pydantic import ValidationError
+
+def extract(text: str, *, attempts: int = 2) -> TicketAnalysis:
+    messages = [{"role": "system", "content": SYSTEM},
+                {"role": "user",   "content": text}]
+
+    for attempt in range(attempts):
+        raw = llm.complete(messages=messages, schema=TicketAnalysis, temperature=0)
+        try:
+            parsed = TicketAnalysis.model_validate_json(raw.text)
+            check_business_rules(parsed, text)          # raises ValueError
+            return parsed
+        except (ValidationError, ValueError) as e:
+            if attempt == attempts - 1:
+                metrics.increment("extract.unrecoverable")
+                raise
+            metrics.increment("extract.repaired")
+            messages += [
+                {"role": "assistant", "content": raw.text},
+                {"role": "user", "content":
+                    f"That response was rejected:\n{e}\n\n"
+                    f"Return a corrected version. Change only what the error names."},
+            ]
+
+def check_business_rules(a: TicketAnalysis, source: str):
+    # Things a schema cannot express, and where hallucination actually hides.
+    if a.order_id and a.order_id not in source:
+        raise ValueError(f"order_id {a.order_id!r} does not appear in the ticket text")
+    if a.refund_requested and a.category == "technical":
+        raise ValueError("refund_requested is true but category is technical; re-check")</code></pre>
+</div>
+
+<p>That <code>order_id not in source</code> check is worth dwelling on. It is a two-line grounding test that catches invented identifiers with complete reliability, and the same pattern — <em>does this extracted value literally appear in the input?</em> — applies to dates, amounts, names and reference numbers. It is the cheapest hallucination detector you will ever write.</p>
+
+<div class="note warn">
+  <span class="note-t">Track your repair rate</span>
+  <p>Count first-attempt successes, repairs and unrecoverable failures as separate metrics. A repair rate creeping from 2% to 15% is an early warning of a model change, a prompt regression or a shift in your input distribution — long before users complain.</p>
+</div>
+
+<h3>Streaming structured output</h3>
+
+<p>You cannot <code>JSON.parse</code> a half-finished object. Three workable approaches:</p>
+
+<ul>
+  <li><b>Do not stream it.</b> For a small object, buffer and parse. The user waits 800ms for a form to populate — acceptable.</li>
+  <li><b>Split the response.</b> Stream the prose field as text, and return the structured fields at the end. Works well when there is one long human-readable field and several small machine ones.</li>
+  <li><b>Use an incremental parser.</b> Libraries that tolerate truncated JSON let you render fields as they complete. Useful for long arrays where each element can appear as it finishes.</li>
+</ul>
+
+<h2><span class="h-rule"></span>Tool calling: the same mechanism, reversed</h2>
+
+<p>Instead of constraining the model's output to your data shape, you describe a set of functions and let it produce a structured request to call one. Your code executes it and hands the result back. The model never runs anything — it only asks.</p>
+
+<div class="flow stack">
+  <div class="step"><b>1 · You send</b><span>Messages, plus a list of tool definitions with JSON-schema parameters</span></div>
+  <div class="arr">›</div>
+  <div class="step"><b>2 · Model replies with a tool call</b><span>Stop reason is <code>tool_calls</code>, not <code>stop</code>. It contains a name, arguments and a call id</span></div>
+  <div class="arr">›</div>
+  <div class="step"><b>3 · You execute</b><span>Validate the arguments, check permissions, run your own function. This is ordinary code you own</span></div>
+  <div class="arr">›</div>
+  <div class="step"><b>4 · You append the result</b><span>A <code>tool</code> message referencing the call id, containing the output as a string</span></div>
+  <div class="arr">›</div>
+  <div class="step"><b>5 · Call again</b><span>The model either answers, or asks for another tool. Loop until it stops or you hit your cap</span></div>
+</div>
+
+<div class="demo" id="loop">
+  <div class="demo-head">
+    <b>Step through a tool loop</b>
+    <span>Watch the messages array grow. This is the whole of chapter 15's agent, in four steps.</span>
+  </div>
+  <div class="demo-body">
+    <div style="display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap">
+      <button class="btn" id="lstep">Next step</button>
+      <button class="btn ghost" id="lreset">Reset</button>
+      <span style="font-size:12.5px;color:#54677A;align-self:center" id="lcaption"></span>
+    </div>
+    <div class="stat" style="margin:0 0 12px">
+      <div><b id="l-turn">0</b><span>round trips</span></div>
+      <div><b id="l-msg">1</b><span>messages in the array</span></div>
+      <div><b id="l-tok">~340</b><span>input tokens next call</span></div>
+    </div>
+    <div class="out" id="lbody"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">tools.py — definitions and the loop</span><button class="copy">Copy</button></div>
+<pre><code>TOOLS = [{
+    "type": "function",
+    "function": {
+        "name": "get_order",
+        "description": ("Look up one order by its reference. Use this whenever the customer "
+                        "mentions an order number, before making any claim about its status. "
+                        "Returns status, dates, items and totals. Read-only."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "order_id": {"type": "string",
+                             "description": "Reference exactly as the customer wrote it, e.g. NW-8842"}
+            },
+            "required": ["order_id"],
+            "additionalProperties": False,
+        },
+    },
+}]
+
+REGISTRY = {"get_order": get_order_impl}          # name -> callable
+MAX_STEPS = 6
+
+def run(user_message: str) -> str:
+    messages = [{"role": "system", "content": SYSTEM},
+                {"role": "user",   "content": user_message}]
+
+    for step in range(MAX_STEPS):
+        r = client.chat.completions.create(model=MODEL, messages=messages,
+                                           tools=TOOLS, temperature=0, max_tokens=800)
+        msg = r.choices[0].message
+        messages.append(msg)                       # keep the assistant turn verbatim
+
+        if r.choices[0].finish_reason != "tool_calls":
+            return msg.content or ""
+
+        for call in msg.tool_calls:                # may be several, issued in parallel
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,           # must match, or the API rejects it
+                "content": execute(call),
+            })
+
+    return "I wasn't able to complete that. Let me pass you to a colleague."
+
+
+def execute(call) -> str:
+    """Never trust the arguments. Validate, authorise, bound the output."""
+    fn = REGISTRY.get(call.function.name)
+    if fn is None:
+        return json.dumps({"error": f"unknown tool {call.function.name}",
+                           "available": list(REGISTRY)})
+    try:
+        args = ToolArgs[call.function.name].model_validate_json(call.function.arguments)
+    except ValidationError as e:
+        return json.dumps({"error": "invalid arguments", "detail": str(e)})
+
+    if not authorised(current_user, call.function.name, args):
+        return json.dumps({"error": "not permitted for this user"})
+
+    try:
+        out = fn(**args.model_dump())
+    except Exception as e:
+        log.exception("tool failed")
+        return json.dumps({"error": type(e).__name__, "detail": str(e)[:200]})
+
+    return truncate_json(out, max_tokens=1500)     # a big result will eat your window</code></pre>
+</div>
+
+<p>Four details in that code are load-bearing and frequently omitted.</p>
+
+<ul>
+  <li><b>The assistant message is appended verbatim</b>, including its tool calls. Reconstructing it loses the call ids and the API rejects the follow-up.</li>
+  <li><b>Errors are returned to the model as tool results, not raised.</b> A well-worded error is information the model can act on — "invalid arguments: order_id must match NW-\d+" often produces a corrected call on the next step. Raising just ends the request.</li>
+  <li><b>Authorisation is checked in your code</b>, per call, against the real user. The model's opinion about what it should be allowed to do is not an authorisation decision.</li>
+  <li><b>Results are truncated.</b> An API returning 200,000 tokens of JSON straight into the context is a real and expensive incident.</li>
+</ul>
+
+<h2><span class="h-rule"></span>Designing tools the model uses correctly</h2>
+
+<p>Tool-use failures are overwhelmingly caused by tool design, not by model weakness. Treat a tool definition as a user interface whose user happens to be a language model.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Principle</th><th>Bad</th><th>Good</th></tr></thead>
+<tbody>
+<tr><td><b>Few tools</b></td><td>40 fine-grained tools; selection accuracy collapses and schemas eat 4,000 tokens</td><td>5–15 well-scoped tools. If you need more, group them behind a router or split into sub-agents (chapter 15)</td></tr>
+<tr><td><b>Unambiguous names</b></td><td><code>search</code>, <code>lookup</code>, <code>find</code> all present</td><td><code>search_help_articles</code>, <code>get_order</code>, <code>find_similar_tickets</code></td></tr>
+<tr><td><b>Descriptions say when, not just what</b></td><td>"Gets an order"</td><td>"Look up one order by reference. Use before making any claim about order status. Read-only."</td></tr>
+<tr><td><b>Narrow parameters</b></td><td><code>{"query": "any SQL you like"}</code></td><td><code>{"status": enum, "since": date, "limit": int ≤ 50}</code></td></tr>
+<tr><td><b>Compact results</b></td><td>The raw upstream payload with 60 fields</td><td>The 6 fields that matter, renamed for clarity, dates formatted</td></tr>
+<tr><td><b>Teaching errors</b></td><td><code>{"error": "400"}</code></td><td><code>{"error": "no order NW-884; references look like NW-8842. Ask the customer to confirm."}</code></td></tr>
+<tr><td><b>Idempotent where possible</b></td><td><code>charge_card</code> with no key — a retry double-charges</td><td><code>charge_card(idempotency_key=...)</code>, so a repeat is a no-op</td></tr>
+<tr><td><b>Separate read from write</b></td><td>One tool that reads or updates depending on arguments</td><td>Distinct tools, with writes requiring confirmation</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Read your tool schemas as a prompt</span>
+  <p>Serialise your full tool list and read it as if it were the only instruction you received. Would you know which one to reach for, when, and with what arguments? Count the tokens too — it is common for tool definitions to be a third of a system prompt, cached or not.</p>
+</div>
+
+<h2><span class="h-rule"></span>How tool calling fails</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Failure</th><th>Symptom</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td><b>Wrong tool chosen</b></td><td>Searches the help centre when it should have looked up the order</td><td>Sharper descriptions with usage conditions; fewer overlapping tools; add an example in the system prompt</td></tr>
+<tr><td><b>No tool called</b></td><td>Answers from memory instead of looking it up</td><td>State the rule explicitly: "you must call get_order before stating any order's status". Some APIs let you force tool use</td></tr>
+<tr><td><b>Invented tool or argument</b></td><td>Calls <code>cancel_order</code>, which does not exist</td><td>Return a structured error listing the real tools. It usually recovers on the next step</td></tr>
+<tr><td><b>Argument drift</b></td><td>Passes <code>"NW 8842"</code> or <code>"8842"</code> instead of <code>"NW-8842"</code></td><td>Pattern in the schema, an example in the description, and normalisation in your handler</td></tr>
+<tr><td><b>Loop</b></td><td>Same tool, same arguments, repeatedly</td><td>Hard step cap; detect a repeated call signature and inject "you already called this and got X — proceed"</td></tr>
+<tr><td><b>Context blowout</b></td><td>Third tool result overflows the window</td><td>Truncate results; summarise large payloads before appending; store the full result and pass a reference id</td></tr>
+<tr><td><b>Parallel calls with order dependency</b></td><td>Issues create and update simultaneously</td><td>Disable parallel calls for stateful tools, or make the dependency explicit in the description</td></tr>
+<tr><td><b>Destructive call on ambiguous intent</b></td><td>Refunds the wrong order after a vague message</td><td>Confirmation step for anything irreversible — the model proposes, the human approves</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">guards worth having from day one</span><button class="copy">Copy</button></div>
+<pre><code>seen: set[str] = set()
+
+def guard(call, step: int):
+    sig = f"{call.function.name}:{call.function.arguments}"
+    if sig in seen:
+        return json.dumps({"error": "you already made this exact call in this conversation; "
+                                    "use the earlier result or try a different approach"})
+    seen.add(sig)
+
+    if call.function.name in DESTRUCTIVE:
+        # Do not execute. Return a proposal for a human to approve.
+        raise NeedsConfirmation(call)
+
+    if step >= MAX_STEPS - 1:
+        return json.dumps({"error": "step budget exhausted; give your best answer now"})
+    return None</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Tools are an authorisation boundary</span>
+  <p>A tool call is an instruction from an untrusted source — the model may be repeating something a user, a retrieved document or a web page told it to do. Every tool must authorise against the real user's permissions, validate its arguments, run with the narrowest possible scope, and never interpolate model output into SQL, a shell, or a URL without escaping. Chapter 17 covers the attacks in detail.</p>
+</div>
+
+<h2><span class="h-rule"></span>Model Context Protocol, briefly</h2>
+
+<p>MCP is an open protocol for exposing tools, resources and prompts to any model client over a standard interface, so a tool server you write once can be used by different applications without bespoke glue. Practically, it means "connect this assistant to our issue tracker" becomes a configuration step rather than an integration project.</p>
+
+<p>It does not change any of the above: the schemas, the loop, the truncation and the authorisation are all still your responsibility, and a remote MCP server is a third party with access to your model's context. Chapter 15 covers using and writing MCP servers; chapter 17 covers trusting them.</p>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Three levels of guarantee. Use <b>constrained decoding with a schema</b> whenever your provider offers it — it deletes a whole class of bug.</li>
+    <li>A schema guarantees shape, never correctness. Keep a <b>validation layer for business rules</b> and check extracted values actually appear in the source.</li>
+    <li>Design schemas for the generator: <b>nullable uncertain fields, enums, reasoning first, shallow, described</b>.</li>
+    <li>Feed validation errors back and <b>retry once</b>. Track the repair rate as a leading indicator of regression.</li>
+    <li>Tool calling is the same mechanism reversed: the model <b>asks</b>, your code executes, authorises and truncates.</li>
+    <li>Most tool failures are <b>tool design failures</b>. Few tools, clear names, descriptions that say when, narrow parameters, teaching errors.</li>
+    <li>Cap the steps, detect repeats, and require <b>human confirmation for anything irreversible</b>.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("07-structured-output.html");
+
+(function(){
+  const root = document.getElementById("loop");
+  if(!root) return;
+
+  const STEPS = [
+    { cap:"Start: system prompt and the customer's message. Tool definitions travel alongside.",
+      msgs:[
+        ['system','You are Northwind support. Call get_order before stating any order status.'],
+        ['user','Where is NW-8842? It was meant to arrive Tuesday.']
+      ], tok:340 },
+    { cap:"The model does not answer. finish_reason is tool_calls — this is a request, not a reply.",
+      msgs:[
+        ['system','You are Northwind support. Call get_order before stating any order status.'],
+        ['user','Where is NW-8842? It was meant to arrive Tuesday.'],
+        ['assistant → tool_calls','get_order({"order_id": "NW-8842"})   id: call_a1']
+      ], tok:392 },
+    { cap:"Your code validates, authorises, executes, truncates — then appends the result against the call id.",
+      msgs:[
+        ['system','You are Northwind support. Call get_order before stating any order status.'],
+        ['user','Where is NW-8842? It was meant to arrive Tuesday.'],
+        ['assistant → tool_calls','get_order({"order_id": "NW-8842"})   id: call_a1'],
+        ['tool (call_a1)','{"status":"in_transit","carrier":"DPD","promised":"2026-08-25","tracking":"7712...","delay_reason":"depot backlog"}']
+      ], tok:498 },
+    { cap:"Second round trip. It has what it needs, so finish_reason is stop and you return the text.",
+      msgs:[
+        ['system','You are Northwind support. Call get_order before stating any order status.'],
+        ['user','Where is NW-8842? It was meant to arrive Tuesday.'],
+        ['assistant → tool_calls','get_order({"order_id": "NW-8842"})   id: call_a1'],
+        ['tool (call_a1)','{"status":"in_transit","carrier":"DPD","promised":"2026-08-25","tracking":"7712...","delay_reason":"depot backlog"}'],
+        ['assistant → stop','Your order NW-8842 is in transit with DPD and was due 25 August. It is held up by a depot backlog. Tracking: 7712...']
+      ], tok:498 }
+  ];
+
+  let i = 0;
+  const body = document.getElementById("lbody");
+  const cap  = document.getElementById("lcaption");
+
+  function render(){
+    const s = STEPS[i];
+    body.innerHTML = s.msgs.map(([role, text]) => {
+      const colour = role.startsWith("system") ? "#54677A"
+                   : role.startsWith("user") ? "#20456A"
+                   : role.startsWith("tool") ? "#1F7A55" : "#B84D7C";
+      return '<div style="margin-bottom:10px">' +
+        '<div style="font-family:var(--sans);font-size:11.5px;font-weight:700;color:' + colour + '">' + role + '</div>' +
+        '<div style="white-space:pre-wrap">' + text.replace(/&/g,"&amp;").replace(/</g,"&lt;") + '</div></div>';
+    }).join("");
+    cap.textContent = s.cap;
+    document.getElementById("l-turn").textContent = Math.min(i, 2) === 0 ? 0 : (i >= 3 ? 2 : 1);
+    document.getElementById("l-msg").textContent = s.msgs.length;
+    document.getElementById("l-tok").textContent = "~" + s.tok;
+  }
+
+  document.getElementById("lstep").addEventListener("click", () => { i = (i + 1) % STEPS.length; render(); });
+  document.getElementById("lreset").addEventListener("click", () => { i = 0; render(); });
+  render();
+})();
+</script>
+</body>
+</html>

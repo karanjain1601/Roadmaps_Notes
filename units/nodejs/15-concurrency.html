@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Cluster, workers and child processes — Node.js</title>
+<meta name="description" content="cluster against worker_threads against child_process, what each buys, what cluster breaks, the cost of message passing, transfer lists and SharedArrayBuffer.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%233FB984' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">Node.js</a><span class="sep">/</span><span>Chapter 15</span></p>
+    <p class="chno">Chapter 15 · Data &amp; scale</p>
+    <h1>Cluster, workers and child processes</h1>
+    <p class="lede">Three ways to escape the single thread, and they are not interchangeable. Two of them multiply your processes and therefore everything a process owns — connection pools, in-memory state, cron timers. The third keeps one process and charges you for every byte that crosses the boundary.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapters 03, 13</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="three">
+<h2>Four options for a CPU-bound endpoint</h2><div class="h2rule"></div>
+
+<div class="demo" id="d-scale">
+  <div class="demo-top"><div class="demo-title">What each one actually buys</div><div class="demo-hint">Watch the last two rows, not the first</div></div>
+  <div class="demo-body">
+    <canvas id="cScale" aria-label="Throughput, memory, connections and broken assumptions for each scaling option"></canvas>
+    <div class="ctrls" style="justify-content:center;flex-wrap:wrap">
+      <div class="ctrl"><label>Cores available</label><input type="range" id="scC" min="1" max="16" step="1" value="4"><output id="scCo">4</output></div>
+      <div class="ctrl"><label>CPU per request</label><input type="range" id="scP" min="1" max="200" step="1" value="35"><output id="scPo">35 ms</output></div>
+      <div class="ctrl"><label>Approach</label><select id="scM" style="max-width:none">
+        <option value="one" selected>one process, as it is</option>
+        <option value="cluster">cluster, one worker per core</option>
+        <option value="threads">one process, a worker-thread pool</option>
+        <option value="containers">more containers, one process each</option></select></div>
+    </div>
+    <div class="rgrid" id="scOut"></div>
+    <div class="readout" id="scNote"></div>
+  </div>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th>Gives you</th><th>Costs you</th></tr></thead>
+<tbody>
+<tr><td><strong><code>cluster</code></strong></td><td>N processes sharing a listening socket, so N threads serving HTTP</td><td class="no">Everything per-process is multiplied: pools, caches, sessions, cron timers, rate-limit counters. And it duplicates what your orchestrator already does</td></tr>
+<tr><td><strong><code>worker_threads</code></strong></td><td class="yes">Real threads inside one process — one pool, one set of state, one cron</td><td>Message passing, and no shared variables. Best for a defined, self-contained computation</td></tr>
+<tr><td><strong><code>child_process.fork</code></strong></td><td>A separate Node process with an IPC channel</td><td>Full process memory each, and JSON-serialised messages. For isolation — running untrusted or crash-prone code</td></tr>
+<tr><td class="yes"><strong>More containers</strong></td><td class="yes">The same parallelism, plus independent scheduling, restarts and limits</td><td>Nothing you were not already paying. Usually the right first answer</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn"><b class="tag">What <code>cluster</code> silently breaks</b>
+<ul style="margin-bottom:0">
+<li><strong>Connection pools.</strong> Eight workers with a pool of ten is eighty connections from one instance — chapter 13's demo.</li>
+<li><strong>In-memory anything.</strong> A rate-limit counter, a session store, a cache, a WebSocket registry: each worker has its own, so a limit of 100 is really 100 × workers and a socket registered on worker 3 is invisible to worker 5.</li>
+<li><strong>Timers.</strong> A <code>setInterval</code> or <code>node-cron</code> job runs once per worker. Chapter 14.</li>
+<li><strong>Sticky sessions.</strong> Round-robin means consecutive requests from one client land on different workers, which breaks anything holding per-connection state — and WebSockets need a sticky strategy or a shared adapter.</li>
+<li><strong>Metrics.</strong> Each worker exposes its own <code>/metrics</code>, so a scrape gets one worker's view. You need an aggregator.</li>
+</ul>
+</div>
+</section>
+
+<section id="messages">
+<h2>The cost of crossing the boundary</h2><div class="h2rule"></div>
+
+<div class="demo" id="d-msg">
+  <div class="demo-top"><div class="demo-title">Was offloading it worth it?</div><div class="demo-hint">Try 40 MB with a 20 ms job</div></div>
+  <div class="demo-body">
+    <canvas id="cMsg" aria-label="Main thread time spent transferring data to a worker compared with doing the work inline"></canvas>
+    <div class="ctrls" style="justify-content:center;flex-wrap:wrap">
+      <div class="ctrl"><label>Payload</label><input type="range" id="mgP" min="1" max="200" step="1" value="8"><output id="mgPo">8 MB</output></div>
+      <div class="ctrl"><label>Work in the worker</label><input type="range" id="mgW" min="1" max="600" step="1" value="120"><output id="mgWo">120 ms</output></div>
+      <div class="ctrl"><label>How it crosses</label><select id="mgM" style="max-width:none">
+        <option value="clone" selected>postMessage — structured clone</option>
+        <option value="transfer">postMessage with a transferList</option>
+        <option value="shared">SharedArrayBuffer</option></select></div>
+    </div>
+    <div class="rgrid" id="mgOut"></div>
+    <div class="readout" id="mgNote"></div>
+  </div>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">javascript — a worker pool, and the three ways to pass data</span><button class="code-copy">Copy</button></div><pre><span class="c">// ── use piscina rather than writing a pool. It handles queueing,</span>
+<span class="c">//    idle timeouts, crashed workers and abort signals. ──</span>
+<span class="k">import</span> Piscina <span class="k">from</span> <span class="s">"piscina"</span>;
+<span class="k">import</span> os <span class="k">from</span> <span class="s">"node:os"</span>;
+
+<span class="k">const</span> pool = <span class="k">new</span> Piscina({
+  filename: <span class="k">new</span> URL(<span class="s">"./resize-worker.js"</span>, <span class="k">import</span>.meta.url).href,
+  maxThreads: os.availableParallelism() - <span class="n">1</span>,   <span class="c">← leave one for the</span>
+  idleTimeout: <span class="n">30_000</span>,                        <span class="c">  main thread</span>
+});
+
+<span class="c">// ① structured clone — the default. COPIES, on the main thread.</span>
+<span class="k">await</span> pool.run({ buf });                <span class="c">← buf is duplicated: ~2.5 ms/MB</span>
+                                        <span class="c">  of blocking, before any work</span>
+
+<span class="c">// ② transferList — MOVES the memory. Nearly free.</span>
+<span class="k">await</span> pool.run({ buf }, { transferList: [buf.buffer] });
+<span class="c">//   the ArrayBuffer is detached here and owned there. Touching it</span>
+<span class="c">//   afterwards throws — which is the point: no copy, no sharing bug.</span>
+
+<span class="c">// ③ SharedArrayBuffer — both threads see the same memory.</span>
+<span class="k">const</span> shared = <span class="k">new</span> SharedArrayBuffer(size);
+<span class="c">//   zero copy either way, and now you have real shared mutable state:</span>
+<span class="c">//   coordinate with Atomics, or corrupt it. Reach for this last.</span>
+
+<span class="c">// ── inside the worker ──</span>
+<span class="k">export default async function</span> ({ buf }) {
+  <span class="k">return</span> resize(buf);       <span class="c">← piscina makes it a plain function</span>
+}
+<span class="c">// ✱ a worker has its own module graph, so every import is loaded</span>
+<span class="c">//   again per thread — chapter 1's startup cost, multiplied. Keep</span>
+<span class="c">//   worker files small; do not import your whole application.</span>
+<span class="c">// ✱ AsyncLocalStorage does NOT cross the boundary. Pass the request</span>
+<span class="c">//   id in the message — chapter 5.</span></pre></div>
+
+<div class="kv">
+<dt>Start with more containers</dt><dd class="yes">Your orchestrator already restarts, schedules, limits and load-balances processes. <code>cluster</code> reimplements a worse version of that inside one container, and then you own the supervision. If you can add replicas, do that first and read the rest of this chapter only if you cannot.</dd>
+<dt><code>availableParallelism()</code>, not <code>cpus().length</code></dt><dd class="no">In a container with a CPU limit of one, <code>os.cpus().length</code> reports the host's core count — often 64 — so a worker-per-core pool creates 64 threads fighting over one core's worth of quota. <code>os.availableParallelism()</code> respects the cgroup. Chapter 19.</dd>
+<dt>Workers are not free to create</dt><dd>Each one is a fresh V8 isolate with its own heap and its own module graph, so spawning costs tens of milliseconds and tens of megabytes. Always a pool, never one per request.</dd>
+<dt>The honest default</dt><dd class="yes">Most Node services need none of this. If the event loop lag from chapter 3 is low, adding threads adds complexity and no capacity. Measure first — chapter 16 — and reach for a worker pool only when a specific, bounded computation is provably the constraint.</dd>
+</div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>Why is "more containers" usually a better answer than <code>cluster</code>?
+<button class="reveal">Show answer</button><div class="ans">Because the orchestrator already does everything <code>cluster</code> does, and does it better: restarts on crash, schedules across hosts, applies memory and CPU limits per process, and load-balances with health checks. <code>cluster</code> reimplements supervision inside one container, and it multiplies everything a process owns — pools, caches, timers, rate-limit counters — which is a set of bugs you did not have. The parallelism is identical either way.</div></li>
+
+<li>What does a worker-thread pool give that <code>cluster</code> does not?
+<button class="reveal">Show answer</button><div class="ans">One process. So one connection pool, one in-memory cache, one set of cron timers, one metrics endpoint, and one WebSocket registry — none of the multiplication problems. The main thread stays free to serve requests while the threads compute. The trade is that nothing is shared automatically: data crosses by message, and the boundary has a cost proportional to the payload.</div></li>
+
+<li>When does offloading to a worker make things worse?
+<button class="reveal">Show answer</button><div class="ans">When the structured clone costs more main-thread time than the work you moved. Cloning is a copy performed <em>on the calling thread</em>, at roughly two and a half milliseconds a megabyte, so handing a forty-megabyte buffer to a worker blocks the main thread for about a hundred milliseconds — and if the job itself was twenty milliseconds you have made the loop block five times longer for no gain. Use a transfer list, or keep it inline.</div></li>
+
+<li>What does a transfer list do differently?
+<button class="reveal">Show answer</button><div class="ans">It moves the memory instead of copying it. The <code>ArrayBuffer</code> is detached from the sending thread and adopted by the receiving one, so the cost is constant rather than proportional to size — and touching the buffer afterwards throws, which is a feature: the ownership transfer is enforced rather than assumed. It is the right default for any sizeable binary payload.</div></li>
+
+<li>Why is <code>os.cpus().length</code> the wrong number in a container?
+<button class="reveal">Show answer</button><div class="ans">Because it reports the host's cores, not your cgroup quota. On a 64-core host with a CPU limit of one, it returns 64 — so a worker-per-core pool spawns 64 threads and tens of gigabytes of intent, all contending for one core's worth of scheduling. Every one of them is slower than a single thread would have been. <code>os.availableParallelism()</code> reads the limit and is the number to use.</div></li>
+
+<li>Why must worker files stay small?
+<button class="reveal">Show answer</button><div class="ans">Because each worker has its own module graph and loads every import independently. Importing your application's root from a worker means resolving and compiling the whole dependency tree once per thread — chapter 1's startup cost multiplied by the pool size, in both time and heap. A worker should import the two or three things the computation needs and nothing else.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin:0">Chapter 16 is the chapter that should come before this one in practice: finding out where the time and the memory actually go.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 15</h2><p>Cluster, workers and child processes. Part of the Node.js unit — <a href="index.html">all 20 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 16 (measuring before scaling), 18 (metrics across workers), 19 (container limits).</p></div>
+    <div><h2>Going deeper</h2><p>The Node <code>worker_threads</code> and <code>cluster</code> references; piscina's documentation for pool behaviour and abort handling.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: scaling options ============ */
+(function(){
+  const cv=document.getElementById("cScale"); if(!cv) return;
+  const cEl=document.getElementById("scC"), pEl=document.getElementById("scP"), mEl=document.getElementById("scM"),
+        out=document.getElementById("scOut"), note=document.getElementById("scNote");
+  function draw(){
+    const C=+cEl.value, P=+pEl.value, m=mEl.value;
+    document.getElementById("scCo").textContent=C;
+    document.getElementById("scPo").textContent=P+" ms";
+    const base=1000/P;
+    let cap, mem, procs, conns, broken, label;
+    if(m==="one"){ cap=base; mem=95; procs=1; conns=10; broken=0; label="1 process, 1 thread"; }
+    else if(m==="cluster"){ cap=base*C; mem=95*C; procs=C; conns=10*C; broken=5; label=C+" processes, 1 container"; }
+    else if(m==="threads"){ cap=base*Math.max(1,C-1); mem=95+42*Math.max(1,C-1); procs=1; conns=10; broken=0; label="1 process, "+Math.max(1,C-1)+" threads"; }
+    else { cap=base*C; mem=95*C; procs=C; conns=10*C; broken=0; label=C+" containers"; }
+    const R=[
+      ["throughput",cap,base*16,Math.round(cap)+"/s","#3FB984"],
+      ["memory",mem,95*16,Math.round(mem)+" MB","#7C8CF8"],
+      ["database connections",conns,160,conns+"","#E0699F"],
+      ["per-process assumptions broken",broken,5,broken?broken+" of 5":"none",broken?"#D9534F":"#3FB984"]
+    ];
+    const w=cv.clientWidth||660, h=22+R.length*26+34, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h);
+    ctx.textBaseline="middle";
+    ctx.fillStyle="#8195A6"; ctx.font="9px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText(label, 20, 11);
+    const lx=Math.min(232,w*0.42), rx=w-84, span=rx-lx;
+    R.forEach((r,i)=>{
+      const y=20+i*26;
+      ctx.fillStyle="#54677A"; ctx.font="10.5px Archivo, Arial"; ctx.textAlign="right";
+      const cut=Math.floor((lx-14)/5.3);
+      ctx.fillText(r[0].length>cut?r[0].slice(0,cut-1)+"…":r[0], lx-10, y+10);
+      const wd=Math.max(3,Math.min(1,r[1]/r[2])*span);
+      ctx.fillStyle=r[4]; ctx.globalAlpha=.85; ctx.fillRect(lx,y,wd,20); ctx.globalAlpha=1;
+      ctx.fillStyle="#54677A"; ctx.font="600 10px ui-monospace, monospace"; ctx.textAlign="left";
+      ctx.fillText(r[3], lx+wd+7, y+10);
+    });
+    const y0=26+R.length*26;
+    const good = m==="threads"||m==="containers";
+    ctx.fillStyle= good?"#E7F7EF": m==="cluster"?"#FFF6E8":"#F5F7F9";
+    ctx.strokeStyle= good?"#3FB984": m==="cluster"?"#D98324":"#DDE3E8"; ctx.lineWidth=2;
+    ctx.fillRect(20,y0,w-40,26); ctx.strokeRect(20.5,y0+.5,w-41,26);
+    ctx.fillStyle= good?"#166B47": m==="cluster"?"#B0651A":"#54677A"; ctx.font="600 11px Archivo, Arial"; ctx.textAlign="center";
+    ctx.fillText(m==="one"? "one thread — this is the baseline"
+      : m==="cluster"? "parallel, and every per-process assumption is now wrong"
+      : m==="threads"? "parallel, one process — pools, caches and timers stay single"
+      : "parallel, and the orchestrator supervises it for you", w/2, y0+13);
+    out.innerHTML=
+      '<div><span>throughput</span><b style="color:#1F7A52">'+Math.round(cap)+'/s</b></div>'+
+      '<div><span>vs baseline</span><b>'+(cap/base).toFixed(1)+'×</b></div>'+
+      '<div><span>memory</span><b style="color:'+(mem>500?"#D98324":"#1F7A52")+'">'+Math.round(mem)+' MB</b></div>'+
+      '<div><span>connections</span><b style="color:'+(conns>40?"#D9534F":"#1F7A52")+'">'+conns+'</b></div>'+
+      '<div><span>things now broken</span><b style="color:'+(broken?"#D9534F":"#1F7A52")+'">'+broken+'</b></div>';
+    let msg;
+    if(m==="one") msg="<b>"+Math.round(base)+" requests a second, and one core is busy while "+(C-1)+" sit idle.</b> That is the situation this chapter exists for — and note it is only a problem because the work is CPU-bound. If those "+P+" milliseconds were spent waiting on a database, one thread would happily serve thousands a second and none of the options below would help at all.";
+    else if(m==="cluster") msg="<b>"+C+"× the throughput, and five things are now wrong that were fine before.</b> "+conns+" database connections from one container (chapter 13); the in-memory rate limiter counts per worker, so your limit is "+C+"× what you configured; every <code>setInterval</code> runs "+C+" times (chapter 14); a WebSocket registered on one worker is invisible to the others; and each worker serves its own <code>/metrics</code>. None of this is announced — you get the throughput immediately and discover the rest over the following weeks.";
+    else if(m==="threads") msg="<b>"+(cap/base).toFixed(1)+"× the throughput in a single process.</b> One connection pool, one cache, one set of timers, one metrics endpoint — every multiplication problem in the option above simply does not arise, and the main thread stays free to accept requests while the threads compute. Memory is lower too, because a thread is a V8 isolate rather than a whole process. The cost is the boundary: data crosses by message, and the next demo is about what that costs.";
+    else msg="<b>Identical parallelism to cluster, and nothing broken.</b> "+C+" containers give you "+Math.round(cap)+" a second with independent scheduling, independent restarts, per-process memory limits and a load balancer that health-checks each one. The per-process multiplication is still real — "+conns+" connections, "+C+" cron runs — but it is <em>visible</em>, sized by your replica count, and something you were already reasoning about. This is why the honest recommendation is to try this before either of the other two.";
+    note.innerHTML=msg;
+  }
+  [cEl,pEl,mEl].forEach(e=>e.addEventListener("input",draw));
+  draw(); debounceResize(draw);
+})();
+
+/* ============ demo 2: message cost ============ */
+(function(){
+  const cv=document.getElementById("cMsg"); if(!cv) return;
+  const pEl=document.getElementById("mgP"), wEl=document.getElementById("mgW"), mEl=document.getElementById("mgM"),
+        out=document.getElementById("mgOut"), note=document.getElementById("mgNote");
+  function draw(){
+    const MB=+pEl.value, W=+wEl.value, m=mEl.value;
+    document.getElementById("mgPo").textContent=MB+" MB";
+    document.getElementById("mgWo").textContent=W+" ms";
+    const perMB = m==="clone"? 2.5 : 0;
+    const outC = MB*perMB + (m==="clone"?0.2:0.15);
+    const backC = m==="clone"? MB*0.25*2.5+0.2 : 0.15;
+    const blocked = outC+backC;
+    const inline = W;
+    const better = blocked < inline;
+    const w=cv.clientWidth||660, h=170, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h);
+    ctx.textBaseline="middle";
+    const lx=136, span=w-lx-20;
+    const scale=Math.max(blocked,inline)*1.12;
+    const X=t=>(t/scale)*span;
+    ctx.fillStyle="#8195A6"; ctx.font="9px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("main-thread time blocked", lx, 12);
+    ctx.fillStyle="#54677A"; ctx.font="600 10px Archivo, Arial"; ctx.textAlign="right";
+    ctx.fillText("do it inline", lx-10, 32);
+    ctx.fillStyle="#D9534F"; ctx.globalAlpha=.85; ctx.fillRect(lx,22,Math.max(3,X(inline)),20); ctx.globalAlpha=1;
+    ctx.fillStyle="#54677A"; ctx.font="600 10px ui-monospace, monospace"; ctx.textAlign="left";
+    ctx.fillText(inline.toFixed(0)+" ms", lx+X(inline)+7, 32);
+    ctx.textAlign="right"; ctx.fillStyle="#54677A"; ctx.font="600 10px Archivo, Arial";
+    ctx.fillText("hand to a worker", lx-10, 62);
+    ctx.fillStyle="#E0699F"; ctx.fillRect(lx,52,Math.max(2,X(outC)),20);
+    ctx.fillStyle="#F2A03D"; ctx.fillRect(lx+X(outC),52,Math.max(2,X(backC)),20);
+    ctx.fillStyle="#54677A"; ctx.font="600 10px ui-monospace, monospace"; ctx.textAlign="left";
+    ctx.fillText(blocked.toFixed(1)+" ms", lx+X(blocked)+7, 62);
+    ctx.fillStyle="#8195A6"; ctx.font="9px Archivo, Arial";
+    ctx.fillText("↑ send", lx+2, 80);
+    if(X(backC)>34) ctx.fillText("↑ result back", lx+X(outC)+2, 80);
+    ctx.fillStyle="#54677A"; ctx.font="600 10px Archivo, Arial"; ctx.textAlign="right";
+    ctx.fillText("worker does the work", lx-10, 100);
+    ctx.fillStyle="#BFE7D3"; ctx.fillRect(lx+X(outC),90,Math.max(3,X(W)),20);
+    ctx.strokeStyle="#3FB984"; ctx.lineWidth=1.4; ctx.strokeRect(lx+X(outC)+.5,90.5,Math.max(3,X(W)),20);
+    ctx.fillStyle="#166B47"; ctx.font="600 9px Archivo, Arial"; ctx.textAlign="left";
+    if(X(W)>60) ctx.fillText("off the main thread", lx+X(outC)+6, 100);
+    ctx.fillStyle= better?"#E7F7EF":"#FBEAE9"; ctx.strokeStyle= better?"#3FB984":"#D9534F"; ctx.lineWidth=2;
+    ctx.fillRect(20,124,w-40,30); ctx.strokeRect(20.5,124.5,w-41,30);
+    ctx.fillStyle= better?"#166B47":"#B0403C"; ctx.font="600 11.5px Archivo, Arial"; ctx.textAlign="center";
+    ctx.fillText(better? "worth it — the loop blocks for "+blocked.toFixed(1)+" ms instead of "+inline+" ms"
+      : "counterproductive — copying costs more than the work you moved", w/2, 139);
+    out.innerHTML=
+      '<div><span>copy cost</span><b style="color:'+(outC>20?"#D9534F":"#1F7A52")+'">'+outC.toFixed(1)+' ms</b></div>'+
+      '<div><span>loop blocked</span><b style="color:'+(better?"#1F7A52":"#D9534F")+'">'+blocked.toFixed(1)+' ms</b></div>'+
+      '<div><span>inline would block</span><b>'+inline+' ms</b></div>'+
+      '<div><span>net</span><b style="color:'+(better?"#1F7A52":"#D9534F")+'">'+(better?"−"+(inline-blocked).toFixed(0)+" ms":"+"+(blocked-inline).toFixed(0)+" ms")+'</b></div>'+
+      '<div><span>zero copy</span><b style="color:'+(m==="clone"?"#D9534F":"#1F7A52")+'">'+(m==="clone"?"no":"yes")+'</b></div>';
+    let msg;
+    if(m==="clone"&&!better) msg="<b>Cloning "+MB+" MB costs "+outC.toFixed(0)+" ms of main-thread time, and the work you moved was only "+W+" ms.</b> The copy happens <em>on the calling thread</em>, at roughly two and a half milliseconds a megabyte, so the loop now blocks for "+blocked.toFixed(0)+" ms rather than "+W+" — you have made the exact problem you were solving "+(blocked/inline).toFixed(1)+" times worse. This is the trap in worker threads and it is invisible in a benchmark that passes small payloads. Switch to a transfer list.";
+    else if(m==="clone") msg="<b>Worth it, but note the copy: "+outC.toFixed(0)+" ms of blocking before the worker starts, plus "+backC.toFixed(0)+" ms for the result.</b> Structured clone duplicates the data on the calling thread, so the benefit shrinks as the payload grows and the work stays constant. Push the payload slider up and watch the verdict flip — and then fix it with a transfer list, which removes the copy entirely.";
+    else if(m==="transfer") msg="<b>A transfer list moves the memory rather than copying it, so the cost is constant at a fraction of a millisecond regardless of size.</b> The <code>ArrayBuffer</code> is detached from this thread and adopted by the worker — and touching it here afterwards throws, which is the point: ownership transfer is enforced rather than assumed, so there is no shared-mutation bug to have. For any sizeable binary payload this is the default, and it makes the "+MB+" MB in this demo free to move.";
+    else msg="<b>A <code>SharedArrayBuffer</code> is visible to both threads at once: zero copy in either direction, and no transfer either.</b> That is as cheap as it gets, and it hands you the one thing worker threads otherwise protect you from — real shared mutable memory. Coordinate with <code>Atomics</code>, or corrupt it in ways that reproduce once a fortnight. Worth it for a large buffer several threads genuinely process together; for handing one job to one worker, a transfer list is simpler and equally fast.";
+    note.innerHTML=msg;
+  }
+  [pEl,wEl,mEl].forEach(e=>e.addEventListener("input",draw));
+  draw(); debounceResize(draw);
+})();
+</script>
+</body>
+</html>

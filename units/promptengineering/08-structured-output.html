@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Structured output — Prompt Engineering</title>
+<meta name="description" content="Schemas, JSON mode, constrained decoding, field design, and the validate-and-repair loop that makes structured output dependable.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 08 · Reliable output</div>
+    <h1>Structured output</h1>
+    <p class="standfirst">The moment a model's output is consumed by code rather than read by a person, "usually well-formatted" stops being good enough. Getting from a tendency to a guarantee is a stack of four techniques, and only the top one is actually a prompting technique.</p>
+    <div class="chap-meta">
+      <span class="tagpill">schemas</span>
+      <span class="tagpill">json mode</span>
+      <span class="tagpill">constrained decoding</span>
+      <span class="tagpill">repair</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Four levels of guarantee</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Level</th><th>Mechanism</th><th>Guarantees</th><th>Typical failure rate</th></tr></thead>
+<tbody>
+<tr><td><b>1 · Ask nicely</b></td><td>"Reply with JSON matching this shape"</td><td>Nothing. A strong tendency</td><td>1–8%, and it spikes on unusual inputs</td></tr>
+<tr><td><b>2 · Ask nicely, plus a prefill</b></td><td>Start the assistant turn with <code>{</code></td><td>Still nothing, but far fewer preambles</td><td>0.5–3%</td></tr>
+<tr><td><b>3 · JSON mode</b></td><td>Provider constrains output to <em>valid JSON</em></td><td>It parses. Not that it matches your schema</td><td>Parse: ~0. Schema: 1–5%</td></tr>
+<tr><td><b>4 · Constrained decoding</b></td><td>Tokens outside the grammar are masked at each step</td><td>Structurally valid against your schema</td><td>Structure: ~0. Content still needs checking</td></tr>
+</tbody>
+</table>
+<caption>Note what none of these guarantee: that the values are correct. Level 4 stops the model returning <code>"severity": "quite bad"</code>. It does not stop it returning <code>"high"</code> when the answer was <code>"low"</code>.</caption>
+</div>
+
+<div class="note key">
+  <span class="note-t">Use the strongest level available, then validate anyway</span>
+  <p>Constrained decoding is a solved problem where your provider or serving stack supports it — take it. But every level still needs a validation step in your code, because structural validity and semantic correctness are different things, and the second is where your bugs will be. The prompt work in this chapter is about making the <em>content</em> right; the mechanism handles the shape.</p>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">the same schema, three ways</span><button class="copy">Copy</button></div>
+<pre><code>from pydantic import BaseModel, Field
+from typing import Literal
+
+class TicketLabel(BaseModel):
+    category: Literal["billing.duplicate_charge", "billing.refund_delay",
+                      "delivery.not_received", "delivery.damaged",
+                      "product.fault", "account.access",
+                      "feedback.praise", "other.unintelligible"]
+    severity: Literal["none", "low", "medium", "high"]
+    order_ref: str | None = Field(default=None, pattern=r"^NW-\d{4}$",
+        description="Only if a reference appears verbatim in the ticket. Never infer one.")
+    reasoning: str = Field(max_length=200,
+        description="One sentence naming the evidence for the category.")
+
+# A. Schema enforced by the provider — strongest, use where available.
+resp = client.responses.parse(model=MODEL, input=messages, text_format=TicketLabel)
+label = resp.output_parsed
+
+# B. JSON mode — valid JSON guaranteed, schema is not.
+resp = client.chat.completions.create(model=MODEL, messages=messages,
+                                      response_format={"type": "json_object"})
+label = TicketLabel.model_validate_json(resp.choices[0].message.content)
+
+# C. Local model with a grammar — same guarantee as A, self-hosted.
+resp = llm(prompt, extra_body={"guided_json": TicketLabel.model_json_schema()})</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Field design is prompt engineering</h2>
+
+<p>The schema is part of the prompt. Field names, types, descriptions and ordering all condition the output, and most structured-output problems are schema problems wearing a costume.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Rule</th><th>Instead of</th><th>Prevents</th></tr></thead>
+<tbody>
+<tr><td><b>Enums over free strings</b></td><td><code>category: str</code></td><td>Eleven spellings of the same label. This is the single biggest win</td></tr>
+<tr><td><b>Reasoning field first</b></td><td>Answer first, explanation after</td><td>Post-hoc rationalisation. The model commits to a label then justifies it</td></tr>
+<tr><td><b>Explicit nullable</b></td><td>Optional fields the model may omit</td><td><code>"order_ref": "N/A"</code>, <code>"unknown"</code>, <code>""</code> — three ways to say nothing</td></tr>
+<tr><td><b>Patterns on identifiers</b></td><td><code>order_ref: str</code></td><td>Fabricated references. The regex rejects invention at validation</td></tr>
+<tr><td><b>Real descriptions</b></td><td>Bare types</td><td>The right shape in the wrong field. Descriptions are read as instructions</td></tr>
+<tr><td><b>Flat over nested</b></td><td>Three levels of objects</td><td>Structural errors — accuracy falls with nesting depth</td></tr>
+<tr><td><b>Bounded lists</b></td><td><code>list[str]</code></td><td>Twelve items where you expected three, or an empty list where you expected content</td></tr>
+<tr><td><b>An explicit uncertainty field</b></td><td>Forcing a confident answer</td><td>Confabulation. Give the model a legitimate place to put "I could not tell"</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="demo" id="schema">
+  <div class="demo-head">
+    <b>Schema quality and its consequences</b>
+    <span>Toggle design decisions and see the estimated effect on validation failures and downstream repair cost.</span>
+  </div>
+  <div class="demo-body">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:6px 18px;margin-bottom:14px">
+      <label><input type="checkbox" class="sq" value="enum" checked> Enums for categorical fields</label>
+      <label><input type="checkbox" class="sq" value="reason"> Reasoning field before the answer</label>
+      <label><input type="checkbox" class="sq" value="null"> Explicit nullable, no sentinel strings</label>
+      <label><input type="checkbox" class="sq" value="pattern"> Regex on identifiers</label>
+      <label><input type="checkbox" class="sq" value="desc"> Description on every field</label>
+      <label><input type="checkbox" class="sq" value="flat" checked> Flat structure</label>
+      <label><input type="checkbox" class="sq" value="unsure"> An "unsure" escape hatch</label>
+      <label><input type="checkbox" class="sq" value="grammar"> Constrained decoding available</label>
+    </div>
+    <div class="row">
+      <div>
+        <label for="q-req">Requests per day — <span id="q-reqv">20,000</span></label>
+        <input type="range" id="q-req" min="0" max="6" step="1" value="3">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="q-struct">—</b><span>structural failures</span></div>
+      <div><b id="q-sem">—</b><span>semantic failures</span></div>
+      <div><b id="q-repair">—</b><span>repair calls / day</span></div>
+      <div><b id="q-cost">—</b><span>repair cost / month</span></div>
+    </div>
+    <div id="q-out"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Reasoning before the answer</h2>
+
+<p>Field order matters because generation is sequential. If <code>category</code> comes before <code>reasoning</code>, the model commits to a label and then writes a justification for it — and the justification will be fluent whether or not the label was right. Put the reasoning first and it genuinely informs the choice.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">the ordering that costs nothing and helps measurably</span><button class="copy">Copy</button></div>
+<pre><code># Weaker: label first, rationalisation after.
+class Bad(BaseModel):
+    category: Literal[...]
+    reasoning: str
+
+# Better: evidence, then conclusion. The category token is now generated in a
+# context that already contains the analysis.
+class Good(BaseModel):
+    evidence: str = Field(max_length=200,
+        description="Quote the phrase in the ticket that determines the category.")
+    category: Literal[...]
+    severity: Literal[...]
+
+# Requiring a QUOTE rather than a summary is what makes this work. A summary can
+# be written to fit any label; a quotation has to actually exist in the input,
+# which you can then verify in code.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Validate, then repair</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">extract.py — the loop that handles the tail</span><button class="copy">Copy</button></div>
+<pre><code>def extract(ticket: str, max_attempts: int = 2) -> TicketLabel:
+    messages = build(ticket)
+
+    for attempt in range(max_attempts + 1):
+        raw = call(messages, temperature=0)
+
+        try:
+            label = TicketLabel.model_validate_json(raw)
+        except ValidationError as e:
+            if attempt == max_attempts:
+                metrics.incr("extract.gave_up")
+                return TicketLabel.fallback(reason="unparseable")
+            # Feed the actual error back. The model fixes what it can see.
+            messages += [{"role": "assistant", "content": raw},
+                         {"role": "user", "content":
+                          f"That did not validate: {summarise(e)}. "
+                          f"Return corrected JSON only, no commentary."}]
+            metrics.incr("extract.structural_retry")
+            continue
+
+        # Structure is fine. Now check the things a schema cannot express.
+        problems = semantic_checks(label, ticket)
+        if not problems:
+            return label
+        if attempt == max_attempts:
+            metrics.incr("extract.semantic_gave_up")
+            return label.flagged(problems)
+        messages += [{"role": "assistant", "content": raw},
+                     {"role": "user", "content":
+                      "Problems with that answer: " + "; ".join(problems) +
+                      ". Return corrected JSON only."}]
+        metrics.incr("extract.semantic_retry")
+
+    return TicketLabel.fallback(reason="exhausted")
+
+
+def semantic_checks(label: TicketLabel, ticket: str) -> list[str]:
+    out = []
+    # The check that catches the most damaging error: an invented reference.
+    if label.order_ref and label.order_ref not in ticket:
+        out.append(f"order_ref {label.order_ref} does not appear in the ticket")
+    if label.evidence and label.evidence.strip('"') not in ticket:
+        out.append("evidence is not a verbatim quotation from the ticket")
+    if label.category == "other.unintelligible" and len(ticket.split()) > 30:
+        out.append("a 30+ word ticket is unlikely to be unintelligible; re-read it")
+    if label.severity == "high" and label.category.startswith("feedback."):
+        out.append("feedback cannot be high severity")
+    return out</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">The repair rate is a metric, not a solution</span>
+  <p>A repair loop hides failures, which is exactly the danger. If 15% of calls need a retry, you are paying 15% more, adding latency to that tail, and — more importantly — the prompt has a problem the loop is papering over. Alert on the rate. A sudden rise usually means a model version changed, an input distribution shifted, or someone edited the schema. Treat the repair loop as a safety net, and treat needing it often as a bug.</p>
+</div>
+
+<h2><span class="h-rule"></span>What a schema cannot express</h2>
+
+<p>These all need code. They are also where the errors that reach production live, because everything structural was caught upstream.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Check</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td><b>Grounding</b></td><td>Every identifier, figure and quotation must appear in the input</td></tr>
+<tr><td><b>Cross-field consistency</b></td><td><code>severity: high</code> is incompatible with <code>category: feedback.praise</code></td></tr>
+<tr><td><b>Arithmetic</b></td><td>Line items must sum to the stated total</td></tr>
+<tr><td><b>Referential integrity</b></td><td>The order id exists, and belongs to this customer</td></tr>
+<tr><td><b>Plausibility</b></td><td>A date in 2029, a refund larger than the order value</td></tr>
+<tr><td><b>Completeness</b></td><td>The ticket mentions three issues and only one was captured</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>Streaming structured output</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Approach</th><th>Trade-off</th></tr></thead>
+<tbody>
+<tr><td><b>Do not stream</b></td><td>Simplest, and usually right. Structured output is consumed by code, which cannot use a partial object</td></tr>
+<tr><td><b>Stream, buffer, parse at the end</b></td><td>You get a progress signal without partial-parse complexity</td></tr>
+<tr><td><b>Incremental parsing</b></td><td>Render fields as they complete. Needs a tolerant parser and careful UI. Worth it only when a human is watching</td></tr>
+<tr><td><b>Split the call</b></td><td>Stream the prose the user reads; make a separate structured call for the data your code needs. Often the cleanest answer</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>When not to use a schema</h2>
+
+<div class="cols">
+  <div class="col bad">
+    <h4>Structure hurts when</h4>
+    <ul>
+      <li>The output is genuinely prose a person reads</li>
+      <li>The schema is so elaborate the model spends its attention on shape rather than content</li>
+      <li>You are forcing categorical answers onto something genuinely continuous</li>
+      <li>Every field is optional — that is not a schema, it is a suggestion</li>
+      <li>You added a field "just in case" and nothing consumes it</li>
+    </ul>
+  </div>
+  <div class="col good">
+    <h4>Structure helps when</h4>
+    <ul>
+      <li>Code consumes the output</li>
+      <li>You need to evaluate it automatically (chapter 12)</li>
+      <li>The task has a fixed set of outcomes</li>
+      <li>You want a place for uncertainty to live</li>
+      <li>You need to constrain what an injected instruction could produce (chapter 10)</li>
+    </ul>
+  </div>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Every field should have a consumer</span>
+  <p>Schemas grow the same way prompts do — by accretion. Someone adds <code>sentiment</code> because it might be useful, nothing ever reads it, and now every request pays tokens to produce it and every eval has to account for it. Once a quarter, grep for each field name in your codebase. Fields with no consumer get deleted. This usually shortens the schema by a third and measurably improves the fields that remain, because there is less to get right.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Four levels of guarantee. <b>Use the strongest your stack supports, and validate anyway</b> — structure and correctness are different things.</li>
+    <li><b>The schema is part of the prompt.</b> Field names, types, descriptions and order all condition the output.</li>
+    <li><b>Enums over free strings</b> is the single biggest win.</li>
+    <li>Put <b>evidence before the answer</b>, and require a verbatim quotation so you can verify it.</li>
+    <li>Give the model an <b>explicit place to be unsure</b>, or it will confabulate to fill a required field.</li>
+    <li>The <b>grounding check</b> — every identifier and figure must appear in the input — catches the most damaging errors.</li>
+    <li><b>Alert on the repair rate.</b> A loop that fires often is hiding a prompt problem.</li>
+    <li>Prune the schema quarterly. <b>Every field should have a consumer.</b></li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("08-structured-output.html");
+
+(function(){
+  const root = document.getElementById("schema");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const REQS = [500, 2000, 5000, 20000, 100000, 500000, 2000000];
+
+  function render(){
+    const on = new Set([].slice.call(document.querySelectorAll(".sq:checked")).map(c => c.value));
+    const ri = parseInt($("q-req").value, 10);
+    const reqs = REQS[ri];
+    $("q-reqv").textContent = reqs.toLocaleString();
+
+    // Illustrative failure model.
+    let struct = 0.055;
+    if(on.has("grammar")) struct = 0.001;
+    else {
+      if(on.has("enum"))  struct -= 0.018;
+      if(on.has("flat"))  struct -= 0.012;
+      if(on.has("desc"))  struct -= 0.006;
+      if(on.has("null"))  struct -= 0.008;
+    }
+    struct = Math.max(0.001, struct);
+
+    let sem = 0.14;
+    if(on.has("enum"))    sem -= 0.030;
+    if(on.has("reason"))  sem -= 0.035;
+    if(on.has("pattern")) sem -= 0.025;
+    if(on.has("desc"))    sem -= 0.018;
+    if(on.has("unsure"))  sem -= 0.028;
+    if(on.has("null"))    sem -= 0.010;
+    sem = Math.max(0.008, sem);
+
+    const failures = struct + sem;
+    const repairs = Math.round(failures * reqs);
+    const monthly = repairs * 30 * (1600/1e6*3 + 120/1e6*15);
+
+    $("q-struct").textContent = (struct*100).toFixed(1) + "%";
+    $("q-sem").textContent    = (sem*100).toFixed(1) + "%";
+    $("q-repair").textContent = repairs.toLocaleString();
+    $("q-cost").textContent   = "$" + Math.round(monthly).toLocaleString();
+
+    const out = [];
+    const add = (sev, title, body) => out.push({sev, title, body});
+
+    if(on.has("grammar"))
+      add("good", "Structural failures are essentially eliminated",
+        "Constrained decoding masks tokens outside the grammar at each step, so malformed output is not merely unlikely — it is unreachable. " +
+        "Notice that the semantic figure is untouched: the mechanism guarantees the shape and says nothing about whether the values are right.");
+    else if(struct > 0.03)
+      add("bad", "Structural failures at " + (struct*100).toFixed(1) + "%",
+        "That is " + Math.round(struct*reqs) + " unparseable responses a day, each needing a retry. " +
+        "If your provider or serving stack supports constrained decoding, this whole row goes away for free.");
+
+    if(!on.has("enum"))
+      add("bad", "Free-text categorical fields",
+        "Without enums you will collect eleven spellings of the same label — \"billing\", \"Billing\", \"billing_issue\", \"duplicate charge\". " +
+        "Every downstream consumer then needs normalisation, and your metrics silently split across variants. This is the cheapest single fix available.");
+
+    if(!on.has("reason"))
+      add("warn", "No reasoning field before the answer",
+        "With the label generated first, any explanation that follows is a rationalisation — fluent whether the label was right or wrong. " +
+        "Putting a short evidence field first, and requiring a verbatim quotation, costs about 40 tokens and measurably improves the label.");
+
+    if(!on.has("pattern"))
+      add("warn", "Identifiers unconstrained",
+        "A regex on order references rejects fabricated ones at validation rather than letting them reach a database. " +
+        "This is the error class that produces confident, well-formed, entirely wrong records.");
+
+    if(!on.has("unsure"))
+      add("warn", "Nowhere to be uncertain",
+        "Every field is required and none permits \"I could not tell\", so the model must produce something. " +
+        "It will — confabulation is what a required field with no escape hatch produces. One nullable confidence or unsure field absorbs it.");
+
+    if(!on.has("null"))
+      add("warn", "No explicit nullable",
+        "Expect \"N/A\", \"unknown\", \"none\", \"\" and null all meaning the same thing across your dataset. Pick one and enforce it in the type.");
+
+    if(!on.has("desc"))
+      add("warn", "Fields without descriptions",
+        "Descriptions are read as instructions — they are the cheapest place to say \"only if it appears verbatim\" or \"ISO 8601\". " +
+        "A bare type invites the right shape in the wrong field, which is the hardest error to spot.");
+
+    if(!on.has("flat"))
+      add("warn", "Nested structure",
+        "Accuracy falls with nesting depth. If the nesting is not consumed as nesting, flatten it — " +
+        "two flat fields beat one object with two keys.");
+
+    if(out.filter(o => o.sev !== "good").length === 0)
+      add("good", "Well-designed schema",
+        "Failures are down to " + (failures*100).toFixed(1) + "% combined. The remaining semantic errors are the interesting ones — " +
+        "grounding, cross-field consistency and arithmetic — and those need checks in code, not schema changes.");
+
+    const colour = s => s === "bad" ? "#E2574C" : s === "warn" ? "#F2A03D" : "#3FB984";
+    $("q-out").innerHTML = out.map(o =>
+      '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid ' + colour(o.sev) +
+      ';border-radius:4px;padding:11px 13px;margin-bottom:8px">' +
+      '<div style="font-weight:600;font-size:14px;margin-bottom:3px">' + o.title + '</div>' +
+      '<div style="font-size:13.5px;line-height:1.5;color:#54677A">' + o.body + '</div></div>').join("") +
+      '<div class="out" style="margin-top:10px">Failure rates are illustrative; the request and cost arithmetic is real. ' +
+      'Measure your own by logging every validation error with the input that caused it — that log is also your next eval set.</div>';
+  }
+
+  [].slice.call(document.querySelectorAll(".sq")).forEach(c => c.addEventListener("change", render));
+  $("q-req").addEventListener("input", render);
+  render();
+})();
+</script>
+</body>
+</html>

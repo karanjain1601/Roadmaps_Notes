@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Reading a query plan — SQL</title>
+<meta name="description" content="EXPLAIN and EXPLAIN ANALYZE, scan and join node types, estimated against actual rows, and finding the line that costs you.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 13 · Making it fast</div>
+    <h1>Reading a query plan</h1>
+    <p class="standfirst">Chapter 1 said you describe the result and the planner chooses the route. This is how you find out what it chose, and — more usefully — where its estimate of your data diverged from reality.</p>
+    <div class="chap-meta">
+      <span class="tagpill">explain</span>
+      <span class="tagpill">analyze</span>
+      <span class="tagpill">node types</span>
+      <span class="tagpill">estimates</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>EXPLAIN and EXPLAIN ANALYZE</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the two commands, and the difference that matters</span><button class="copy">Copy</button></div>
+<pre><code>-- EXPLAIN: the plan, with estimates. Does not run the query. Instant and safe.
+EXPLAIN SELECT …;
+
+-- EXPLAIN ANALYZE: RUNS the query and reports actual timings and row counts.
+-- This is the one you want, and it really does execute — including writes.
+EXPLAIN ANALYZE SELECT …;
+
+-- Always wrap a write in a transaction you roll back:
+BEGIN;
+EXPLAIN ANALYZE UPDATE orders SET status = 'expired' WHERE …;
+ROLLBACK;
+
+-- The full form, worth using by default:
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS, FORMAT TEXT) SELECT …;
+--   ANALYZE   actual rows and time
+--   BUFFERS   pages read from cache vs disk  <- the most under-used option
+--   VERBOSE   output columns per node
+--   SETTINGS  non-default planner settings, which explain odd choices
+
+-- MySQL: EXPLAIN ANALYZE (8.0.18+), or EXPLAIN FORMAT=JSON.
+-- SQL Server: SET STATISTICS IO, TIME ON, plus the actual execution plan.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Estimated against actual is the whole skill</span>
+  <p>Plain <code>EXPLAIN</code> shows what the planner <em>believes</em>. <code>EXPLAIN ANALYZE</code> shows what happened. The gap between them is where nearly every bad plan comes from: the planner estimated 12 rows, got 400,000, and chose a nested loop that would have been perfect for 12. <b>Find the node with the largest ratio between estimated and actual rows</b> — that is almost always the cause, and fixing the estimate fixes the plan without you having to outsmart the optimiser.</p>
+</div>
+
+<h2><span class="h-rule"></span>Reading the tree</h2>
+
+<div class="demo" id="plan">
+  <div class="demo-head">
+    <b>An annotated plan</b>
+    <span>A real-shaped plan for a common query. Pick a scenario and see what the numbers are telling you.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="p-case">Scenario</label>
+        <select id="p-case">
+          <option value="good" selected>Healthy plan</option>
+          <option value="badest">Estimate far below actual</option>
+          <option value="missing">Missing index</option>
+          <option value="sort">Sort spilling to disk</option>
+          <option value="loop">Nested loop over too many rows</option>
+        </select>
+      </div>
+    </div>
+    <div id="p-tree"></div>
+    <div class="stat">
+      <div><b id="p-time">—</b><span>total time</span></div>
+      <div><b id="p-worst">—</b><span>worst node</span></div>
+      <div><b id="p-ratio">—</b><span>est vs actual</span></div>
+    </div>
+    <div class="out" id="p-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">how to read the indentation</span><button class="copy">Copy</button></div>
+<pre><code>Sort  (cost=1842.19..1844.69 rows=1000 width=48)
+      (actual time=38.412..38.501 rows=1000 loops=1)
+  Sort Key: o.placed_at DESC
+  Sort Method: quicksort  Memory: 143kB
+  ->  Hash Join  (cost=54.00..1792.36 rows=1000 width=48)
+                 (actual time=1.204..36.882 rows=1000 loops=1)
+        Hash Cond: (o.customer_id = c.id)
+        ->  Seq Scan on orders o  (cost=0.00..1710.00 rows=1000 width=32)
+                                  (actual time=0.018..33.201 rows=1000 loops=1)
+              Filter: (status = 'paid'::text)
+              Rows Removed by Filter: 89000
+        ->  Hash  (cost=41.00..41.00 rows=1040 width=24)
+                  (actual time=1.160..1.161 rows=1040 loops=1)
+              ->  Seq Scan on customers c  (…)
+
+-- Reading rules:
+--   * the MOST INDENTED nodes run FIRST; results flow upward
+--   * cost=A..B  A is the startup cost, B the total. Arbitrary units
+--   * rows= is per LOOP, not in total. Multiply by loops for the real figure
+--   * actual time=A..B  A is time to the first row, B to the last
+--   * a node's time INCLUDES its children, so subtract to get its own cost
+--   * "Rows Removed by Filter" is often the most informative line in the plan</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Scan nodes</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Node</th><th>Means</th><th>Concerning when</th></tr></thead>
+<tbody>
+<tr><td><b>Seq Scan</b></td><td>Reads the whole table</td><td>Only if the table is large <em>and</em> the query is selective. On small tables it is correct</td></tr>
+<tr><td><b>Index Scan</b></td><td>Walks the index, fetches each row</td><td>Returning a large fraction — a seq scan would beat it</td></tr>
+<tr><td><b>Index Only Scan</b></td><td>Answered from the index alone</td><td>Rarely. Check <code>Heap Fetches</code> — high means the visibility map is stale</td></tr>
+<tr><td><b>Bitmap Heap Scan</b></td><td>Collect row locations, sort, fetch in page order</td><td>Normal for medium selectivity. <code>Recheck Cond</code> with <code>lossy</code> means work memory was short</td></tr>
+<tr><td><b>Function Scan</b></td><td>Output of a set-returning function</td><td>The planner has no statistics for it and guesses 1000 rows</td></tr>
+<tr><td><b>CTE Scan</b></td><td>A materialised CTE</td><td>The optimisation fence (chapter 7)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>Join nodes</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Join</th><th>How it works</th><th>Good when</th><th>Disaster when</th></tr></thead>
+<tbody>
+<tr><td><b>Nested Loop</b></td><td>For each outer row, look up matches</td><td>The outer side is tiny and the inner is indexed</td><td>The outer side is large — cost is outer × inner lookup</td></tr>
+<tr><td><b>Hash Join</b></td><td>Build a hash of the smaller side, probe with the larger</td><td>Large unsorted inputs, equality join</td><td>The hash does not fit in memory and spills to disk</td></tr>
+<tr><td><b>Merge Join</b></td><td>Sort both sides, walk them together</td><td>Both already sorted, e.g. by index</td><td>A large sort is needed first</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">A nested loop with a bad estimate is the classic catastrophic plan</span>
+  <p>The planner estimates 5 outer rows and chooses a nested loop: 5 index lookups, microseconds. The real answer is 500,000 rows, so it performs 500,000 index lookups and the query takes twenty minutes. The plan is not wrong for the data the planner expected — <b>it is wrong about the data</b>. This is why the estimate/actual ratio is the first thing to look at: a nested loop with <code>loops=500000</code> where <code>rows=5</code> was estimated is the signature, and it is visible at a glance once you know to look.</p>
+</div>
+
+<h2><span class="h-rule"></span>The lines that tell you what to fix</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Line in the plan</th><th>What it means</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td><code>Rows Removed by Filter: 890000</code></td><td>Read and discarded nearly a million rows</td><td>Index the filtered column, or extend an existing index</td></tr>
+<tr><td><code>Sort Method: external merge Disk: 84MB</code></td><td>The sort did not fit in memory</td><td>Raise <code>work_mem</code> for that query, or avoid the sort with an index</td></tr>
+<tr><td><code>Heap Fetches: 483920</code></td><td>An index-only scan that was not</td><td><code>VACUUM</code> the table so the visibility map is current</td></tr>
+<tr><td><code>Recheck Cond … lossy</code></td><td>The bitmap ran out of memory and tracked pages, not rows</td><td>Raise <code>work_mem</code>, or narrow the predicate</td></tr>
+<tr><td><code>Buffers: shared read=48210</code></td><td>48,210 pages came from disk, not cache</td><td>The working set does not fit. More memory, or less data</td></tr>
+<tr><td><code>loops=248301</code></td><td>An inner node ran a quarter of a million times</td><td>Almost always a nested loop with a bad estimate</td></tr>
+<tr><td><code>rows=1 … actual rows=94820</code></td><td>The estimate was off by five orders of magnitude</td><td>Analyse the table; consider extended statistics</td></tr>
+<tr><td><code>Parallel Seq Scan … Workers Launched: 0</code></td><td>Parallelism was planned and not granted</td><td>Worker slots exhausted by other queries</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>Why estimates go wrong</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Cause</th><th>Symptom</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td><b>Stale statistics</b></td><td>Estimates match the table as it was last month</td><td><code>ANALYZE table</code>; tune autovacuum to run more often</td></tr>
+<tr><td><b>Correlated columns</b></td><td>Estimate is the product of two independent selectivities, but they are not independent</td><td><code>CREATE STATISTICS … (dependencies)</code> in Postgres 10+</td></tr>
+<tr><td><b>Skewed distribution</b></td><td>Fine for most values, terrible for the one that is 40% of the table</td><td>Raise the statistics target on that column</td></tr>
+<tr><td><b>Expressions</b></td><td>No statistics exist for <code>lower(email)</code></td><td>Create an expression index — it carries statistics too</td></tr>
+<tr><td><b>Function calls in predicates</b></td><td>The planner assumes a fixed selectivity</td><td>Mark functions <code>STABLE</code>, or restructure</td></tr>
+<tr><td><b>Parameter sniffing</b></td><td>A prepared plan built for one parameter value, reused for a very different one</td><td>Force a re-plan, or use a generic plan</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">correlated columns — the estimate bug worth knowing</span><button class="copy">Copy</button></div>
+<pre><code>-- The planner assumes columns are independent, so it multiplies selectivities:
+--     P(city = 'Manchester') × P(postcode LIKE 'M1%')
+-- But postcode DETERMINES city, so the true selectivity is the smaller of the
+-- two, not the product. The estimate comes out ~1000× too low, and a nested
+-- loop is chosen for what is actually a large result.
+
+CREATE STATISTICS addr_stats (dependencies, ndistinct)
+    ON city, postcode FROM addresses;
+ANALYZE addresses;
+
+-- Common correlated pairs worth checking: (country, city), (status,
+-- cancelled_at), (product, category), (year, quarter). Anywhere one column
+-- functionally determines another, the default estimate is wrong.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>A method for a slow query</h2>
+
+<div class="flow stack">
+  <div class="step"><b>1 · <code>EXPLAIN (ANALYZE, BUFFERS)</code></b><span>Twice — the first run warms the cache and its timings mislead</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Find the node with the most time of its own</b><span>Subtract children's time. Not the top node — that one includes everything</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Check its estimated against actual rows</b><span>A ratio over ~100 means the plan was chosen for imaginary data</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Look for rows discarded</b><span>"Rows Removed by Filter" points straight at a missing index column</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Check buffers</b><span>Heavy <code>read</code> rather than <code>hit</code> means the working set does not fit in memory</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>6 · Change one thing, re-run, compare</b><span>An index, an ANALYZE, a rewritten predicate. One at a time</span></div>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Paste the plan into a visualiser</span>
+  <p>Text plans are hard to read past about fifteen nodes, and the arithmetic of subtracting child times is tedious and error-prone. Tools like explain.depesz.com and explain.dalibo.com take the raw output and highlight the expensive node, the bad estimates and the discarded rows automatically. Use one. Reading plans by eye is a skill worth having and not a skill worth demonstrating on a fifty-node plan at midnight. Do sanitise first if the plan contains real values.</p>
+</div>
+
+<h2><span class="h-rule"></span>Nudging the planner</h2>
+
+<div class="cols">
+  <div class="col good">
+    <h4>Fix the cause</h4>
+    <ul>
+      <li><code>ANALYZE</code> the table</li>
+      <li>Raise the statistics target on a skewed column</li>
+      <li>Create extended statistics for correlated columns</li>
+      <li>Add the index the plan is asking for</li>
+      <li>Rewrite a predicate to be SARGable (chapter 12)</li>
+      <li>Raise <code>work_mem</code> for the session running a big sort</li>
+    </ul>
+  </div>
+  <div class="col bad">
+    <h4>Force the outcome</h4>
+    <ul>
+      <li><code>SET enable_nestloop = off</code> — a sledgehammer, and session-wide</li>
+      <li>Optimiser hints (MySQL, Oracle, and via <code>pg_hint_plan</code>)</li>
+      <li><code>OFFSET 0</code> or a CTE as an optimisation barrier</li>
+      <li>Freezing a plan</li>
+    </ul>
+    <p style="margin-top:8px">All of these work and all of them mean the plan stops adapting when your data changes. Use them to confirm a diagnosis, then fix the cause.</p>
+  </div>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Test on production-shaped data</span>
+  <p>A plan built against ten thousand development rows tells you almost nothing about a hundred million production rows: the planner's choices are driven by table sizes and value distributions, and both are different. Sequential scans that are correct locally become disasters at scale, and indexes that look pointless locally are essential. Where you cannot use production data, at least generate the right volumes and the right skew — a column where one value is 40% of the table behaves nothing like a uniformly distributed one.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><code>EXPLAIN</code> shows beliefs; <b><code>EXPLAIN ANALYZE</code> shows what happened</b>. It really runs the query — wrap writes in a rollback.</li>
+    <li>Read the tree <b>innermost first</b>. Times include children, and <code>rows=</code> is per loop.</li>
+    <li>The first thing to look at is the <b>ratio of estimated to actual rows</b>. That gap is where bad plans come from.</li>
+    <li>A <b>nested loop with a huge <code>loops=</code></b> is the classic catastrophic plan, and it is a data-estimate problem, not a join-type problem.</li>
+    <li><b>"Rows Removed by Filter"</b> points straight at a missing index column, and is often the most useful line in a plan.</li>
+    <li>A <b>sequential scan is frequently correct</b>. Judge it by selectivity and table size, not by reflex.</li>
+    <li>Estimates go wrong from <b>stale statistics, correlated columns and skew</b> — all fixable without touching the query.</li>
+    <li><b>Fix the cause, do not force the plan.</b> Forced plans stop adapting the moment your data changes.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("13-query-plans.html");
+
+(function(){
+  const root = document.getElementById("plan");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const CASES = {
+    good: {
+      total: 4.8, worst: "Index Scan on orders", ratio: "1.1×",
+      nodes: [
+        {d:0, t:"Limit", cost:"cost=0.85..38.20 rows=20", act:"actual time=0.041..4.772 rows=20 loops=1", ok:true},
+        {d:1, t:"Nested Loop", cost:"cost=0.85..1866.30 rows=1000", act:"actual time=0.039..4.760 rows=20 loops=1", ok:true},
+        {d:2, t:"Index Scan using idx_orders_cust_status on orders o", cost:"cost=0.43..812.40 rows=1042", act:"actual time=0.022..1.108 rows=20 loops=1", ok:true,
+         extra:["Index Cond: ((customer_id = 42) AND (status = 'paid'::text))"]},
+        {d:2, t:"Index Scan using customers_pkey on customers c", cost:"cost=0.42..1.01 rows=1", act:"actual time=0.004..0.004 rows=1 loops=20", ok:true,
+         extra:["Index Cond: (id = o.customer_id)"]}
+      ],
+      note: "This is what healthy looks like. The index condition uses both columns, estimates are close to actual, the nested loop runs only 20 times because the LIMIT stops it early, and nothing is discarded by a filter.\n\nNote the inner Index Scan says loops=1 in the estimate and loops=20 in reality — that is normal and correct for a nested loop. The per-loop time of 0.004ms × 20 is negligible, which is exactly when a nested loop is the right choice."
+    },
+    badest: {
+      total: 18420, worst: "Nested Loop", ratio: "38,000×",
+      nodes: [
+        {d:0, t:"Nested Loop", cost:"cost=0.85..4210.66 rows=12", act:"actual time=0.088..18419.402 rows=456213 loops=1", ok:false},
+        {d:1, t:"Seq Scan on events e", cost:"cost=0.00..3891.00 rows=12 width=44", act:"actual time=0.019..204.881 rows=456213 loops=1", ok:false,
+         extra:["Filter: ((source = 'web') AND (region = 'eu-west'))", "Rows Removed by Filter: 143787"]},
+        {d:1, t:"Index Scan using sessions_pkey on sessions s", cost:"cost=0.42..26.62 rows=1", act:"actual time=0.039..0.039 rows=1 loops=456213", ok:false,
+         extra:["Index Cond: (id = e.session_id)"]}
+      ],
+      note: "The signature catastrophic plan. The planner estimated 12 rows from the Seq Scan and got 456,213 — a factor of 38,000. For 12 rows a nested loop is ideal; for 456,213 it performs that many index lookups and the query takes eighteen seconds.\n\nThe plan is not wrong for the data the planner expected. It is wrong about the data. Look at loops=456213 on the inner node — that number is the whole story.\n\nThe cause here is correlated columns: source and region are not independent, so multiplying their selectivities gives an estimate three orders of magnitude too low. CREATE STATISTICS on the pair fixes the estimate, and the planner then chooses a hash join by itself."
+    },
+    missing: {
+      total: 1240, worst: "Seq Scan on orders", ratio: "1.0×",
+      nodes: [
+        {d:0, t:"Aggregate", cost:"cost=48210.00..48210.01 rows=1", act:"actual time=1239.884..1239.885 rows=1 loops=1", ok:true},
+        {d:1, t:"Seq Scan on orders o", cost:"cost=0.00..48196.00 rows=5602", act:"actual time=0.312..1238.104 rows=5588 loops=1", ok:false,
+         extra:["Filter: ((customer_id = 42) AND (status = 'paid'::text))", "Rows Removed by Filter: 4994412", "Buffers: shared hit=2104 read=29896"]}
+      ],
+      note: "The estimate is excellent — 5,602 predicted against 5,588 actual. The problem is not the planner's understanding; it is that there is no index to use, so it must read five million rows to find five thousand.\n\n\"Rows Removed by Filter: 4,994,412\" is the line that names the fix. 99.9% of the work was reading rows only to discard them. An index on (customer_id, status) turns this into a sub-millisecond seek.\n\nAlso note Buffers: 29,896 pages came from disk rather than cache. On a table this size, a full scan evicts everything else from the buffer cache too — so this one query degrades every other query running at the same time."
+    },
+    sort: {
+      total: 8940, worst: "Sort", ratio: "1.0×",
+      nodes: [
+        {d:0, t:"Limit", cost:"cost=412088.20..412088.25 rows=20", act:"actual time=8938.104..8938.882 rows=20 loops=1", ok:true},
+        {d:1, t:"Sort", cost:"cost=412088.20..414588.20 rows=1000000", act:"actual time=8938.102..8938.212 rows=20 loops=1", ok:false,
+         extra:["Sort Key: o.placed_at DESC", "Sort Method: external merge  Disk: 84120kB"]},
+        {d:2, t:"Seq Scan on orders o", cost:"cost=0.00..38196.00 rows=1000000", act:"actual time=0.018..612.440 rows=1000000 loops=1", ok:true}
+      ],
+      note: "The scan took 0.6 seconds and the sort took eight. \"Sort Method: external merge Disk: 84120kB\" is the reason: the sort did not fit in work_mem, so it spilled 84MB to disk and merged it back.\n\nTwo fixes, and the second is much better. Raising work_mem for this query keeps the sort in memory — but it still sorts a million rows to return twenty. An index on placed_at DESC lets the rows arrive already ordered, so the Limit stops after twenty and the sort node disappears entirely.\n\nThis is the general shape of ORDER BY ... LIMIT: without a matching index the database sorts everything and throws almost all of it away."
+    },
+    loop: {
+      total: 6210, worst: "Nested Loop", ratio: "9.4×",
+      nodes: [
+        {d:0, t:"Nested Loop", cost:"cost=0.42..28914.00 rows=8800", act:"actual time=0.061..6209.881 rows=82640 loops=1", ok:false},
+        {d:1, t:"Seq Scan on customers c", cost:"cost=0.00..184.00 rows=8800", act:"actual time=0.011..3.102 rows=8804 loops=1", ok:true},
+        {d:1, t:"Index Scan using idx_orders_customer on orders o", cost:"cost=0.42..3.20 rows=1", act:"actual time=0.688..0.702 rows=9 loops=8804", ok:false,
+         extra:["Index Cond: (customer_id = c.id)", "Buffers: shared hit=18402 read=61088"]}
+      ],
+      note: "The outer side is correct — 8,804 customers, well estimated. The problem is that the inner side runs 8,804 times, and each run costs 0.7ms because the index entries are scattered across the disk.\n\n8,804 × 0.7ms is six seconds. A hash join would read the orders table once, sequentially, and build a hash — likely under a second. The planner chose the loop because it estimated one matching order per customer and there are nine.\n\nNote the buffers: 61,088 pages read from disk across those loops. Random access to the same table 8,804 times reads far more than one sequential pass would. This is the case where a Seq Scan on the inner side is genuinely faster, and forcing enable_nestloop = off temporarily is a good way to confirm the diagnosis before fixing the estimate."
+    }
+  };
+
+  function render(){
+    const c = CASES[$("p-case").value];
+    $("p-time").textContent  = c.total < 1000 ? c.total.toFixed(1) + "ms" : (c.total/1000).toFixed(1) + "s";
+    $("p-worst").textContent = c.worst.length > 22 ? c.worst.slice(0,20) + "…" : c.worst;
+    $("p-ratio").textContent = c.ratio;
+
+    $("p-tree").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-radius:5px;padding:12px 13px;margin:14px 0 12px;' +
+      'font-family:var(--mono);font-size:11.5px;line-height:1.65;overflow-x:auto">' +
+      c.nodes.map(n => {
+        const pad = "  ".repeat(n.d);
+        const arrow = n.d > 0 ? "->  " : "";
+        const col = n.ok ? "#25323E" : "#B0453B";
+        const w = n.ok ? "400" : "700";
+        let s = '<span style="color:' + col + ';font-weight:' + w + '">' + pad + arrow + n.t + '</span>' +
+                '<span style="color:#8FA0AF">  (' + n.cost + ')</span>\n' +
+                '<span style="color:#8FA0AF">' + pad + "    " + '</span>' +
+                '<span style="color:' + (n.ok ? "#54677A" : "#B0453B") + '">(' + n.act + ')</span>\n';
+        (n.extra || []).forEach(e => {
+          const hot = /Removed by Filter|Disk:|read=/.test(e);
+          s += '<span style="color:' + (hot ? "#B0453B" : "#54677A") + ';font-weight:' + (hot ? "700" : "400") +
+               '">' + pad + "    " + e.replace(/[<>&]/g, ch => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[ch])) + '</span>\n';
+        });
+        return s;
+      }).join("") + '</pre>';
+
+    $("p-note").textContent = c.note;
+  }
+
+  $("p-case").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

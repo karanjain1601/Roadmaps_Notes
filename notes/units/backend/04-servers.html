@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Web servers and concurrency — Backend Developer</title>
+<meta name="description" content="Reverse proxies and load balancing, the three concurrency models and when each wins, connection pool sizing, timeouts and graceful shutdown.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%233FB984' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">Backend Developer</a><span class="sep">/</span><span>Chapter 04</span></p>
+    <p class="chno">Chapter 04 · Serving requests</p>
+    <h1>Web servers and concurrency</h1>
+    <p class="lede">Your application handles one request at a time. Everything that makes it handle thousands — the proxy in front, the worker model underneath, the pool of database connections beside it — is configuration you probably inherited. It is also where a surprising share of production incidents begin.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapter 02</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="proxy">
+<h2>What sits in front</h2><div class="h2rule"></div>
+
+<p class="lead">Almost nobody exposes an application server directly to the internet. Something sits in front, and it is doing more than forwarding.</p>
+
+<div class="kv">
+<dt>TLS termination</dt><dd>Certificates live in one place instead of every application instance. Chapter 2.</dd>
+<dt>Load balancing</dt><dd>Spread requests across instances, and stop sending them to one that has stopped answering.</dd>
+<dt>Buffering slow clients</dt><dd class="yes">The one people forget. A client on a poor mobile connection takes two seconds to send its request body; the proxy absorbs that so your expensive application worker is occupied for milliseconds rather than seconds. This alone can multiply effective capacity.</dd>
+<dt>Static files and compression</dt><dd>Serving a file from disk and gzipping a response are things a proxy does far better than an application runtime.</dd>
+<dt>A place for cross-cutting concerns</dt><dd>Rate limits, IP allow-lists, request size caps, header rewriting, redirects — all configurable without a deploy.</dd>
+</div>
+
+<div class="tw">
+<table class="tight">
+<thead><tr><th>Algorithm</th><th>Sends the request to</th><th>Suits</th></tr></thead>
+<tbody>
+<tr><td><strong>Round robin</strong></td><td>Each instance in turn</td><td>Uniform requests and identical instances. The default, and often fine</td></tr>
+<tr><td><strong>Least connections</strong></td><td class="yes">Whichever is handling the fewest right now</td><td>Variable request durations — usually the better default</td></tr>
+<tr><td><strong>Least response time</strong></td><td>The one currently answering fastest</td><td>Heterogeneous hardware</td></tr>
+<tr><td><strong>IP or key hash</strong></td><td>A deterministic instance for a given key</td><td>Cache locality, sticky sessions. Rebalances badly when instances change unless consistent hashing is used</td></tr>
+<tr><td><strong>Weighted</strong></td><td>Proportionally, by configured weight</td><td>Canary releases, mixed instance sizes</td></tr>
+<tr><td><strong>Power of two choices</strong></td><td>The lesser-loaded of two random instances</td><td class="yes">Nearly as good as least-connections with far less coordination. What large systems use</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box tip"><b class="tag">Health checks are the part that matters</b>
+<p style="margin:0">A load balancer without health checks distributes failures evenly. Two distinctions are worth making. <strong>Liveness</strong> asks "is this process wedged and in need of a restart?"; <strong>readiness</strong> asks "should this instance receive traffic right now?" — which is false during startup, during a slow warm-up, and while draining before shutdown. Second, <strong>do not make your health check test your database</strong>. If it does, a brief database blip marks every instance unhealthy simultaneously, the balancer removes them all, and a recoverable incident becomes a total outage. Check that the process can answer; check dependencies separately and alert on them.</p>
+</div>
+</section>
+
+<section id="concurrency">
+<h2>The three concurrency models</h2><div class="h2rule"></div>
+
+<p class="lead">A request spends its time in two very different ways: burning CPU, and waiting for something else. The right model depends entirely on the ratio, and the crossover is sharper than most people expect.</p>
+
+<div class="demo" id="d-conc">
+  <div class="demo-top"><div class="demo-title">Throughput by model</div><div class="demo-hint">Drag the two sliders and watch the ranking invert</div></div>
+  <div class="demo-body">
+    <canvas id="cConc" aria-label="Throughput of different concurrency models against CPU and I/O time"></canvas>
+    <div class="ctrls" style="justify-content:center">
+      <div class="ctrl"><label>CPU work per request</label><input type="range" id="ccC" min="0.5" max="60" step="0.5" value="3"><output id="ccCo">3 ms</output></div>
+      <div class="ctrl"><label>Waiting on I/O</label><input type="range" id="ccI" min="0" max="300" step="5" value="95"><output id="ccIo">95 ms</output></div>
+      <div class="ctrl"><label>CPU cores</label><input type="range" id="ccN" min="1" max="16" step="1" value="4"><output id="ccNo">4</output></div>
+    </div>
+    <div class="rgrid" id="ccOut"></div>
+    <div class="readout" id="ccNote"></div>
+  </div>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th>Process per request</th><th>Thread per request</th><th>Event loop</th></tr></thead>
+<tbody>
+<tr><td>Isolation</td><td class="yes">Complete — a crash kills one worker</td><td>Shared memory; one bad thread can take the process</td><td class="no">None — an unhandled error can stop everything</td></tr>
+<tr><td>Memory per connection</td><td class="no">Megabytes</td><td>Hundreds of kilobytes of stack</td><td class="yes">Kilobytes</td></tr>
+<tr><td>Practical concurrency</td><td class="no">Tens</td><td>Hundreds to a few thousand</td><td class="yes">Tens of thousands</td></tr>
+<tr><td>Blocking call in the handler</td><td class="yes">Fine — blocks one worker</td><td class="yes">Fine — blocks one thread</td><td class="no">Catastrophic — blocks every request</td></tr>
+<tr><td>CPU-bound work</td><td class="yes">Scales across cores</td><td>Scales, unless a global lock intervenes</td><td class="no">One core, unless you run several loops</td></tr>
+<tr><td>Debugging</td><td class="yes">Simple, sequential</td><td class="no">Race conditions</td><td>Sequential, but stack traces are worse</td></tr>
+<tr><td>Found in</td><td>Gunicorn sync, PHP-FPM, Unicorn</td><td>Tomcat, Puma, Gunicorn threads</td><td>Node, FastAPI/ASGI, Netty, nginx</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn"><b class="tag">The failure that catches every team once</b>
+<p style="margin-bottom:6px">One synchronous call inside an async handler. A blocking database driver, a CPU-heavy image resize, <code>time.sleep</code>, an ordinary <code>requests.get</code> — anything that does not yield. In a threaded server it slows one request. In an event loop <strong>it stops every request on that process</strong>, including the health check, so the load balancer removes the instance and the traffic moves to the next one, which promptly does the same thing.</p>
+<p style="margin:0">The symptom is distinctive: latency across <em>all</em> endpoints degrades together, including trivial ones, and the process shows one core pinned. If you use an async framework, the discipline is absolute — every library in the request path must be async, and CPU-bound work goes to a thread pool or a queue.</p>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">python — the same mistake in three frameworks</span><button class="code-copy">Copy</button></div><pre><span class="c"># ── FastAPI: this blocks the entire event loop ──</span>
+<span class="f">@app.get</span>(<span class="s">"/report"</span>)
+<span class="k">async def</span> <span class="f">report</span>():
+    data = requests.get(<span class="s">"https://slow.example.com"</span>)   <span class="c"># ✗ synchronous</span>
+    <span class="k">return</span> heavy_pdf_render(data)                     <span class="c"># ✗ CPU-bound</span>
+
+<span class="c"># ── correct: async client, and CPU work moved off the loop ──</span>
+<span class="f">@app.get</span>(<span class="s">"/report"</span>)
+<span class="k">async def</span> <span class="f">report</span>():
+    <span class="k">async with</span> httpx.AsyncClient() <span class="k">as</span> c:
+        data = <span class="k">await</span> c.get(<span class="s">"https://slow.example.com"</span>, timeout=<span class="n">2.0</span>)
+    <span class="k">return</span> <span class="k">await</span> run_in_threadpool(heavy_pdf_render, data)
+
+<span class="c"># ── FastAPI will also do the right thing if you simply drop `async`: ──</span>
+<span class="f">@app.get</span>(<span class="s">"/report"</span>)
+<span class="k">def</span> <span class="f">report</span>():                                       <span class="c"># note: not async</span>
+    ...                                              <span class="c"># run in a threadpool for you</span>
+    <span class="c"># a plain `def` handler is safer than a badly written `async` one</span></pre></div>
+</section>
+
+<section id="pools">
+<h2>Connection pools</h2><div class="h2rule"></div>
+
+<p class="lead">Opening a database connection costs a round trip and real memory on the server, so nobody opens one per request. A pool holds a fixed number open and hands them out — which turns your database into a queue, with all the behaviour queues have.</p>
+
+<div class="demo" id="d-pool">
+  <div class="demo-top"><div class="demo-title">Pool under load</div><div class="demo-hint">Push utilisation past 80% and watch what happens to waiting</div></div>
+  <div class="demo-body">
+    <canvas id="cPool" aria-label="A connection pool with busy slots and a waiting queue"></canvas>
+    <div class="ctrls" style="justify-content:center">
+      <div class="ctrl"><label>Arrival rate</label><input type="range" id="plL" min="10" max="1200" step="10" value="300"><output id="plLo">300/s</output></div>
+      <div class="ctrl"><label>Query time</label><input type="range" id="plS" min="1" max="120" step="1" value="20"><output id="plSo">20 ms</output></div>
+      <div class="ctrl"><label>Pool size</label><input type="range" id="plC" min="1" max="60" step="1" value="10"><output id="plCo">10</output></div>
+    </div>
+    <div class="rgrid" id="plOut"></div>
+    <div class="readout" id="plNote"></div>
+  </div>
+</div>
+
+<div class="eq">$$L = \lambda W$$</div>
+<p class="where">Little's Law. The number of requests in the system equals the arrival rate multiplied by the time each spends there — and it holds for any stable system regardless of the distributions involved. Rearranged, it sizes the pool: to serve λ requests per second where each holds a connection for <em>s</em> seconds, you need at least λ·s connections just to keep up, and more to absorb variation.</p>
+
+<div class="box intu"><b class="tag">Bigger pools are not better pools</b>
+<p style="margin-bottom:6px">The instinct when requests start queueing is to raise the pool size. Often that makes things worse. A database has a fixed amount of parallelism — cores, disks, lock contention — and beyond it, more concurrent queries do not run faster, they run slower <em>and</em> all together. You have moved the queue from your application, where it is visible and boundable, into the database, where it is neither.</p>
+<p style="margin:0">A common starting point for a relational database is <strong>(cores × 2) + effective spindles</strong>, which for a modern 8-core server on SSDs is roughly 20 connections <em>in total across every application instance</em>. Teams running fifty instances with a pool of twenty each are asking a database sized for twenty concurrent queries to run a thousand. Count the total, not the per-instance number.</p>
+</div>
+
+<div class="tw">
+<table class="tight">
+<thead><tr><th>Symptom</th><th>Usually means</th></tr></thead>
+<tbody>
+<tr><td>Requests hang rather than fail</td><td class="yes">No timeout on pool acquisition. Always set one — failing fast beats hanging</td></tr>
+<tr><td>Latency fine at p50, terrible at p99</td><td>Queueing. The average hides it; percentiles do not</td></tr>
+<tr><td>One slow endpoint degrades every endpoint</td><td class="yes">A shared pool. Consider a separate, smaller pool for known-slow work</td></tr>
+<tr><td>"Too many connections" from the database</td><td>Instances × pool size exceeds the server's limit. Count the product</td></tr>
+<tr><td>Connections leak until exhaustion</td><td>A path that returns or raises without releasing. Use the context manager, always</td></tr>
+<tr><td>Idle connections dropped overnight</td><td>A firewall or the database closing them. Enable pool recycling and pre-ping</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="lifecycle">
+<h2>Timeouts and shutdown</h2><div class="h2rule"></div>
+
+<div class="code"><div class="code-top"><span class="code-lang">python — every outbound call needs a deadline</span><button class="code-copy">Copy</button></div><pre><span class="c"># the default timeout for most HTTP clients is: none. Forever.</span>
+<span class="c"># one slow dependency then consumes every worker you have.</span>
+httpx.get(url, timeout=httpx.Timeout(connect=<span class="n">1.0</span>, read=<span class="n">2.0</span>, write=<span class="n">2.0</span>, pool=<span class="n">1.0</span>))
+
+<span class="c"># databases need one too — at the statement level, not just the client</span>
+engine = create_engine(
+    dsn,
+    pool_size=<span class="n">10</span>, max_overflow=<span class="n">5</span>,
+    pool_timeout=<span class="n">2</span>,            <span class="c"># fail fast rather than queue forever</span>
+    pool_recycle=<span class="n">1800</span>,        <span class="c"># reopen before a firewall silently drops it</span>
+    pool_pre_ping=<span class="k">True</span>,       <span class="c"># cheap liveness check on checkout</span>
+    connect_args={<span class="s">"options"</span>: <span class="s">"-c statement_timeout=3000"</span>},
+)
+
+<span class="c"># the budget must shrink as you go down the stack, or it is not a budget:</span>
+<span class="c">#   client 10s  >  gateway 8s  >  service 5s  >  database 3s</span>
+<span class="c"># if the database timeout exceeds the gateway's, the gateway gives up first</span>
+<span class="c"># and the query keeps running — work nobody is waiting for. Chapter 19.</span></pre></div>
+
+<div class="box tip"><b class="tag">Graceful shutdown, in order</b>
+<ol style="margin-bottom:0">
+<li><strong>Fail the readiness check</strong> so the load balancer stops sending new requests. Do this <em>first</em>, and wait a few seconds — the balancer needs a moment to notice.</li>
+<li><strong>Stop accepting new connections</strong>, but keep serving the ones in flight.</li>
+<li><strong>Drain</strong>, with a deadline. Finish outstanding requests, then stop waiting.</li>
+<li><strong>Close pools and flush</strong> — database connections, buffered logs, metrics.</li>
+<li><strong>Exit.</strong> If the orchestrator's grace period expires first it will send SIGKILL, and everything in flight is lost, so the drain deadline must be shorter than that period.</li>
+</ol>
+</div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>Why put a reverse proxy in front of an application server that can already speak HTTP?
+<button class="reveal">Show answer</button><div class="ans">Several reasons, but the most underrated is buffering slow clients: a proxy absorbs the two seconds a mobile client takes to upload a request body so your application worker is busy for milliseconds instead. It also centralises TLS, serves static files and compresses far more efficiently than an application runtime, and gives you a place for rate limits and header rules that does not require a deploy.</div></li>
+
+<li>Why should a health check not test the database?
+<button class="reveal">Show answer</button><div class="ans">Because a brief database problem then marks every instance unhealthy at once. The load balancer removes them all and a recoverable blip becomes a total outage — and once the database recovers, all traffic returns simultaneously to cold instances. A readiness check should answer "can this process serve traffic", which is about the process. Monitor dependencies separately and alert on them there.</div></li>
+
+<li>When does an event loop lose to a thread pool?
+<button class="reveal">Show answer</button><div class="ans">When requests are CPU-bound rather than waiting. An event loop runs on one core, so if each request needs 40 ms of computation it can complete at most 25 per second per process, while a thread pool spreads that across every core. The demo shows the crossover clearly: with heavy I/O the event loop wins by an order of magnitude, and as CPU time rises the lines converge and then invert. Multiple loop processes recover the cores, which is what production async deployments actually do.</div></li>
+
+<li>An async endpoint calls a synchronous HTTP library. What is the symptom in production?
+<button class="reveal">Show answer</button><div class="ans">Every endpoint on that process gets slow together, including trivial ones and the health check, and one core sits pinned. The blocking call prevents the loop from servicing anything else, so it is not one slow endpoint but a stalled process. Because the health check also stalls, the load balancer removes the instance and moves traffic to the next one, which does the same thing — the failure walks through the fleet.</div></li>
+
+<li>Requests are queueing for connections. Why might raising the pool size make it worse?
+<button class="reveal">Show answer</button><div class="ans">Because the database has fixed parallelism. Past that point, more concurrent queries do not complete faster — they contend for cores, buffers and locks, so every query slows down and they all slow down together. You have moved the queue from your application, where it is visible and can be bounded with a timeout, into the database, where it is neither. The real fix is usually a faster query, a cache, or fewer queries per request.</div></li>
+
+<li>Why must the timeout budget shrink as a request goes down the stack?
+<button class="reveal">Show answer</button><div class="ans">Because otherwise an inner call outlives the caller waiting for it. If the gateway gives up after 8 seconds but the database statement timeout is 30, the client gets an error while the query keeps running — consuming a connection and CPU for a result nobody will read. Under load those orphaned queries accumulate and make recovery slower. Each layer's timeout should be comfortably less than its caller's.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin:0">Chapter 5 moves up to what those workers are actually serving: designing an API that survives its own second version.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 04</h2><p>Web servers and concurrency. Part of the Backend Developer unit — <a href="index.html">all 22 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 12 (pools and ORMs), 19 (load shedding and backpressure), 21 (rolling deploys need graceful shutdown).</p></div>
+    <div><h2>Going deeper</h2><p>Brendan Gregg's <em>Systems Performance</em> for the queueing theory; the nginx and Gunicorn documentation are both unusually clear.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: concurrency models ============ */
+(function(){
+  const cv=document.getElementById("cConc"); if(!cv) return;
+  const cEl=document.getElementById("ccC"), iEl=document.getElementById("ccI"), nEl=document.getElementById("ccN");
+  const out=document.getElementById("ccOut"), note=document.getElementById("ccNote");
+  function draw(){
+    const cpu=+cEl.value, io=+iEl.value, cores=+nEl.value;
+    document.getElementById("ccCo").textContent=cpu+" ms";
+    document.getElementById("ccIo").textContent=io+" ms";
+    document.getElementById("ccNo").textContent=cores;
+    const total=cpu+io;
+    // throughput ceilings, requests/sec
+    const M=[
+      ["1 sync process",   1000/total, "One request at a time, start to finish. The whole "+total+" ms is occupied, including the "+io+" ms spent doing nothing."],
+      [cores+" sync processes", cores*1000/total, "One worker per core. Concurrency equals the worker count, so waiting still wastes a whole worker each."],
+      ["16 threads",       Math.min(16*1000/total, cores*1000/cpu), "Threads block cheaply, so waiting no longer wastes a core — but each thread costs memory and the CPU work still needs a core to run on."],
+      ["event loop, 1 core", Math.min(1000/cpu, 20000), "Waiting costs nothing at all: the loop runs another request. The ceiling is CPU — one core doing "+cpu+" ms of work per request."],
+      ["event loop, "+cores+" cores", Math.min(cores*1000/cpu, 20000), "One loop process per core. This is how async servers are actually deployed, and it removes the single-core ceiling."]
+    ];
+    const max=Math.max(...M.map(m=>m[1]));
+    const w=cv.clientWidth||660, h=26+M.length*32, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h);
+    ctx.textBaseline="middle";
+    const lx=Math.min(160,w*0.31), rx=w-84, span=rx-lx;
+    const best=M.reduce((a,b)=>b[1]>a[1]?b:a);
+    M.forEach((m,i)=>{
+      const y=18+i*32, isBest=m===best;
+      ctx.fillStyle= isBest?"#16232F":"#54677A"; ctx.font=(isBest?"600 ":"")+"11px Archivo, Arial"; ctx.textAlign="right";
+      ctx.fillText(m[0], lx-9, y+10);
+      const wd=Math.max(3,(m[1]/max)*span);
+      ctx.fillStyle= isBest?"#3FB984":"#BFE7D3";
+      ctx.fillRect(lx,y,wd,20);
+      ctx.fillStyle= isBest?"#1F7A52":"#8195A6"; ctx.font=(isBest?"600 ":"")+"11px ui-monospace, monospace"; ctx.textAlign="left";
+      ctx.fillText(Math.round(m[1]).toLocaleString()+" req/s", lx+wd+7, y+10);
+    });
+    const ratio=io/Math.max(cpu,0.1);
+    const loop=M[4][1], threads=M[2][1], procs=M[1][1];
+    out.innerHTML=
+      '<div><span>per request</span><b>'+cpu+' ms CPU + '+io+' ms wait</b></div>'+
+      '<div><span>I/O to CPU ratio</span><b>'+ratio.toFixed(1)+' : 1</b></div>'+
+      '<div><span>best model</span><b style="color:#1F7A52;font-size:11.5px">'+best[0]+'</b></div>'+
+      '<div><span>event loop vs threads</span><b style="color:'+(loop>threads?"#1F7A52":"#D9534F")+'">'+(loop/threads).toFixed(2)+'×</b></div>'+
+      '<div><span>vs one process</span><b>'+(best[1]/M[0][1]).toFixed(0)+'×</b></div>';
+    let msg;
+    if(ratio>10) msg="<b>Heavily I/O-bound — "+ratio.toFixed(0)+" ms of waiting for every millisecond of work.</b> This is the ordinary shape of a web request: a little routing and serialisation around a database call. The event loop wins by a wide margin because waiting costs it nothing, while every process or thread model burns a whole worker sitting idle. "+best[0]+" reaches "+Math.round(best[1]).toLocaleString()+" req/s against "+Math.round(M[0][1])+" for a single sync process.";
+    else if(ratio>2) msg="<b>Mixed — "+ratio.toFixed(1)+" ms of waiting per millisecond of work.</b> The event loop is still ahead but the gap has narrowed to "+(loop/threads).toFixed(1)+"× over threads, and the CPU ceiling is starting to bind. At this ratio the choice is defensible either way, and the deciding factor is usually which model your team can debug at three in the morning rather than the throughput number.";
+    else if(ratio>0.3) msg="<b>Roughly balanced.</b> The models have converged: with "+cpu+" ms of computation per request, everything is limited by cores rather than by concurrency. Notice that "+M[1][0].toLowerCase()+" and the multi-core event loop are now within a few per cent of each other — at this point the concurrency model has stopped being the interesting variable.";
+    else msg="<b>CPU-bound — only "+io+" ms of waiting against "+cpu+" ms of work.</b> The single-core event loop is now the <em>worst</em> option at "+Math.round(M[3][1])+" req/s, because it cannot use more than one core no matter how many requests are in flight. Anything that spreads across cores wins. This is why image processing, report generation and encryption belong in a thread pool or a background queue rather than in an async handler.";
+    note.innerHTML=msg;
+  }
+  [cEl,iEl,nEl].forEach(e=>e.addEventListener("input",draw));
+  draw(); debounceResize(draw);
+})();
+
+/* ============ demo 2: connection pool ============ */
+(function(){
+  const cv=document.getElementById("cPool"); if(!cv) return;
+  const lEl=document.getElementById("plL"), sEl=document.getElementById("plS"), cEl=document.getElementById("plC");
+  const out=document.getElementById("plOut"), note=document.getElementById("plNote");
+  function erlangC(a,c){
+    if(a>=c) return 1;
+    let sum=0, term=1;
+    for(let k=0;k<c;k++){ if(k>0) term*=a/k; sum+=term; }
+    const last=term*a/c, num=last/(1-a/c);
+    return num/(sum+num);
+  }
+  function draw(){
+    const lam=+lEl.value, svc=+sEl.value/1000, c=+cEl.value;
+    document.getElementById("plLo").textContent=lam+"/s";
+    document.getElementById("plSo").textContent=(svc*1000)+" ms";
+    document.getElementById("plCo").textContent=c;
+    const a=lam*svc, rho=a/c;
+    const sat=rho>=1;
+    const pw=erlangC(a,c);
+    const wq=sat?Infinity:pw*svc/(c-a);
+    const wtot=sat?Infinity:wq+svc;
+    const lq=sat?Infinity:lam*wq;
+    const busy=Math.min(c,a);
+    const w=cv.clientWidth||660, h=176, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h);
+    ctx.textBaseline="middle";
+    const pad=16, cols=Math.min(c,30), sw=Math.min(26,(w-2*pad-140)/cols);
+    ctx.fillStyle="#54677A"; ctx.font="600 10px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("pool — "+c+" connection"+(c>1?"s":""), pad, 18);
+    for(let i=0;i<cols;i++){
+      const x=pad+i*(sw+3), full=i<Math.floor(busy), part=i===Math.floor(busy)&&busy%1>0.05;
+      ctx.fillStyle="#F2F5F7"; ctx.strokeStyle="#E1E7EC"; ctx.lineWidth=1;
+      ctx.fillRect(x,30,sw,26); ctx.strokeRect(x+.5,30.5,sw,26);
+      if(full||part){
+        const frac=full?1:(busy%1);
+        ctx.fillStyle= rho>0.9?"#D9534F": rho>0.7?"#F2A03D":"#3FB984";
+        ctx.fillRect(x,30+26*(1-frac),sw,26*frac);
+      }
+    }
+    if(c>30){ ctx.fillStyle="#8195A6"; ctx.font="10px Archivo, Arial"; ctx.textAlign="left";
+      ctx.fillText("+"+(c-30)+" more", pad+30*(sw+3)+4, 43); }
+    ctx.fillStyle="#54677A"; ctx.font="600 10px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("requests waiting for a connection", pad, 82);
+    const qmax=w-2*pad, qw= sat? qmax : Math.min(qmax,(lq/40)*qmax);
+    ctx.fillStyle="#F2F5F7"; ctx.fillRect(pad,92,qmax,22);
+    if(qw>1){ ctx.fillStyle= sat?"#D9534F": lq>5?"#F2A03D":"#3FB984"; ctx.fillRect(pad,92,qw,22); }
+    ctx.strokeStyle="#E1E7EC"; ctx.lineWidth=1; ctx.strokeRect(pad+.5,92.5,qmax,22);
+    ctx.fillStyle= qw>90?"#fff":"#54677A"; ctx.font="600 11px ui-monospace, monospace"; ctx.textAlign="left";
+    ctx.fillText(sat?"unbounded — growing":lq.toFixed(1)+" queued on average", pad+8, 103);
+    const bx=pad, bw=w-2*pad;
+    ctx.fillStyle="#54677A"; ctx.font="600 10px Archivo, Arial";
+    ctx.fillText("utilisation", bx, 132);
+    ctx.fillStyle="#F2F5F7"; ctx.fillRect(bx+64,126,bw-64,13);
+    ctx.fillStyle= rho>=1?"#D9534F": rho>0.8?"#F2A03D":"#3FB984";
+    ctx.fillRect(bx+64,126,Math.min(1,rho)*(bw-64),13);
+    [0.7,0.8].forEach(m=>{ const x=bx+64+m*(bw-64);
+      ctx.strokeStyle="#16232F"; ctx.lineWidth=1; ctx.setLineDash([2,2]);
+      ctx.beginPath(); ctx.moveTo(x,124); ctx.lineTo(x,141); ctx.stroke(); ctx.setLineDash([]); });
+    ctx.fillStyle="#16232F"; ctx.font="600 11px ui-monospace, monospace"; ctx.textAlign="left";
+    ctx.fillText((rho*100).toFixed(0)+"%", bx+64+Math.min(1,rho)*(bw-64)+6>bw-30?bw-34:bx+64+Math.min(1,rho)*(bw-64)+6, 132);
+    ctx.fillStyle="#B8C4CE"; ctx.font="9px Archivo, Arial"; ctx.textAlign="center";
+    ctx.fillText("70%", bx+64+0.7*(bw-64), 152); ctx.fillText("80%", bx+64+0.8*(bw-64), 164);
+    out.innerHTML=
+      '<div><span>offered load</span><b>'+a.toFixed(1)+' erlangs</b></div>'+
+      '<div><span>utilisation</span><b style="color:'+(rho>=1?"#D9534F":rho>0.8?"#D98324":"#1F7A52")+'">'+(rho*100).toFixed(0)+'%</b></div>'+
+      '<div><span>chance of waiting</span><b>'+(pw*100).toFixed(0)+'%</b></div>'+
+      '<div><span>average wait</span><b style="color:'+(sat?"#D9534F":wq*1000>50?"#D98324":"#1F7A52")+'">'+(sat?"∞":(wq*1000).toFixed(1)+" ms")+'</b></div>'+
+      '<div><span>total latency</span><b>'+(sat?"∞":(wtot*1000).toFixed(1)+" ms")+'</b></div>'+
+      '<div><span>min pool needed</span><b>'+Math.ceil(a)+'</b></div>';
+    let msg;
+    if(sat) msg="<b>Saturated. "+lam+" requests per second each holding a connection for "+(svc*1000)+" ms needs "+a.toFixed(1)+" connections just to keep up, and there are "+c+".</b> The queue grows without limit, latency rises until something times out, and the pool never recovers on its own. This is connection pool exhaustion, and in production it shows up as requests hanging rather than failing — which is why an acquisition timeout matters more than the pool size. You need at least "+Math.ceil(a)+" connections, a faster query, or fewer queries per request.";
+    else if(rho>0.85) msg="<b>"+(rho*100).toFixed(0)+"% utilisation, and the queue is doing most of the damage.</b> Service time is only "+(svc*1000)+" ms but the average request now takes "+(wtot*1000).toFixed(0)+" ms, because "+(pw*100).toFixed(0)+"% of them wait first. This is the non-linear part of the curve: at high utilisation a small increase in traffic produces a large increase in latency. Systems that look fine on a dashboard live here, one traffic spike from the previous case.";
+    else if(rho>0.7) msg="<b>"+(rho*100).toFixed(0)+"% utilisation — the usual comfort ceiling.</b> Average wait is "+(wq*1000).toFixed(1)+" ms on top of "+(svc*1000)+" ms of work. There is enough headroom to absorb a burst, but not much. Past about 80% the queueing term starts growing faster than the traffic that causes it, so this is the point at which capacity planning stops being optional.";
+    else msg="<b>"+(rho*100).toFixed(0)+"% utilisation — comfortable.</b> Only "+(pw*100).toFixed(0)+"% of requests wait at all, and the average wait is "+(wq*1000).toFixed(1)+" ms against "+(svc*1000)+" ms of actual work. Note what happens if you now <em>increase</em> the pool size: almost nothing improves, because nothing is queueing. Pool size only helps when utilisation is the constraint, which is the point of Little's Law — measure the load before tuning the knob.";
+    note.innerHTML=msg;
+  }
+  [lEl,sEl,cEl].forEach(e=>e.addEventListener("input",draw));
+  draw(); debounceResize(draw);
+})();
+</script>
+</body>
+</html>

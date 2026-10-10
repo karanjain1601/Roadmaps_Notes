@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Partitioning, sharding, consistent hashing — System Design Notes</title>
+<meta name="description" content="Range and hash partitioning, choosing a shard key, hot spots, the consistent hashing ring with virtual nodes, rebalancing, routing and cross-shard queries.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/notes.css">
+<style>
+  .ringwrap{display:grid;gap:16px;grid-template-columns:minmax(0,340px) minmax(0,1fr);align-items:start}
+  @media (max-width:640px){.ringwrap{grid-template-columns:1fr}}
+  .nodechips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+  .nodechip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--rule);border-radius:999px;
+    padding:3px 10px;font-size:12px;font-weight:600;color:var(--text-2)}
+  .nodechip i{width:9px;height:9px;border-radius:50%}
+</style>
+</head>
+<body>
+<div class="readbar"></div>
+
+<header class="top">
+  <div class="top-inner">
+    <a class="home" href="../../index.html"><span class="mark"></span>All roadmaps</a>
+    <span class="top-sep">/</span>
+    <a class="home" href="index.html" style="color:var(--band-text)">System Design</a>
+    <span class="top-spacer"></span>
+    <button class="rail-toggle" aria-expanded="false">Contents</button>
+    <nav class="top-nav" aria-label="Chapter navigation"></nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail" id="rail" aria-label="Chapter and section navigation"></aside>
+
+  <article>
+    <p class="crumb">Part 2 · Distributed systems core &nbsp;·&nbsp; <b>Chapter 07</b></p>
+    <h1>Partitioning, sharding, consistent hashing</h1>
+    <p class="standfirst">Replication makes copies; partitioning makes pieces. It is the only way past one machine's write capacity, and the shard key you pick is the most expensive decision in the design to change later. This chapter covers the schemes, how to choose the key, what skew does, the consistent hashing ring, and how to reshard something that is already serving traffic.</p>
+    <div class="meta">
+      <span>~40 min read</span>
+      <span>Shard keys · the ring · rebalancing · routing</span>
+      <span>2 interactive panels</span>
+      <span>Prerequisite: chapter 6</span>
+    </div>
+
+    <div class="body">
+
+      <h2><span class="h2n">7.1</span>What partitioning buys, and what it charges</h2>
+
+      <p>A partition (shard) is a subset of the data that lives on its own node or replica set. Every shard handles the writes and reads for its own keys, so total write capacity, storage and memory scale with the number of shards. That is the entire benefit, and it is enormous — it is the difference between a ceiling and no ceiling.</p>
+
+      <p>The charges are all consequences of one fact: <strong>operations that span shards are no longer cheap.</strong> A join across shards becomes a distributed query. A transaction across shards becomes two-phase commit or a saga. A "list everything sorted by date" becomes a scatter-gather across every shard with a merge at the end. An auto-increment id becomes a coordination problem. Uniqueness constraints stop being enforceable by the database.</p>
+
+      <div class="note key">
+        <span class="lab">Do not shard before you must</span>
+        <p>Sharding is close to irreversible and it removes capabilities you may not notice you were using. Exhaust the cheaper options first, roughly in this order: add the missing index; move reads to replicas; cache; archive or tier old rows out of the hot table; buy a bigger machine; split by <em>function</em> into separate databases (federation) which is much easier than splitting by row; and only then partition. A single modern database node with a well-designed schema handles a few thousand writes per second and terabytes of data — most systems die of complexity long before they hit that.</p>
+      </div>
+
+      <h2><span class="h2n">7.2</span>The partitioning schemes</h2>
+
+      <div class="tw">
+        <table>
+          <caption>How to decide which key goes where</caption>
+          <thead><tr><th>Scheme</th><th>Mechanism</th><th>Good at</th><th>Bad at</th></tr></thead>
+          <tbody>
+            <tr><td><b>Range</b></td><td>Sorted key space cut into contiguous ranges: A–F, G–M, …</td><td>Range scans and ordered iteration are one shard's work</td><td>Hot spots — sequential keys such as timestamps all land on the last shard</td></tr>
+            <tr><td><b>Hash</b></td><td><code>shard = hash(key) mod S</code>, or a hash ring</td><td>Even distribution, no hot ranges</td><td>Range scans must touch every shard; ordering is destroyed</td></tr>
+            <tr><td><b>Compound (hash + range)</b></td><td>Hash the first component, sort within it: <code>(user_id, timestamp)</code></td><td>Both — spread across users, ordered within a user</td><td>Requires the first component in every query</td></tr>
+            <tr><td><b>Directory / lookup</b></td><td>A lookup service maps key → shard explicitly</td><td>Total flexibility, easy rebalancing, can move individual tenants</td><td>Another service on the critical path, and it must be highly available and cached</td></tr>
+            <tr><td><b>Entity group / tenant</b></td><td>All data for one customer, household or account lives on one shard</td><td>Transactions and joins stay local — a huge simplification</td><td>Large tenants create unavoidable skew</td></tr>
+            <tr><td><b>Geographic</b></td><td>By region, for latency or data residency</td><td>Local latency, legal compliance</td><td>Population is unevenly distributed; cross-region users are awkward</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The compound key deserves emphasis because it is the answer most often reached for in practice. A messaging system partitioned on <code>conversation_id</code> and sorted by <code>(conversation_id, sent_at)</code> spreads load evenly across conversations while making "the last fifty messages in this conversation" a single sequential read on one shard. That is hash partitioning's distribution with range partitioning's locality, and the trick is available whenever queries always know the first component.</p>
+
+      <h2><span class="h2n">7.3</span>Choosing the shard key</h2>
+
+      <p>Four criteria, all of which must hold. Failing any one of them produces a system that works in staging and falls over in production.</p>
+
+      <dl>
+        <dt>1 · High cardinality</dt>
+        <dd>There must be far more distinct key values than shards, or you cannot spread. <code>country</code> has ~200 values; <code>boolean is_premium</code> has two. Neither can partition a thousand-shard cluster.</dd>
+        <dt>2 · Even distribution</dt>
+        <dd>Values must be roughly uniformly used. <code>country</code> fails again — a tenth of the world's users are in one of them. Cardinality without uniformity is not enough.</dd>
+        <dt>3 · Query alignment</dt>
+        <dd>Your dominant queries must include the key, or every query becomes a scatter-gather across all shards. If you shard orders by <code>order_id</code> but always query "all orders for this customer", you have made every read touch every shard.</dd>
+        <dt>4 · Immutability</dt>
+        <dd>Changing a record's shard key means deleting it from one shard and inserting into another — not a transaction any more. Choose something that never changes: <code>user_id</code>, not <code>email</code>; <code>account_id</code>, not <code>subscription_tier</code>.</dd>
+      </dl>
+
+      <div class="tw">
+        <table>
+          <caption>Worked examples</caption>
+          <thead><tr><th>System</th><th>Good key</th><th>Why</th><th>Tempting bad key</th></tr></thead>
+          <tbody>
+            <tr><td>Chat</td><td><code>conversation_id</code></td><td>Reads and writes are always scoped to a conversation</td><td><code>message_id</code> — every conversation read hits every shard</td></tr>
+            <tr><td>E-commerce orders</td><td><code>customer_id</code></td><td>"My orders" is the dominant query; a customer's orders stay together</td><td><code>order_date</code> — today's orders all hit one shard</td></tr>
+            <tr><td>Multi-tenant SaaS</td><td><code>tenant_id</code></td><td>Transactions, joins and isolation stay within a tenant</td><td><code>created_at</code> — no locality, and a write hot spot</td></tr>
+            <tr><td>Time-series metrics</td><td><code>(metric_name, host)</code> hashed, time as sort key</td><td>Spreads writes; range scan per series is local</td><td>Raw timestamp — the entire write load lands on one shard</td></tr>
+            <tr><td>Social graph</td><td><code>user_id</code></td><td>Everything about a user is co-located</td><td><code>(follower, followee)</code> pair — doubles storage and splits every query</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2><span class="h2n">7.4</span>Skew and hot spots</h2>
+
+      <p>Even a mathematically perfect hash cannot fix skew in the <em>access</em> pattern. Three distinct problems get called "hot spots":</p>
+
+      <ol>
+        <li><b>Hot shard</b> — one shard holds more data or takes more traffic than its peers. Usually caused by a low-cardinality or non-uniform key.</li>
+        <li><b>Hot key</b> — a single key is so popular that no partitioning scheme helps, because the key is atomic. A celebrity account, a flash-sale product, a global config row.</li>
+        <li><b>Sequential hot spot</b> — the write cursor is always at the end of the key space: timestamps, auto-increment ids, ULIDs. Every write goes to one shard while the others idle.</li>
+      </ol>
+
+      <div class="tw">
+        <table>
+          <caption>Mitigations, and what each costs</caption>
+          <thead><tr><th>Problem</th><th>Fix</th><th>Cost</th></tr></thead>
+          <tbody>
+            <tr><td>Sequential writes</td><td>Prefix the key with a hash bucket: <code>hash(id) % 16 : timestamp</code></td><td>A time-range scan must now query 16 buckets and merge</td></tr>
+            <tr><td>Hot key, read-heavy</td><td>Cache it, and add request coalescing so one miss does not become a thousand origin reads</td><td>Staleness; and the cache node itself may become hot</td></tr>
+            <tr><td>Hot key, write-heavy</td><td>Split into N sub-keys (<code>counter:post42:0…15</code>), write to a random one, sum on read</td><td>Reads become a fan-out of N; exact-value reads get harder</td></tr>
+            <tr><td>Large tenant</td><td>Give it a dedicated shard, or sub-partition within the tenant</td><td>A directory-based routing layer, and per-tenant operations</td></tr>
+            <tr><td>General imbalance</td><td>More, smaller partitions than nodes, and move partitions between nodes</td><td>Bookkeeping; but this is the standard solution and it is worth it</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Skew explorer</h4>
+          <p>Realistic access is Zipf-distributed, not uniform. See what that does to per-shard load, and what splitting the hottest key buys.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="k-shards">Shards <b><span id="k-shardsv">8</span></b></label>
+              <input type="range" id="k-shards" min="2" max="32" step="1" value="8">
+            </div>
+            <div class="ctrl">
+              <label for="k-zipf">Access skew (Zipf s) <b><span id="k-zipfv">1.00</span></b></label>
+              <input type="range" id="k-zipf" min="0" max="2" step="0.05" value="1">
+            </div>
+            <div class="ctrl">
+              <label for="k-split">Split the hottest key into <b><span id="k-splitv">1</span></b> sub-keys</label>
+              <input type="range" id="k-split" min="1" max="32" step="1" value="1">
+            </div>
+          </div>
+          <div class="bars" id="k-bars"></div>
+          <div class="out">
+            <div class="stats" id="k-stats"></div>
+            <p id="k-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">7.5</span>Consistent hashing</h2>
+
+      <h3>Why <code>hash(key) mod N</code> is a trap</h3>
+
+      <p>The obvious scheme works perfectly until the number of nodes changes. Go from 4 nodes to 5 and <code>hash(key) mod 4</code> becomes <code>hash(key) mod 5</code> — which reassigns roughly <b>80% of all keys</b>. For a cache that means a near-total miss storm and a thundering herd against the origin. For a database it means moving four fifths of your data over the network before the cluster is usable again. Adding one machine should move about 1/N of the keys, not most of them.</p>
+
+      <h3>The ring</h3>
+
+      <p>Map the hash space onto a circle, from 0 to 2<sup>32</sup> (or whatever the hash width is) wrapping back to 0. Place each node at one or more positions on that circle, determined by hashing the node's name. To find the owner of a key, hash the key to a point on the circle and walk <em>clockwise</em> to the first node position you meet. That node owns the key.</p>
+
+      <p>The property that makes this work: when a node leaves, only the keys that were walking clockwise into <em>that</em> node need to move, and they move to the next node round. Every other key keeps the same owner. When a node joins, it takes over only the arc immediately behind its new position. Both operations touch approximately 1/N of the keys and nothing else.</p>
+
+      <h3>Virtual nodes</h3>
+
+      <p>With one position per node, the arcs are wildly uneven — hashes cluster, and with 5 nodes it is entirely normal for one to own 40% of the ring. The fix is to place each physical node at many positions (typically 100–256 "virtual nodes"), so each physical node owns many small arcs whose total length converges on its fair share. Virtual nodes also make heterogeneous hardware easy: give a machine with twice the RAM twice as many virtual nodes and it takes twice the load.</p>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>The hash ring</h4>
+          <p>Add and remove nodes, and watch how few keys move. Turn virtual nodes down to 1 to see why they exist.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="h-v">Virtual nodes per machine <b><span id="h-vv">64</span></b></label>
+              <input type="range" id="h-v" min="1" max="256" step="1" value="64">
+            </div>
+            <div class="ctrl">
+              <label for="h-k">Sample keys <b><span id="h-kv">600</span></b></label>
+              <input type="range" id="h-k" min="100" max="3000" step="100" value="600">
+            </div>
+          </div>
+          <div class="btnrow">
+            <button class="btn primary" id="h-add">Add a node</button>
+            <button class="btn" id="h-rm">Remove a node</button>
+            <button class="btn" id="h-reset">Reset to 4 nodes</button>
+          </div>
+          <div class="ringwrap">
+            <canvas id="h-ring" width="340" height="340" aria-label="Consistent hashing ring"></canvas>
+            <div>
+              <div class="nodechips" id="h-chips"></div>
+              <div class="bars" id="h-bars"></div>
+            </div>
+          </div>
+          <div class="out">
+            <div class="stats" id="h-stats"></div>
+            <p id="h-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h3>Alternatives worth knowing</h3>
+
+      <div class="tw">
+        <table>
+          <caption>Other ways to map keys to nodes with minimal disruption</caption>
+          <thead><tr><th>Algorithm</th><th>Idea</th><th>When to prefer it</th></tr></thead>
+          <tbody>
+            <tr><td><b>Rendezvous (HRW) hashing</b></td><td>For each key, compute <code>hash(key, node)</code> for every node and pick the highest</td><td>Perfectly even without virtual nodes; simple to implement; cost is O(N) per lookup, fine for small N</td></tr>
+            <tr><td><b>Jump consistent hash</b></td><td>A short arithmetic function mapping a key to one of N buckets, moving minimal keys as N changes</td><td>Very fast, no memory. But buckets are numbered 0…N−1, so it cannot express arbitrary node removal</td></tr>
+            <tr><td><b>Maglev hashing</b></td><td>Builds a large lookup table with near-perfect balance and minimal disruption</td><td>Load balancers needing consistent backend selection at packet rate</td></tr>
+            <tr><td><b>Fixed partition count</b></td><td>Hash into a fixed large number of partitions (say 4096); assign partitions to nodes in a map</td><td>The most common approach in databases — see rebalancing below. Simple, explicit, easy to move a single partition</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2><span class="h2n">7.6</span>Rebalancing</h2>
+
+      <div class="tw">
+        <table>
+          <caption>Three strategies, and their operational feel</caption>
+          <thead><tr><th>Strategy</th><th>How it works</th><th>Pros and cons</th></tr></thead>
+          <tbody>
+            <tr><td><b>Fixed number of partitions</b></td><td>Create far more partitions than nodes at the start (e.g. 1 024 for 10 nodes). Nodes own many partitions each; adding a node steals whole partitions from existing ones</td><td class="yes">Simple, predictable, only whole partitions move. <span class="no">You must guess the count up front — too few caps growth, too many adds overhead</span></td></tr>
+            <tr><td><b>Dynamic partitioning</b></td><td>Partitions split when they exceed a size threshold and merge when they shrink, like a B-tree</td><td class="yes">Adapts to any data volume, works with range partitioning. <span class="no">More machinery; a cold start has one partition and no parallelism until it splits</span></td></tr>
+            <tr><td><b>Proportional to nodes</b></td><td>Fixed partitions per node; adding a node splits some random existing partitions and takes half of each</td><td class="yes">Partition size stays roughly constant as the cluster grows. <span class="no">Random splits can land unevenly</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <span class="lab">Automatic rebalancing during an incident</span>
+        <p>Fully automatic rebalancing is dangerous in combination with automatic failure detection. A node becomes slow, is declared dead, and the cluster starts moving its data — which saturates the network, makes other nodes look slow, which triggers more rebalancing. A busy cluster can rebalance itself into an outage. Most mature systems require a human to approve adding or removing capacity, while allowing automatic <em>failover</em> of leadership. Detection can be automatic; large data movement should be deliberate.</p>
+      </div>
+
+      <h2><span class="h2n">7.7</span>Routing: who knows where the key lives?</h2>
+
+      <figure class="diagram">
+        <div class="mermaid">
+flowchart TB
+  subgraph A["1 · Client-side routing"]
+    C1["Client with<br/>partition map"] --> N1["Correct node"]
+  end
+  subgraph B["2 · Routing tier / proxy"]
+    C2["Client"] --> P["Proxy holding<br/>the map"] --> N2["Correct node"]
+  end
+  subgraph C["3 · Redirect"]
+    C3["Client"] --> N3["Any node"]
+    N3 -.->|"MOVED slot 4711 to node C"| C3
+    C3 --> N4["Correct node"]
+  end
+  ZK[("Coordination service<br/>holds the authoritative map")] -.-> C1
+  ZK -.-> P
+  ZK -.-> N3
+        </div>
+        <figcaption>All three need one authoritative copy of the partition map, usually in a consensus store. They differ in who caches it: the client, a proxy, or the data nodes themselves.</figcaption>
+      </figure>
+
+      <ul>
+        <li><b>Client-side</b> — fastest, one network hop, no extra tier. The cost is a fat client library in every language you use, and the pain of rolling out a change to the map. Cassandra and Kafka work this way.</li>
+        <li><b>Proxy tier</b> — thin clients, central control, easy to change behaviour. Adds a hop and another thing to scale and keep available. Vitess, PgBouncer-style poolers and most managed offerings work this way.</li>
+        <li><b>Redirect</b> — nodes tell clients where to go when they guess wrong; the client caches the correction. Cheap to operate, occasional extra round trip. Redis Cluster's <code>MOVED</code> and <code>ASK</code> responses are the well-known example.</li>
+      </ul>
+
+      <h2><span class="h2n">7.8</span>Secondary indexes across shards</h2>
+
+      <p>Partitioning is defined by the primary key, so every other query dimension needs an index — and there are only two ways to place it.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Local versus global secondary indexes</caption>
+          <thead><tr><th></th><th>Local (document-partitioned)</th><th>Global (term-partitioned)</th></tr></thead>
+          <tbody>
+            <tr><td>Layout</td><td>Each shard indexes only its own rows</td><td>The index itself is partitioned by the indexed term, independently of the data</td></tr>
+            <tr><td>Write</td><td class="yes">Local — one shard, atomic with the row</td><td class="no">Cross-shard — the row is on shard 3, its index entry on shard 7</td></tr>
+            <tr><td>Read</td><td class="no">Scatter-gather to every shard, merge results</td><td class="yes">One shard holds every match for a term</td></tr>
+            <tr><td>Consistency</td><td class="yes">Trivially consistent with the data</td><td class="no">Usually asynchronous, so the index lags the data</td></tr>
+            <tr><td>Used by</td><td>Elasticsearch, MongoDB, Cassandra secondary indexes, DynamoDB LSI</td><td>DynamoDB GSI, Riak search, purpose-built inverted indexes</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Local indexes make writes cheap and reads expensive; global indexes do the reverse. Since scatter-gather is subject to the tail amplification from <a href="03-performance.html">Chapter 3</a>, a local index over 100 shards will have a p99 governed by your slowest shard's p99.9. That is the practical reason large systems tend to build a separate, purpose-built search index fed asynchronously from the change stream, rather than trying to make the partitioned primary store answer every query shape.</p>
+
+      <h2><span class="h2n">7.9</span>Operations that span shards</h2>
+
+      <dl>
+        <dt>Cross-shard reads (scatter-gather)</dt>
+        <dd>Query every shard, merge and sort in the coordinator. Cost is the slowest shard plus the merge, and it does not scale — adding shards makes each such query worse. Bound the damage with deadlines, partial results, and by designing so the common queries are single-shard.</dd>
+        <dt>Cross-shard transactions: two-phase commit</dt>
+        <dd>A coordinator asks every participant to <em>prepare</em> (durably promise it can commit), and if all agree, tells them to <em>commit</em>. Correct, and it has a nasty property: between prepare and commit, participants hold locks and cannot act unilaterally. If the coordinator dies in that window, the participants are stuck — the classic blocking problem. Modern systems make the coordinator itself fault-tolerant with consensus, which is exactly what Spanner and CockroachDB do, and it is why they can offer distributed transactions at a latency cost rather than not at all.</dd>
+        <dt>Sagas</dt>
+        <dd>Give up atomicity and build the operation as a sequence of local transactions, each with a compensating action if a later step fails. Reserve stock; charge card; if charging fails, release stock. Not isolated — other actors can observe intermediate states — but it does not hold locks across services. The standard answer in microservice architectures, covered in <a href="17-async.html">Chapter 17</a>.</dd>
+        <dt>Unique constraints</dt>
+        <dd>"No two users may have the same email" cannot be enforced by a database that has been split by <code>user_id</code>. The usual solution is a separate, small, strongly consistent registry keyed by the unique attribute — a table sharded by <code>email</code>, or a row in a consensus store — that you claim before creating the user.</dd>
+      </dl>
+
+      <h2><span class="h2n">7.10</span>Resharding a live system</h2>
+
+      <p>This is where the interview goes when you have got the basics right, and it is genuinely hard. The playbook, which is the same whether you are splitting a shard or changing the key entirely:</p>
+
+      <ol>
+        <li><b>Add the routing indirection first,</b> if it does not exist. You cannot change the mapping if the mapping is hard-coded in application logic.</li>
+        <li><b>Backfill.</b> Copy existing data to its new home in the background, at a rate that does not disturb production. This may run for days.</li>
+        <li><b>Dual-write.</b> Application writes go to both old and new locations. Both must succeed, or you need a reconciliation job — this is where an outbox or change stream is much safer than writing twice from application code.</li>
+        <li><b>Verify.</b> Read from both and compare, on real traffic, for long enough to be convincing. Count rows, checksum ranges, sample records.</li>
+        <li><b>Shift reads gradually,</b> by percentage or by tenant, with a fast switch back. This is the step where you find out what you missed.</li>
+        <li><b>Stop writing to the old location,</b> and only then delete it — after a retention period long enough to recover from a problem discovered late.</li>
+      </ol>
+
+      <div class="note good">
+        <span class="lab">The pre-split trick</span>
+        <p>If you suspect you will need to shard eventually, hash into a large fixed number of logical partitions on day one — 1 024 is a common choice — and map many logical partitions to each physical node. On a single node this costs almost nothing: it is a column, or a prefix on the key. When you need to grow, you move logical partitions between nodes without ever rehashing a key or touching application code. Choosing this on day one is minutes of work; retrofitting it is the multi-week project described above.</p>
+      </div>
+
+      <details class="check">
+        <summary>You shard a URL shortener by <code>hash(short_code)</code>. Traffic grows and you add nodes. Reads are fine but analytics queries — "top 100 links this hour" — have become unusable. Why, and what would you do?</summary>
+        <div class="ans">
+          <p>The shard key is right for the dominant operation (resolve one code) and useless for the analytics query, which has no <code>short_code</code> in it and therefore must scatter to every shard, take the top 100 from each, and merge. That gets worse with every node you add. The fix is not to change the shard key — it would break the fast path that matters. It is to stop asking the transactional store analytical questions: emit click events to a stream, aggregate them in a purpose-built store (a time-series database, a warehouse, or a Redis sorted set per hour), and serve the leaderboard from there. Different access pattern, different store, fed asynchronously.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Why do virtual nodes matter, and roughly how many should you use?</summary>
+        <div class="ans">
+          <p>With one ring position per node, arc lengths are random and the variance is large — with a handful of nodes it is common for the largest to own several times the share of the smallest, and removing a node dumps its entire arc on a single neighbour rather than spreading it. Many positions per node average out the randomness: load imbalance falls roughly with the square root of the number of virtual nodes, so 100–256 per machine brings imbalance to a few percent, which is where most implementations settle. They also let you weight heterogeneous machines and spread a departing node's load across all survivors instead of one.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>A multi-tenant SaaS shards by <code>tenant_id</code>. One customer is 40% of all traffic. What are your options?</summary>
+        <div class="ans">
+          <p>Four, in increasing order of effort. <b>Dedicated shard</b>: move that tenant to its own node or replica set — a directory-based routing map makes this a config change, and it also isolates the blast radius, which the customer will probably pay for. <b>Sub-partition within the tenant</b>: use a compound key like <code>(tenant_id, sub_bucket)</code> so the big tenant spreads across shards while small tenants stay on one; the cost is that cross-bucket queries for that tenant become scatter-gather. <b>Read replicas for that tenant only</b>, if the load is read-dominated. <b>Separate tiers</b>: a "large tenant" cluster and a "long tail" cluster with different provisioning. Whichever you pick, the important part is that the routing layer already supports per-tenant placement — if the mapping is <code>hash(tenant) mod N</code> baked into application code, none of these options is available to you.</p>
+        </div>
+      </details>
+
+      <div class="recap">
+        <h2>Recap</h2>
+        <ol>
+          <li><b>Partitioning is the only way past one node's write capacity,</b> and it costs you cheap joins, transactions, ordering and uniqueness.</li>
+          <li><b>Exhaust indexes, replicas, caching, archiving, bigger hardware and functional splits first.</b> Sharding is close to irreversible.</li>
+          <li><b>A shard key must have high cardinality, even distribution, alignment with your dominant queries, and immutability.</b> All four.</li>
+          <li><b>Compound keys — hash the first component, sort within it — give distribution and locality at once.</b></li>
+          <li><b>Skew is separate from partitioning:</b> hot shards need a better key, hot keys need caching or sub-key splitting, sequential keys need a hash prefix.</li>
+          <li><b><code>hash mod N</code> remaps most keys when N changes.</b> A hash ring remaps 1/N; virtual nodes make the split even and let you weight machines.</li>
+          <li><b>Many small partitions mapped to nodes</b> is the practical rebalancing strategy — move partitions, never rehash keys.</li>
+          <li><b>Local indexes are cheap to write and expensive to read; global indexes are the reverse.</b> Scatter-gather inherits tail amplification.</li>
+          <li><b>Reshard with routing indirection, backfill, dual writes, verification, gradual read shift, then deletion</b> — and pre-split into logical partitions on day one to avoid ever needing it.</li>
+        </ol>
+      </div>
+
+      <nav class="pn" aria-label="Previous and next chapter"></nav>
+    </div>
+  </article>
+</div>
+
+<script src="assets/notes.js"></script>
+<script>
+var PALETTE = ["#E2574C", "#3FB984", "#4BA3E3", "#F2A03D", "#B47BE5", "#25B7C4", "#7C8CF8", "#8FBF4D"];
+function stat2(k, v, tone) {
+  var d = document.createElement("div"); d.className = "stat";
+  var a = document.createElement("div"); a.className = "k"; a.textContent = k;
+  var b = document.createElement("div"); b.className = "v"; b.textContent = v;
+  if (tone) b.style.color = tone;
+  d.append(a, b); return d;
+}
+function bar2(label, pct, value, colour) {
+  var row = document.createElement("div"); row.className = "bar";
+  var k = document.createElement("span"); k.textContent = label;
+  var t = document.createElement("span"); t.className = "track";
+  var f = document.createElement("span"); f.className = "fill";
+  f.style.width = Math.max(0.5, Math.min(100, pct)) + "%";
+  if (colour) f.style.background = colour;
+  t.appendChild(f);
+  var v = document.createElement("span"); v.className = "val"; v.textContent = value;
+  row.append(k, t, v); return row;
+}
+/* 32-bit string hash → [0,1) */
+function h01(s) {
+  var h = 2166136261;
+  for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  h ^= h >>> 15; h = Math.imul(h, 2246822507); h ^= h >>> 13;
+  return ((h >>> 0) % 1000000) / 1000000;
+}
+
+/* ---------- skew explorer ---------- */
+(function () {
+  var sh = document.getElementById("k-shards"), z = document.getElementById("k-zipf"),
+      sp = document.getElementById("k-split"), bars = document.getElementById("k-bars"),
+      stats = document.getElementById("k-stats"), note = document.getElementById("k-note");
+  var KEYS = 400;
+
+  function draw() {
+    var S = +sh.value, s = +z.value, split = +sp.value;
+    document.getElementById("k-shardsv").textContent = S;
+    document.getElementById("k-zipfv").textContent = s.toFixed(2);
+    document.getElementById("k-splitv").textContent = split;
+    sp.max = S * 2;
+
+    /* Zipf weights over KEYS distinct keys */
+    var w = [], tot = 0;
+    for (var i = 1; i <= KEYS; i++) { var x = 1 / Math.pow(i, s); w.push(x); tot += x; }
+
+    var load = new Array(S).fill(0);
+    for (var i2 = 0; i2 < KEYS; i2++) {
+      var share = w[i2] / tot * 100;
+      if (i2 === 0 && split > 1) {
+        for (var j = 0; j < split; j++) load[Math.floor(h01("key0#" + j) * S)] += share / split;
+      } else {
+        load[Math.floor(h01("key" + i2) * S)] += share;
+      }
+    }
+    var max = Math.max.apply(null, load), min = Math.min.apply(null, load);
+    var fair = 100 / S;
+
+    bars.innerHTML = "";
+    load.forEach(function (v, i) {
+      bars.appendChild(bar2("shard " + i, (v / max) * 100, v.toFixed(1) + "%",
+        v > fair * 1.6 ? "var(--line)" : v < fair * 0.5 ? "var(--text-3)" : "var(--ok)"));
+    });
+
+    stats.innerHTML = "";
+    stats.appendChild(stat2("Fair share", fair.toFixed(1) + "%"));
+    stats.appendChild(stat2("Hottest shard", max.toFixed(1) + "%", max > fair * 1.6 ? "var(--line)" : ""));
+    stats.appendChild(stat2("Imbalance (max ÷ fair)", (max / fair).toFixed(2) + "×", max / fair > 1.6 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(stat2("Capacity wasted", (100 * (1 - (100 / S) / max)).toFixed(0) + "%",
+      (100 / S) / max < 0.6 ? "var(--line)" : ""));
+
+    note.textContent = s < 0.3
+      ? "Near-uniform access. Hashing alone balances the shards, and you must provision for roughly the fair share plus a margin."
+      : max / fair > 2.5
+      ? "Severely skewed. You must provision every shard for the hottest one, so most of the cluster sits idle while one node saturates. Splitting the hot key or giving it a dedicated shard is the only way out — a better hash function will not help, because the skew is in the access pattern, not the mapping."
+      : split > 1
+      ? "Splitting the hottest key spreads its writes across sub-keys. Reads now need to fan out to " + split + " places and sum, which is the price of the balance."
+      : "Moderate skew, the normal case for real workloads. Watch the imbalance ratio: it is the factor by which you must over-provision the whole cluster.";
+  }
+  [sh, z, sp].forEach(function (x) { x.addEventListener("input", draw); });
+  draw();
+})();
+
+/* ---------- consistent hashing ring ---------- */
+(function () {
+  var vslider = document.getElementById("h-v"), kslider = document.getElementById("h-k"),
+      cvs = document.getElementById("h-ring"), chips = document.getElementById("h-chips"),
+      bars = document.getElementById("h-bars"), stats = document.getElementById("h-stats"),
+      note = document.getElementById("h-note");
+  var nodes = ["node-1", "node-2", "node-3", "node-4"], seq = 4, lastMoved = null, lastAction = "";
+
+  function ring() {
+    var V = +vslider.value, pts = [];
+    nodes.forEach(function (n, ni) {
+      for (var i = 0; i < V; i++) pts.push({ a: h01(n + "#vn" + i), n: ni });
+    });
+    pts.sort(function (a, b) { return a.a - b.a; });
+    return pts;
+  }
+  function ownerOf(pts, a) {
+    if (!pts.length) return -1;
+    var lo = 0, hi = pts.length - 1;
+    if (a > pts[hi].a) return pts[0].n;
+    while (lo < hi) { var m = (lo + hi) >> 1; if (pts[m].a < a) lo = m + 1; else hi = m; }
+    return pts[lo].n;
+  }
+  function assign() {
+    var pts = ring(), K = +kslider.value, out = [];
+    for (var i = 0; i < K; i++) out.push({ a: h01("obj:" + i), o: ownerOf(pts, h01("obj:" + i)) });
+    return { pts: pts, keys: out };
+  }
+  var prev = null;
+
+  function draw(changed) {
+    document.getElementById("h-vv").textContent = vslider.value;
+    document.getElementById("h-kv").textContent = kslider.value;
+    var st = assign();
+
+    /* how many keys changed owner */
+    var moved = null;
+    if (prev && prev.keys.length === st.keys.length && changed) {
+      moved = 0;
+      for (var i = 0; i < st.keys.length; i++) {
+        if (prev.names[prev.keys[i].o] !== nodes[st.keys[i].o]) moved++;
+      }
+      lastMoved = moved / st.keys.length * 100;
+    }
+    prev = { keys: st.keys, names: nodes.slice() };
+
+    /* canvas */
+    var dpr = window.devicePixelRatio || 1, size = 340;
+    cvs.width = size * dpr; cvs.height = size * dpr;
+    cvs.style.width = "100%"; cvs.style.maxWidth = size + "px"; cvs.style.height = "auto";
+    var c = cvs.getContext("2d"); c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    c.clearRect(0, 0, size, size);
+    var cx = size / 2, cy = size / 2, R = size / 2 - 34;
+    var css = getComputedStyle(document.body);
+
+    c.strokeStyle = css.getPropertyValue("--rule").trim(); c.lineWidth = 12;
+    c.beginPath(); c.arc(cx, cy, R, 0, Math.PI * 2); c.stroke();
+
+    /* arcs coloured by owner: sample the circle */
+    var pts = st.pts;
+    if (pts.length) {
+      var steps = 1440;
+      for (var s = 0; s < steps; s++) {
+        var a0 = s / steps, a1 = (s + 1) / steps;
+        var o = ownerOf(pts, (a0 + a1) / 2);
+        c.strokeStyle = PALETTE[o % PALETTE.length];
+        c.lineWidth = 12;
+        c.beginPath();
+        c.arc(cx, cy, R, a0 * Math.PI * 2 - Math.PI / 2, a1 * Math.PI * 2 - Math.PI / 2);
+        c.stroke();
+      }
+    }
+    /* keys */
+    st.keys.forEach(function (k) {
+      var ang = k.a * Math.PI * 2 - Math.PI / 2;
+      var rr = R + 15;
+      c.fillStyle = PALETTE[k.o % PALETTE.length];
+      c.globalAlpha = 0.85;
+      c.beginPath(); c.arc(cx + Math.cos(ang) * rr, cy + Math.sin(ang) * rr, 2.1, 0, 7); c.fill();
+      c.globalAlpha = 1;
+    });
+    c.fillStyle = css.getPropertyValue("--text-2").trim();
+    c.font = "600 12px Archivo, sans-serif"; c.textAlign = "center";
+    c.fillText(nodes.length + " nodes", cx, cy - 4);
+    c.font = "11px Archivo, sans-serif";
+    c.fillStyle = css.getPropertyValue("--text-3").trim();
+    c.fillText(pts.length + " ring positions", cx, cy + 13);
+
+    /* chips + load */
+    chips.innerHTML = "";
+    nodes.forEach(function (n, i) {
+      var d = document.createElement("span"); d.className = "nodechip";
+      var dot = document.createElement("i"); dot.style.background = PALETTE[i % PALETTE.length];
+      d.append(dot, document.createTextNode(n));
+      chips.appendChild(d);
+    });
+    var load = new Array(nodes.length).fill(0);
+    st.keys.forEach(function (k) { load[k.o]++; });
+    var max = Math.max.apply(null, load) || 1, fair = st.keys.length / nodes.length;
+    bars.innerHTML = "";
+    load.forEach(function (v, i) {
+      bars.appendChild(bar2(nodes[i], (v / max) * 100, ((v / st.keys.length) * 100).toFixed(1) + "%", PALETTE[i % PALETTE.length]));
+    });
+
+    stats.innerHTML = "";
+    stats.appendChild(stat2("Nodes", nodes.length));
+    stats.appendChild(stat2("Fair share", (100 / nodes.length).toFixed(1) + "%"));
+    stats.appendChild(stat2("Worst node", ((max / st.keys.length) * 100).toFixed(1) + "%",
+      max / fair > 1.35 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(stat2("Imbalance", (max / fair).toFixed(2) + "×", max / fair > 1.35 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(stat2("Keys moved" + (lastAction ? " (" + lastAction + ")" : ""),
+      lastMoved == null ? "—" : lastMoved.toFixed(1) + "%", lastMoved > 40 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(stat2("mod-N would move", nodes.length > 1
+      ? ((1 - 1 / nodes.length) * 100).toFixed(0) + "%" : "—", "var(--line)"));
+
+    note.textContent = +vslider.value < 8
+      ? "With few virtual nodes the arcs are wildly uneven — this is the raw randomness of the hash, and it is why every production implementation uses a hundred or more positions per machine."
+      : lastMoved != null
+      ? "Adding or removing a node moved " + lastMoved.toFixed(1) + "% of keys. Plain hash-modulo would have moved roughly " + ((1 - 1 / nodes.length) * 100).toFixed(0) + "% — the difference between a brief warm-up and a total cache miss storm."
+      : "Each machine holds many small arcs, so its share converges on the fair value and a departure spreads across all survivors rather than landing on one neighbour.";
+  }
+
+  document.getElementById("h-add").addEventListener("click", function () {
+    if (nodes.length >= 8) return;
+    nodes.push("node-" + (++seq)); lastAction = "added"; draw(true);
+  });
+  document.getElementById("h-rm").addEventListener("click", function () {
+    if (nodes.length <= 1) return;
+    nodes.pop(); lastAction = "removed"; draw(true);
+  });
+  document.getElementById("h-reset").addEventListener("click", function () {
+    nodes = ["node-1", "node-2", "node-3", "node-4"]; seq = 4; lastMoved = null; lastAction = ""; prev = null; draw(false);
+  });
+  [vslider, kslider].forEach(function (x) { x.addEventListener("input", function () { lastMoved = null; lastAction = ""; prev = null; draw(false); }); });
+  addEventListener("resize", function () { draw(false); });
+  draw(false);
+})();
+</script>
+</body>
+</html>

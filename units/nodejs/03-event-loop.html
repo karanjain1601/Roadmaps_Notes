@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · The event loop — Node.js</title>
+<meta name="description" content="The loop phases, microtasks against macrotasks, nextTick against setImmediate, blocking and event loop lag, starvation and how to measure it.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%233FB984' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+<style>
+  .outbox{background:#0F2438;border-radius:5px;padding:11px 14px;font-family:var(--mono);font-size:12.5px;
+    line-height:1.7;color:#C7D8E6;overflow-x:auto;white-space:pre;min-height:150px}
+  .outbox .n{color:#6C8299}.outbox .v{color:#8FD3B0;font-weight:600}
+  .outbox .ph{color:#E4C989}
+</style>
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">Node.js</a><span class="sep">/</span><span>Chapter 03</span></p>
+    <p class="chno">Chapter 03 · The runtime</p>
+    <h1>The event loop</h1>
+    <p class="lede">The most important chapter in the unit. Almost every confusing Node behaviour — a timer that fired late, an <code>await</code> that did not yield where you expected, one endpoint making every endpoint slow — is this loop doing precisely what it is specified to do.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapter 01</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="phases">
+<h2>The phases</h2><div class="h2rule"></div>
+
+<div class="tw">
+<table class="tight">
+<thead><tr><th>Phase</th><th>Runs</th></tr></thead>
+<tbody>
+<tr><td><strong>timers</strong></td><td><code>setTimeout</code> and <code>setInterval</code> callbacks whose time has come</td></tr>
+<tr><td><strong>pending callbacks</strong></td><td>A few deferred system callbacks, mostly TCP errors</td></tr>
+<tr><td>idle, prepare</td><td class="no">Internal. You never see these</td></tr>
+<tr><td><strong>poll</strong></td><td class="yes">Where the loop <em>waits</em>. Retrieves completed I/O and runs its callbacks. Almost all of your work happens here</td></tr>
+<tr><td><strong>check</strong></td><td><code>setImmediate</code> callbacks — deliberately after poll</td></tr>
+<tr><td><strong>close</strong></td><td><code>close</code> events on sockets and handles</td></tr>
+<tr><td class="yes">…and between <em>every</em> callback</td><td class="yes">The <code>process.nextTick</code> queue drains completely, then the promise microtask queue drains completely</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="demo" id="d-phase">
+  <div class="demo-top"><div class="demo-title">Nine log lines, and the order they arrive in</div><div class="demo-hint">Predict the order before stepping</div></div>
+  <div class="demo-body">
+    <canvas id="cPhase" aria-label="The event loop phases with the current phase highlighted"></canvas>
+    <div class="outbox" id="phOut2" style="margin-top:12px"></div>
+    <div class="ctrls" style="justify-content:center;margin-top:12px">
+      <button class="btn primary" id="phNext">Step</button>
+      <button class="btn" id="phAuto">Play</button>
+      <button class="btn" id="phRst">Restart</button>
+    </div>
+    <div class="rgrid" id="phOut"></div>
+    <div class="readout" id="phNote"></div>
+  </div>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">javascript — the program in the demo</span><button class="code-copy">Copy</button></div><pre>console.log(<span class="s">"A sync"</span>);
+
+setTimeout(() => console.log(<span class="s">"E timeout 0"</span>), <span class="n">0</span>);
+setImmediate(() => console.log(<span class="s">"F immediate"</span>));
+
+readFile(<span class="s">"data.json"</span>, () => {
+  console.log(<span class="s">"G io callback"</span>);
+  setImmediate(() => console.log(<span class="s">"H immediate in io"</span>));
+  setTimeout(() => console.log(<span class="s">"I timeout in io"</span>), <span class="n">0</span>);
+  process.nextTick(() => console.log(<span class="s">"io: nextTick"</span>));
+});
+
+Promise.resolve().then(() => console.log(<span class="s">"D promise"</span>));
+process.nextTick(() => console.log(<span class="s">"C nextTick"</span>));
+
+console.log(<span class="s">"B sync"</span>);
+
+<span class="c">// the three rules that determine everything above:</span>
+<span class="c">//   ① all synchronous code runs to completion first</span>
+<span class="c">//   ② nextTick drains, then microtasks drain, between every callback</span>
+<span class="c">//   ③ then the loop begins its phases, in fixed order</span></pre></div>
+
+<div class="box warn"><b class="tag"><code>nextTick</code> against a promise, and why it matters</b>
+<p style="margin:0">Both are microtask-like and drain between callbacks, but the <code>nextTick</code> queue drains <em>entirely first</em> — and it is drained again after each microtask batch. So a recursive <code>process.nextTick</code> starves the loop completely: no timers, no I/O, nothing, forever, with the process at 100% CPU and no error. A recursive <code>setImmediate</code> is the well-behaved equivalent, because <code>check</code> is a phase the loop passes through once per iteration rather than a queue it must empty. <strong>The practical rule: use <code>setImmediate</code> to yield, and reach for <code>nextTick</code> almost never</strong> — its remaining legitimate use is deferring something to just after the current operation, and even then <code>queueMicrotask</code> is usually clearer.</p>
+</div>
+</section>
+
+<section id="blocking">
+<h2>What blocking actually does</h2><div class="h2rule"></div>
+
+<div class="demo" id="d-block">
+  <div class="demo-top"><div class="demo-title">One CPU-bound route, and the whole process</div><div class="demo-hint">Watch the health check, not the throughput</div></div>
+  <div class="demo-body">
+    <canvas id="cBlock" aria-label="Event loop lag and latency under CPU-bound load"></canvas>
+    <div class="ctrls" style="justify-content:center;flex-wrap:wrap">
+      <div class="ctrl"><label>Requests</label><input type="range" id="blR" min="5" max="400" step="5" value="60"><output id="blRo">60/s</output></div>
+      <div class="ctrl"><label>CPU per request</label><input type="range" id="blC" min="1" max="120" step="1" value="12"><output id="blCo">12 ms</output></div>
+      <div class="ctrl"><label>Mitigation</label><select id="blM">
+        <option value="none" selected>none</option>
+        <option value="chunk">yield with setImmediate every 5 ms</option>
+        <option value="worker">move it to a worker thread</option></select></div>
+    </div>
+    <div class="rgrid" id="blOut"></div>
+    <div class="readout" id="blNote"></div>
+  </div>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">javascript — measuring it, and the two ways out</span><button class="code-copy">Copy</button></div><pre><span class="c">// ── measure first. This is the single most useful Node metric. ──</span>
+<span class="k">import</span> { monitorEventLoopDelay } <span class="k">from</span> <span class="s">"node:perf_hooks"</span>;
+
+<span class="k">const</span> h = monitorEventLoopDelay({ resolution: <span class="n">10</span> });
+h.enable();
+setInterval(() => {
+  metrics.gauge(<span class="s">"loop.lag.p99"</span>, h.percentile(<span class="n">99</span>) / <span class="n">1e6</span>);   <span class="c">← ns → ms</span>
+  h.reset();
+}, <span class="n">10_000</span>).unref();
+<span class="c">// alert above roughly 100 ms at p99. Chapter 18.</span>
+
+<span class="c">// ── ① chunking: buys FAIRNESS, not capacity ──</span>
+<span class="k">async function</span> hashAll(items) {
+  <span class="k">let</span> since = performance.now();
+  <span class="k">for</span> (<span class="k">const</span> it <span class="k">of</span> items) {
+    hash(it);
+    <span class="k">if</span> (performance.now() - since &gt; <span class="n">5</span>) {          <span class="c">← every 5 ms of work,</span>
+      <span class="k">await</span> <span class="k">new</span> Promise(setImmediate);            <span class="c">  hand the loop back</span>
+      since = performance.now();
+    }
+  }
+}
+<span class="c">// the total CPU is identical. What changes is that a health check no</span>
+<span class="c">// longer waits behind the whole job — it waits at most one chunk.</span>
+
+<span class="c">// ── ② a worker: buys CAPACITY, at the cost of message passing ──</span>
+<span class="k">import</span> { Worker } <span class="k">from</span> <span class="s">"node:worker_threads"</span>;
+<span class="k">const</span> pool = <span class="k">new</span> WorkerPool(<span class="s">"./hash-worker.js"</span>, os.availableParallelism() - <span class="n">1</span>);
+<span class="k">const</span> digest = <span class="k">await</span> pool.run(payload);   <span class="c">← runs on another thread,</span>
+<span class="c">// chapter 15 — including when this is not worth it.  loop stays free</span></pre></div>
+
+<div class="kv">
+<dt><code>setTimeout(fn, 0)</code> is not zero</dt><dd>Node clamps it to 1 ms, and the callback runs in the next timers phase — which is whenever the loop gets there. Under load that can be tens of milliseconds. Timers are a floor, never a guarantee, and a long-running callback delays every other timer behind it.</dd>
+<dt>Why the process exits, or does not</dt><dd>The loop runs while any handle is active. An open server, a pending timer or a live socket keeps the process alive; <code>unref()</code> tells the loop to ignore a handle for that purpose, which is what you want on a metrics interval or a shutdown deadline so it cannot hold the process open.</dd>
+<dt>Synchronous APIs</dt><dd class="no"><code>readFileSync</code>, <code>execSync</code>, <code>crypto.pbkdf2Sync</code>, <code>zlib.gzipSync</code> and <code>JSON.parse</code> on a large payload all block the loop for their whole duration. They are fine at startup and in a CLI; in a request handler each one is a bomb whose size is the input's size.</dd>
+<dt>Where <code>await</code> actually yields</dt><dd><code>await</code> yields at the point the awaited value is <em>pending</em>. Awaiting an already-resolved promise still defers the continuation to the microtask queue, but no loop phase runs in between — so <code>await</code> inside a tight computational loop does not let other requests through. Only a macrotask boundary such as <code>setImmediate</code> does that, which is why the chunking pattern above uses it.</dd>
+</div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>Why does <code>process.nextTick</code> run before a resolved promise's <code>.then</code>?
+<button class="reveal">Show answer</button><div class="ans">Because Node drains the <code>nextTick</code> queue completely before touching the promise microtask queue, and drains it again after each microtask batch. It is a Node-specific queue with higher priority than the language's microtasks. The practical consequence is that a recursive <code>nextTick</code> starves everything — no timers, no I/O, no other callbacks — at full CPU and with no error.</div></li>
+
+<li>Why does <code>setImmediate</code> run after a <code>setTimeout(fn, 0)</code> at the top level but before one registered inside an I/O callback?
+<button class="reveal">Show answer</button><div class="ans">Because of where the loop is when each is registered. At the top level, the loop's first iteration reaches <code>timers</code> before <code>check</code>, so the timeout wins. Inside an I/O callback the loop is already in the <code>poll</code> phase, and <code>check</code> comes next in the same iteration while <code>timers</code> is not visited again until the following one — so the immediate wins. Same two calls, opposite order, entirely determined by phase position.</div></li>
+
+<li>Why is <code>setImmediate</code> the right way to yield and <code>nextTick</code> the wrong one?
+<button class="reveal">Show answer</button><div class="ans">Because <code>check</code> is a phase the loop passes through once per iteration, so scheduling into it lets a full iteration run in between — timers fire, I/O callbacks run, other requests progress. The <code>nextTick</code> queue must be emptied before the loop advances at all, so recursively adding to it means the loop never moves. Yielding with <code>setImmediate</code> gives other work a turn; yielding with <code>nextTick</code> gives it nothing.</div></li>
+
+<li>Twelve milliseconds of CPU per request at sixty requests a second. Why is the health check at risk?
+<button class="reveal">Show answer</button><div class="ans">Because utilisation is 72%, and at that level queueing is substantial — a request arriving must wait for whatever is already executing plus whatever is queued ahead of it, and the health check queues like everything else. It needs no CPU of its own and still waits tens of milliseconds. Push utilisation towards 100% and the wait grows without bound, the probe times out, and the orchestrator restarts a process that was merely busy.</div></li>
+
+<li>Does chunking with <code>setImmediate</code> increase throughput?
+<button class="reveal">Show answer</button><div class="ans">No. The total CPU work is identical, so capacity is unchanged — if arrivals exceed capacity the queue still grows without bound. What chunking changes is fairness: the longest single block drops from the whole job to one chunk, so short requests and health checks are no longer stuck behind a long one. It converts "the service is down" into "the service is slow", which is a real improvement and not a capacity fix. Only another thread or another process adds capacity.</div></li>
+
+<li>Why doesn't <code>await</code> inside a computational loop let other requests through?
+<button class="reveal">Show answer</button><div class="ans">Because awaiting an already-resolved value only defers the continuation to the microtask queue, and microtasks drain before the loop advances a phase. No timer fires and no I/O callback runs in between, so from the loop's point of view you are still in one long callback. To actually yield you need a macrotask boundary — <code>await new Promise(setImmediate)</code> — which lets a full loop iteration happen.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin:0">Chapter 4 covers what you write on top of the loop: callbacks, promises, and the concurrency patterns worth knowing.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 03</h2><p>The event loop. Part of the Node.js unit — <a href="index.html">all 20 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Everything. Chapters 4, 6, 15, 16 and 18 all build directly on it.</p></div>
+    <div><h2>Going deeper</h2><p>The Node guide "The Node.js Event Loop, Timers, and process.nextTick"; libuv's design document for the phases as implemented.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: phase walker ============ */
+(function(){
+  const cv=document.getElementById("cPhase"); if(!cv) return;
+  const box=document.getElementById("phOut2"), out=document.getElementById("phOut"), note=document.getElementById("phNote");
+  const PHASES=["synchronous","nextTick","microtasks","timers","pending","poll","check","close"];
+  const S=[
+    {p:0,out:["A sync"],it:0,n:"<b>All synchronous top-level code runs first, to completion.</b> The <code>setTimeout</code>, <code>setImmediate</code>, <code>readFile</code> and <code>nextTick</code> calls only <em>register</em> callbacks — none of them runs yet. The loop has not started."},
+    {p:0,out:["A sync","B sync"],it:0,n:"<b>Still synchronous.</b> <code>B</code> prints after <code>A</code> and before everything else, even though <code>D promise</code> was on an already-resolved promise. Resolved does not mean immediate: the continuation is queued."},
+    {p:1,out:["A sync","B sync","C nextTick"],it:0,n:"<b>The <code>nextTick</code> queue drains — before microtasks, and before the loop starts.</b> This queue has higher priority than the language's own microtasks, which is a Node-specific detail and the reason recursive <code>nextTick</code> can starve the process entirely."},
+    {p:2,out:["A sync","B sync","C nextTick","D promise"],it:0,n:"<b>Then the promise microtask queue drains.</b> Both queues are emptied completely, and both will be drained again between every single callback from here on. Only now does the event loop begin."},
+    {p:3,out:["A sync","B sync","C nextTick","D promise","E timeout 0"],it:1,n:"<b>Iteration 1, timers phase: the 0 ms timeout fires.</b> Note it was clamped to 1 ms and ran when the loop reached this phase — which happened to be almost immediately here, and under load could be tens of milliseconds later."},
+    {p:5,out:["A sync","B sync","C nextTick","D promise","E timeout 0"],it:1,n:"<b>Iteration 1, poll phase — and <code>readFile</code> is not finished.</b> It went to libuv's thread pool (chapter 1) and has not come back, so there is nothing to run. The loop does not wait here, because a <code>setImmediate</code> is pending and <code>check</code> is next."},
+    {p:6,out:["A sync","B sync","C nextTick","D promise","E timeout 0","F immediate"],it:1,n:"<b>Iteration 1, check phase: <code>setImmediate</code> runs.</b> So at the top level, <code>setTimeout(fn, 0)</code> beat <code>setImmediate</code> — because the loop passes <code>timers</code> before <code>check</code>. Remember this; it inverts in two steps' time."},
+    {p:5,out:["A sync","B sync","C nextTick","D promise","E timeout 0","F immediate","G io callback"],it:2,n:"<b>Iteration 2, poll phase: the file read completed and its callback runs.</b> This is where nearly all real work happens in a server — every incoming request, every database response, every HTTP reply arrives in the poll phase."},
+    {p:1,out:["A sync","B sync","C nextTick","D promise","E timeout 0","F immediate","G io callback","io: nextTick"],it:2,n:"<b>The <code>nextTick</code> queue drains immediately after that callback,</b> before the loop moves on. This is the \"between every callback\" rule in action — not once per iteration, but after each individual callback."},
+    {p:6,out:["A sync","B sync","C nextTick","D promise","E timeout 0","F immediate","G io callback","io: nextTick","H immediate in io"],it:2,n:"<b>Iteration 2, check phase: the immediate registered <em>inside</em> the I/O callback runs — and the timeout registered beside it does not.</b> The loop was in <code>poll</code>, so <code>check</code> is next in this same iteration while <code>timers</code> will not be revisited until the following one. Identical two calls, opposite order to step 6."},
+    {p:3,out:["A sync","B sync","C nextTick","D promise","E timeout 0","F immediate","G io callback","io: nextTick","H immediate in io","I timeout in io"],it:3,fin:true,n:"<b>Iteration 3, timers phase: the last timeout fires.</b> Final order: two synchronous lines, <code>nextTick</code>, the promise, then the loop's phases across three iterations. Nothing here is arbitrary — every position follows from the phase order plus the rule that both microtask queues drain between callbacks. Learn those two things and this becomes predictable rather than folklore."}
+  ];
+  let k=0, timer=null;
+  function draw(){
+    const s=S[Math.min(k,S.length-1)], active=k>0?s.p:-1;
+    const w=cv.clientWidth||660, h=76, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h);
+    ctx.textBaseline="middle";
+    ctx.fillStyle="#8195A6"; ctx.font="9px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("before the loop", 14, 12);
+    ctx.textAlign="right"; ctx.fillText("the loop's phases, in order", w-14, 12);
+    const n=PHASES.length, pad=14, gap=4, bw=(w-2*pad-(n-1)*gap)/n;
+    PHASES.forEach((p,i)=>{
+      const x=pad+i*(bw+gap), on=i===active, pre=i<3;
+      ctx.fillStyle= on?(pre?"#FFF6E8":"#E7F7EF"):"#fff";
+      ctx.strokeStyle= on?(pre?"#D98324":"#3FB984"):"#E1E7EC"; ctx.lineWidth= on?2.4:1.1;
+      if(pre) ctx.setLineDash(on?[]:[3,3]);
+      ctx.fillRect(x,22,bw,26); ctx.strokeRect(x+.5,22.5,bw,26); ctx.setLineDash([]);
+      ctx.fillStyle= on?(pre?"#B0651A":"#166B47"):"#8195A6"; ctx.font=(on?"600 ":"")+"9.5px Archivo, Arial"; ctx.textAlign="center";
+      const t=p.length*5>bw-6?p.slice(0,Math.floor((bw-8)/5))+"…":p;
+      ctx.fillText(t,x+bw/2,35);
+    });
+    ctx.fillStyle="#54677A"; ctx.font="600 10px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText(k===0?"the loop has not started":"loop iteration "+(s.it||"—"), 14, 62);
+    ctx.textAlign="right"; ctx.fillStyle="#8195A6"; ctx.font="9px Archivo, Arial";
+    ctx.fillText("nextTick and microtasks drain between every callback", w-14, 62);
+    box.innerHTML= k===0
+      ? '<span class="n">// step through — the order is the point</span>'
+      : s.out.map((o,i)=>'<span class="n">'+String(i+1).padStart(2)+'.</span> <span class="v">'+o+'</span>').join("\n");
+    out.innerHTML=
+      '<div><span>step</span><b>'+k+' / '+S.length+'</b></div>'+
+      '<div><span>phase</span><b>'+(k?PHASES[s.p]:"—")+'</b></div>'+
+      '<div><span>loop iteration</span><b>'+(k?(s.it||0):0)+'</b></div>'+
+      '<div><span>printed</span><b>'+(k?s.out.length:0)+' / 10</b></div>';
+    note.innerHTML= k===0
+      ? "<b>Ten log lines from the program below.</b> Write down the order you expect, then step through. Most people get the last four wrong the first time."
+      : s.n;
+  }
+  function stop(){ if(timer){clearInterval(timer);timer=null;document.getElementById("phAuto").textContent="Play";} }
+  document.getElementById("phNext").addEventListener("click",()=>{ if(k<S.length){k++;draw();} });
+  document.getElementById("phRst").addEventListener("click",()=>{ stop(); k=0; draw(); });
+  document.getElementById("phAuto").addEventListener("click",function(){
+    if(timer){stop();return;} this.textContent="Pause";
+    timer=setInterval(()=>{ if(k<S.length){k++;draw();} else stop(); },1600);
+  });
+  draw(); debounceResize(draw);
+})();
+
+/* ============ demo 2: blocking ============ */
+(function(){
+  const cv=document.getElementById("cBlock"); if(!cv) return;
+  const rEl=document.getElementById("blR"), cEl=document.getElementById("blC"), mEl=document.getElementById("blM"),
+        out=document.getElementById("blOut"), note=document.getElementById("blNote");
+  const CORES=4;
+  function draw(){
+    const R=+rEl.value, C=+cEl.value, m=mEl.value;
+    document.getElementById("blRo").textContent=R+"/s";
+    document.getElementById("blCo").textContent=C+" ms";
+    const capacity = m==="worker"? 1000/C*(CORES-1) : 1000/C;
+    const rho = R/capacity;
+    const served=Math.min(R,capacity);
+    const block = m==="chunk"? Math.min(5,C) : m==="worker"? 0.4 : C;
+    let wait;
+    if(rho>=1) wait=Infinity;
+    else wait = rho*C/(2*(1-rho));
+    const lag = rho>=1? Infinity : wait + block;
+    const shortP99 = rho>=1? Infinity : wait*3 + block;
+    const probeFail = !(lag<1000);
+    const w=cv.clientWidth||660, h=176, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h);
+    ctx.textBaseline="middle";
+    const pad=20, bar=w-2*pad-108;
+    function row(y,lbl,frac,text,col){
+      ctx.fillStyle="#54677A"; ctx.font="600 10px Archivo, Arial"; ctx.textAlign="left";
+      ctx.fillText(lbl, pad, y+10);
+      ctx.fillStyle="#F2F5F7"; ctx.fillRect(pad+108,y,bar,20);
+      ctx.fillStyle=col; ctx.fillRect(pad+108,y,Math.max(3,Math.min(1,frac)*bar),20);
+      ctx.strokeStyle="#E1E7EC"; ctx.lineWidth=1; ctx.strokeRect(pad+108.5,y+.5,bar,20);
+      ctx.fillStyle= frac>0.28?"#fff":"#54677A"; ctx.font="600 10px ui-monospace, monospace"; ctx.textAlign="left";
+      ctx.fillText(text, frac>0.28?pad+116:pad+114+Math.min(1,frac)*bar, y+10);
+    }
+    row(16,"loop utilisation",rho,Math.round(Math.min(rho,2)*100)+"%",
+      rho>=1?"#D9534F":rho>0.8?"#F2A03D":"#3FB984");
+    row(46,"longest single block",block/60,block.toFixed(1)+" ms",
+      block>20?"#D9534F":block>6?"#F2A03D":"#3FB984");
+    row(76,"event loop lag",lag===Infinity?1:lag/500,
+      lag===Infinity?"unbounded":Math.round(lag)+" ms",
+      lag===Infinity||lag>200?"#D9534F":lag>50?"#F2A03D":"#3FB984");
+    row(106,"a /health request",shortP99===Infinity?1:shortP99/1000,
+      shortP99===Infinity?"never answered":Math.round(shortP99)+" ms",
+      probeFail?"#D9534F":shortP99>200?"#F2A03D":"#3FB984");
+    ctx.fillStyle= probeFail?"#FBEAE9":"#E7F7EF"; ctx.strokeStyle= probeFail?"#D9534F":"#3FB984"; ctx.lineWidth=2;
+    ctx.fillRect(pad,140,w-2*pad,28); ctx.strokeRect(pad+.5,140.5,w-2*pad,28);
+    ctx.fillStyle= probeFail?"#B0403C":"#166B47"; ctx.font="600 11.5px Archivo, Arial"; ctx.textAlign="center";
+    ctx.fillText(rho>=1? "arrivals exceed capacity — the queue grows without bound"
+      : probeFail? "the liveness probe times out — the orchestrator restarts a busy process"
+      : "healthy", w/2, 154);
+    out.innerHTML=
+      '<div><span>capacity</span><b>'+Math.round(capacity)+'/s</b></div>'+
+      '<div><span>served</span><b style="color:'+(served<R?"#D9534F":"#1F7A52")+'">'+Math.round(served)+'/s</b></div>'+
+      '<div><span>utilisation</span><b style="color:'+(rho>=1?"#D9534F":rho>0.8?"#D98324":"#1F7A52")+'">'+Math.round(rho*100)+'%</b></div>'+
+      '<div><span>loop lag</span><b style="color:'+(lag===Infinity||lag>200?"#D9534F":"#1F7A52")+'">'+(lag===Infinity?"∞":Math.round(lag)+" ms")+'</b></div>'+
+      '<div><span>longest block</span><b style="color:'+(block>20?"#D9534F":"#1F7A52")+'">'+block.toFixed(1)+' ms</b></div>';
+    let msg;
+    if(rho>=1&&m!=="worker") msg="<b>"+R+" requests a second each needing "+C+" ms of CPU is "+Math.round(rho*100)+"% of one thread. There is no capacity left.</b> The queue grows for as long as the load lasts, latency rises without bound, and — the part that turns this into an outage — the health check queues with everything else and eventually times out, so the orchestrator kills a process that was merely busy. Its replacement receives the same traffic, cold. Chunking will not help here, because the total CPU is unchanged; only more threads or fewer milliseconds per request will.";
+    else if(m==="worker") msg="<b>Moving the work to a worker pool multiplies capacity by the cores you can spare and leaves the loop almost idle.</b> Loop lag is "+Math.round(lag)+" ms and the longest block is under a millisecond — the main thread now only serialises a message and waits. The costs are real: payloads are structured-cloned across the boundary, so large buffers are copied unless you transfer them; a pool needs writing or importing; and the work must be self-contained. Chapter 15 is about when that trade is worth making.";
+    else if(m==="chunk") msg="<b>Chunking cut the longest block from "+C+" ms to "+block.toFixed(0)+" ms — and served throughput is unchanged at "+Math.round(served)+" a second.</b> That is the honest summary: yielding every few milliseconds buys <em>fairness</em>, not capacity. A health check or a cheap endpoint no longer sits behind an entire job, so the service degrades to slow instead of appearing dead. If arrivals still exceed capacity the queue grows exactly as before. Fairness first, then capacity — in that order, because fairness is one line of code.";
+    else if(rho>0.7) msg="<b>"+Math.round(rho*100)+"% utilisation, and queueing is already the dominant cost.</b> Loop lag is "+Math.round(lag)+" ms, so a request needing no CPU at all waits that long before it starts. This is the same queueing arithmetic as chapter 4 of the Backend unit, with one thread instead of a pool — and the reason a Node service can look fine on average and be badly behaved at p99 long before it saturates.";
+    else msg="<b>"+Math.round(rho*100)+"% utilisation, "+Math.round(lag)+" ms of loop lag.</b> Comfortable — the loop is idle most of the time, which is the state Node is designed for. Raise either slider and watch the lag rise faster than the utilisation does, then compare the two mitigations: one changes the block size and one changes the capacity.";
+    note.innerHTML=msg;
+  }
+  [rEl,cEl,mEl].forEach(e=>e.addEventListener("input",draw));
+  draw(); debounceResize(draw);
+})();
+</script>
+</body>
+</html>

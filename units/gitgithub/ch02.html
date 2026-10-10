@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Inside .git: the object database — Git &amp; GitHub</title>
+<meta name="description" content="Blobs, trees, commits and tags. Content addressing with a real SHA-1 implementation, the .git directory tour, packfiles, and the move to SHA-256.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M8 24V11a3 3 0 013-3h10' stroke='%237C8CF8' stroke-width='2.5' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='8' cy='24' r='3' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='23' cy='8' r='3' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch02">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Git &amp; GitHub
+    </a>
+    <div class="chno"><b>Chapter 02</b><span>Foundations</span></div>
+    <h1>Inside <code style="font-size:.82em;background:#153351;color:#C7D8E6;padding:.06em .3em;border-radius:4px">.git</code>: the object database</h1>
+    <p class="lede">Underneath the 150 commands there is a key–value store with four kinds of value and one rule: <b>the key is the hash of the value</b>. Everything else — branches, merges, the impossibility of quietly editing history, the reason rebasing rewrites commit IDs — falls out of that rule. This chapter builds the store by hand.</p>
+    <div class="meta"><span>32 min</span><span>2 demos</span><span>9 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="content">
+      <h2 data-nav="Content addressing">Content addressing</h2>
+      <p class="sub">The name is computed from the value, so the same content always has the same name.</p>
+      <p>An ordinary file system addresses content by location: <code>/home/you/notes.txt</code> is a name you chose, and the bytes behind it can change without the name changing. Git addresses content by <em>hash</em>: the name of a piece of content is the SHA-1 digest of that content, prefixed with a small header. You do not choose it, and you cannot change the content without also changing the name.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">the whole idea, in one command</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ echo "hello world" | git hash-object --stdin
+3b18e512dba79e4c8300dd08aeb37f8e728b8dad
+
+$ echo "hello world" | git hash-object --stdin      # same input, anywhere, forever
+3b18e512dba79e4c8300dd08aeb37f8e728b8dad</pre>
+      </div>
+      <p>Run that on your machine and on a build server in Frankfurt in 2031 and you get the same forty characters. Four properties follow immediately, and they carry the entire design:</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Property</th><th>Because</th><th>What it buys you</th></tr></thead>
+          <tbody>
+            <tr><td>Deduplication</td><td>Identical content computes to one name</td><td>An unchanged file across 5,000 commits is stored once</td></tr>
+            <tr><td>Integrity</td><td>Content that changed no longer matches its name</td><td>Silent disk corruption is detectable — <code>git fsck</code></td></tr>
+            <tr><td>Immutability</td><td>Editing content produces a different object</td><td>Nothing in history can be altered in place, only replaced</td></tr>
+            <tr><td>Cheap comparison</td><td>Equal names imply equal content</td><td>Comparing two directory trees is comparing two hashes</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>That last one is why Git can diff a huge tree fast: at any level, if the two hashes match, the entire subtree beneath is identical and can be skipped without reading a single byte.</p>
+    </section>
+
+    <section id="types">
+      <h2 data-nav="Four object types">The four object types</h2>
+      <p class="sub">Blob, tree, commit, tag. There is no fifth.</p>
+      <p>Every object is stored the same way: a header <code>&lt;type&gt; &lt;size in bytes&gt;\0</code>, then the content, all zlib-compressed and written to a file named after the hash <em>of the uncompressed header plus content</em>.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Type</th><th>Holds</th><th>Notably does not hold</th></tr></thead>
+          <tbody>
+            <tr><td><strong>blob</strong></td><td>The raw bytes of one file</td><td>Its name, its path, its permissions, any timestamp</td></tr>
+            <tr><td><strong>tree</strong></td><td>A directory listing: mode, type, hash and name per entry</td><td>Its own name, timestamps, owner, group</td></tr>
+            <tr><td><strong>commit</strong></td><td>One tree hash, zero or more parents, author, committer, message</td><td>Any diff — a commit contains no changes</td></tr>
+            <tr><td><strong>tag</strong></td><td>A target object, its type, a tag name, tagger, message</td><td>Nothing much; only annotated tags create an object at all</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Read the "does not hold" column again — it explains a lot of Git's behaviour. A blob has no name, so renaming a file creates no new blob and Git has to <em>infer</em> renames by comparing content later. A tree has no timestamps, so checking out old code gives you files dated today. Nothing records ownership, so Git cannot be used as a backup tool for a system directory.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">inspecting any object</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ git cat-file -t 3b18e51      # type
+blob
+$ git cat-file -s 3b18e51      # size in bytes
+12
+$ git cat-file -p 3b18e51      # pretty-print the content
+hello world</pre>
+      </div>
+      <p>Short hashes work anywhere a full one does, as long as they are unambiguous in your repository — usually seven characters, more in a very large one. Git resolves them for you.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Object hash calculator</h3>
+          <span class="hint">Real SHA-1, computed in your browser — matches <code>git hash-object</code> exactly</span>
+        </div>
+        <div class="demo-body">
+          <label for="h-in" style="display:block;font-size:13px;color:var(--text-2);margin-bottom:6px">File content</label>
+          <textarea id="h-in" class="field" rows="3" spellcheck="false">hello world</textarea>
+          <div class="ctrl" style="margin-top:10px">
+            <label><input type="checkbox" id="h-nl" checked> trailing newline (as your editor writes)</label>
+            <span class="sep"></span>
+            <label for="h-type">type</label>
+            <select id="h-type">
+              <option value="blob">blob</option>
+              <option value="commit">commit</option>
+              <option value="tag">tag</option>
+            </select>
+            <button class="btn ghost" id="h-empty">Empty file</button>
+          </div>
+          <div class="term" id="h-term"></div>
+          <div class="rgrid" id="h-out"></div>
+          <p class="readout" id="h-note"></p>
+        </div>
+      </div>
+      <div class="note">
+        <span class="lbl">Why the header exists</span>
+        <p>Without <code>blob 12\0</code> in front, a blob and a commit with the same bytes would collide, and the type would have to be stored somewhere else. The header also means the hash of an empty file is not the hash of nothing: it is <code>e69de29bb2d1d6434b8b29ae775ad8c2e48c5391</code>, a constant you will eventually recognise on sight because empty files are common.</p>
+      </div>
+    </section>
+
+    <section id="trees">
+      <h2 data-nav="Trees">Trees: how directories are stored</h2>
+      <p class="sub">A tree is a sorted list of pointers, and nothing else.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">a real tree, pretty-printed</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ git cat-file -p HEAD^{tree}
+100644 blob a45bd4f1c9b7e2d3f8a01c5e6b7d8e9f0a1b2c3d    README.md
+100755 blob 7d9f3c2b8a4e1f6d5c0b9a8e7f6d5c4b3a2f1e0d    build.sh
+040000 tree 2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e    src</pre>
+      </div>
+      <p>On disk each entry is <code>&lt;mode&gt; &lt;name&gt;\0</code> followed by the 20 raw bytes of the target hash — no separators, no padding, no order but one: entries are sorted by name, with directory names compared as though they ended in <code>/</code>. That sort order is part of the format, which is why two people building the same directory always produce the same tree hash.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Mode</th><th>Means</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td><code>100644</code></td><td>Regular file</td><td>The overwhelming majority</td></tr>
+            <tr><td><code>100755</code></td><td>Executable file</td><td>The <em>only</em> permission bit Git records</td></tr>
+            <tr><td><code>120000</code></td><td>Symbolic link</td><td>The blob contains the link target as text</td></tr>
+            <tr><td><code>040000</code></td><td>Subdirectory</td><td>Points at another tree object</td></tr>
+            <tr><td><code>160000</code></td><td>Gitlink</td><td>A submodule: a commit hash from another repository (ch. 17)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>So Git's permission model is one bit. If your deploy depends on a file being mode 600, the repository cannot express that and something else must set it.</p>
+      <div class="trap">
+        <span class="lbl">Trap: empty directories</span>
+        <p>There is no object type for "empty directory". A tree is a list of entries; a directory with nothing in it produces no entries and therefore does not exist as far as Git is concerned. This is why projects contain files called <code>.gitkeep</code> — an arbitrary convention, not a Git feature, whose only job is to give the directory something to hold.</p>
+      </div>
+    </section>
+
+    <section id="commits">
+      <h2 data-nav="Commits and the DAG">Commits and the graph</h2>
+      <p class="sub">A commit is a text file that names a tree and its parents.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">git cat-file -p HEAD</span><button class="copy">Copy</button></div>
+<pre data-lang="text">tree 9c1f7a4b2e8d5c0a3f6b9e2d1c4a7b0e3f6d9c2a
+parent 4a7b0e3f6d9c2a1f8e5b2c9d6a3f0e7b4c1d8a5f
+author A U Thor &lt;author@example.com&gt; 1700000000 +0000
+committer A U Thor &lt;author@example.com&gt; 1700000000 +0000
+
+Add rate limiting to the login endpoint
+
+Brute-force attempts were unbounded.</pre>
+      </div>
+      <p>That is the entire object. Hash those bytes with a <code>commit</code> header and you get the commit ID. Several consequences worth stating explicitly:</p>
+      <ul>
+        <li><strong>A commit contains no changes.</strong> It names one complete tree. What <code>git show</code> displays as a diff is computed against the parent's tree at display time.</li>
+        <li><strong>Parents make it a graph.</strong> Zero parents means a root commit. One is ordinary. Two or more is a merge (ch. 10). The result is a directed acyclic graph — the "commit DAG" — and branches are just names pointing into it.</li>
+        <li><strong>Author and committer are different people.</strong> The author wrote the change; the committer created this object. They diverge whenever a maintainer applies your patch, and whenever you rebase — rebasing preserves the author and stamps you as committer, which is why rebased commits show a new date in some views.</li>
+        <li><strong>The parent hash is inside the hash.</strong> Change anything about a commit — even one character of its message — and its ID changes; since its child names it as parent, the child's ID changes too, and so on to the tip. This is what people mean by "rewriting history": not editing commits, but building new ones and abandoning the old chain (ch. 12).</li>
+      </ul>
+      <p>Git is, structurally, a Merkle DAG — the same shape as a blockchain's integrity mechanism, five years earlier and for the same reason: so that naming the tip is enough to pin down everything reachable from it.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Object churn: what a commit actually creates</h3>
+          <span class="hint">Toggle which files change and watch which objects are new and which are reused. Every ID here is real.</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight" id="c-toggles"></div>
+          <div id="c-cols" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:10px"></div>
+          <div class="rgrid" id="c-stats"></div>
+          <p style="font-size:12.5px;color:var(--text-2);margin:12px 0 6px">Click any object above to inspect it:</p>
+          <div class="term" id="c-term">Select an object.</div>
+          <p class="readout" id="c-note"></p>
+        </div>
+      </div>
+      <div class="tip">
+        <span class="lbl">The pattern to take away</span>
+        <p>Changing one file deep in a tree creates a new blob, a new tree for every directory on the path up to the root, and a new commit. Nothing else is touched. A commit in the Linux kernel that edits one driver file creates perhaps five or six objects, not eighty thousand.</p>
+      </div>
+    </section>
+
+    <section id="dotgit">
+      <h2 data-nav="The .git tour">The <code>.git</code> directory, entry by entry</h2>
+      <p class="sub">Nine things, no magic.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">a repository with some history</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ ls -A .git
+COMMIT_EDITMSG  HEAD  ORIG_HEAD  config  description
+hooks/  index  info/  logs/  objects/  packed-refs  refs/</pre>
+      </div>
+      <dl class="dl">
+        <dt>HEAD</dt>
+        <dd>Usually one line: <code>ref: refs/heads/main</code>. A pointer to the branch you are on. When it holds a raw commit hash instead, you are in "detached HEAD" (ch. 4).</dd>
+        <dt>objects/</dt>
+        <dd>The store. Loose objects live at <code>objects/3b/18e512...</code> — first two hex characters as the directory, to keep any one directory small. <code>objects/pack/</code> holds packfiles; <code>objects/info/</code> holds metadata for alternates and packs.</dd>
+        <dt>refs/</dt>
+        <dd><code>refs/heads/</code> is your branches, <code>refs/tags/</code> your tags, <code>refs/remotes/origin/</code> the last known state of the remote. Each is a file containing a 40-character hash and a newline — 41 bytes. That is all a branch is.</dd>
+        <dt>packed-refs</dt>
+        <dd>Once you have thousands of refs, one file each is wasteful, so Git packs them into this single text file. A ref may live in either place; <code>git rev-parse</code> and friends check both.</dd>
+        <dt>index</dt>
+        <dd>A binary file listing what the next commit will contain, plus cached <code>stat</code> data so <code>git status</code> can skip unchanged files without reading them. Chapter 3 is about this file.</dd>
+        <dt>logs/</dt>
+        <dd>The reflog: an append-only record of every value each ref has held, with timestamps. This is the undo history that makes "I lost a commit" almost always false (ch. 4, ch. 8).</dd>
+        <dt>config</dt>
+        <dd>Repository-local configuration, including the remote URLs. <code>description</code> next to it is used only by GitWeb and can be ignored.</dd>
+        <dt>hooks/</dt>
+        <dd>Executable scripts Git runs at defined moments. Ships full of <code>.sample</code> files, all disabled (ch. 23).</dd>
+        <dt>ORIG_HEAD, MERGE_HEAD, FETCH_HEAD, COMMIT_EDITMSG</dt>
+        <dd>Scratch state. <code>ORIG_HEAD</code> is where HEAD was before the last drastic operation — a one-step undo. <code>MERGE_HEAD</code> exists only during a conflicted merge. <code>COMMIT_EDITMSG</code> is the message buffer your editor just wrote.</dd>
+      </dl>
+      <div class="code">
+        <div class="code-top"><span class="tag">proving a branch is a 41-byte file</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ cat .git/refs/heads/main
+8f3d2a19c1b0e4f8a7d6c5b4a3928170f6e5d4c3
+
+$ wc -c .git/refs/heads/main
+41 .git/refs/heads/main
+
+$ git branch experiment          # create a branch
+$ cat .git/refs/heads/experiment # ...is one more 41-byte file
+8f3d2a19c1b0e4f8a7d6c5b4a3928170f6e5d4c3</pre>
+      </div>
+      <p>That is why Git's branches are described as cheap. Creating one writes 41 bytes; deleting one removes a file. Compare with systems where a branch is a server-side copy of the tree.</p>
+    </section>
+
+    <section id="packs">
+      <h2 data-nav="Packfiles">Loose objects, packfiles and gc</h2>
+      <p class="sub">Where the delta compression from chapter 1 actually happens.</p>
+      <p>A freshly created object is written <em>loose</em>: one zlib-compressed file per object. That is fast to write and terrible at scale — a repository with a million objects would be a million files, most of them nearly identical to another.</p>
+      <p>So Git periodically repacks. A <strong>packfile</strong> (<code>.pack</code>) holds many objects in one file, with an index (<code>.idx</code>) for random access, and inside it objects may be stored as deltas against a similar object rather than in full. Git chooses delta bases by heuristics on size and name similarity, and caps chain depth (default 50) so reconstruction stays bounded.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">looking at the store</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ git count-objects -vH
+count: 43              # loose objects
+size: 172.00 KiB
+in-pack: 15284         # objects inside packfiles
+packs: 2
+size-pack: 8.42 MiB
+prune-packable: 0
+garbage: 0
+
+$ git gc                       # repack, and prune unreachable objects older than 2 weeks
+$ git gc --aggressive          # slower, recomputes deltas from scratch — rarely worth it
+$ git verify-pack -v .git/objects/pack/pack-*.idx | head    # per-object sizes and chain depths</pre>
+      </div>
+      <p>Two behaviours surprise people:</p>
+      <ul>
+        <li><strong>Deleting things does not shrink the repository.</strong> An object stays until it is unreachable <em>and</em> pruned, and the default grace period is two weeks. A 200&nbsp;MB video committed once and deleted in the next commit is still in every clone, forever, unless the history is rewritten (ch. 23).</li>
+        <li><strong>gc runs on its own.</strong> Commands that create many objects trigger <code>git gc --auto</code>, which is why an occasional push or commit pauses for a second. <code>git maintenance start</code> moves that work to a background schedule.</li>
+      </ul>
+      <div class="note">
+        <span class="lbl">Reachability</span>
+        <p>An object is reachable if you can walk to it from any ref — a branch, a tag, the index, a stash, or an entry in the reflog. Everything else is garbage awaiting collection. This is why the reflog is such an effective safety net: for two weeks after you "lose" a commit, the reflog still names it, so it is still reachable and still on disk.</p>
+      </div>
+    </section>
+
+    <section id="sha256">
+      <h2 data-nav="SHA-1 and SHA-256">SHA-1, collisions, and the move to SHA-256</h2>
+      <p class="sub">A cryptographic footnote with real operational consequences.</p>
+      <p>SHA-1 has been considered theoretically weak since 2005, and in 2017 Google and CWI demonstrated <em>SHAttered</em>: two different PDF files with the same SHA-1 digest. Since object names are SHA-1 digests, this is a legitimate question for Git.</p>
+      <p>Three things are true at once:</p>
+      <ul>
+        <li>Git has shipped <strong>collision-detecting SHA-1</strong> (sha1dc) since version 2.13. It detects the bit patterns characteristic of known collision attacks and aborts rather than accepting the object, at a small speed cost.</li>
+        <li>An attack must produce a collision against an object that already exists in your repository, and get you to accept it — much harder than producing two colliding files of your own.</li>
+        <li>Git supports a full <strong>SHA-256 object format</strong> (<code>git init --object-format=sha256</code>) since 2.29. It works, but repositories in the two formats cannot yet interoperate, and major hosts including GitHub do not accept them, so in practice everything you touch is SHA-1.</li>
+      </ul>
+      <p>The practical takeaway is small: do not treat a Git hash as a security boundary on its own. If you need to prove a commit came from a specific person, sign it (ch. 5) — signatures, not hashes, are the authentication mechanism.</p>
+    </section>
+
+    <section id="plumbing">
+      <h2 data-nav="Making a commit by hand">Making a commit without porcelain</h2>
+      <p class="sub">The best twenty minutes you can spend on Git.</p>
+      <p>Everything the previous sections described can be driven directly. Doing this once, in a scratch repository, converts the model from something you have read into something you have operated.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">a commit built from plumbing only</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ mkdir plumb &amp;&amp; cd plumb &amp;&amp; git init -q
+
+# 1. write a blob into the object store (-w writes; without it, just prints the hash)
+$ echo 'hello world' | git hash-object -w --stdin
+3b18e512dba79e4c8300dd08aeb37f8e728b8dad
+
+# 2. put that blob in the index under a name and mode
+$ git update-index --add --cacheinfo 100644,3b18e512dba79e4c8300dd08aeb37f8e728b8dad,hello.txt
+
+# 3. turn the index into a tree object
+$ git write-tree
+68aba62e560c0ebc3396e8ae9335232cd93a3f60
+
+# 4. wrap the tree in a commit (no parent — this is a root commit)
+$ echo 'First commit, by hand' | git commit-tree 68aba62
+d4c1f0a7b3e2519f8c6a0d4b7e3f2a1c9d8b7e6f
+
+# 5. point a branch at it
+$ git update-ref refs/heads/main d4c1f0a
+
+$ git log --oneline
+d4c1f0a (HEAD -&gt; main) First commit, by hand
+$ git status
+On branch main
+nothing to commit, working tree clean</pre>
+      </div>
+      <p>No <code>git add</code>, no <code>git commit</code>. Those two commands are convenience wrappers over exactly these steps — which is precisely what "porcelain over plumbing" means.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Plumbing command</th><th>Does</th><th>You'll meet it in</th></tr></thead>
+          <tbody>
+            <tr><td><code>git hash-object</code></td><td>Compute (and optionally store) an object ID</td><td>This chapter</td></tr>
+            <tr><td><code>git cat-file</code></td><td>Read any object's type, size or content</td><td>Everywhere</td></tr>
+            <tr><td><code>git ls-tree</code></td><td>List a tree's entries</td><td>Ch. 6, 23</td></tr>
+            <tr><td><code>git rev-parse</code></td><td>Turn any revision expression into a hash</td><td>Ch. 4, 22</td></tr>
+            <tr><td><code>git rev-list</code></td><td>Walk the commit graph and list commits</td><td>Ch. 6, 23</td></tr>
+            <tr><td><code>git update-ref</code></td><td>Move a ref, with a reflog entry</td><td>Ch. 4, 8</td></tr>
+            <tr><td><code>git for-each-ref</code></td><td>Enumerate refs with a format string</td><td>Ch. 22</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 02 in eight lines</h2>
+        <ul>
+          <li>Git is a key–value store where <b>the key is the SHA-1 of the value</b>, prefixed with <code>&lt;type&gt; &lt;size&gt;\0</code>.</li>
+          <li>Four object types: <b>blob</b> (bytes), <b>tree</b> (a sorted directory listing), <b>commit</b> (one tree plus parents and metadata), <b>tag</b> (an annotated pointer).</li>
+          <li>Blobs have no names and trees have no timestamps — which is why renames are inferred, checkouts have today's dates, and only the executable bit survives.</li>
+          <li>A commit stores <b>no diff</b>. Diffs are computed by comparing its tree with its parent's.</li>
+          <li>Because a parent's hash is part of a commit's hash, <b>changing any commit changes every descendant</b>. That is all "rewriting history" means.</li>
+          <li>A branch is a <b>41-byte file</b> under <code>.git/refs/heads/</code> containing a commit hash.</li>
+          <li>Objects start loose and get <b>packed</b>, with delta compression inside the packfile. Unreachable objects survive until pruned, so deleting a big file does not shrink the clone.</li>
+          <li>SHA-1 is collision-hardened in Git and SHA-256 exists but isn't interoperable yet; use <b>signatures</b>, not hashes, for authenticity.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary>Two files in a repository, <code>a/config.json</code> and <code>b/config.json</code>, have byte-identical contents. How many blobs?</summary>
+        <div class="ans"><p>One. A blob is content, with no name and no path, so both tree entries point at the same object. Copy that file into fifty directories and the store still gains no blobs — only the trees change, because they list different names pointing at the same hash.</p></div>
+      </details>
+      <details class="chk">
+        <summary>You amend the message of a commit that has ten commits after it. How many commit objects does the repository now contain for that line of history?</summary>
+        <div class="ans"><p>Twenty-two, temporarily. The original eleven still exist (unreachable but not yet pruned, and still named in the reflog), and eleven new ones have been created — the amended commit plus rebuilt copies of all ten descendants, each with a new hash because its parent's hash changed. The old chain disappears from the store only after it falls out of the reflog and <code>gc</code> prunes it.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A colleague committed a 300&nbsp;MB dataset, then deleted it in the next commit and pushed. The clone is still 300&nbsp;MB. Why, and what actually fixes it?</summary>
+        <div class="ans"><p>The blob is still reachable — from the earlier commit, which is still in history. Deleting a file in a later commit only changes later trees; it does not remove anything from the object store. The fix is to rewrite history so no commit references that blob (<code>git filter-repo</code>, ch. 23), force-push, and have every collaborator re-clone, then let <code>gc</code> prune. On GitHub you also need support to run garbage collection server-side.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Why can Git tell instantly that two large directory trees are identical, without reading any files?</summary>
+        <div class="ans"><p>Because each directory is a tree object whose hash covers the names, modes and hashes of everything inside it, recursively. If the two root trees have the same hash, every byte beneath them is identical by construction. Git exploits this constantly — during diff, merge and status it prunes whole subtrees whose hashes match, which is why operations scale with what changed rather than with repository size.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Chapter 3 takes the one component this chapter skipped — <code>.git/index</code> — and builds the three-trees model that explains <code>add</code>, <code>reset</code>, <code>restore</code> and every confusing thing <code>git status</code> has ever told you.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li>Run the plumbing sequence above in a scratch repo.</li>
+        <li><code>find .git/objects -type f</code> after two commits — count them and name each one with <code>cat-file -t</code>.</li>
+        <li><code>git cat-file -p HEAD^{tree}</code> in a real project.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>Pro Git 2nd edition, chapter 10 (Git Internals); <code>Documentation/gitformat-pack.txt</code> in the Git source; the SHAttered disclosure (Stevens et al., 2017) and Git's sha1dc implementation.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Real SHA-1 (FIPS 180-4) — verified against git hash-object
+   ============================================================ */
+function sha1(bytes) {
+  var ml = bytes.length;
+  var out = new Uint8Array(((ml + 8) >> 6 << 6) + 64);
+  out.set(bytes);
+  out[ml] = 0x80;
+  var dv = new DataView(out.buffer);
+  var bl = ml * 8;
+  dv.setUint32(out.length - 8, Math.floor(bl / 4294967296));
+  dv.setUint32(out.length - 4, bl >>> 0);
+  var h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE, h3 = 0x10325476, h4 = 0xC3D2E1F0;
+  var w = new Uint32Array(80);
+  for (var i = 0; i < out.length; i += 64) {
+    var j;
+    for (j = 0; j < 16; j++) w[j] = dv.getUint32(i + j * 4);
+    for (j = 16; j < 80; j++) {
+      var n = w[j - 3] ^ w[j - 8] ^ w[j - 14] ^ w[j - 16];
+      w[j] = (n << 1) | (n >>> 31);
+    }
+    var a = h0, b = h1, c = h2, d = h3, e = h4;
+    for (j = 0; j < 80; j++) {
+      var f, k;
+      if (j < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
+      else if (j < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+      else if (j < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+      else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+      var t = (((a << 5) | (a >>> 27)) + f + e + k + w[j]) >>> 0;
+      e = d; d = c; c = ((b << 30) | (b >>> 2)) >>> 0; b = a; a = t;
+    }
+    h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0;
+    h3 = (h3 + d) >>> 0; h4 = (h4 + e) >>> 0;
+  }
+  return [h0, h1, h2, h3, h4].map(function (x) { return x.toString(16).padStart(8, "0"); }).join("");
+}
+
+var ENC = new TextEncoder();
+function concatBytes(a, b) {
+  var out = new Uint8Array(a.length + b.length);
+  out.set(a); out.set(b, a.length);
+  return out;
+}
+function gitHash(type, body) {
+  return sha1(concatBytes(ENC.encode(type + " " + body.length + "\u0000"), body));
+}
+function hexToBytes(h) {
+  var a = new Uint8Array(h.length / 2);
+  for (var i = 0; i < a.length; i++) a[i] = parseInt(h.substr(i * 2, 2), 16);
+  return a;
+}
+
+/* ============================================================
+   Demo 1 — object hash calculator
+   ============================================================ */
+(function () {
+  var ta = document.getElementById("h-in");
+  var nl = document.getElementById("h-nl");
+  var ty = document.getElementById("h-type");
+  var term = document.getElementById("h-term");
+  var out = document.getElementById("h-out");
+  var note = document.getElementById("h-note");
+  document.getElementById("h-empty").addEventListener("click", function () {
+    ta.value = ""; nl.checked = false; render();
+  });
+
+  var SELFTEST = gitHash("blob", new Uint8Array(0));
+  var PASS = SELFTEST === "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
+
+  function esc(s) { return s.replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+
+  function render() {
+    var text = ta.value + (nl.checked ? "\n" : "");
+    var body = ENC.encode(text);
+    var type = ty.value;
+    var id = gitHash(type, body);
+    var header = type + " " + body.length + "\\0";
+
+    term.innerHTML =
+      '<span class="d">bytes hashed:</span>\n' +
+      '<span class="y">' + esc(header) + "</span>" + esc(text.replace(/\n/g, "\u21b5\n")) + "\n\n" +
+      '<span class="p">$</span> printf %s ' + (text.length ? "'" + esc(text.replace(/\n/g, "\\n")) + "'" : "''") +
+      " | git hash-object -t " + type + " --stdin\n" +
+      '<span class="g">' + id + "</span>";
+
+    out.innerHTML = "";
+    tile("Object ID", id.slice(0, 12) + "…", null, true, id);
+    tile("Content bytes", String(body.length), "UTF-8");
+    tile("Header", esc(header), "prepended");
+    tile("Loose path", ".git/objects/" + id.slice(0, 2) + "/" + id.slice(2, 8) + "…", null, false, ".git/objects/" + id.slice(0, 2) + "/" + id.slice(2));
+    tile("Self-test", PASS ? "passes" : "FAILS", "empty blob");
+
+    var extras = [];
+    if (body.length === 0) extras.push("The empty object is a constant every Git user eventually memorises.");
+    if (!nl.checked && ta.value.length) extras.push("Note the missing trailing newline — <code>echo</code> adds one, so <code>echo 'x' | git hash-object --stdin</code> would give a different ID than this.");
+    note.innerHTML =
+      "The hash covers the header as well as the content, so an identical string stored as a <code>blob</code> and as a <code>commit</code> gets different IDs — switch the type selector and watch. " +
+      "The first two hex characters become the directory name, which is why <code>.git/objects</code> has up to 256 subdirectories. " +
+      extras.join(" ");
+  }
+
+  function tile(k, v, small, hi, mono) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v" + (mono ? " mono" : "");
+    vv.innerHTML = mono ? mono : v;
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  ta.addEventListener("input", render);
+  nl.addEventListener("change", render);
+  ty.addEventListener("change", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — object churn across three commits (real object IDs)
+   ============================================================ */
+(function () {
+  var FILES = [
+    { path: "README.md", dir: "", versions: [
+      "# demo\n",
+      "# demo\n\nA tiny project.\n",
+      "# demo\n\nA tiny project. Now documented.\n"] },
+    { path: "src/app.js", dir: "src", versions: [
+      "console.log('hi')\n",
+      "console.log('hi there')\n",
+      "console.log('hello, world')\n"] },
+    { path: "src/util.js", dir: "src", versions: [
+      "export const pad = n => String(n).padStart(2, '0')\n",
+      "export const pad = (n, w = 2) => String(n).padStart(w, '0')\n",
+      "export const pad = (n, w = 2, c = '0') => String(n).padStart(w, c)\n"] }
+  ];
+  var IDENT = "A U Thor <author@example.com> 1700000000 +0000";
+  var MSGS = ["Initial commit", "Second commit", "Third commit"];
+
+  /* which files changed in commit 2 and commit 3 */
+  var changed = { 1: { "README.md": false, "src/app.js": true, "src/util.js": false },
+                  2: { "README.md": false, "src/app.js": true, "src/util.js": true } };
+
+  var togWrap = document.getElementById("c-toggles");
+  var cols = document.getElementById("c-cols");
+  var stats = document.getElementById("c-stats");
+  var term = document.getElementById("c-term");
+  var note = document.getElementById("c-note");
+  var objects = {};   /* id -> {type, body, label} */
+
+  [1, 2].forEach(function (ci) {
+    var lbl = document.createElement("span");
+    lbl.style.cssText = "font-size:12.5px;color:var(--text-2);margin-right:2px";
+    lbl.textContent = "Commit " + (ci + 1) + " changes:";
+    togWrap.appendChild(lbl);
+    FILES.forEach(function (f) {
+      var b = document.createElement("button");
+      b.className = "btn mono" + (changed[ci][f.path] ? " on" : "");
+      b.textContent = f.path;
+      b.addEventListener("click", function () {
+        changed[ci][f.path] = !changed[ci][f.path];
+        render();
+      });
+      b.dataset.ci = ci;
+      b.dataset.path = f.path;
+      togWrap.appendChild(b);
+    });
+    if (ci === 1) {
+      var sep = document.createElement("span");
+      sep.className = "sep";
+      togWrap.appendChild(sep);
+    }
+  });
+
+  function versionAt(f, ci) {
+    var v = 0;
+    for (var i = 1; i <= ci; i++) if (changed[i][f.path]) v++;
+    return Math.min(v, f.versions.length - 1);
+  }
+
+  function buildCommit(ci, parentId) {
+    var created = [];
+    var record = function (id, type, body, label) {
+      if (!objects[id]) { objects[id] = { type: type, body: body, label: label }; }
+      created.push(id);
+    };
+
+    /* blobs */
+    var blobIds = {};
+    FILES.forEach(function (f) {
+      var text = f.versions[versionAt(f, ci)];
+      var id = gitHash("blob", ENC.encode(text));
+      blobIds[f.path] = id;
+      record(id, "blob", text, f.path);
+    });
+
+    /* src tree */
+    var srcEntries = FILES.filter(function (f) { return f.dir === "src"; })
+      .map(function (f) { return { mode: "100644", name: f.path.split("/")[1], id: blobIds[f.path], type: "blob" }; })
+      .sort(function (a, b) { return a.name < b.name ? -1 : 1; });
+    var srcId = treeId(srcEntries);
+    record(srcId, "tree", treeText(srcEntries), "src/");
+
+    /* root tree */
+    var rootEntries = [
+      { mode: "100644", name: "README.md", id: blobIds["README.md"], type: "blob" },
+      { mode: "40000", name: "src", id: srcId, type: "tree" }
+    ];
+    var rootId = treeId(rootEntries);
+    record(rootId, "tree", treeText(rootEntries), "root tree");
+
+    /* commit */
+    var cText = "tree " + rootId + "\n" +
+      (parentId ? "parent " + parentId + "\n" : "") +
+      "author " + IDENT + "\n" +
+      "committer " + IDENT + "\n\n" + MSGS[ci] + "\n";
+    var cId = gitHash("commit", ENC.encode(cText));
+    record(cId, "commit", cText, MSGS[ci]);
+
+    return { id: cId, root: rootId, src: srcId, blobs: blobIds, created: created, text: cText };
+  }
+
+  function treeId(entries) {
+    var parts = [];
+    entries.forEach(function (e) {
+      parts.push(concatBytes(ENC.encode(e.mode + " " + e.name + "\u0000"), hexToBytes(e.id)));
+    });
+    var total = parts.reduce(function (a, p) { return a + p.length; }, 0);
+    var body = new Uint8Array(total);
+    var off = 0;
+    parts.forEach(function (p) { body.set(p, off); off += p.length; });
+    return gitHash("tree", body);
+  }
+  function treeText(entries) {
+    return entries.map(function (e) {
+      return (e.mode === "40000" ? "040000" : e.mode) + " " + e.type + " " + e.id + "\t" + e.name;
+    }).join("\n") + "\n";
+  }
+
+  function render() {
+    Array.prototype.forEach.call(togWrap.querySelectorAll("button"), function (b) {
+      b.classList.toggle("on", changed[b.dataset.ci][b.dataset.path]);
+    });
+
+    objects = {};
+    var commits = [];
+    var parent = null;
+    var seen = {};
+    for (var ci = 0; ci < 3; ci++) {
+      var c = buildCommit(ci, parent);
+      c.isNew = {};
+      c.created.forEach(function (id) {
+        c.isNew[id] = !seen[id];
+        seen[id] = true;
+      });
+      commits.push(c);
+      parent = c.id;
+    }
+
+    cols.innerHTML = "";
+    commits.forEach(function (c, ci) {
+      var box = document.createElement("div");
+      box.style.cssText = "border:1px solid var(--rule-2);border-radius:5px;overflow:hidden";
+      var head = document.createElement("div");
+      head.style.cssText = "padding:7px 10px;background:#F4F6F8;border-bottom:1px solid var(--rule-2);font-size:12.5px;font-weight:700";
+      var newCount = c.created.filter(function (id) { return c.isNew[id]; }).length;
+      head.innerHTML = MSGS[ci] + '<span style="font-weight:500;color:var(--text-2)"> · ' + newCount + " new</span>";
+      box.appendChild(head);
+      var list = document.createElement("div");
+      list.style.cssText = "padding:7px 8px;display:flex;flex-direction:column;gap:3px";
+
+      var rows = [
+        { id: c.id, t: "commit", n: MSGS[ci] },
+        { id: c.root, t: "tree", n: "/" },
+        { id: c.blobs["README.md"], t: "blob", n: "README.md" },
+        { id: c.src, t: "tree", n: "src/" },
+        { id: c.blobs["src/app.js"], t: "blob", n: "app.js" },
+        { id: c.blobs["src/util.js"], t: "blob", n: "util.js" }
+      ];
+      rows.forEach(function (r) {
+        var isNew = c.isNew[r.id];
+        var btn = document.createElement("button");
+        btn.style.cssText =
+          "text-align:left;font-family:var(--mono);font-size:11.5px;padding:3px 7px;border-radius:3px;" +
+          "border:1px solid " + (isNew ? "var(--acc-line)" : "var(--rule-2)") + ";" +
+          "background:" + (isNew ? "var(--acc-wash)" : "#FAFBFC") + ";" +
+          "color:" + (isNew ? "var(--acc-deep)" : "var(--text-3)") + ";" +
+          (isNew ? "font-weight:600;" : "") + "width:100%";
+        btn.innerHTML = (isNew ? "+ " : "· ") + r.id.slice(0, 7) + " " + r.t + " " + r.n;
+        btn.addEventListener("click", function () { inspect(r.id); });
+        list.appendChild(btn);
+      });
+      box.appendChild(list);
+      cols.appendChild(box);
+    });
+
+    var total = Object.keys(objects).length;
+    var naive = 3 * 6;
+    stats.innerHTML = "";
+    stat("Objects created", String(total), "across 3 commits", true);
+    stat("If nothing were shared", String(naive), "6 per commit");
+    stat("Reused", String(naive - total), "not written again");
+    stat("New in commit 3", String(commits[2].created.filter(function (id) { return commits[2].isNew[id]; }).length), "objects");
+
+    var c3changed = FILES.filter(function (f) { return changed[2][f.path]; }).map(function (f) { return f.path; });
+    note.innerHTML = c3changed.length === 0
+      ? "Commit 3 changes no files, so its tree is byte-identical to commit 2's and gets the <b>same hash</b> — every blob and tree is reused and the only new object is the commit itself. Git will refuse to make such a commit without <code>--allow-empty</code>, but the object model has no problem with it."
+      : "Commit 3 touches <b>" + c3changed.join(", ") + "</b>. That creates a new blob for each changed file, a new tree for every directory on the path to the root, and one commit object. Files in untouched directories keep pointing at the exact same objects — nothing is copied.";
+
+    inspect(commits[2].id);
+  }
+
+  function inspect(id) {
+    var o = objects[id];
+    if (!o) return;
+    var body = typeof o.body === "string" ? o.body : "";
+    var esc = body.replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; });
+    term.innerHTML =
+      '<span class="p">$</span> git cat-file -t ' + id.slice(0, 7) + "\n" + '<span class="y">' + o.type + "</span>\n" +
+      '<span class="p">$</span> git cat-file -p ' + id.slice(0, 7) + "\n" + esc +
+      (o.type === "tree" ? '\n<span class="d">(on disk the hashes are 20 raw bytes, not hex text)</span>' : "") +
+      '\n<span class="d">full id: ' + id + "</span>";
+  }
+
+  function stat(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    d.innerHTML = '<span class="k"></span><span class="v"></span>';
+    d.querySelector(".k").textContent = k;
+    d.querySelector(".v").textContent = v;
+    if (small) {
+      var s = document.createElement("small");
+      s.textContent = " " + small;
+      d.querySelector(".v").appendChild(s);
+    }
+    stats.appendChild(d);
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

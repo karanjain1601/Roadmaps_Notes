@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Caching — System Design Notes</title>
+<meta name="description" content="Where caches live, read and write strategies, eviction policies compared by simulation, invalidation, stampedes, hot keys and cache-caused outages.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/notes.css">
+</head>
+<body>
+<div class="readbar"></div>
+
+<header class="top">
+  <div class="top-inner">
+    <a class="home" href="../../index.html"><span class="mark"></span>All roadmaps</a>
+    <span class="top-sep">/</span>
+    <a class="home" href="index.html" style="color:var(--band-text)">System Design</a>
+    <span class="top-spacer"></span>
+    <button class="rail-toggle" aria-expanded="false">Contents</button>
+    <nav class="top-nav" aria-label="Chapter navigation"></nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail" id="rail" aria-label="Chapter and section navigation"></aside>
+
+  <article>
+    <p class="crumb">Part 4 · Storing the data &nbsp;·&nbsp; <b>Chapter 15</b></p>
+    <h1>Caching</h1>
+    <p class="standfirst">The highest-leverage optimisation available and the source of the strangest bugs. This chapter covers where caches live and which one to reach for, the four write strategies and what each guarantees, why eviction policy matters more than people think, and the five failure modes — stampede, hot key, penetration, avalanche, and the cache that takes the database down when it dies.</p>
+    <div class="meta">
+      <span>~40 min read</span>
+      <span>Strategies · eviction · invalidation · stampedes</span>
+      <span>2 interactive panels</span>
+      <span>Prerequisite: chapters 3, 9</span>
+    </div>
+
+    <div class="body">
+
+      <h2><span class="h2n">15.1</span>Why caching works at all</h2>
+
+      <p>Caching is a bet on <b>locality</b>: that what was recently or frequently requested will be requested again. In real systems that bet is overwhelmingly good, because request popularity follows a Zipf-like distribution — a small head of items takes a large share of traffic. Twenty per cent of items typically serve eighty per cent of requests, and in consumer systems it is often closer to five and ninety-five.</p>
+
+      <p>The arithmetic of hit ratio is worth internalising, because it is not linear in the way it feels:</p>
+
+      <div class="codewrap">
+        <span class="lang">What a hit ratio buys</span>
+        <pre><code>origin load = requests × (1 − hit ratio)
+
+  hit ratio 0%    → 100% of load reaches the origin
+  hit ratio 50%   →  50%          (2× relief)
+  hit ratio 90%   →  10%          (10×)
+  hit ratio 95%   →   5%          (20×)
+  hit ratio 99%   →   1%          (100×)
+  hit ratio 99.9% →   0.1%        (1000×)
+
+Going from 90% to 99% is a 10× reduction in origin load —
+the same relief as going from 0% to 90%. The last few
+percent are where all the value is, and where all the
+difficulty is, because they are the long tail.</code></pre>
+      </div>
+
+      <h2><span class="h2n">15.2</span>Where caches live</h2>
+
+      <div class="tw">
+        <table>
+          <caption>Every layer, cheapest first</caption>
+          <thead><tr><th>Layer</th><th>Latency</th><th>Invalidation</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td><b>Client / app memory</b></td><td class="num">0 ms</td><td class="no">Impossible — you cannot reach it</td><td>Only for immutable data or very short TTLs</td></tr>
+            <tr><td><b>Browser HTTP cache</b></td><td class="num">0 ms</td><td class="no">Only by changing the URL</td><td>Content-hashed asset URLs make this safe and free</td></tr>
+            <tr><td><b>CDN edge</b></td><td class="num">5–30 ms</td><td class="mid">Purge, or surrogate keys</td><td><a href="09-cdn.html">Chapter 9</a></td></tr>
+            <tr><td><b>Reverse proxy</b></td><td class="num">&lt;1 ms</td><td class="mid">Purge API</td><td>nginx or Varnish in front of the app; often forgotten and very effective</td></tr>
+            <tr><td><b>In-process (local) cache</b></td><td class="num">~0.001 ms</td><td class="no">Hard — every instance has its own copy</td><td>Fastest possible. Use for small, hot, tolerant-of-staleness data</td></tr>
+            <tr><td><b>Distributed cache (Redis, Memcached)</b></td><td class="num">0.3–1 ms</td><td class="yes">Easy — one authoritative copy to delete</td><td>The default meaning of "the cache" in most architectures</td></tr>
+            <tr><td><b>Database buffer pool</b></td><td class="num">~0.1 ms</td><td class="yes">Automatic and always correct</td><td>Free, and the reason RAM is the cheapest database upgrade</td></tr>
+            <tr><td><b>Materialised view / read model</b></td><td class="num">query cost</td><td class="mid">Refresh or stream-fed</td><td>A cache that survives restarts and can be queried</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <span class="lab">The near-cache pattern</span>
+        <p>Two tiers together: a small in-process cache in front of the shared Redis. The local tier absorbs the very hot keys at zero latency and removes almost all network round trips; the shared tier holds the long tail and provides one place to invalidate. The catch is coherence — each instance has its own local copy, so invalidation must either be a short TTL (seconds), or a broadcast over a pub/sub channel telling every instance to drop a key. Short TTLs are simpler and usually sufficient; the broadcast is the correct answer when staleness is unacceptable and the data changes rarely.</p>
+      </div>
+
+      <h2><span class="h2n">15.3</span>Read strategies</h2>
+
+      <dl>
+        <dt>Cache-aside (lazy loading)</dt>
+        <dd>The application checks the cache; on a miss it reads the database, writes the cache, and returns. The overwhelming default: simple, resilient to a cache outage, and only caches what is actually asked for. Its weaknesses are a cold start after any restart, three code paths to get right at every call site, and the stampede problem below.</dd>
+        <dt>Read-through</dt>
+        <dd>The cache itself loads from the database on a miss, so the application only ever talks to the cache. Cleaner call sites and a natural place to implement coalescing — and it makes the cache a hard dependency, since if it is down there is no path to the data.</dd>
+      </dl>
+
+      <div class="codewrap">
+        <span class="lang">Cache-aside, with the details that matter</span>
+        <pre><code>def get_user(user_id):
+    key = f"user:v3:{user_id}"          # version the key format:
+                                        # changing the shape? bump v3 → v4
+                                        # and every old entry is orphaned,
+                                        # not stale
+    hit = cache.get(key)
+    if hit is not None:
+        return None if hit == NEGATIVE else deserialize(hit)
+
+    with single_flight(key):            # only one loader per key per process
+        hit = cache.get(key)            # re-check: someone may have filled it
+        if hit is not None:
+            return deserialize(hit)
+
+        row = db.get_user(user_id)
+        if row is None:
+            cache.set(key, NEGATIVE, ttl=30)      # negative caching
+            return None
+
+        cache.set(key, serialize(row),
+                  ttl=jitter(300, 0.1))           # ±10% so TTLs do not align
+        return row</code></pre>
+      </div>
+
+      <h2><span class="h2n">15.4</span>Write strategies</h2>
+
+      <div class="tw">
+        <table>
+          <caption>What happens to the cache when data changes</caption>
+          <thead><tr><th>Strategy</th><th>On write</th><th>Buys</th><th>Costs</th></tr></thead>
+          <tbody>
+            <tr><td><b>Write-through</b></td><td>Write cache and database synchronously</td><td>Cache is never stale; reads after writes are warm</td><td>Every write pays both; caches data that may never be read</td></tr>
+            <tr><td><b>Write-around</b></td><td>Write the database; invalidate the cache entry</td><td>Avoids polluting the cache with write-only data</td><td>The next read is a miss</td></tr>
+            <tr><td><b>Write-behind (write-back)</b></td><td>Write cache, acknowledge, flush to the database later</td><td>Very fast writes; batches and coalesces repeated updates</td><td>Data loss if the cache dies before flushing. Only for data you can afford to lose</td></tr>
+            <tr><td><b>Refresh-ahead</b></td><td>Proactively refresh entries before they expire</td><td>Hot keys never expire under load, so no stampede</td><td>Wasted work refreshing things nobody asks for again</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <span class="lab">Invalidate, do not update</span>
+        <p>When data changes, deleting the cache entry is safer than writing the new value into it. Updating creates a race: two concurrent writers can interleave so the cache ends up holding the older value permanently, while the database holds the newer one. Deletion has a much smaller window and self-heals on the next read. And order matters: <b>write the database first, then delete the cache</b>. The reverse — delete then write — leaves a window where a concurrent reader repopulates the cache from the old database state, and that stale entry then lives for a full TTL. For the residual race, some systems use a delayed second delete a second later; more robustly, drive invalidation from the database's change stream so it cannot be skipped by a code path that forgot.</p>
+      </div>
+
+      <h2><span class="h2n">15.5</span>Eviction</h2>
+
+      <p>A cache is finite, so something must go. The policy matters more than people expect, because the difference between a good and bad policy at the same memory size can be tens of percentage points of hit ratio — which, per the arithmetic above, is the difference between 10× and 2× origin relief.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Policies</caption>
+          <thead><tr><th>Policy</th><th>Evicts</th><th>Strength</th><th>Failure mode</th></tr></thead>
+          <tbody>
+            <tr><td><b>LRU</b></td><td>Least recently used</td><td>Adapts instantly to changing popularity; cheap to implement</td><td>A scan — one pass over many cold items — evicts the entire hot set</td></tr>
+            <tr><td><b>LFU</b></td><td>Least frequently used</td><td>Immune to scans; keeps genuinely popular items</td><td>Stale popularity: yesterday's hit is unevictable today. Needs ageing</td></tr>
+            <tr><td><b>FIFO</b></td><td>Oldest inserted</td><td>Trivial, no bookkeeping</td><td>Ignores usage entirely; evicts the hottest item as readily as the coldest</td></tr>
+            <tr><td><b>Random</b></td><td>Anything</td><td>No metadata, no lock contention. Surprisingly decent</td><td>No better than chance on the hot set</td></tr>
+            <tr><td><b>W-TinyLFU</b></td><td>LRU with a frequency-based <em>admission</em> filter</td><td>Near-optimal in practice: a new item only displaces a resident one if it is estimated to be more popular</td><td>More machinery; needs a frequency sketch with ageing</td></tr>
+            <tr><td><b>TTL only</b></td><td>Whatever expired</td><td>Bounds staleness rather than memory</td><td>Says nothing about capacity — combine with a size policy</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Eviction policies under load</h4>
+          <p>The same request stream through four policies, scored on user traffic only. Turn on the batch job, then turn on shifting popularity.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="ev-keys">Distinct keys <b><span id="ev-keysv">5000</span></b></label>
+              <input type="range" id="ev-keys" min="500" max="20000" step="500" value="5000">
+            </div>
+            <div class="ctrl">
+              <label for="ev-cap">Cache holds <b><span id="ev-capv">500</span></b> keys</label>
+              <input type="range" id="ev-cap" min="50" max="4000" step="50" value="500">
+            </div>
+            <div class="ctrl">
+              <label for="ev-skew">Popularity skew (Zipf s) <b><span id="ev-skewv">0.90</span></b></label>
+              <input type="range" id="ev-skew" min="0.3" max="1.6" step="0.05" value="0.9">
+            </div>
+            <div class="ctrl">
+              <label for="ev-scan">Batch job sweeps <b><span id="ev-scanv">0</span>%</b> of traffic</label>
+              <input type="range" id="ev-scan" min="0" max="40" step="1" value="0">
+            </div>
+            <div class="ctrl">
+              <label for="ev-shift">Popularity shifts over time <b><span id="ev-shiftv">0</span>%</b></label>
+              <input type="range" id="ev-shift" min="0" max="100" step="5" value="0">
+            </div>
+          </div>
+          <div class="bars" id="ev-bars"></div>
+          <div class="out">
+            <div class="stats" id="ev-stats"></div>
+            <p id="ev-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">15.6</span>Invalidation</h2>
+
+      <p>The hard problem, in ascending order of correctness:</p>
+
+      <ol>
+        <li><b>TTL only.</b> Data is wrong for up to the TTL, and that is the whole design. Perfectly adequate for a great deal of content — a follower count that is 60 seconds old harms nobody.</li>
+        <li><b>Explicit delete on write.</b> The write path removes affected keys. Correct when every write path remembers, which is until someone adds a new one, or a backfill script changes rows directly.</li>
+        <li><b>Versioned keys.</b> Include a version in the key: <code>user:v3:18:profile</code>. Changing the format bumps the version, and every old entry becomes unreachable rather than wrong. Also lets you invalidate a whole class instantly by bumping a namespace counter.</li>
+        <li><b>Tags / dependency tracking.</b> Entries record which entities they depend on; changing an entity evicts everything tagged with it. Necessary once a cached item is derived from several sources.</li>
+        <li><b>Change-stream driven.</b> Invalidation is generated from the database's own replication log, so no code path can forget it and a backfill invalidates correctly for free. The most robust option and the most machinery. See <a href="17-async.html">Chapter 17</a>.</li>
+      </ol>
+
+      <h2><span class="h2n">15.7</span>The five failure modes</h2>
+
+      <h3>Stampede (thundering herd)</h3>
+
+      <p>A popular key expires. Every request that arrives during the recompute window misses, and all of them go to the database to compute the same value. A key taking 200 ms to compute and serving 5 000 requests per second produces 1 000 simultaneous identical queries.</p>
+
+      <ul class="tight">
+        <li><b>Single-flight / request coalescing.</b> Only one caller recomputes; the rest wait for its result. One line of library code and the single most effective fix.</li>
+        <li><b>Probabilistic early expiration.</b> As an entry approaches expiry, each reader has a small and rising chance of refreshing it early — so the refresh happens before the cliff, by one caller, without any coordination.</li>
+        <li><b>Serve stale while revalidating.</b> Return the expired value immediately and refresh in the background. Latency never spikes at all.</li>
+        <li><b>Locking.</b> A distributed lock per key. Works, and adds a dependency and a lock-timeout failure mode; prefer single-flight within each process plus one of the above.</li>
+      </ul>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Stampede at expiry</h4>
+          <p>What the origin sees when a hot key expires, with each mitigation applied.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="sp-rps">Requests/s for this key <b><span id="sp-rpsv">5000</span></b></label>
+              <input type="range" id="sp-rps" min="10" max="50000" step="10" value="5000">
+            </div>
+            <div class="ctrl">
+              <label for="sp-cost">Recompute time <b><span id="sp-costv">200</span> ms</b></label>
+              <input type="range" id="sp-cost" min="5" max="3000" step="5" value="200">
+            </div>
+            <div class="ctrl">
+              <label for="sp-inst">Application instances <b><span id="sp-instv">40</span></b></label>
+              <input type="range" id="sp-inst" min="1" max="300" step="1" value="40">
+            </div>
+            <div class="ctrl">
+              <label for="sp-keys">Keys expiring together <b><span id="sp-keysv">1</span></b></label>
+              <input type="range" id="sp-keys" min="1" max="5000" step="1" value="1">
+            </div>
+          </div>
+          <div class="bars" id="sp-bars"></div>
+          <div class="out">
+            <div class="stats" id="sp-stats"></div>
+            <p id="sp-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h3>Hot key</h3>
+
+      <p>One key takes so much traffic that the single cache node holding it saturates — a celebrity's profile, a flash-sale product, a global configuration entry. Sharding does not help, because the key is atomic. Three fixes: replicate the key across several cache nodes with a suffix chosen at random by the client; put a small local cache in front so most requests never leave the process; or, for counters, split the key into sub-keys and sum on read.</p>
+
+      <h3>Penetration</h3>
+
+      <p>Requests for keys that do not exist miss the cache <em>every time</em> and hit the database <em>every time</em>. Under a scraping or attack pattern of random ids, the cache provides zero protection. Two fixes: <b>negative caching</b> — store a short-lived marker meaning "this does not exist" — and a <b>Bloom filter</b> of existing keys, checked before the cache, which answers "definitely absent" cheaply for a fraction of the memory.</p>
+
+      <h3>Avalanche</h3>
+
+      <p>Many keys expire at the same instant, usually because they were all populated together after a deploy or a cache flush, all with the same TTL. The origin receives a wall of misses. The fix is one line: <b>add jitter</b>, so a nominal 300-second TTL is actually 270–330 seconds, and expiry spreads out instead of aligning.</p>
+
+      <h3>The cache falling over</h3>
+
+      <p>The most dangerous one, because it is a capacity problem disguised as a dependency problem. If your cache serves 95% of reads and it goes away, the database instantaneously receives twenty times its normal load — and dies, and cannot serve the traffic needed to refill the cache. This is a cold-start deadlock, and it has taken down large services.</p>
+
+      <div class="note trap">
+        <span class="lab">Design for the cache being empty</span>
+        <ul class="tight">
+          <li><b>Know the multiplier.</b> Compute origin load at a 0% hit ratio and decide, explicitly, whether you can survive it. If not, you have a hidden single point of failure with a nice name.</li>
+          <li><b>Coalesce and rate-limit misses,</b> so a cold cache produces one origin request per key rather than thousands.</li>
+          <li><b>Shed load rather than collapse.</b> Serving 20% of traffic and rejecting the rest lets the cache refill; trying to serve everything means serving nothing.</li>
+          <li><b>Replicate the cache tier,</b> so a single node failure loses a fraction of the keyspace rather than all of it — consistent hashing means only that node's share is affected.</li>
+          <li><b>Warm before taking traffic.</b> A new instance or a restarted cache should be populated with the top keys before the load balancer sends it work.</li>
+        </ul>
+      </div>
+
+      <h2><span class="h2n">15.8</span>Operating a cache</h2>
+
+      <div class="tw">
+        <table>
+          <caption>What to watch, and what each signal means</caption>
+          <thead><tr><th>Metric</th><th>Watch for</th></tr></thead>
+          <tbody>
+            <tr><td>Hit ratio, per key prefix</td><td>A sudden drop is a code change to the key format or a TTL. Per-prefix breakdown finds it in seconds; a global number never will</td></tr>
+            <tr><td>Evictions per second</td><td>Non-zero evictions with a low hit ratio means the cache is too small. Zero evictions and low hit ratio means the data is not reusable — caching is the wrong tool</td></tr>
+            <tr><td>Memory used vs limit</td><td>Approaching the limit changes behaviour from "TTL expiry" to "evict under pressure", which is a different and worse regime</td></tr>
+            <tr><td>Latency p99 of cache calls</td><td>A cache slower than the database is worse than no cache. Usually a big key, a slow command, or network saturation</td></tr>
+            <tr><td>Key and value size distribution</td><td>One multi-megabyte value can stall a single-threaded cache for everyone. Cap value size and alert on the outliers</td></tr>
+            <tr><td>Origin request rate</td><td>The real indicator that caching is working. Alert on it rising, not on the cache itself</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Two sizing notes. Cache size should be driven by the working set, not by a round number: measure the number of distinct keys requested in a window equal to your intended TTL, multiply by average value size, add 30%. And <b>serialisation format matters more than it seems</b> — JSON is often the largest cost in a cache round trip, both in bytes and in CPU on both ends; a compact binary format can halve latency and memory for the same data.</p>
+
+      <details class="check">
+        <summary>Your cache hit ratio is 99% and the p99 latency of your service is still bad. What is going on?</summary>
+        <div class="ans">
+          <p>The 1% is doing the damage. If a hit costs 1 ms and a miss costs 200 ms, then at a 99% hit ratio one request in a hundred takes 200 ms — which <em>is</em> your p99, by definition. Improving the hit ratio to 99.5% halves the tail; making the miss path faster helps just as much. And if a page makes twenty cached calls, the chance it contains at least one miss is 1 − 0.99²⁰ ≈ 18%, so nearly a fifth of pages inherit the miss latency — the fan-out amplification from <a href="03-performance.html">Chapter 3</a> applies to cache misses exactly as it does to service calls. Fixes: serve stale while revalidating so a miss never blocks a user, coalesce so misses do not queue behind each other, and reduce the number of separate cached lookups per request.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Why does deleting the cache entry beat updating it, and why is order significant?</summary>
+        <div class="ans">
+          <p>Updating creates a lost-update race between two writers: A reads, B reads, B writes DB, B writes cache, A writes DB, A writes cache — the cache now holds A's value while the database holds… whichever committed last, and they can disagree permanently until the TTL expires. Deletion narrows the window to the moment between the database write and the delete, and it self-heals on the next read. On ordering: write the database first, then delete. If you delete first, a concurrent reader can miss, read the <em>old</em> row from the database, and repopulate the cache with stale data just before your write lands — and that stale entry now survives for a full TTL. The remaining race in write-then-delete is much narrower, and is closed properly by driving invalidation from the database's change stream rather than from application code.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>A nightly report job reads every row in the products table. The next morning, cache hit ratio has collapsed. Explain and fix.</summary>
+        <div class="ans">
+          <p>Classic LRU scan pollution. The job touched every key once, and under LRU each of those touches promoted a cold item and evicted a hot one, so by the end the cache contains the last N products the job happened to read — none of which any user wants. The hot set has to be rebuilt from scratch during the morning peak, which is exactly the wrong time. Fixes, in order of effort: have the batch job bypass the cache entirely (a read path that does not populate); use an admission policy such as W-TinyLFU, which refuses to admit a one-off item over a frequently-used resident one; segment the cache so batch and interactive traffic cannot evict each other; or run the job against a replica with its own cache. The eviction simulator above reproduces this exactly — raise the batch sweep percentage and watch LRU shed several points of user hit ratio while frequency-based eviction barely moves.</p>
+        </div>
+      </details>
+
+      <div class="recap">
+        <h2>Recap</h2>
+        <ol>
+          <li><b>Origin load is requests × (1 − hit ratio).</b> 90% to 99% is another 10× — the last few percent carry the value.</li>
+          <li><b>Pick the layer deliberately.</b> Local caches are fastest and impossible to invalidate; distributed caches are one authoritative copy; the near-cache pattern combines both with a short TTL or a broadcast.</li>
+          <li><b>Cache-aside is the default;</b> read-through centralises the logic and makes the cache a hard dependency.</li>
+          <li><b>Invalidate rather than update, and write the database before deleting the key.</b></li>
+          <li><b>Eviction policy is worth real hit ratio.</b> LRU dies on scans; LFU dies on shifting popularity; admission-based policies handle both.</li>
+          <li><b>Version keys, jitter TTLs, and cache negatives.</b> Three one-line habits that prevent three whole failure classes.</li>
+          <li><b>Coalesce misses.</b> Single-flight plus serve-stale-while-revalidating removes stampedes entirely.</li>
+          <li><b>Hot keys need replication or a local tier;</b> sharding cannot split a single key.</li>
+          <li><b>Know your origin load at a 0% hit ratio.</b> If the answer is "we die", the cache is a single point of failure and needs replication, load shedding and warm-up.</li>
+        </ol>
+      </div>
+
+      <nav class="pn" aria-label="Previous and next chapter"></nav>
+    </div>
+  </article>
+</div>
+
+<script src="assets/notes.js"></script>
+<script>
+function st15(k, v, tone) {
+  var d = document.createElement("div"); d.className = "stat";
+  var a = document.createElement("div"); a.className = "k"; a.textContent = k;
+  var b = document.createElement("div"); b.className = "v"; b.textContent = v;
+  if (tone) b.style.color = tone;
+  d.append(a, b); return d;
+}
+function bar15(label, pct, value, colour) {
+  var row = document.createElement("div"); row.className = "bar";
+  var k = document.createElement("span"); k.textContent = label;
+  var t = document.createElement("span"); t.className = "track";
+  var f = document.createElement("span"); f.className = "fill";
+  f.style.width = Math.max(0.5, Math.min(100, pct)) + "%";
+  if (colour) f.style.background = colour;
+  t.appendChild(f);
+  var v = document.createElement("span"); v.className = "val"; v.textContent = value;
+  row.append(k, t, v); return row;
+}
+function fmtN15(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "k";
+  return Math.round(n).toString();
+}
+
+/* ---------- eviction policy simulator ---------- */
+(function () {
+  var keysIn = document.getElementById("ev-keys"), capIn = document.getElementById("ev-cap"),
+      skewIn = document.getElementById("ev-skew"), scanIn = document.getElementById("ev-scan"),
+      shiftIn = document.getElementById("ev-shift"),
+      bars = document.getElementById("ev-bars"), stats = document.getElementById("ev-stats"),
+      note = document.getElementById("ev-note");
+  var REQ = 30000;
+
+  function rng(seed) { var s = seed >>> 0; return function () { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 4294967296; }; }
+
+  /* A Zipf-distributed request stream, optionally interleaved with a
+     sequential batch sweep and with popularity drifting over time. */
+  function stream(N, s, scanPct, shiftPct) {
+    var r = rng(424242);
+    var M = Math.min(N, 4000);
+    var cdf = new Float64Array(M), tot = 0;
+    for (var i = 0; i < M; i++) { tot += 1 / Math.pow(i + 1, s); cdf[i] = tot; }
+    for (var j = 0; j < M; j++) cdf[j] /= tot;
+    var pick = function (offset) {
+      var u = r(), lo = 0, hi = M - 1;
+      while (lo < hi) { var m = (lo + hi) >> 1; if (cdf[m] < u) lo = m + 1; else hi = m; }
+      return (lo + offset) % N;
+    };
+    var key = new Int32Array(REQ), isScan = new Uint8Array(REQ), pos = 0;
+    for (var q = 0; q < REQ; q++) {
+      var offset = Math.floor((q / REQ) * (shiftPct / 100) * N);
+      if (r() * 100 < scanPct) { key[q] = pos % N; isScan[q] = 1; pos++; }
+      else key[q] = pick(offset);
+    }
+    return { key: key, isScan: isScan };
+  }
+
+  function lruVictim(m) { var b = Infinity, v = -1; m.forEach(function (t, k) { if (t < b) { b = t; v = k; } }); return v; }
+
+  /* Hit ratio is scored on user traffic only: the batch job's own misses are
+     unavoidable, so counting them would hide the damage it does to everyone else. */
+  function simulate(policy, st, cap) {
+    var cache = new Map(), freq = new Map(), order = [], r = rng(99);
+    var hits = 0, total = 0, clock = 0;
+    for (var i = 0; i < st.key.length; i++) {
+      var k = st.key[i]; clock++;
+      var counted = !st.isScan[i];
+      if (counted) total++;
+      if (policy === "lfu") {
+        freq.set(k, (freq.get(k) || 0) + 1);
+        if ((clock & 4095) === 0) freq.forEach(function (v, kk) {
+          var n = v >> 1; if (n === 0) freq.delete(kk); else freq.set(kk, n);
+        });
+      }
+      if (cache.has(k)) {
+        if (counted) hits++;
+        if (policy === "lru") cache.set(k, clock);
+        continue;
+      }
+      if (cache.size >= cap) {
+        var victim = -1;
+        if (policy === "lru") victim = lruVictim(cache);
+        else if (policy === "lfu") {
+          var bf = Infinity;
+          cache.forEach(function (v, kk) { var f = freq.get(kk) || 0; if (f < bf) { bf = f; victim = kk; } });
+        } else if (policy === "fifo") {
+          while (order.length && !cache.has(order[0])) order.shift();
+          victim = order.length ? order.shift() : cache.keys().next().value;
+        } else {
+          var n2 = Math.floor(r() * cache.size), c = 0;
+          cache.forEach(function (v, kk) { if (c++ === n2) victim = kk; });
+        }
+        cache.delete(victim);
+      }
+      cache.set(k, clock);
+      if (policy === "fifo") order.push(k);
+    }
+    return hits / Math.max(1, total);
+  }
+
+  function draw() {
+    var N = +keysIn.value, cap = Math.min(+capIn.value, N), s = +skewIn.value,
+        scan = +scanIn.value, shift = +shiftIn.value;
+    document.getElementById("ev-keysv").textContent = N;
+    document.getElementById("ev-capv").textContent = cap;
+    document.getElementById("ev-skewv").textContent = s.toFixed(2);
+    document.getElementById("ev-scanv").textContent = scan;
+    document.getElementById("ev-shiftv").textContent = shift;
+
+    var st = stream(N, s, scan, shift);
+    var base = stream(N, s, 0, shift);
+    var POL = [["lru", "LRU"], ["lfu", "LFU (aged)"], ["fifo", "FIFO"], ["rand", "Random"]];
+    var res = POL.map(function (p) { return { id: p[0], n: p[1], h: simulate(p[0], st, cap) }; });
+    var clean = POL.map(function (p) { return { id: p[0], h: simulate(p[0], base, cap) }; });
+    var best = res.reduce(function (a, b) { return b.h > a.h ? b : a; });
+    var lru = res[0], lfu = res[1];
+    var lruLoss = clean[0].h - lru.h, lfuLoss = clean[1].h - lfu.h;
+
+    bars.innerHTML = "";
+    res.forEach(function (x) {
+      bars.appendChild(bar15(x.n, x.h * 100, (x.h * 100).toFixed(1) + "%",
+        x.id === best.id ? "var(--ok)" : x.h < best.h * 0.8 ? "var(--line)" : "#B87A17"));
+    });
+
+    stats.innerHTML = "";
+    stats.appendChild(st15("Best policy", best.n + " · " + (best.h * 100).toFixed(1) + "%", "var(--ok)"));
+    stats.appendChild(st15("Cache holds", (cap / N * 100).toFixed(1) + "% of keys"));
+    stats.appendChild(st15("Origin load, best", ((1 - best.h) * 100).toFixed(1) + "%"));
+    stats.appendChild(st15("Origin load, worst", ((1 - Math.min.apply(null, res.map(function (x) { return x.h; }))) * 100).toFixed(1) + "%", "var(--line)"));
+    stats.appendChild(st15("LRU lost to the sweep", (lruLoss * 100).toFixed(1) + " pts",
+      lruLoss > 0.03 ? "var(--line)" : ""));
+    stats.appendChild(st15("LFU lost to the sweep", (lfuLoss * 100).toFixed(1) + " pts",
+      lfuLoss > 0.03 ? "var(--line)" : "var(--ok)"));
+
+    note.textContent = scan >= 10 && lruLoss > lfuLoss + 0.02
+      ? "The batch sweep costs LRU " + (lruLoss * 100).toFixed(1) + " points of user hit ratio and LFU only " + (lfuLoss * 100).toFixed(1) + ". Every scanned key promotes itself under LRU and evicts something hot; frequency-based eviction ignores a key seen once. This is why a nightly report job shows up as a morning latency incident."
+      : shift >= 50
+      ? "Now the reverse: popularity is moving, and LFU is holding on to keys that were popular earlier and will never be requested again, while LRU follows the change immediately. Neither policy wins both columns — which is exactly why production caches use an admission filter (W-TinyLFU) that keeps LFU's scan resistance while letting genuinely new hot keys in."
+      : s < 0.6
+      ? "Nearly uniform access: there is no hot set to protect, so every policy lands near the fraction of the keyspace you can hold and the choice barely matters. Uniform access is the case where caching itself is the wrong tool."
+      : "Skewed access with no batch job and stable popularity — the benign case, where LRU is close to optimal. This is the workload most benchmarks use, which is why LRU's weaknesses tend to be discovered in production rather than in testing.";
+  }
+  [keysIn, capIn, skewIn, scanIn, shiftIn].forEach(function (x) { x.addEventListener("change", draw); });
+  draw();
+})();
+
+/* ---------- stampede ---------- */
+(function () {
+  var rps = document.getElementById("sp-rps"), cost = document.getElementById("sp-cost"),
+      inst = document.getElementById("sp-inst"), keys = document.getElementById("sp-keys"),
+      bars = document.getElementById("sp-bars"), stats = document.getElementById("sp-stats"),
+      note = document.getElementById("sp-note");
+
+  function draw() {
+    var R = +rps.value, C = +cost.value / 1000, I = +inst.value, K = +keys.value;
+    document.getElementById("sp-rpsv").textContent = R;
+    document.getElementById("sp-costv").textContent = +cost.value;
+    document.getElementById("sp-instv").textContent = I;
+    document.getElementById("sp-keysv").textContent = K;
+
+    var naive = R * C * K;                       /* everyone in the window recomputes */
+    var single = Math.min(I, R * C) * K;         /* one per process per key */
+    var jitter = K > 1 ? single / Math.min(K, 30) : single;  /* spread expiry over time */
+    var swr = 1 * Math.min(I, 2) * Math.min(K, 5);           /* background refresh only */
+
+    var worst = naive || 1;
+    bars.innerHTML = "";
+    bars.appendChild(bar15("No protection", Math.sqrt(naive / worst) * 100, fmtN15(naive) + " queries", "var(--line)"));
+    bars.appendChild(bar15("+ single-flight", Math.sqrt(single / worst) * 100, fmtN15(single) + " queries", "#B87A17"));
+    bars.appendChild(bar15("+ TTL jitter", Math.sqrt(jitter / worst) * 100, fmtN15(jitter) + " queries", "#B87A17"));
+    bars.appendChild(bar15("+ serve stale, refresh behind", Math.sqrt(swr / worst) * 100, fmtN15(swr) + " queries", "var(--ok)"));
+
+    stats.innerHTML = "";
+    stats.appendChild(st15("Requests in the miss window", fmtN15(R * C)));
+    stats.appendChild(st15("Origin queries, unprotected", fmtN15(naive), naive > 500 ? "var(--line)" : ""));
+    stats.appendChild(st15("With single-flight", fmtN15(single), single > 200 ? "#B87A17" : "var(--ok)"));
+    stats.appendChild(st15("With all mitigations", fmtN15(swr), "var(--ok)"));
+    stats.appendChild(st15("Reduction", (naive / Math.max(1, swr)).toFixed(0) + "×", "var(--ok)"));
+    stats.appendChild(st15("User-visible stall", swr > 0 ? "none" : "—", "var(--ok)"));
+
+    note.textContent = naive > 2000
+      ? "An unprotected expiry sends " + fmtN15(naive) + " identical queries at the origin in " + (+cost.value) + " ms. That is not a cache miss, it is a self-inflicted denial of service — and it happens on a schedule, every TTL."
+      : K > 100
+      ? "Thousands of keys expiring together is the avalanche case, usually caused by populating them all at once after a deploy with an identical TTL. Jitter alone fixes it and costs one line."
+      : single > 50
+      ? "Single-flight only deduplicates within one process, so with " + I + " instances you still get one query per instance. Add serve-stale-while-revalidating and the user never waits at all."
+      : "Well protected. The important one is serve-stale: it removes the latency cliff entirely, so expiry stops being an event that users can feel.";
+  }
+  [rps, cost, inst, keys].forEach(function (x) { x.addEventListener("input", draw); });
+  draw();
+})();
+</script>
+</body>
+</html>

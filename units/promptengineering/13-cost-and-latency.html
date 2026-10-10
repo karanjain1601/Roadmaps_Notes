@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Optimising cost and latency — Prompt Engineering</title>
+<meta name="description" content="Prompt length, caching-aware layout, model routing, output limits, and automatic prompt optimisation.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 13 · Engineering practice</div>
+    <h1>Optimising cost and latency</h1>
+    <p class="standfirst">Prompt work usually optimises for quality alone, then someone looks at the invoice. The levers here are ordered by return per hour of effort, and the first two are free — they are layout decisions you should have made anyway.</p>
+    <div class="chap-meta">
+      <span class="tagpill">caching</span>
+      <span class="tagpill">length</span>
+      <span class="tagpill">routing</span>
+      <span class="tagpill">output limits</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Know which half you are paying for</h2>
+
+<p>Output tokens typically cost three to five times input tokens. A prompt of 2,000 input tokens producing 400 output tokens is often majority-<em>output</em> cost, which surprises people who spend their optimisation effort on the prompt.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">the arithmetic worth doing before optimising anything</span><button class="copy">Copy</button></div>
+<pre><code>IN, OUT, CACHED = 3.00, 15.00, 0.30      # $ per million, illustrative
+
+def breakdown(tokens_in: int, tokens_out: int, cached: int, calls_per_day: int):
+    fresh = tokens_in - cached
+    c_in     = fresh  / 1e6 * IN
+    c_cached = cached / 1e6 * CACHED
+    c_out    = tokens_out / 1e6 * OUT
+    per = c_in + c_cached + c_out
+    return {
+        "per_call": per,
+        "monthly": per * calls_per_day * 30,
+        "share_input":  (c_in + c_cached) / per,
+        "share_output": c_out / per,
+    }
+
+breakdown(tokens_in=2000, tokens_out=400, cached=0, calls_per_day=20_000)
+# per_call $0.0120 — input 50%, output 50%
+
+breakdown(tokens_in=2000, tokens_out=400, cached=1600, calls_per_day=20_000)
+# per_call $0.0072 — input 17%, output 83%
+#
+# Note what caching did: it cut the bill 40% AND changed which half to optimise.
+# Do this calculation first, or you will spend a day shortening a prompt that
+# accounts for a sixth of the cost.</code></pre>
+</div>
+
+<div class="demo" id="opt">
+  <div class="demo-head">
+    <b>Optimisation levers, in order of return</b>
+    <span>Apply them cumulatively and watch where the money actually goes.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="o-in">Prompt tokens — <span id="o-inv">2,400</span></label>
+        <input type="range" id="o-in" min="200" max="12000" step="100" value="2400">
+      </div>
+      <div>
+        <label for="o-out">Output tokens — <span id="o-outv">400</span></label>
+        <input type="range" id="o-out" min="20" max="2000" step="20" value="400">
+      </div>
+      <div>
+        <label for="o-req">Requests per day — <span id="o-reqv">50,000</span></label>
+        <input type="range" id="o-req" min="0" max="6" step="1" value="3">
+      </div>
+    </div>
+    <label style="margin-top:12px">Levers applied</label>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:6px 18px;margin:8px 0 4px">
+      <label><input type="checkbox" class="ol" value="cache"> Cache-aware layout (free)</label>
+      <label><input type="checkbox" class="ol" value="outcap"> Cap and shorten the output</label>
+      <label><input type="checkbox" class="ol" value="prune"> Prune the prompt by a third</label>
+      <label><input type="checkbox" class="ol" value="route"> Route easy inputs to a small model</label>
+      <label><input type="checkbox" class="ol" value="batch"> Batch what can wait</label>
+    </div>
+    <div class="stat">
+      <div><b id="o-per">—</b><span>cost / call</span></div>
+      <div><b id="o-month">—</b><span>cost / month</span></div>
+      <div><b id="o-save">—</b><span>saved vs baseline</span></div>
+      <div><b id="o-lat">—</b><span>p50 latency</span></div>
+    </div>
+    <div id="o-bars"></div>
+    <div class="out" id="o-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Lever 1 — cache-aware layout</h2>
+
+<p>Free, and usually the largest single reduction. Chapter 3 covered the mechanism; the operational points are what matter here.</p>
+
+<ul class="check">
+  <li><b>Everything stable comes first</b>, byte-identical on every request. System prompt, tool schemas, examples.</li>
+  <li><b>Nothing variable above the line.</b> Dates, names, session ids, A/B flags, feature toggles — all below.</li>
+  <li><b>Whitespace is part of the bytes.</b> A template that sometimes emits an extra newline halves your hit rate silently. Test for it (chapter 11).</li>
+  <li><b>Never rewrite the prefix mid-conversation.</b> Appending a reminder at the end is free; editing the system prompt invalidates everything after it.</li>
+  <li><b>Check the minimum cacheable length.</b> Providers have a floor — a 300-token prefix may not be cached at all.</li>
+  <li><b>Watch the TTL.</b> Low-traffic endpoints may never hit a warm cache; the discount assumes requests arrive close together.</li>
+  <li><b>Monitor the hit rate as a first-class metric.</b> A collapse is the earliest signal that someone put something variable in the prefix.</li>
+</ul>
+
+<h2><span class="h-rule"></span>Lever 2 — the output</h2>
+
+<p>The most under-attacked cost, because prompt length is visible in the editor and output length is not.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Technique</th><th>Effect</th></tr></thead>
+<tbody>
+<tr><td><b>State a length limit and mean it</b></td><td>"Under 80 words" cuts typical output by half against no limit. Assert on it in evals</td></tr>
+<tr><td><b>A schema instead of prose</b></td><td>Structured output is dramatically shorter than the equivalent explanation</td></tr>
+<tr><td><b>Drop the preamble</b></td><td>"Reply with the answer only, no preamble" removes "Certainly! Here's a summary of…" from every response</td></tr>
+<tr><td><b>Strip the reasoning</b></td><td>If working goes in <code>&lt;scratch&gt;</code> tags you still pay for it. Consider whether the task needs it at all (chapter 7)</td></tr>
+<tr><td><b>Set <code>max_tokens</code> to a real ceiling</b></td><td>Protection against runaway generation, and it makes cost predictable</td></tr>
+<tr><td><b>Stop sequences</b></td><td>Stop the moment the useful part ends rather than letting it trail into a closing paragraph</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Output length is also latency</span>
+  <p>Tokens are generated sequentially at a roughly fixed rate, so 400 output tokens is several seconds regardless of how fast your prompt prefills. Halving the output halves the visible wait. This makes output reduction the only lever that improves cost and latency together — and it is why "be concise" as an <em>enforced numeric limit</em> is worth more than any infrastructure change.</p>
+</div>
+
+<h2><span class="h-rule"></span>Lever 3 — prune the prompt</h2>
+
+<p>Chapter 3 argued that deletion is a prompt-engineering technique. It is also a cost technique, and the two motivations point the same way.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">an ablation sweep — which parts are earning their tokens?</span><button class="copy">Copy</button></div>
+<pre><code>SECTIONS = ["role", "rules_6_to_12", "examples_3_and_4", "edge_cases", "voice_notes"]
+
+def ablate(prompt, cases):
+    base = run(prompt, cases)
+    print(f"full: {base['pass_rate']:.3f}  {base['tokens_in']} tokens")
+
+    for s in SECTIONS:
+        trimmed = prompt.without(s)
+        r = run(trimmed, cases)
+        delta = r["pass_rate"] - base["pass_rate"]
+        saved = base["tokens_in"] - r["tokens_in"]
+        verdict = ("DELETE"  if delta >= -0.01 else
+                   "review"  if delta >= -0.03 else "keep")
+        print(f"-{s:<18} {r['pass_rate']:.3f} ({delta:+.3f})  -{saved} tokens  {verdict}")
+
+# full: 0.912  2380 tokens
+# -role              0.909 (-0.003)  -140 tokens  DELETE
+# -rules_6_to_12     0.905 (-0.007)  -310 tokens  DELETE
+# -examples_3_and_4  0.871 (-0.041)  -420 tokens  keep
+# -edge_cases        0.884 (-0.028)  -260 tokens  review
+# -voice_notes       0.913 (+0.001)  -180 tokens  DELETE
+#
+# Deleting the three marked sections: 630 tokens saved, pass rate 0.908.
+# Within noise of the full prompt, at 26% less input on every request forever.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Run the ablation before you optimise anything else</span>
+  <p>Prompts grow by accretion and nobody ever measures what the accreted parts contribute. An afternoon of ablation routinely finds a quarter of the prompt doing nothing measurable — and that quarter has been billed on every request since it was added. It also frequently <em>improves</em> quality, because the surviving instructions stop competing for attention. This is the highest return per hour in the chapter.</p>
+</div>
+
+<h2><span class="h-rule"></span>Lever 4 — routing</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">route.py — classify, then escalate only what needs it</span><button class="copy">Copy</button></div>
+<pre><code>async def answer(q: str, ctx) -> Answer:
+    difficulty = await classify(q)                # small model, ~80ms, negligible cost
+
+    if difficulty == "simple":
+        r = await call(PROMPT_SHORT.render(q=q), model=SMALL)
+        if looks_uncertain(r):                    # hedging, refusal, low confidence
+            metrics.incr("router.escalated")
+            r = await call(PROMPT_FULL.render(q=q), model=MID)
+        return r
+
+    return await call(PROMPT_FULL.render(q=q),
+                      model=LARGE if difficulty == "hard" else MID)
+
+# Two things to track:
+#   escalation rate  — above ~15% the classifier is mis-routing and you are
+#                      paying for two calls to do one job
+#   quality by route — the small-model path must be evaluated separately, or a
+#                      regression there hides inside a healthy overall average
+#
+# A cheaper variant that often works as well: skip the classifier entirely, try
+# the small model first, and escalate on low confidence. One fewer call on the
+# happy path, at the cost of a slower tail.</code></pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Routing signal</th><th>Cost</th><th>Reliability</th></tr></thead>
+<tbody>
+<tr><td>Input length or type</td><td>Free</td><td>Crude but surprisingly effective</td></tr>
+<tr><td>A small classifier model</td><td>~80ms, negligible</td><td>Good, and evaluable like anything else</td></tr>
+<tr><td>Embedding similarity to known-hard cases</td><td>~30ms</td><td>Good where you have labelled history</td></tr>
+<tr><td>Try small, escalate on low confidence</td><td>One extra call on the tail</td><td>Best quality; needs the confidence signal from chapter 9</td></tr>
+<tr><td>Ask the model to self-assess difficulty first</td><td>A full call</td><td>Usually not worth it — you have already paid</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>Lever 5 — batch what can wait</h2>
+
+<p>Most providers offer an asynchronous batch endpoint at roughly half price with a delivery window measured in hours. Anything not on a user's critical path belongs there: back-classification of a backlog, nightly summarisation, eval runs, dataset generation, re-processing after a prompt change.</p>
+
+<p>Eval runs in particular are worth moving. A 500-case suite at three repeats is 1,500 calls, run on every prompt change, and none of it is latency-sensitive.</p>
+
+<h2><span class="h-rule"></span>Automatic prompt optimisation</h2>
+
+<p>Use a model to improve the prompt: generate candidate variants, score them against your eval set, keep the best, iterate. It works, with real caveats.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">optimise.py — search over prompts, scored by your evals</span><button class="copy">Copy</button></div>
+<pre><code>REWRITE = """Here is a prompt and the cases it currently fails.
+
+<prompt>{prompt}</prompt>
+<failures>{failures}</failures>
+
+Propose 4 revised prompts, each targeting a different hypothesis about the cause.
+Change one thing per variant. Keep the output contract identical. Return JSON:
+[{{"hypothesis": "...", "prompt": "..."}}]"""
+
+def optimise(prompt, cases, rounds: int = 3, holdout: list = None):
+    best = (prompt, run(prompt, cases)["pass_rate"])
+
+    for _ in range(rounds):
+        fails = failing_cases(best[0], cases)
+        variants = structured_call(list[Variant], REWRITE.format(
+            prompt=best[0].source(), failures=render(fails[:8])))
+
+        for v in variants:
+            score = run(v.prompt, cases)["pass_rate"]
+            if score > best[1] + 0.01:            # require a real margin
+                best = (v.prompt, score)
+
+    # The step that makes this trustworthy: confirm on data the search never saw.
+    held = run(best[0], holdout)["pass_rate"]
+    print(f"train {best[1]:.3f}  holdout {held:.3f}")
+    return best[0], held</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Optimised prompts overfit, and they get long</span>
+  <p>The search will happily find a prompt that scores 0.96 on your 60 cases and 0.84 on anything else — it has learned your eval set, not your task. Always hold out cases the search never sees, and judge only on those. Second problem: candidate variants tend to grow, because adding is easier than removing. Cap the length in the rewrite instruction, and run an ablation on the winner. And read the result — an automatically-generated prompt nobody understands is a maintenance liability regardless of its score.</p>
+</div>
+
+<h2><span class="h-rule"></span>Latency specifically</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Contributor</th><th>Lever</th></tr></thead>
+<tbody>
+<tr><td><b>Prefill</b> — grows with prompt length</td><td>Caching helps most here; shorter prompts help linearly</td></tr>
+<tr><td><b>Decode</b> — grows with output length</td><td>The dominant term for anything over ~200 output tokens. Shorten the output</td></tr>
+<tr><td><b>Reasoning tokens</b></td><td>Generated at normal speed. Several seconds per call. Reserve for tasks that need it</td></tr>
+<tr><td><b>Model size</b></td><td>A smaller model is faster per token as well as cheaper. Routing helps twice</td></tr>
+<tr><td><b>Extra calls</b> — ensembling, self-eval</td><td>Run in parallel where possible: five parallel calls cost 5× and take 1×</td></tr>
+<tr><td><b>Perceived latency</b></td><td>Stream. It changes nothing measurable and everything experienced</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Measure before optimising, then measure after</span>
+  <p>Every change here trades against quality, and the trade is only visible if you run the eval set on both sides. A prompt pruned by 30% that loses two points of accuracy might be an excellent trade or a terrible one depending on what an error costs you (chapter 9's demo). Record cost, p95 latency and pass rate together in every eval report, and make the trade explicitly rather than discovering it later.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Compute the input/output split first.</b> Output usually costs 3–5× input per token, and caching changes which half to attack.</li>
+    <li><b>Cache-aware layout is free</b> and usually the largest single reduction. Whitespace counts; monitor the hit rate.</li>
+    <li>Output length is <b>the only lever that improves cost and latency together</b>. Enforce a numeric limit and assert on it.</li>
+    <li><b>Run an ablation.</b> An afternoon routinely finds a quarter of the prompt contributing nothing — and deleting it often helps quality too.</li>
+    <li>Routing halves cost on mixed traffic. <b>Watch the escalation rate and evaluate each route separately.</b></li>
+    <li><b>Batch anything off the critical path</b>, starting with your own eval runs.</li>
+    <li>Automatic optimisation works but <b>overfits and inflates</b>. Hold out cases, cap length, ablate the winner, and read it.</li>
+    <li>Record <b>cost, p95 latency and pass rate together</b>, so every trade is made deliberately.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("13-cost-and-latency.html");
+
+(function(){
+  const root = document.getElementById("opt");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const REQS = [1000, 5000, 20000, 50000, 200000, 1000000, 5000000];
+  const IN = 3.0, OUT = 15.0, CACHED = 0.30;
+  const SMALL_IN = 0.40, SMALL_OUT = 1.60;
+
+  function render(){
+    let tin  = parseInt($("o-in").value, 10);
+    let tout = parseInt($("o-out").value, 10);
+    const ri = parseInt($("o-req").value, 10);
+    const reqs = REQS[ri];
+    const on = new Set([].slice.call(document.querySelectorAll(".ol:checked")).map(c => c.value));
+
+    $("o-inv").textContent  = tin.toLocaleString();
+    $("o-outv").textContent = tout.toLocaleString();
+    $("o-reqv").textContent = reqs.toLocaleString();
+
+    // Baseline
+    const basePer = tin/1e6*IN + tout/1e6*OUT;
+
+    // Apply levers cumulatively
+    let inTok = tin, outTok = tout, cached = 0;
+    if(on.has("prune"))  inTok = Math.round(inTok * 0.68);
+    if(on.has("outcap")) outTok = Math.round(outTok * 0.55);
+    if(on.has("cache"))  cached = Math.round(inTok * 0.72);
+
+    const fresh = inTok - cached;
+    let per = fresh/1e6*IN + cached/1e6*CACHED + outTok/1e6*OUT;
+
+    if(on.has("route")){
+      // 70% of traffic to a small model at a fraction of the price
+      const small = fresh/1e6*SMALL_IN + cached/1e6*(SMALL_IN*0.1) + outTok/1e6*SMALL_OUT;
+      per = 0.70 * small + 0.30 * per + 0.0002;    // + classifier
+    }
+    let effective = per;
+    if(on.has("batch")) effective = per * 0.75;    // 30% of volume batched at half price
+
+    const monthly = effective * reqs * 30;
+    const baseMonthly = basePer * reqs * 30;
+    const saved = 1 - effective / basePer;
+
+    // Latency: prefill scales with fresh input, decode with output
+    let lat = 0.25 + fresh/9000 + outTok/95;
+    if(on.has("cache")) lat -= cached/60000;
+    if(on.has("route")) lat *= 0.72;
+    lat = Math.max(0.2, lat);
+
+    $("o-per").textContent   = "$" + effective.toFixed(5);
+    $("o-month").textContent = "$" + Math.round(monthly).toLocaleString();
+    $("o-save").textContent  = (saved*100).toFixed(0) + "%";
+    $("o-lat").textContent   = lat.toFixed(1) + "s";
+
+    // Cost breakdown bars
+    const parts = [
+      ["Input, uncached", fresh/1e6*IN],
+      ["Input, cached",   cached/1e6*CACHED],
+      ["Output",          outTok/1e6*OUT]
+    ];
+    const maxP = Math.max.apply(null, parts.map(p => p[1])) || 1;
+    $("o-bars").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">Where the money goes, per call</div>' +
+      parts.map(([n, v]) =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px">' +
+        '<span style="min-width:132px;font-size:13px">' + n + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + Math.max(1, v/maxP*100).toFixed(0) + '%"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:74px;text-align:right">$' +
+        v.toFixed(5) + ' · ' + Math.round(v/(parts[0][1]+parts[1][1]+parts[2][1])*100) + '%</span></div>').join("");
+
+    const notes = [];
+    const outShare = (outTok/1e6*OUT) / (fresh/1e6*IN + cached/1e6*CACHED + outTok/1e6*OUT);
+    notes.push("Output is " + Math.round(outShare*100) + "% of the per-call cost here. " +
+               (outShare > 0.6
+                 ? "That means shortening the prompt is the wrong place to spend your effort — attack the output first."
+                 : "Input dominates, so caching and pruning are where the return is."));
+
+    if(!on.has("cache"))
+      notes.push("Cache-aware layout is unticked and it is free — a layout decision, not an infrastructure project. " +
+                 "On this configuration it alone would save about $" +
+                 Math.round((basePer - (tin*0.28/1e6*IN + tin*0.72/1e6*CACHED + tout/1e6*OUT)) * reqs * 30).toLocaleString() +
+                 "/month. Start here, always.");
+    if(!on.has("prune"))
+      notes.push("Pruning is unticked. Run the ablation sweep before anything else: it routinely finds a quarter of the prompt contributing nothing measurable, " +
+                 "and deleting it often improves quality because the surviving instructions stop competing.");
+    if(!on.has("outcap") && tout > 250)
+      notes.push("Output is " + tout + " tokens with no cap applied. This is the only lever that cuts cost and latency together — " +
+                 "a numeric limit, a schema instead of prose, and \"no preamble\" typically halve it.");
+    if(on.has("route"))
+      notes.push("Routing sends 70% of traffic to a small model. Evaluate that path separately: a regression on the cheap route hides inside a healthy overall average, " +
+                 "and the escalation rate rising above about 15% means you are paying for two calls to do one job.");
+    if(on.has("batch"))
+      notes.push("Batching assumes 30% of volume is off the critical path at roughly half price. Your own eval runs belong here first — " +
+                 "a 500-case suite at three repeats is 1,500 calls on every prompt change, none of it latency-sensitive.");
+    if(saved > 0.6)
+      notes.push("Combined saving of " + (saved*100).toFixed(0) + "% against baseline, from $" +
+                 Math.round(baseMonthly).toLocaleString() + " to $" + Math.round(monthly).toLocaleString() +
+                 "/month. Now run the eval set on the optimised version — every one of these levers trades against quality, " +
+                 "and the trade is only visible if you measure both sides.");
+
+    notes.push("Prices are illustrative at $3/M in, $15/M out, cached at a tenth. Substitute your provider's actual figures — the ratios matter more than the absolutes.");
+    $("o-note").textContent = notes.join("\n\n");
+  }
+
+  ["o-in","o-out","o-req"].forEach(id => $(id).addEventListener("input", render));
+  [].slice.call(document.querySelectorAll(".ol")).forEach(c => c.addEventListener("change", render));
+  render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Writing data — SQL</title>
+<meta name="description" content="INSERT, UPDATE, DELETE, upserts, RETURNING, and doing bulk changes without locking the table for an hour.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 09 · Changing data</div>
+    <h1>Writing data</h1>
+    <p class="standfirst">Reads that go wrong give you a wrong number. Writes that go wrong give you wrong data, permanently, and often across tables that were consistent five minutes ago. This chapter is about the habits that make that unlikely.</p>
+    <div class="chap-meta">
+      <span class="tagpill">insert</span>
+      <span class="tagpill">upsert</span>
+      <span class="tagpill">returning</span>
+      <span class="tagpill">batching</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>INSERT</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the forms worth knowing</span><button class="copy">Copy</button></div>
+<pre><code>-- Always name the columns. Without them, adding or reordering a column in the
+-- table silently changes what your INSERT means.
+INSERT INTO orders (customer_id, amount, status)
+VALUES (42, 129.99, 'pending');
+
+-- Multi-row: one statement, one round trip, one parse. Dramatically faster
+-- than a loop of single inserts — this is the N+1 of writes.
+INSERT INTO orders (customer_id, amount, status)
+VALUES (42, 129.99, 'pending'),
+       (43,  59.00, 'pending'),
+       (44, 210.50, 'paid');
+
+-- From a query: the whole point of a set-based language.
+INSERT INTO order_archive (id, customer_id, amount)
+SELECT id, customer_id, amount FROM orders WHERE placed_at < '2020-01-01';
+
+-- RETURNING gives back generated values without a second query.
+INSERT INTO orders (customer_id, amount)
+VALUES (42, 129.99)
+RETURNING id, placed_at;
+-- Postgres, SQLite 3.35+, MariaDB. SQL Server uses OUTPUT INSERTED.*.
+-- MySQL has LAST_INSERT_ID(), which returns only the first id of a batch.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Bulk loading: COPY, not INSERT</span>
+  <p>For anything over a few thousand rows, the bulk-load path is an order of magnitude faster than even multi-row inserts — <code>COPY</code> in PostgreSQL, <code>LOAD DATA INFILE</code> in MySQL, <code>BULK INSERT</code> in SQL Server. It bypasses much of the per-statement machinery. If you are loading a million rows and it is taking twenty minutes, this is almost always the answer, and it is usually a one-line change in the driver.</p>
+</div>
+
+<h2><span class="h-rule"></span>Upserts</h2>
+
+<p>"Insert it, or update it if it already exists." The obvious implementation is a race condition, and this is one of the few places where dialects differ so much it is worth memorising all three.</p>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the broken version, and why</span><button class="copy">Copy</button></div>
+<pre><code>-- BROKEN. Two concurrent requests can both pass the check, then both insert.
+if not db.query("SELECT 1 FROM prefs WHERE user_id = ?", uid):
+    db.execute("INSERT INTO prefs (user_id, theme) VALUES (?, ?)", uid, theme)
+else:
+    db.execute("UPDATE prefs SET theme = ? WHERE user_id = ?", theme, uid)
+
+-- The window between the SELECT and the INSERT is small and it is not zero.
+-- Under load it is hit regularly, and the symptom is a unique-violation error
+-- in a code path that "cannot" produce one — or duplicate rows if there is no
+-- constraint, which is worse.
+--
+-- No isolation level fixes this by itself (chapter 10). It needs a single
+-- atomic statement.</code></pre>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the atomic version, per dialect</span><button class="copy">Copy</button></div>
+<pre><code>-- PostgreSQL / SQLite
+INSERT INTO prefs (user_id, theme, updated_at)
+VALUES (42, 'dark', now())
+ON CONFLICT (user_id) DO UPDATE
+    SET theme = EXCLUDED.theme,           -- EXCLUDED = the row you tried to insert
+        updated_at = EXCLUDED.updated_at
+    WHERE prefs.theme IS DISTINCT FROM EXCLUDED.theme;   -- skip no-op writes
+-- The WHERE is worth adding: without it, an unchanged value still writes a new
+-- row version, bloats the table and fires triggers for nothing.
+
+-- ON CONFLICT DO NOTHING when you only want the insert to be idempotent:
+INSERT INTO events (id, payload) VALUES (…) ON CONFLICT (id) DO NOTHING;
+
+-- MySQL / MariaDB
+INSERT INTO prefs (user_id, theme) VALUES (42, 'dark')
+ON DUPLICATE KEY UPDATE theme = VALUES(theme);
+
+-- SQL Server, Oracle: MERGE. Powerful, verbose, and historically bug-prone
+-- under concurrency in SQL Server — read your version's guidance before
+-- relying on it for high-contention keys.
+MERGE prefs AS t
+USING (VALUES (42, 'dark')) AS s (user_id, theme) ON t.user_id = s.user_id
+WHEN MATCHED THEN UPDATE SET theme = s.theme
+WHEN NOT MATCHED THEN INSERT (user_id, theme) VALUES (s.user_id, s.theme);</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">An upsert needs a unique constraint to conflict against</span>
+  <p><code>ON CONFLICT (user_id)</code> requires a unique index or constraint on <code>user_id</code>. Without one there is nothing for the database to detect, and the statement errors. This is a feature: it forces you to declare the uniqueness rule you are relying on, which means it also holds for every other code path — including the migration script someone runs by hand. If you find yourself wanting an upsert on a column with no unique constraint, the missing constraint is the actual bug.</p>
+</div>
+
+<h2><span class="h-rule"></span>UPDATE and DELETE</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the discipline that prevents the worst incident in this unit</span><button class="copy">Copy</button></div>
+<pre><code>-- 1. ALWAYS write the SELECT first and look at the rows.
+SELECT * FROM orders WHERE status = 'pending' AND placed_at < now() - interval '30 days';
+
+-- 2. Then convert it. Same WHERE, no edits.
+UPDATE orders
+SET status = 'expired', updated_at = now()
+WHERE status = 'pending' AND placed_at < now() - interval '30 days';
+
+-- 3. Check the row count against what the SELECT returned. If they differ,
+--    something is wrong and you want to know now, not tomorrow.
+
+-- In a console, wrap it. The transaction is your undo.
+BEGIN;
+UPDATE orders SET status = 'expired' WHERE …;
+-- UPDATE 1,284      <- expected ~1,280. Close enough.
+SELECT count(*) FROM orders WHERE status = 'expired';   -- sanity check
+COMMIT;   -- or ROLLBACK if the number is wrong</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">A missing WHERE updates every row</span>
+  <p><code>UPDATE users SET is_admin = true</code> is valid SQL, runs instantly, and affects the entire table. There is no confirmation and no undo outside a transaction. Two protections worth having: run your console in a mode that requires an explicit <code>COMMIT</code> (<code>\set AUTOCOMMIT off</code> in psql, <code>--safe-updates</code> in the MySQL client, which refuses unqualified updates entirely), and give production credentials to as few humans as possible. Most people who have done this did it once.</p>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">UPDATE from another table</span><button class="copy">Copy</button></div>
+<pre><code>-- PostgreSQL
+UPDATE orders o
+SET region = c.region
+FROM customers c
+WHERE c.id = o.customer_id
+  AND o.region IS DISTINCT FROM c.region;    -- skip rows already correct
+
+-- MySQL uses a join in the UPDATE clause instead:
+UPDATE orders o JOIN customers c ON c.id = o.customer_id
+SET o.region = c.region
+WHERE o.region <=> c.region IS NOT TRUE;
+
+-- Note IS DISTINCT FROM rather than <>: with a plain <>, rows where either
+-- side is NULL evaluate to UNKNOWN and are skipped — so a NULL region never
+-- gets filled in, and the backfill silently does nothing for exactly the
+-- rows that needed it most. Chapter 3.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Bulk changes without an outage</h2>
+
+<div class="demo" id="batch">
+  <div class="demo-head">
+    <b>One big UPDATE, or many small ones</b>
+    <span>The total work is the same. What differs is how long anything else has to wait.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="b-rows">Rows to update — <span id="b-rowsv">5 million</span></label>
+        <input type="range" id="b-rows" min="1" max="6" step="1" value="4">
+      </div>
+      <div>
+        <label for="b-size">Batch size — <span id="b-sizev">10,000</span></label>
+        <input type="range" id="b-size" min="0" max="5" step="1" value="3">
+      </div>
+      <div>
+        <label for="b-idx">Indexes on the table — <span id="b-idxv">3</span></label>
+        <input type="range" id="b-idx" min="0" max="8" step="1" value="3">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="b-total">—</b><span>total time</span></div>
+      <div><b id="b-lock">—</b><span>longest single lock</span></div>
+      <div><b id="b-batches">—</b><span>batches</span></div>
+      <div><b id="b-verdict">—</b><span>verdict</span></div>
+    </div>
+    <div id="b-bars"></div>
+    <div class="out" id="b-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">batched backfill — the pattern to keep in a snippet file</span><button class="copy">Copy</button></div>
+<pre><code>-- Each batch is its own transaction, so locks are released between them and
+-- other work proceeds. Keyset iteration, not OFFSET (chapter 14).
+DO $$
+DECLARE
+    last_id bigint := 0;
+    n       int;
+BEGIN
+    LOOP
+        WITH batch AS (
+            SELECT id FROM orders
+            WHERE id > last_id AND region IS NULL
+            ORDER BY id
+            LIMIT 10000
+            FOR UPDATE SKIP LOCKED          -- do not block on rows others hold
+        )
+        UPDATE orders o
+        SET region = c.region
+        FROM batch b JOIN customers c ON c.id = o.customer_id
+        WHERE o.id = b.id;
+
+        GET DIAGNOSTICS n = ROW_COUNT;
+        EXIT WHEN n = 0;
+
+        SELECT max(id) INTO last_id FROM (
+            SELECT id FROM orders WHERE id > last_id ORDER BY id LIMIT 10000) t;
+
+        COMMIT;                              -- release locks
+        PERFORM pg_sleep(0.05);              -- let replication and autovacuum breathe
+    END LOOP;
+END $$;
+
+-- The three things that make this safe:
+--   * bounded batch size, so no lock is held long
+--   * a commit between batches, so waiters get through
+--   * resumable — it can be killed and restarted, because the WHERE clause
+--     only matches rows not yet done</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Make bulk operations resumable and idempotent</span>
+  <p>Write the <code>WHERE</code> clause so that already-processed rows no longer match — <code>WHERE region IS NULL</code> rather than a row range. Then killing the job halfway and restarting it is safe, running it twice is harmless, and you can stop it when the on-call alert fires without having to reason about where it got to. This one property turns a scary operation into a routine one, and it costs nothing to design in.</p>
+</div>
+
+<h2><span class="h-rule"></span>Deleting</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Approach</th><th>Speed</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><code>DELETE FROM t WHERE …</code></td><td>Row by row</td><td>Transactional, fires triggers, respects foreign keys, leaves dead rows to vacuum</td></tr>
+<tr><td><code>TRUNCATE t</code></td><td>Near-instant</td><td>Whole table only. Usually not transactional in MySQL. Does not fire row triggers</td></tr>
+<tr><td>Drop a partition</td><td>Instant</td><td>The right answer for time-series retention</td></tr>
+<tr><td>Create a new table, swap</td><td>Fast</td><td>When deleting most of a large table, keeping the survivors is cheaper</td></tr>
+<tr><td>Soft delete</td><td>An update</td><td>Every query must now filter it — enforce with a view, not discipline</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">deleting most of a table</span><button class="copy">Copy</button></div>
+<pre><code>-- Deleting 95% of 100 million rows: slow, bloats the table, and the space is
+-- not returned to the OS without a rewrite.
+DELETE FROM events WHERE created_at < now() - interval '90 days';
+
+-- Faster: keep the 5% and swap. One brief exclusive lock at the rename.
+BEGIN;
+CREATE TABLE events_new (LIKE events INCLUDING ALL);
+INSERT INTO events_new SELECT * FROM events
+  WHERE created_at >= now() - interval '90 days';
+ALTER TABLE events RENAME TO events_old;
+ALTER TABLE events_new RENAME TO events;
+COMMIT;
+DROP TABLE events_old;    -- after you have confirmed the swap
+
+-- Better still: partition by month from the start and DROP the old partition.
+-- Instant, no bloat, no rewrite. If a table has a retention policy, it should
+-- probably be partitioned (chapter 16).</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Cascading deletes can be much bigger than they look</span>
+  <p><code>ON DELETE CASCADE</code> is convenient and it means one <code>DELETE</code> can touch tables you were not thinking about, several levels deep. Deleting one customer might remove their orders, then the line items of those orders, then the shipments — millions of rows and a long lock from a statement that looked like it affected one row. Before deleting from a parent table in production, follow the foreign keys and count what will actually go. Chapter 11 covers choosing between <code>CASCADE</code>, <code>RESTRICT</code> and <code>SET NULL</code>.</p>
+</div>
+
+<h2><span class="h-rule"></span>Writing safely from application code</h2>
+
+<ul class="check">
+  <li><b>Parameterise everything.</b> Never build SQL by string concatenation — chapter 15.</li>
+  <li><b>Check the affected row count.</b> An <code>UPDATE</code> that matched zero rows usually means someone else changed the row first, and silence is the wrong response.</li>
+  <li><b>Use <code>RETURNING</code></b> rather than a follow-up <code>SELECT</code> — one round trip, and no race in between.</li>
+  <li><b>Make retries safe.</b> Network timeouts mean you do not know whether a write landed. An idempotency key plus <code>ON CONFLICT DO NOTHING</code> makes the retry harmless.</li>
+  <li><b>Do not read-modify-write.</b> <code>UPDATE t SET n = n + 1</code> is atomic; reading <code>n</code> and writing back <code>n+1</code> loses updates under concurrency (chapter 10).</li>
+  <li><b>Batch multi-row writes.</b> One statement with a thousand rows, not a thousand statements.</li>
+  <li><b>Keep transactions short.</b> Never hold one open across a network call to another service.</li>
+</ul>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the lost-update bug, and the one-line fix</span><button class="copy">Copy</button></div>
+<pre><code>-- BROKEN under concurrency. Two requests read 10, both write 11, one increment
+-- is lost. Nothing errors.
+n = db.query("SELECT stock FROM products WHERE id = ?", pid)
+db.execute("UPDATE products SET stock = ? WHERE id = ?", n - 1, pid)
+
+-- Atomic: the database reads and writes under one lock.
+UPDATE products SET stock = stock - 1
+WHERE id = 42 AND stock > 0
+RETURNING stock;
+-- Zero rows returned means it was already out of stock — the check and the
+-- decrement happen together, so there is no window between them.</code></pre>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Always name the columns</b> in an <code>INSERT</code>, and batch multi-row writes into one statement.</li>
+    <li>For bulk loads use <b><code>COPY</code> or the equivalent</b>, not inserts.</li>
+    <li>Check-then-insert is a <b>race condition</b>. Use an atomic upsert, which requires the unique constraint you should have anyway.</li>
+    <li><b>Write the <code>SELECT</code> first</b>, convert it to the <code>UPDATE</code> without editing the <code>WHERE</code>, and check the row count.</li>
+    <li>Use <b><code>IS DISTINCT FROM</code></b> in backfills, or NULL rows are silently skipped.</li>
+    <li><b>Batch large changes</b>, commit between batches, and make the <code>WHERE</code> clause resumable and idempotent.</li>
+    <li>Deleting most of a table? <b>Keep the survivors and swap</b>, or partition and drop.</li>
+    <li><b>Never read-modify-write.</b> <code>SET n = n - 1 WHERE n &gt; 0 RETURNING n</code> does the check and the change atomically.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("09-writing-data.html");
+
+(function(){
+  const root = document.getElementById("batch");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const ROWS = [10000, 100000, 1000000, 5000000, 20000000, 100000000];
+  const RLBL = ["10 thousand","100 thousand","1 million","5 million","20 million","100 million"];
+  const SIZES = [0, 1000, 5000, 10000, 50000, 200000];   // 0 = single statement
+
+  function time(s){
+    if(s < 1) return (s*1000).toFixed(0) + "ms";
+    if(s < 90) return s.toFixed(1) + "s";
+    if(s < 5400) return (s/60).toFixed(1) + " min";
+    return (s/3600).toFixed(1) + " hr";
+  }
+
+  function render(){
+    const n = ROWS[parseInt($("b-rows").value, 10) - 1];
+    const si = parseInt($("b-size").value, 10);
+    const size = SIZES[si];
+    const idx = parseInt($("b-idx").value, 10);
+    $("b-rowsv").textContent = RLBL[parseInt($("b-rows").value, 10) - 1];
+    $("b-sizev").textContent = size === 0 ? "one statement" : size.toLocaleString();
+    $("b-idxv").textContent = idx;
+
+    // per-row cost rises with index count
+    const perRow = (2.5 + idx * 1.6) / 1e6;      // seconds
+    const perBatch = 0.06;                       // commit + planning overhead
+
+    const batches = size === 0 ? 1 : Math.ceil(n / size);
+    const work = n * perRow;
+    const total = work + batches * perBatch + (size === 0 ? 0 : batches * 0.05);
+    const lock = size === 0 ? work : (size * perRow) + perBatch;
+
+    $("b-total").textContent   = time(total);
+    $("b-lock").textContent    = time(lock);
+    $("b-batches").textContent = batches.toLocaleString();
+    $("b-verdict").textContent = lock > 30 ? "outage" : lock > 3 ? "risky" : "safe";
+
+    const rows = [
+      ["Total work", total],
+      ["Longest lock", lock],
+      ["Overhead from batching", batches * (perBatch + (size === 0 ? 0 : 0.05))]
+    ];
+    const max = Math.max.apply(null, rows.map(r => r[1]));
+    $("b-bars").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">Time</div>' +
+      rows.map(([lab, v], i) =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px">' +
+        '<span style="min-width:170px;font-size:13px">' + lab + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + Math.max(0.5, v/max*100).toFixed(1) +
+        '%' + (i === 1 ? (lock > 30 ? ';background:#E2574C' : lock > 3 ? ';background:#F2A03D' : ';background:#3FB984') : '') +
+        '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:64px;text-align:right">' +
+        time(v) + '</span></div>').join("");
+
+    const notes = [];
+    if(size === 0){
+      notes.push("One statement holds row locks on all " + n.toLocaleString() + " rows for " + time(lock) +
+                 ". Anything trying to touch those rows waits for the entire duration, and on most engines the transaction also pins resources that vacuum and replication need.");
+      if(lock > 30)
+        notes.push("At " + time(lock) + " this is an outage rather than a slow query. Connection pools fill with waiting requests, health checks time out, and the application falls over while the database is technically fine. " +
+                   "Killing it halfway rolls everything back, so you also pay the time again on the retry.");
+    } else {
+      notes.push(batches.toLocaleString() + " batches of " + size.toLocaleString() + ". No lock is held longer than " + time(lock) +
+                 ", so other work gets through between batches. Total time is " + time(total) + " — about " +
+                 Math.round((total/work - 1) * 100) + "% more than the single statement, and that overhead is what you are buying availability with.");
+      if(lock < 1)
+        notes.push("A sub-second lock is short enough that most callers will not notice it at all. This is the target for anything running against a live table.");
+      if(batches > 2000)
+        notes.push(batches.toLocaleString() + " batches means a lot of round trips and commits. A larger batch size would finish sooner at the cost of a longer individual lock — the trade this slider exists to explore.");
+    }
+
+    if(idx >= 5)
+      notes.push("With " + idx + " indexes, every updated row rewrites " + idx + " index entries as well as the row itself. " +
+                 "For a one-off backfill it can be worth dropping the non-essential indexes, running the update, and rebuilding them — often faster overall, though the rebuild needs its own window.");
+    if(idx === 0)
+      notes.push("With no indexes the write is as cheap as it gets, but any WHERE clause on the update becomes a full scan. Backfills usually want at least an index on whatever the batch iterates by.");
+
+    notes.push("Timings are a rough model (~2.5µs per row plus ~1.6µs per index). The relationship is what matters: total work barely changes with batch size, and the longest lock changes enormously.");
+    $("b-note").textContent = notes.join("\n\n");
+  }
+
+  ["b-rows","b-size","b-idx"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

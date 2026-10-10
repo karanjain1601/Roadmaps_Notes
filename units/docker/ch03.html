@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3 · Images, layers and content addressing — Docker</title>
+<meta name="description" content="An image is a stack of tarballs plus a JSON config, addressed by SHA-256 digest. Overlay filesystems, whiteouts, copy-up, and why deleting a file in a later layer does not shrink the image.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Crect x='6' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='19' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='10' width='5' height='5' fill='%23fff'/%3E%3Cpath d='M4 22h22a5 5 0 004-4' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch03">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Docker
+    </a>
+    <div class="chno"><b>Chapter 3</b><span>Foundations</span></div>
+    <h1>Images, layers and content addressing</h1>
+    <p class="lede">An image is not a disk snapshot. <b>It is an ordered list of tarballs, plus a JSON file describing how to start a process, all addressed by the SHA-256 of their own contents.</b> That structure explains layer caching, registry deduplication, why tags are untrustworthy, and the single most common reason images are far larger than they need to be.</p>
+    <div class="meta"><span>30 min</span><span>2 demos</span><span>8 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="structure">
+      <h2 data-nav="What an image is">What an image actually is</h2>
+      <p class="sub">Four kinds of object, and one of them is the name you type.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Object</th><th>Is</th><th>Addressed by</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Layer</strong></td><td>A tarball of filesystem changes — files added, modified, deleted</td><td>SHA-256 of the blob</td></tr>
+            <tr><td><strong>Config</strong></td><td>JSON: the ordered layer list, plus <code>Env</code>, <code>Cmd</code>, <code>Entrypoint</code>, <code>User</code>, architecture</td><td>SHA-256 of the JSON — <b>this is the image ID</b></td></tr>
+            <tr><td><strong>Manifest</strong></td><td>JSON: pointers to the config and the layers, with sizes</td><td>SHA-256 of the JSON — the digest in <code>image@sha256:…</code></td></tr>
+            <tr><td><strong>Index</strong></td><td>JSON: one manifest per platform, for multi-arch images</td><td>SHA-256 of the JSON</td></tr>
+            <tr><td><strong>Tag</strong></td><td>A mutable name in a registry pointing at a manifest or index</td><td>Nothing — it is just a label</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Because the config lists the layers, and the manifest names the config, changing any byte of any layer changes the config, which changes the manifest. <strong>It is a Merkle tree</strong> — the same structure Git uses for commits and trees, and it gives the same properties: content that is identical is stored once, and an identifier fixes the entire contents transitively.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">look at a real one</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker pull nginx:1.27-alpine
+$ docker image inspect nginx:1.27-alpine -f '{{.Id}}'
+sha256:2b8b1b3a5c…                      # the CONFIG digest = the image ID
+
+$ docker image inspect nginx:1.27-alpine -f '{{range .RootFS.Layers}}{{println .}}{{end}}'
+sha256:63ca1fbb43…                      # diff_ids: the UNCOMPRESSED layer digests
+sha256:8a3d5a0d3f…
+
+$ docker image inspect nginx:1.27-alpine -f '{{index .RepoDigests 0}}'
+nginx@sha256:41523187cf…                # the MANIFEST digest — what to pin in production
+
+$ docker buildx imagetools inspect nginx:1.27-alpine    # the index, per platform</pre>
+      </div>
+      <div class="key">
+        <span class="lbl">Three different digests, and people conflate them constantly</span>
+        <p>The <strong>image ID</strong> is the config digest, computed locally. The <strong>repository digest</strong> is the manifest digest, assigned by the registry. And each layer has two digests: its <code>diffID</code> (SHA-256 of the uncompressed tar, used locally) and its blob digest (SHA-256 of the compressed blob, used for transfer). They are all different numbers for the same image, and only the manifest digest is what you pin with <code>image@sha256:…</code>.</p>
+      </div>
+    </section>
+
+    <section id="digests">
+      <h2 data-nav="The digest chain">The digest chain</h2>
+      <p class="sub">Real SHA-256, computed in the page. Change a layer and watch what else moves.</p>
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Layer digest calculator</h3>
+          <span class="hint">Genuine SHA-256 — the same function Docker uses to name every object</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl" id="h-edits"></div>
+          <div id="h-chain"></div>
+          <div class="rgrid" id="h-out"></div>
+          <p class="readout" id="h-note"></p>
+        </div>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">the config, trimmed to what matters</span><button class="copy">Copy</button></div>
+<pre data-lang="text">{
+  "architecture": "amd64",
+  "os": "linux",
+  "config": {
+    "Env": ["PATH=/usr/local/bin:…", "NODE_ENV=production"],
+    "Entrypoint": ["node"],
+    "Cmd": ["server.js"],
+    "WorkingDir": "/app",
+    "User": "node"
+  },
+  "rootfs": {
+    "type": "layers",
+    "diff_ids": [
+      "sha256:63ca1fbb43…",     ← every layer, in order
+      "sha256:8a3d5a0d3f…",
+      "sha256:c41a2f0e77…"
+    ]
+  },
+  "history": [ … one entry per Dockerfile instruction … ]
+}</pre>
+      </div>
+      <p>Notice what lives in the config rather than in a layer: environment variables, the entrypoint, the working directory, the user. <strong>Those instructions create no filesystem layer at all</strong> — they only edit this JSON, which is why <code>docker history</code> shows them as 0&nbsp;B.</p>
+    </section>
+
+    <section id="overlay">
+      <h2 data-nav="Overlay filesystems">How the layers become one filesystem</h2>
+      <p class="sub"><code>overlay2</code>, and the two mechanics that decide your image size.</p>
+      <p>The layers are stacked by an overlay filesystem. Read-only layers are the <em>lower</em> directories, the container's writable layer is the <em>upper</em> directory, and the process sees a single merged view:</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">the actual mount</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker inspect -f '{{.GraphDriver.Data.LowerDir}}' web | tr ':' '\n' | head -3
+/var/lib/docker/overlay2/9f8e…/diff        # topmost read-only layer
+/var/lib/docker/overlay2/7d6c…/diff
+/var/lib/docker/overlay2/5b4a…/diff        # the base
+
+$ mount | grep overlay
+overlay on /var/lib/docker/overlay2/3f9c…/merged type overlay
+  (lowerdir=…9f8e/diff:…7d6c/diff:…5b4a/diff,
+   upperdir=…3f9c/diff, workdir=…3f9c/work)</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Mechanic</th><th>What happens</th><th>Cost</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Lookup</strong></td><td>Topmost layer containing the path wins</td><td>Free</td></tr>
+            <tr><td><strong>Copy-up</strong></td><td>Writing to a file from a lower layer copies the <b>whole file</b> up first</td><td>The file's full size, every time</td></tr>
+            <tr><td><strong>Whiteout</strong></td><td>Deleting a lower-layer file writes a marker (<code>.wh.&lt;name&gt;</code>) in the upper layer</td><td>Nothing is reclaimed — the bytes stay below</td></tr>
+            <tr><td><strong>Opaque directory</strong></td><td>Deleting a whole directory writes <code>.wh..wh..opq</code>, hiding everything beneath it</td><td>Same — hidden, not removed</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="key">
+        <span class="lbl">Copy-up and whiteouts are the two facts that explain image bloat</span>
+        <p>A later layer can never make an image smaller. <code>RUN rm -rf /var/lib/apt/lists/*</code> in its own instruction adds whiteout markers <em>on top of</em> the layer that still contains every one of those files, so the image grows slightly. And <code>RUN chown -R app /app</code> after copying 200&nbsp;MB of dependencies copies all 200&nbsp;MB into a new layer, doubling it. The demo below prices both.</p>
+      </div>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Layer stack and image size</h3>
+          <span class="hint">The merged view, the whiteouts, and what the image actually weighs</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl" id="o-toggles"></div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(252px,1fr));gap:11px">
+            <div>
+              <div style="font-size:12px;color:var(--text-2);margin-bottom:5px">the layers, bottom to top</div>
+              <div class="term" id="o-layers" style="min-height:auto;font-size:11.4px"></div>
+            </div>
+            <div>
+              <div style="font-size:12px;color:var(--text-2);margin-bottom:5px">the merged view the process sees</div>
+              <div class="term" id="o-merged" style="min-height:auto;font-size:11.4px"></div>
+            </div>
+          </div>
+          <div class="rgrid" id="o-out"></div>
+          <p class="readout" id="o-note"></p>
+        </div>
+      </div>
+    </section>
+
+    <section id="history">
+      <h2 data-nav="Reading an image">Reading an image you did not build</h2>
+      <p class="sub">Where the size went, and what is in there.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">layer by layer</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker history --no-trunc --human my-app:latest
+IMAGE          CREATED BY                                      SIZE
+&lt;missing&gt;      RUN npm ci                                      241MB
+&lt;missing&gt;      COPY package*.json ./                           412kB
+&lt;missing&gt;      ENV NODE_ENV=production                         0B      &lt;- config only
+&lt;missing&gt;      /bin/sh -c #(nop) CMD ["node" "server.js"]      0B
+
+$ docker image inspect my-app -f '{{.Size}}'            # total, in bytes
+$ docker system df -v                                    # per-image, shared vs unique
+$ docker save my-app | tar -tv | head                     # the raw structure</pre>
+      </div>
+      <p><code>&lt;missing&gt;</code> is not an error: intermediate image IDs are not retained for pulled images, so only the layer sizes and the instruction that produced them survive. The <strong>0&nbsp;B rows are the config-only instructions</strong> — proof of the split described above.</p>
+      <div class="tip">
+        <span class="lbl">Use <code>dive</code> once on your worst image</span>
+        <p><code>dive my-app:latest</code> shows each layer's file tree with the bytes it contributed, and flags files that are added and later deleted — the exact waste the demo above models. It takes two minutes and usually finds something embarrassing: a cache directory, a <code>.git</code> folder, a 200&nbsp;MB test fixture.</p>
+      </div>
+    </section>
+
+    <section id="sharing">
+      <h2 data-nav="Sharing and pulls">Why pulls are usually fast</h2>
+      <p class="sub">Content addressing means the same layer is stored and transferred once.</p>
+      <p>Because a layer is named by its own digest, two images built <code>FROM node:22-alpine</code> share those base layers on disk and in the registry. A pull fetches only the digests you do not already have:</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">what a pull is really doing</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker pull my-app:v2
+63ca1fbb43: Already exists          # base layers, shared with every other image
+8a3d5a0d3f: Already exists
+c41a2f0e77: Pull complete            # only the layers that changed
+Digest: sha256:41523187cf…
+Status: Downloaded newer image for my-app:v2</pre>
+      </div>
+      <p>This is why instruction order in a Dockerfile is a deployment-speed decision, not a style preference: put the layers that rarely change underneath, and a new release ships only the top few megabytes. Chapter 6 is entirely about arranging that deliberately.</p>
+      <div class="note">
+        <span class="lbl">Sharing is by digest, not by name</span>
+        <p>Two layers are shared only if their contents hash identically. <code>RUN apt-get update</code> in two images produces two <em>different</em> layers, because the package lists differ by timestamp — so they cannot be shared even though the instruction is the same. Building both <code>FROM</code> the same pinned base image is what actually produces sharing.</p>
+      </div>
+    </section>
+
+    <section id="tags">
+      <h2 data-nav="Tags versus digests">Tags versus digests</h2>
+      <p class="sub">A tag is a mutable pointer. In production that matters.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Reference</th><th>Resolves to</th><th>Stable?</th></tr></thead>
+          <tbody>
+            <tr><td><code>nginx</code></td><td><code>nginx:latest</code> at pull time</td><td class="no">no — and <code>latest</code> means nothing in particular</td></tr>
+            <tr><td><code>nginx:1.27</code></td><td>Whatever 1.27.x was published most recently</td><td class="no">no — moves on every patch release</td></tr>
+            <tr><td><code>nginx:1.27.3</code></td><td>That release — usually</td><td>Mostly, but a tag <em>can</em> be repointed</td></tr>
+            <tr><td><code>nginx@sha256:41523187cf…</code></td><td>Exactly those bytes, forever</td><td class="yes">yes — immutable by construction</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">pinning, and finding what to pin</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker image inspect nginx:1.27-alpine -f '{{index .RepoDigests 0}}'
+nginx@sha256:41523187cf…
+
+# in a Dockerfile: readable tag in a comment, digest in the instruction
+FROM nginx@sha256:41523187cf…   # 1.27-alpine
+
+$ docker pull nginx@sha256:41523187cf…      # cannot possibly get anything else</pre>
+      </div>
+      <div class="trap">
+        <span class="lbl">"It worked yesterday" and the moving tag</span>
+        <p>A build that says <code>FROM node:22</code> is a build whose base changes underneath it without a commit, a review or a notification — so a failure appearing overnight with no code change is usually this. The same reasoning applies to your own images: deploying <code>my-app:latest</code> means your rollback target is whatever <code>latest</code> happens to point at now, which may be the broken build. Digests in production, tags for humans; chapter 15 covers the tagging strategy that gives you both.</p>
+      </div>
+      <div class="key">
+        <span class="lbl">Multi-arch, in one paragraph</span>
+        <p><code>nginx:1.27-alpine</code> usually resolves to an <strong>index</strong>, not a manifest — a list of per-platform manifests, and your client picks the one matching its architecture. That is why the same tag works on an ARM laptop and an x86 server, and why <code>docker pull</code> of an image with no <code>linux/arm64</code> entry fails with a platform error rather than running slowly. Chapter 8 covers building these.</p>
+      </div>
+    </section>
+
+    <section id="storage">
+      <h2 data-nav="On disk">Where all of this lives</h2>
+      <p class="sub">And how to reclaim the space it takes.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">accounting for the disk</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker system df
+TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
+Images          47        6         18.2GB    14.1GB (77%)
+Containers      12        2         240MB     198MB (82%)
+Local Volumes   9         3         3.4GB     2.1GB (61%)
+Build Cache     312       0         6.8GB     6.8GB
+
+$ docker system df -v                      # itemised, per image and volume
+
+$ docker image prune                        # dangling images only — safe
+$ docker builder prune --keep-storage 10GB   # bound the build cache
+$ docker system prune                        # containers, networks, dangling images
+$ docker system prune -a --volumes           # ...and everything unused. Reads volumes too</pre>
+      </div>
+      <div class="warn">
+        <span class="lbl"><code>--volumes</code> deletes data</span>
+        <p><code>docker system prune -a --volumes</code> removes every volume not attached to a running container — which includes the database volume of anything you have merely stopped. There is no undo. Run <code>docker volume ls</code> and <code>docker system df -v</code> first, and prefer the narrower commands: <code>docker image prune</code> and <code>docker builder prune</code> reclaim most of the space with none of the risk.</p>
+      </div>
+      <p>The build cache is usually the biggest surprise in that table. It is not part of any image, it grows without bound by default, and <code>docker image prune</code> does not touch it — <code>docker builder prune</code> is the one that does.</p>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 3 in eight lines</h2>
+        <ul>
+          <li>An image is <b>ordered layers + a config JSON</b>, described by a manifest, all named by the SHA-256 of their own contents — a Merkle tree.</li>
+          <li>The <b>image ID is the config digest</b>; the <b>repository digest is the manifest digest</b>; layers have both an uncompressed <code>diffID</code> and a compressed blob digest.</li>
+          <li><code>ENV</code>, <code>CMD</code>, <code>ENTRYPOINT</code>, <code>USER</code> and <code>WORKDIR</code> create <b>no filesystem layer</b> — they edit the config, hence 0&nbsp;B in <code>docker history</code>.</li>
+          <li>Layers stack with an overlay filesystem: topmost match wins, upper layer is writable.</li>
+          <li><b>Copy-up:</b> modifying a lower-layer file copies the whole file up — so a later <code>chown -R</code> can double your image.</li>
+          <li><b>Whiteouts:</b> deleting a lower-layer file only hides it. A later <code>RUN rm</code> never shrinks an image; combine cleanup into the same instruction.</li>
+          <li>Identical layers are stored and transferred once, so instruction order determines how much a release actually ships.</li>
+          <li>Tags are mutable pointers; only <code>image@sha256:…</code> is immutable. Pin digests in production.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary>Your Dockerfile ends with <code>RUN rm -rf /root/.cache/pip</code> and the image is unchanged in size. Why, and what is the fix?</summary>
+        <div class="ans"><p>Because that <code>RUN</code> is its own layer, and a layer cannot remove bytes from the layers beneath it — it writes whiteout markers that hide the cache while every file remains in the earlier layer, so the image gets marginally <em>larger</em>. Fix: do the cleanup in the same instruction that created the files (<code>RUN pip install … &amp;&amp; rm -rf /root/.cache/pip</code>), so the cache never gets committed to a layer at all. Better still, use <code>--mount=type=cache</code> (chapter 6) so it is never in the build context, or a multi-stage build (chapter 7) so only the artefact is copied forward.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Two teams build images <code>FROM python:3.12-slim</code>. Do they share layers on disk? What if both run <code>RUN apt-get update</code>?</summary>
+        <div class="ans"><p>The base layers are shared, because they are byte-identical and therefore hash identically — stored once, and reported by <code>docker system df -v</code> as shared. The <code>apt-get update</code> layers are <b>not</b> shared: the package lists they write differ (timestamps, mirror state), so the tarballs hash differently even though the instruction text is the same. Sharing is a property of content, never of instructions — which is also why the build cache and the on-disk layer store are two separate things.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A colleague asks why <code>ENV NODE_ENV=production</code> shows 0&nbsp;B while <code>COPY package.json .</code> shows 412&nbsp;kB.</summary>
+        <div class="ans"><p>Because they change different objects. <code>COPY</code> writes files, so it produces a layer — a tarball with a digest and a size. <code>ENV</code> changes only the image config JSON, so there is no tarball and nothing to measure; the history entry exists to record the instruction. The same is true of <code>CMD</code>, <code>ENTRYPOINT</code>, <code>WORKDIR</code>, <code>USER</code>, <code>EXPOSE</code> and <code>LABEL</code>. It also means changing an <code>ENV</code> invalidates the build cache from that point on (chapter 6) while adding no bytes.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Production runs <code>my-app:latest</code>. A deploy breaks things and you need to roll back. What is the problem?</summary>
+        <div class="ans"><p>There is nothing to roll back <em>to</em>: <code>latest</code> now points at the broken image, and the previous one may have no tag at all. Tags are mutable pointers, so <code>latest</code> records only the most recent push rather than a history. What you want instead is an immutable reference per release — a digest, or a tag containing the commit SHA or version — recorded in whatever deploys the service, so rolling back is naming the previous one. Chapter 15 covers the strategy; the digest is what makes it reliable, because a digest cannot be repointed.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Chapter 4 finishes the foundations: the client–daemon split, the four object types you manage, and how to read <code>docker inspect</code> without scrolling through 300 lines of JSON.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li><code>docker history --human $(docker images -q | head -1)</code> — find the 0&nbsp;B rows.</li>
+        <li><code>docker system df</code> — how much is reclaimable?</li>
+        <li><code>docker image inspect nginx -f '{{index .RepoDigests 0}}'</code>.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>The OCI image specification (manifest, config and layer definitions), the Linux overlayfs documentation, and Docker's storage-driver reference.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — layer digest chain (real SHA-256 from unit.js)
+   ============================================================ */
+(function () {
+  var LAYERS = [
+    { inst: "FROM node:22-alpine", content: "alpine-3.20-rootfs+node-22.7.0", label: "base" },
+    { inst: "COPY package*.json ./", content: '{"name":"api","version":"2.4.1","deps":{"express":"4.19.2"}}', label: "manifest files" },
+    { inst: "RUN npm ci", content: "node_modules@express-4.19.2+412-transitive-packages", label: "dependencies" },
+    { inst: "COPY src ./src", content: "src/index.js+src/routes.js+src/auth.js", label: "application code" }
+  ];
+  var CONFIG = { env: "NODE_ENV=production", cmd: "node server.js", user: "node" };
+
+  var editsHost = document.getElementById("h-edits");
+  var chain = document.getElementById("h-chain");
+  var out = document.getElementById("h-out");
+  var note = document.getElementById("h-note");
+  var lastEdit = null;
+
+  var EDITS = [
+    { label: "edit src/index.js", i: 3, apply: function (l) { l.content = "src/index.js*+src/routes.js+src/auth.js"; } },
+    { label: "bump a dependency", i: 1, apply: function (l) { l.content = '{"name":"api","version":"2.4.2","deps":{"express":"4.20.0"}}'; LAYERS[2].content = "node_modules@express-4.20.0+414-transitive-packages"; } },
+    { label: "change ENV only", i: -1, apply: function () { CONFIG.env = "NODE_ENV=staging"; } },
+    { label: "new base image", i: 0, apply: function (l) { l.content = "alpine-3.21-rootfs+node-22.9.0"; } },
+    { label: "reset", i: null, apply: null }
+  ];
+
+  var ORIGINAL = JSON.parse(JSON.stringify({ LAYERS: LAYERS, CONFIG: CONFIG }));
+
+  EDITS.forEach(function (e) {
+    var b = document.createElement("button");
+    b.className = "btn" + (e.apply === null ? " ghost" : "");
+    b.textContent = e.label;
+    b.addEventListener("click", function () {
+      if (e.apply === null) {
+        LAYERS.forEach(function (l, i) { l.content = ORIGINAL.LAYERS[i].content; });
+        CONFIG.env = ORIGINAL.CONFIG.env;
+        lastEdit = null;
+      } else {
+        e.apply(LAYERS[e.i] || {});
+        lastEdit = e;
+      }
+      Array.prototype.forEach.call(editsHost.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+      if (e.apply !== null) b.classList.add("on");
+      render();
+    });
+    editsHost.appendChild(b);
+  });
+
+  function short(d) { return "sha256:" + d.slice(0, 12) + "…"; }
+
+  function compute() {
+    var diffIds = LAYERS.map(function (l) { return sha256Text(l.content); });
+    var configJson = JSON.stringify({
+      config: { Env: [CONFIG.env], Cmd: [CONFIG.cmd], User: CONFIG.user },
+      rootfs: { type: "layers", diff_ids: diffIds.map(function (d) { return "sha256:" + d; }) }
+    });
+    var configDigest = sha256Text(configJson);
+    var manifestJson = JSON.stringify({
+      config: { digest: "sha256:" + configDigest, size: configJson.length },
+      layers: diffIds.map(function (d, i) { return { digest: "sha256:" + d, size: LAYERS[i].content.length }; })
+    });
+    return { diffIds: diffIds, configDigest: configDigest, manifestDigest: sha256Text(manifestJson) };
+  }
+
+  var baseline = compute();
+
+  function render() {
+    var c = compute();
+    var changedLayers = c.diffIds.filter(function (d, i) { return d !== baseline.diffIds[i]; }).length;
+    var firstChanged = -1;
+    c.diffIds.forEach(function (d, i) { if (firstChanged === -1 && d !== baseline.diffIds[i]) firstChanged = i; });
+
+    var rows = LAYERS.map(function (l, i) {
+      var moved = c.diffIds[i] !== baseline.diffIds[i];
+      return '<div style="display:flex;gap:10px;align-items:baseline;font-size:12.5px;padding:6px 10px;border-radius:4px;margin-bottom:4px;border:1px solid ' +
+        (moved ? "var(--bad-line)" : "var(--rule-2)") + ";background:" + (moved ? "var(--bad-wash)" : "#FAFBFC") + '">' +
+        '<span style="font-family:var(--mono);font-size:10.5px;color:var(--text-3);min-width:14px">' + (i + 1) + "</span>" +
+        '<span style="font-family:var(--mono);flex:1 1 130px;font-size:11.5px">' + l.inst + "</span>" +
+        '<span style="font-family:var(--mono);font-size:11px;color:' + (moved ? "var(--bad)" : "var(--text-2)") + '">' +
+        short(c.diffIds[i]) + "</span>" +
+        (moved ? '<span style="font-size:10.5px;font-weight:700;color:var(--bad)">changed</span>'
+               : '<span style="font-size:10.5px;color:var(--good);font-weight:600">cached</span>') + "</div>";
+    }).join("");
+
+    var cfgMoved = c.configDigest !== baseline.configDigest;
+    var manMoved = c.manifestDigest !== baseline.manifestDigest;
+    chain.innerHTML = rows +
+      '<div style="display:flex;gap:10px;align-items:baseline;font-size:12.5px;padding:6px 10px;border-radius:4px;margin:8px 0 4px;border:1px solid ' +
+      (cfgMoved ? "var(--bad-line)" : "var(--rule-2)") + ";background:" + (cfgMoved ? "var(--bad-wash)" : "#F4F6F8") + '">' +
+      '<span style="flex:1 1 130px"><b>config</b> — diff_ids + Env/Cmd/User</span>' +
+      '<span style="font-family:var(--mono);font-size:11px;color:' + (cfgMoved ? "var(--bad)" : "var(--text-2)") + '">' +
+      short(c.configDigest) + '</span><span style="font-size:10.5px;font-weight:700">= image ID</span></div>' +
+      '<div style="display:flex;gap:10px;align-items:baseline;font-size:12.5px;padding:6px 10px;border-radius:4px;border:1px solid ' +
+      (manMoved ? "var(--bad-line)" : "var(--rule-2)") + ";background:" + (manMoved ? "var(--bad-wash)" : "#F4F6F8") + '">' +
+      '<span style="flex:1 1 130px"><b>manifest</b> — config + layer digests</span>' +
+      '<span style="font-family:var(--mono);font-size:11px;color:' + (manMoved ? "var(--bad)" : "var(--text-2)") + '">' +
+      short(c.manifestDigest) + '</span><span style="font-size:10.5px;font-weight:700">= repo digest</span></div>';
+
+    out.innerHTML = "";
+    tile("Layers changed", String(changedLayers) + "/" + LAYERS.length, "must rebuild", changedLayers > 0);
+    tile("Reusable", String(LAYERS.length - changedLayers), "from cache", changedLayers < LAYERS.length);
+    tile("Image ID", cfgMoved ? "new" : "same", "config digest", !cfgMoved);
+    tile("Bytes to push", changedLayers ? "layers " + (firstChanged + 1) + "–" + LAYERS.length : "none",
+      "registry already has the rest");
+
+    var msgs = [];
+    if (!lastEdit) {
+      msgs.push("These are <b>real SHA-256 digests</b> computed in the page from each layer's content, exactly as Docker names its objects. The config hashes the ordered list of layer digests, and the manifest hashes the config — so the image ID transitively fixes every byte in the image. Press an edit button and watch what moves.");
+    } else if (lastEdit.i === -1) {
+      msgs.push("<b>Changing an <code>ENV</code> moved no layer at all</b> — every layer digest is unchanged and cacheable — yet the config digest changed, so the <b>image ID is new</b>. This is the config/layer split from the section above, visible as arithmetic: metadata-only instructions produce a different image with identical filesystem content.");
+    } else if (lastEdit.i === 3) {
+      msgs.push("Editing the application code changed <b>only the top layer</b>. Layers 1–3 hash identically, so the build reuses them and the registry already has them — a release ships a few hundred kilobytes. <b>This is the entire argument for Dockerfile ordering</b> (chapter 6): put what changes often at the top.");
+    } else if (lastEdit.i === 1) {
+      msgs.push("Bumping a dependency changed layer 2, and therefore layer 3 as well — <code>npm ci</code> produces different content, so its digest moves too. Only the base layer survives. Note the cascade is downstream-only: <b>a change never invalidates the layers beneath it</b>, which is why the base image sits at the bottom.");
+    } else if (lastEdit.i === 0) {
+      msgs.push("A new base image changes <b>every</b> digest above it, because each layer's identity depends on nothing but its own content — and <code>npm ci</code> against a different Node version genuinely produces different content. This is why base image updates are a full rebuild and a full push, and why they belong on a deliberate schedule rather than in a moving tag (see the trap below).");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "12.5px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — layer stack, whiteouts, copy-up and image size
+   ============================================================ */
+(function () {
+  var combine = false, chown = false;
+  var togHost = document.getElementById("o-toggles");
+  var layersEl = document.getElementById("o-layers");
+  var mergedEl = document.getElementById("o-merged");
+  var out = document.getElementById("o-out");
+  var note = document.getElementById("o-note");
+
+  [["combine", "combine the cleanup into the same RUN"], ["chown", "add RUN chown -R node /app"]].forEach(function (t, i) {
+    var b = document.createElement("button");
+    b.className = "btn mono";
+    b.textContent = t[1];
+    b.addEventListener("click", function () {
+      if (i === 0) combine = !combine; else chown = !chown;
+      b.classList.toggle("on", i === 0 ? combine : chown);
+      render();
+    });
+    togHost.appendChild(b);
+  });
+
+  function build() {
+    var L = [];
+    L.push({ inst: "FROM node:22-alpine", ops: [
+      { op: "add", path: "/usr/local/bin/node", mb: 52.0 },
+      { op: "add", path: "/bin/busybox", mb: 1.1 },
+      { op: "add", path: "/etc/os-release", mb: 0.001 }
+    ] });
+    L.push({ inst: "COPY package*.json ./app/", ops: [
+      { op: "add", path: "/app/package.json", mb: 0.004 },
+      { op: "add", path: "/app/package-lock.json", mb: 0.41 }
+    ] });
+    if (combine) {
+      L.push({ inst: "RUN npm ci && npm cache clean --force", ops: [
+        { op: "add", path: "/app/node_modules", mb: 180.0 }
+      ] });
+    } else {
+      L.push({ inst: "RUN npm ci", ops: [
+        { op: "add", path: "/app/node_modules", mb: 180.0 },
+        { op: "add", path: "/root/.npm", mb: 61.0 }
+      ] });
+      L.push({ inst: "RUN npm cache clean --force", ops: [
+        { op: "del", path: "/root/.npm", mb: 0.0 }
+      ] });
+    }
+    if (chown) {
+      L.push({ inst: "RUN chown -R node /app", ops: [
+        { op: "copyup", path: "/app/node_modules", mb: 180.0 },
+        { op: "copyup", path: "/app/package-lock.json", mb: 0.41 },
+        { op: "copyup", path: "/app/package.json", mb: 0.004 }
+      ] });
+    }
+    L.push({ inst: "COPY src ./app/src", ops: [
+      { op: "add", path: "/app/src", mb: 0.83 }
+    ] });
+    return L;
+  }
+
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+  function mb(v) { return v >= 1 ? v.toFixed(1) + " MB" : Math.round(v * 1000) + " kB"; }
+
+  function render() {
+    var L = build();
+
+    /* merged view: last writer wins; a delete hides the path */
+    var view = {};
+    L.forEach(function (l, li) {
+      l.ops.forEach(function (o) {
+        if (o.op === "del") { view[o.path] = { hidden: true, from: li, mb: 0 }; }
+        else {
+          var prev = view[o.path];
+          view[o.path] = { hidden: false, from: li, mb: o.mb, copiedUp: o.op === "copyup", was: prev ? prev.from : null };
+        }
+      });
+    });
+
+    var total = L.reduce(function (a, l) {
+      return a + l.ops.reduce(function (b, o) { return b + o.mb; }, 0);
+    }, 0);
+    var visible = Object.keys(view).reduce(function (a, p) {
+      return a + (view[p].hidden ? 0 : view[p].mb);
+    }, 0);
+
+    layersEl.innerHTML = L.map(function (l, li) {
+      var sz = l.ops.reduce(function (a, o) { return a + o.mb; }, 0);
+      var head = '<span class="y">' + esc(l.inst) + "</span>" +
+        '<span class="d">   ' + mb(sz) + "</span>";
+      var body = l.ops.map(function (o) {
+        if (o.op === "del") return '<span class="r">  .wh.' + esc(o.path.split("/").pop()) + "</span>" +
+          '<span class="d">   whiteout, 0 B — hides ' + esc(o.path) + "</span>";
+        if (o.op === "copyup") return '<span class="r">  ' + esc(o.path) + "</span>" +
+          '<span class="d">   ' + mb(o.mb) + " copied up from below</span>";
+        return "  " + esc(o.path) + '<span class="d">   ' + mb(o.mb) + "</span>";
+      }).join("\n");
+      return head + "\n" + body;
+    }).join("\n\n");
+
+    mergedEl.innerHTML = Object.keys(view).sort().map(function (p) {
+      var v = view[p];
+      if (v.hidden) return '<span class="d">  (' + esc(p) + " — hidden by a whiteout, bytes still in layer " +
+        (findOwner(L, p) + 1) + ")</span>";
+      return "  " + esc(p) + '<span class="d">   ' + mb(v.mb) + "  from layer " + (v.from + 1) +
+        (v.copiedUp ? " (copy-up)" : "") + "</span>";
+    }).join("\n") + '\n\n<span class="d">' + mb(visible) + " reachable, out of " + mb(total) + " stored</span>";
+
+    var waste = total - visible;
+    out.innerHTML = "";
+    tile("Image size", mb(total), "what you pull", waste < 1);
+    tile("Reachable", mb(visible), "what you can see");
+    tile("Unreachable", mb(waste), "stored, invisible", waste > 1);
+    tile("Layers", String(L.length), "in the image");
+
+    var msgs = [];
+    if (!combine && !chown) {
+      msgs.push("<b>" + mb(waste) + " of this image is unreachable.</b> The npm cache was written in layer 3 and deleted in layer 4 — but layer 4 can only add a <code>.wh.</code> whiteout marker, so every byte remains in layer 3 and is pulled by every consumer forever. Turn on the first toggle to fix it.");
+    }
+    if (combine && !chown) {
+      msgs.push("<b>Combining the cleanup into the same <code>RUN</code> saves " +
+        mb(61.0) + "</b>, because the cache is deleted before the layer is committed — so it is never in a tarball at all. Same commands, same result, one fewer layer, and a materially smaller image. This is the single highest-value Dockerfile habit.");
+    }
+    if (chown) {
+      msgs.push("<b><code>chown -R</code> is the expensive one.</b> Changing a file's ownership is a write, and writing to a file from a lower layer triggers <b>copy-up</b> — the whole file is duplicated into the new layer first. Recursively chowning 180 MB of dependencies therefore adds 180 MB to the image, which is why the total just jumped to " +
+        mb(total) + ". The fix is to set ownership as you copy: <code>COPY --chown=node:node</code>, which writes the files once with the right owner.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function findOwner(L, path) {
+    var owner = -1;
+    L.forEach(function (l, li) {
+      l.ops.forEach(function (o) { if (o.path === path && o.op !== "del") owner = li; });
+    });
+    return owner;
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13.5px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

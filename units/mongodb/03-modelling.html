@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Modelling for access patterns — MongoDB</title>
+<meta name="description" content="The inversion from relational design: start from the queries, not the entities — and the patterns that follow from doing so.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 03 · Documents</div>
+    <h1>Modelling for access patterns</h1>
+    <p class="standfirst">Relational design starts from the entities and derives the queries. Document design goes the other way, and doing it in the wrong order is the single most reliable way to produce a MongoDB schema you will regret.</p>
+    <div class="chap-meta">
+      <span class="tagpill">the inversion</span>
+      <span class="tagpill">bucket</span>
+      <span class="tagpill">computed</span>
+      <span class="tagpill">subset</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The inversion</h2>
+
+<div class="cols">
+  <div class="col">
+    <h4>Relational</h4>
+    <ol style="margin:0;padding-left:1.2em">
+      <li>Identify the entities and their relationships</li>
+      <li>Normalise until each fact lives in one place</li>
+      <li>Write whatever queries you need</li>
+      <li>Add indexes where they are slow</li>
+    </ol>
+    <p style="margin-top:10px">The schema is derived from the domain, and the query engine adapts. This works because joins are cheap and the optimiser is good.</p>
+  </div>
+  <div class="col">
+    <h4>Document</h4>
+    <ol style="margin:0;padding-left:1.2em">
+      <li>List the operations the application performs</li>
+      <li>Rank them by frequency and latency sensitivity</li>
+      <li>Design documents so the top ones are single-document reads</li>
+      <li>Accept duplication and computation on write to achieve that</li>
+    </ol>
+    <p style="margin-top:10px">The schema is derived from the workload. This works because a single-document read is very fast and a <code>$lookup</code> is not.</p>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">A normalised document schema gets the worst of both</span>
+  <p>The commonest way to fail with MongoDB is to design the relational schema and transliterate it — a collection per entity, ids between them, and <code>$lookup</code> wherever a join used to be. You now pay for joins that are less capable than SQL's, without foreign keys, without the optimiser's join reordering, and without the constraint system. <b>If your document schema looks like your relational one, you have chosen the wrong database or done the wrong modelling.</b> Chapter 18 is about telling which.</p>
+</div>
+
+<h2><span class="h-rule"></span>Doing it</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">the workload table, which is the actual deliverable</span><button class="copy">Copy</button></div>
+<pre><code>Before writing any schema, fill this in. It takes an hour and it decides
+everything that follows.
+
+  Operation                       Freq/sec   Latency   Reads or writes
+  ------------------------------  ---------  --------  ----------------
+  Show a product page                  400      50ms   read
+  Add to basket                         40     100ms   write
+  Show basket                          120      50ms   read
+  Place an order                         4     500ms   write
+  Show my order history                 20     200ms   read
+  Warehouse: today's orders            0.1        5s   read
+  Analytics: revenue by category      0.01       60s   read
+
+Then, for each one:
+  * which documents does it touch
+  * what does it filter on, and what does it sort by
+  * can it be one query against one collection
+
+The top three by frequency should each be a single-document read or a single
+indexed query. If they are not, the schema is wrong, and no amount of
+indexing will fix it later.
+
+Note the bottom two rows. They are rare and latency-tolerant, so they are
+ALLOWED to be slow, complicated aggregations — and designing the schema
+around them at the expense of the top rows is the classic mistake.</code></pre>
+</div>
+
+<div class="demo" id="wl">
+  <div class="demo-head">
+    <b>Designing from a workload</b>
+    <span>Pick the dominant operation. The schema that serves it well is usually not the normalised one.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="w-op">The operation that runs most often</label>
+        <select id="w-op">
+          <option value="page" selected>Render an entity's full page</option>
+          <option value="list">Render a paginated list</option>
+          <option value="append">Append an event or reading</option>
+          <option value="counter">Increment a counter</option>
+          <option value="latest">Fetch the most recent N per key</option>
+          <option value="search">Filter by many optional criteria</option>
+          <option value="rollup">Aggregate over a time range</option>
+        </select>
+      </div>
+      <div>
+        <label for="w-scale">Documents in the collection — <span id="w-scalev">10 million</span></label>
+        <input type="range" id="w-scale" min="1" max="6" step="1" value="4">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="w-pat">—</b><span>pattern</span></div>
+      <div><b id="w-ops">—</b><span>DB operations per request</span></div>
+      <div><b id="w-cost">—</b><span>paid on</span></div>
+    </div>
+    <div id="w-code"></div>
+    <div class="out" id="w-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>The patterns</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Pattern</th><th>Problem it solves</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><td><b>Extended reference</b></td><td>A join on a hot read path</td><td>Duplicated fields to keep in sync (chapter 2)</td></tr>
+<tr><td><b>Subset</b></td><td>A large child collection where you usually need a few</td><td>Two sources of truth for the same list</td></tr>
+<tr><td><b>Computed</b></td><td>An aggregate recomputed on every read</td><td>Work on write; can drift if updates are missed</td></tr>
+<tr><td><b>Bucket</b></td><td>High-frequency small documents, or an unbounded array</td><td>More complex writes and reads</td></tr>
+<tr><td><b>Outlier</b></td><td>99% of documents are small, 1% are enormous</td><td>Two code paths</td></tr>
+<tr><td><b>Attribute</b></td><td>Many optional fields you need to index</td><td>Less readable; one index serves everything</td></tr>
+<tr><td><b>Schema versioning</b></td><td>Changing document shape over time</td><td>Read paths handle several versions (chapter 17)</td></tr>
+<tr><td><b>Polymorphic</b></td><td>Related but differently-shaped entities</td><td>Application must dispatch on a type field</td></tr>
+<tr><td><b>Approximation</b></td><td>A counter written far more than it is read precisely</td><td>The number is approximate, deliberately</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Bucket</h3>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">the one that fixes time-series and unbounded arrays</span><button class="copy">Copy</button></div>
+<pre><code>// One document per reading: 8 million documents a day, each with its own
+// _id index entry and per-document overhead. Queries over a day scan
+// millions of documents.
+{ device: "d-41", t: ISODate("2026-03-14T09:31:02Z"), temp: 21.4 }
+
+// BUCKETED: one document per device per hour.
+{
+  device: "d-41",
+  hour:   ISODate("2026-03-14T09:00:00Z"),
+  count:  3600,
+  min:    20.9, max: 22.1, sum: 76840.2,     // precomputed, for free
+  samples: [ { s: 2, v: 21.4 }, { s: 3, v: 21.5 }, … ]   // second offsets
+}
+
+db.readings.updateOne(
+  { device: "d-41", hour: hourStart },
+  { $push: { samples: { s: secondOfHour, v: 21.4 } },
+    $inc:  { count: 1, sum: 21.4 },
+    $min:  { min: 21.4 }, $max: { max: 21.4 } },
+  { upsert: true }
+);
+
+// 3600x fewer documents, 3600x fewer index entries, and the hourly rollup
+// is already computed. The bucket is bounded by construction, so it never
+// approaches 16 MB.
+//
+// Pick the bucket size so the document stays comfortably under a few hundred
+// KB — per hour, per day, or a fixed count, whichever suits the rate.
+//
+// MongoDB 5.0+ has TIME-SERIES COLLECTIONS, which do this automatically with
+// better compression. Use them for genuine time-series; the manual pattern
+// is still the right answer for anything that is not (a chat thread, an
+// audit trail, a feed).
+db.createCollection("readings", {
+  timeseries: { timeField: "t", metaField: "device", granularity: "seconds" },
+  expireAfterSeconds: 7776000
+});</code></pre>
+</div>
+
+<h3>Computed</h3>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">pay on write, because reads outnumber writes</span><button class="copy">Copy</button></div>
+<pre><code>// Recomputing on every read: an aggregation over the comments collection,
+// 400 times a second, for a number that changes twice an hour.
+const count = await db.comments.countDocuments({ postId: id });
+
+// Computed: maintained when the underlying data changes.
+db.posts.updateOne({ _id: postId }, { $inc: { commentCount: 1 } });
+
+// Now the listing page reads one document and has everything. The trade is
+// that the count can drift if an update path is missed — so:
+//   * do the increment in the SAME operation as the insert where possible
+//   * or drive it from a change stream (chapter 14), which cannot be missed
+//   * and run a periodic reconciliation job that recomputes and corrects
+//
+// The reconciliation job is the part people skip, and it is what makes this
+// pattern safe rather than merely fast. Once a night, cheap, and it turns
+// "the count is wrong and nobody knows why" into a fixed bug.
+
+// APPROXIMATION, when even the increment is too much: update the counter
+// only 1 time in 100, adding 100. The number is statistically close and the
+// write load is 1% of what it was. Correct for view counts; not for money.
+if (Math.random() < 0.01) {
+  db.posts.updateOne({ _id: id }, { $inc: { views: 100 } });
+}</code></pre>
+</div>
+
+<h3>Subset</h3>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">the top N, embedded; the rest, referenced</span><button class="copy">Copy</button></div>
+<pre><code>// A product has 4,000 reviews. The page shows five, and almost nobody
+// clicks through to the rest.
+{
+  _id: ObjectId("p1"),
+  name: "Wireless keyboard",
+  reviewCount: 4127,
+  averageRating: 4.3,
+  topReviews: [                        // maintained, bounded, embedded
+    { by: "Amara", stars: 5, body: "…" },
+    …                                  // five of them
+  ]
+}
+// The full set lives in its own collection, fetched only if asked for.
+
+// Maintaining the subset atomically:
+db.products.updateOne({ _id: id }, {
+  $push: {
+    topReviews: { $each: [newReview], $sort: { helpful: -1 }, $slice: 5 }
+  }
+});
+// $each + $sort + $slice keeps the best five in one atomic operation and
+// discards the rest. This is the operator that makes the pattern practical.</code></pre>
+</div>
+
+<h3>Attribute</h3>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">many optional fields, one index</span><button class="copy">Copy</button></div>
+<pre><code>// Products across categories have wildly different attributes. Indexing
+// every possible field is impossible, and most are null on most documents.
+{ _id: …, name: "…", screenSize: 15.6, ram: 16, weight: 1.4, isbn: null, … }
+
+// ATTRIBUTE PATTERN: a single array of key/value pairs.
+{
+  _id: …, name: "Laptop",
+  specs: [
+    { k: "screenSize", v: 15.6 },
+    { k: "ram", v: 16 },
+    { k: "weight", v: 1.4 }
+  ]
+}
+db.products.createIndex({ "specs.k": 1, "specs.v": 1 });   // ONE index, all fields
+
+db.products.find({ specs: { $elemMatch: { k: "ram", v: { $gte: 16 } } } });
+
+// Note this contradicts chapter 2's "arrays as maps" antipattern, and the
+// distinction is the index. Use an object when the keys are KNOWN and few:
+// specs.ram is simpler to read and query. Use this pattern when the keys are
+// OPEN-ENDED and you need to index across all of them — which is exactly the
+// case an object cannot serve, because you cannot index a field you do not
+// know the name of.</code></pre>
+</div>
+
+<h3>Outlier</h3>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">when 1% of your data breaks the design</span><button class="copy">Copy</button></div>
+<pre><code>// Almost every user has under 100 followers. A handful have 40 million.
+// Designing for the celebrity ruins the common case; ignoring them breaks.
+
+{ _id: ObjectId("u1"), name: "…", followers: [ … ] }               // normal
+{ _id: ObjectId("u9"), name: "…", followers: [ … 1000 of them ],
+  hasExtras: true }                                                // outlier
+
+// The flag tells the application to check the overflow collection. 99% of
+// reads take the fast path and never know the other one exists.
+db.followerOverflow.find({ userId: ObjectId("u9") });
+
+// The pattern is: OPTIMISE FOR THE COMMON CASE, and add an escape hatch for
+// the tail rather than degrading everything to accommodate it. The cost is
+// two code paths, and the flag is what keeps the second one cheap to check.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Denormalisation, deliberately</h2>
+
+<div class="note warn">
+  <span class="note-t">Every copy needs an owner and a reconciliation</span>
+  <p>These patterns all trade consistency for read speed, and that trade is only sound when someone has decided <b>which write path owns each duplicated value</b> and <b>how it gets corrected when that path is missed</b>. Write both down next to the field. A computed count with no reconciliation job is a number that will be wrong within a year and nobody will be able to say when it started — which is measurably worse than recomputing it on read, because at least that was slow and correct. The reconciliation job is not optional polish; it is what makes the pattern honest.</p>
+</div>
+
+<h2><span class="h-rule"></span>A method</h2>
+
+<div class="flow stack">
+  <div class="step"><b>1 · List every operation, with frequency and latency budget</b><span>The workload table above. An hour's work, and it decides everything</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Rank by frequency × latency sensitivity</b><span>The top three get designed for; the rest are allowed to be awkward</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · For each of the top three, aim for one query</b><span>Single document, or one indexed find. If you cannot, ask why</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Apply the patterns to close the gap</b><span>Extended reference, subset, computed, bucket</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Check the writes still work</b><span>Every duplicated field is now a write-path obligation</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>6 · Check the growth</b><span>Which arrays grow? What bounds them? Chapter 2</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>7 · Write down the invariants and how they are maintained</b><span>Including the reconciliation jobs. This is the document that survives you</span></div>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Design for the workload you have, not the one you might have</span>
+  <p>The mirror image of the earlier mistake: designing for a hypothetical future scale rather than the actual current workload. Bucketing a collection that receives forty documents a day, sharding at ten thousand documents, or building an outlier escape hatch for a tail that does not exist all add complexity for nothing — and the complexity is permanent while the imagined scale may never arrive. <b>Model the workload you can measure, keep the schema simple enough to change, and apply the patterns when a specific number says to.</b></p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Relational design derives queries from entities. <b>Document design derives documents from queries.</b></li>
+    <li><b>A normalised document schema gets the worst of both</b> — all the joins, none of the constraints.</li>
+    <li>Write the <b>workload table</b> first: operation, frequency, latency budget. It decides the schema.</li>
+    <li>The <b>top three operations should each be one query</b>. Rare, latency-tolerant ones are allowed to be complicated.</li>
+    <li><b>Bucket</b> fixes time-series and unbounded arrays. Time-series collections do it automatically for genuine time-series.</li>
+    <li><b>Computed</b> pays on write because reads outnumber writes — and needs a reconciliation job to stay honest.</li>
+    <li><b>Subset</b> plus <code>$push/$sort/$slice</code> keeps a bounded hot list next to an unbounded cold one.</li>
+    <li><b>Design for the workload you can measure</b>, not the one you imagine.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("03-modelling.html");
+
+(function(){
+  const root = document.getElementById("wl");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const N = [1000, 100000, 1000000, 10000000, 100000000, 1000000000];
+  const NL = ["1 thousand","100 thousand","1 million","10 million","100 million","1 billion"];
+
+  const P = {
+    page: {pat:"extended reference + subset", ops:"1", cost:"write",
+      code:'// Everything the page needs, in one document\n{\n  _id: ObjectId("p1"),\n  name: "Wireless keyboard",\n  price: NumberDecimal("64.99"),\n  brand: { id: ObjectId("b3"), name: "Kinesis", logo: "…" },  // extended ref\n  reviewCount: 4127, averageRating: 4.3,                      // computed\n  topReviews: [ … 5 … ]                                       // subset\n}\n\nawait db.products.findOne({ slug });   // one operation, done',
+      note:"The dominant read should be a single findOne by an indexed field. Everything the page renders lives in the document, even where that means duplicating a brand name and precomputing a rating.\n\nThe cost moves to the write path: when the brand is renamed something must update the copies, and when a review is added something must recompute the average. Both are far rarer than the read, which is the whole trade.\n\nThe part to get right is ownership. Write down which code path owns each duplicated field and what reconciles it — a nightly job that recomputes and corrects is what turns this from fast-and-drifting into fast-and-correct."},
+    list: {pat:"subset + computed, on the list documents", ops:"1", cost:"write",
+      code:'// The listing document carries only what the CARD shows\ndb.products.find(\n  { category: "keyboards", active: true },\n  { name: 1, price: 1, thumb: 1, averageRating: 1, reviewCount: 1 }\n).sort({ popularity: -1 }).limit(24);\n\ndb.products.createIndex(\n  { category: 1, active: 1, popularity: -1 });',
+      note:"A list is a projection problem as much as a schema one. Fetch only the fields the card renders — a product document with a long description and 5 embedded reviews costs the same to read whether you display them or not.\n\nThe index must cover the filter AND the sort, in that order, or MongoDB sorts the whole result set in memory and fails past 32 MB (chapter 7's ESR rule).\n\nIf the list is the dominant read and the full document is large, consider a separate summary collection maintained by a change stream. That is a real cost in complexity, so measure before reaching for it."},
+    append: {pat:"bucket", ops:"1", cost:"read complexity",
+      code:'// One document per device per hour, not per reading\ndb.readings.updateOne(\n  { device: id, hour: hourStart },\n  { $push: { samples: { s: secondOfHour, v: value } },\n    $inc:  { count: 1, sum: value },\n    $min:  { min: value }, $max: { max: value } },\n  { upsert: true }\n);\n\n// Or, for genuine time-series, let MongoDB do it:\ndb.createCollection("readings", {\n  timeseries: { timeField: "t", metaField: "device" },\n  expireAfterSeconds: 7776000\n});',
+      note:"High-frequency appends are the case bucketing exists for. One document per reading means one _id index entry per reading and millions of documents scanned for any range query.\n\nBucketing by hour reduces both by three orders of magnitude and gives you the hourly rollup for free, because $inc, $min and $max maintain it as you go.\n\nDo NOT append to an unbounded array on a parent document instead. WiredTiger rewrites the whole document when it grows, so each push costs more than the last — the write cost is quadratic over the document's lifetime, and it ends at the 16 MB limit.\n\nFor genuine time-series data, MongoDB 5.0+ time-series collections do all of this automatically with better compression."},
+    counter: {pat:"computed, or approximation", ops:"1", cost:"write contention",
+      code:'// Exact\ndb.posts.updateOne({ _id: id }, { $inc: { views: 1 } });\n\n// Approximate — 1% of the writes, statistically equivalent\nif (Math.random() < 0.01) {\n  db.posts.updateOne({ _id: id }, { $inc: { views: 100 } });\n}\n\n// Sharded counter, when one document is too hot\ndb.counters.updateOne(\n  { postId: id, bucket: Math.floor(Math.random() * 16) },\n  { $inc: { n: 1 } }, { upsert: true });',
+      note:"$inc is atomic and cheap, so a counter on its own is not a problem. The problem is CONTENTION: every write to a single hot document serialises on that document, and WiredTiger's document-level concurrency means a popular post's counter becomes a bottleneck.\n\nThree escalating answers. For a view count, approximate — increment 1% of the time by 100, and the number is statistically indistinguishable at 1% of the write load. For something that must be exact but is very hot, shard the counter across sixteen documents and sum them on read. For money, neither: use an exact counter and accept the contention, or restructure so the writes are not to one document.\n\nDecide which category you are in before optimising. Approximation is correct for views and wrong for balances."},
+    latest: {pat:"subset, or a bounded array", ops:"1", cost:"write",
+      code:'// Maintained bounded list — one atomic operation\ndb.users.updateOne({ _id: id }, {\n  $push: {\n    recentActivity: {\n      $each: [event], $sort: { at: -1 }, $slice: 20\n    }\n  }\n});\n\n// Or referenced with a compound index, when N is large\ndb.activity.createIndex({ userId: 1, at: -1 });\ndb.activity.find({ userId: id }).sort({ at: -1 }).limit(20);',
+      note:"\"The most recent N per key\" has two good answers and the choice is about how big N is and whether you ever need more.\n\nA bounded embedded array with $each/$sort/$slice is one atomic operation and one read. It is ideal when N is small and you never need item 21 — a recent-activity strip, the last five notifications.\n\nA separate collection with a compound index on (key, timestamp descending) is right when N is larger or the history matters. The index supplies the sort, so the query stops after 20 documents rather than sorting everything.\n\nWhat you should NOT do is fetch all of them and slice in application code — that transfers everything to discard almost all of it, which is the SQL unit's chapter 1 argument in a different syntax."},
+    search: {pat:"attribute pattern, or a search index", ops:"1", cost:"index design",
+      code:'// Attribute pattern: one index serves every attribute\n{ specs: [ { k: "ram", v: 16 }, { k: "screen", v: 15.6 } ] }\ndb.products.createIndex({ "specs.k": 1, "specs.v": 1 });\n\ndb.products.find({\n  specs: { $elemMatch: { k: "ram", v: { $gte: 16 } } }\n});\n\n// Many optional criteria in arbitrary combinations is often the point\n// where a dedicated search index is the right answer instead.',
+      note:"Filtering on many optional criteria in arbitrary combinations is genuinely hard for any database, because you cannot build a compound index for every combination — the number of them is factorial.\n\nThe attribute pattern gets you one index that serves any single attribute lookup, which handles the common case of one or two filters. MongoDB can intersect indexes for multiple conditions, though it does so less effectively than a purpose-built structure.\n\nBe honest about when this has outgrown the database. Faceted search over a dozen optional dimensions with relevance ranking is what search engines are for, and Atlas Search or an external index is the right answer rather than an increasingly elaborate compound index strategy."},
+    rollup: {pat:"precomputed rollups, or a bucket", ops:"1 read, 1 background write", cost:"staleness",
+      code:'// Do not aggregate raw data on every request\n// Precompute on a schedule, into a rollup collection\ndb.dailyRevenue.updateOne(\n  { day: today, category: cat },\n  { $inc: { revenue: amount, orders: 1 } },\n  { upsert: true }\n);\n\n// The dashboard then reads documents, not an aggregation\ndb.dailyRevenue.find({ day: { $gte: from, $lte: to } });',
+      note:"Aggregating over a time range is exactly what the pipeline is for, and running it on every dashboard load is exactly what it is not for.\n\nMaintain rollups instead: increment a per-day-per-dimension document as the events arrive, or recompute on a schedule. The dashboard then reads a handful of documents rather than scanning millions.\n\nThe cost is staleness, and it is usually acceptable — a revenue dashboard that is current to the last minute is fine and nobody notices. Say what the staleness is, so the number on the screen can be trusted.\n\nIf the data is already bucketed by hour (see the append pattern), the rollup is largely done: each bucket carries its own count, sum, min and max."}
+  };
+
+  function render(){
+    const k = $("w-op").value;
+    const p = P[k];
+    const ni = parseInt($("w-scale").value,10) - 1;
+    $("w-scalev").textContent = NL[ni];
+
+    $("w-pat").textContent  = p.pat;
+    $("w-ops").textContent  = p.ops;
+    $("w-cost").textContent = p.cost;
+
+    $("w-code").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid #25B7C4;border-radius:5px;' +
+      'padding:11px 13px;margin:14px 0 12px;font-family:var(--mono);font-size:12px;line-height:1.6;overflow-x:auto">' +
+      p.code.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>';
+
+    const notes = [p.note];
+
+    if(N[ni] <= 100000)
+      notes.push("At " + NL[ni] + " documents, most of this is unnecessary. The whole collection fits in cache, almost any query is fast, and a simple normalised-ish schema will serve you fine. Apply these patterns when a measured number says to — premature bucketing and precomputation add permanent complexity for scale that may never arrive.");
+    else if(N[ni] >= 100000000)
+      notes.push("At " + NL[ni] + " documents the working set almost certainly exceeds memory, so the question shifts from \"is the query indexed\" to \"how many pages does it touch\" (chapter 9). At this scale sharding is also probably in view, and the shard key interacts with everything here — chapter 13, and it is close to irreversible.");
+
+    notes.push("Whatever the pattern: write down which code path owns each duplicated or computed value, and what reconciles it when that path is missed. A computed field with no reconciliation job is a number that will be wrong within a year with no way to say when it started.");
+    $("w-note").textContent = notes.join("\n\n");
+  }
+
+  ["w-op","w-scale"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

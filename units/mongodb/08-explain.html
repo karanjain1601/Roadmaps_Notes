@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Reading explain output — MongoDB</title>
+<meta name="description" content="executionStats, the stage tree, keys and docs examined against documents returned, and the ratios that identify the problem.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 08 · Making it fast</div>
+    <h1>Reading explain output</h1>
+    <p class="standfirst">Three numbers answer nearly every performance question in MongoDB: keys examined, documents examined, and documents returned. The ratios between them tell you what is wrong, and the stage tree tells you where.</p>
+    <div class="chap-meta">
+      <span class="tagpill">executionStats</span>
+      <span class="tagpill">the ratios</span>
+      <span class="tagpill">stages</span>
+      <span class="tagpill">covered</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The three numbers</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">always use executionStats</span><button class="copy">Copy</button></div>
+<pre><code>db.orders.find({ status: "paid" }).sort({ placedAt: -1 })
+         .explain("executionStats");
+
+//   "queryPlanner"        the chosen plan only. No numbers. Nearly useless
+//   "executionStats"      RUNS the query and reports actuals   <- this one
+//   "allPlansExecution"   plus what the rejected candidates did
+
+// The numbers to read, in the executionStats block:
+{
+  nReturned:              20,      // documents the query produced
+  totalKeysExamined:      20,      // index entries read
+  totalDocsExamined:      20,      // documents fetched from disk or cache
+  executionTimeMillis:    2,
+  executionSuccess:       true
+}
+
+// An ideal query has all three EQUAL. Every index entry read led to a
+// document, and every document was returned. Nothing was read and discarded.
+//
+// Note that explain("executionStats") actually executes the query — safe for
+// a find, and worth thinking about for an update or a delete, where explain
+// does NOT apply the write but does do the work of finding the documents.</code></pre>
+</div>
+
+<div class="demo" id="exp">
+  <div class="demo-head">
+    <b>Diagnosing from the ratios</b>
+    <span>Six realistic outputs. The two ratios identify the problem before you read the stage tree.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="x-case">Scenario</label>
+        <select id="x-case">
+          <option value="ideal" selected>Healthy</option>
+          <option value="covered">Covered query</option>
+          <option value="scan">No index at all</option>
+          <option value="wrongorder">Index exists, wrong field order</option>
+          <option value="unselective">Index used, poor selectivity</option>
+          <option value="sortmem">In-memory sort</option>
+          <option value="multikey">Multikey over-fetch</option>
+        </select>
+      </div>
+    </div>
+    <div id="x-nums"></div>
+    <div class="stat">
+      <div><b id="x-r1">—</b><span>keys ÷ returned</span></div>
+      <div><b id="x-r2">—</b><span>docs ÷ returned</span></div>
+      <div><b id="x-dx">—</b><span>diagnosis</span></div>
+    </div>
+    <div id="x-tree"></div>
+    <div class="out" id="x-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Two ratios, and each points at a different fix</span>
+  <p><b>keysExamined ÷ nReturned</b> measures how well the index narrows things down. Above about 1 means the index is being scanned and filtered — the fields are wrong, or in the wrong order. <b>docsExamined ÷ nReturned</b> measures how much of the filtering happened <em>after</em> fetching documents. Above 1 means MongoDB read documents only to discard them, which is the expensive kind of wrong. Both at 1 is ideal; <code>docsExamined: 0</code> is better still and means the query was covered.</p>
+</div>
+
+<h2><span class="h-rule"></span>The stage tree</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">read it inside out — children run first</span><button class="copy">Copy</button></div>
+<pre><code>LIMIT
+  └── SORT                      ← a SORT stage means an in-memory sort
+        └── FETCH               ← reading documents
+              └── IXSCAN        ← reading the index
+
+The stages you will see:
+
+  COLLSCAN          reading every document. Fine on a tiny collection,
+                    a bug on a large one
+  IXSCAN            reading an index. Look at indexBounds to see how much
+  FETCH             getting the document for an index entry. Its
+                    "filter" field shows conditions applied AFTER the fetch
+  SORT              an in-memory sort. 32 MB ceiling. Usually fixable with
+                    an index (chapter 7's ESR)
+  SORT_KEY_GENERATOR  always accompanies SORT
+  LIMIT / SKIP      as expected
+  PROJECTION_COVERED  the good one — answered from the index alone
+  PROJECTION_SIMPLE / PROJECTION_DEFAULT  ordinary projections
+  OR / SORT_MERGE   an $or served by several indexes
+  AND_SORTED / AND_HASH   index intersection. Rarer than people expect
+  SUBPLAN           an $or where each branch is planned separately
+  EOF               the query provably matches nothing
+
+The single most useful habit: find the FETCH stage and read its "filter".
+Anything listed there is a condition that could not be answered by the index
+and required the document. That is your index gap, named explicitly.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Covered queries</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">totalDocsExamined: 0</span><button class="copy">Copy</button></div>
+<pre><code>db.orders.createIndex({ status: 1, placedAt: -1, reference: 1 });
+
+db.orders.find(
+  { status: "paid" },
+  { reference: 1, placedAt: 1, _id: 0 }      // _id: 0 is REQUIRED
+).sort({ placedAt: -1 });
+
+//   totalDocsExamined: 0
+//   stage: PROJECTION_COVERED
+
+// Every field the query needs — filter, sort and projection — is in the
+// index, so MongoDB never touches a document. On a collection larger than
+// memory this is the difference between an index page read and a random
+// disk seek per result.
+
+// The conditions:
+//   * every filter field is in the index
+//   * every projected field is in the index
+//   * _id is explicitly excluded, unless _id is in the index
+//   * the index is NOT multikey — an array index has one entry per element
+//     and cannot reconstruct the original array
+//   * on a sharded collection, the shard key fields must also be present
+
+// The trade is index size: adding a field purely to cover a query makes
+// every write to that field maintain a larger index. Worth it for a query
+// running hundreds of times a second on a collection that does not fit in
+// memory; not worth it otherwise.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Plan selection</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">MongoDB races the candidates, then caches the winner</span><button class="copy">Copy</button></div>
+<pre><code>// There is no cost model like PostgreSQL's. When several indexes could serve
+// a query, MongoDB runs each candidate for a short trial period and picks
+// whichever produces results fastest. The winning plan is then CACHED for
+// that query shape.
+
+db.orders.explain("allPlansExecution").find({ … });
+//   rejectedPlans, each with its own executionStats — genuinely useful for
+//   seeing why the index you expected was not chosen
+
+db.orders.getPlanCache().list();
+db.orders.getPlanCache().clear();      // after adding an index, or when
+                                       // diagnosing a bad cached plan
+
+// The cache is keyed by query SHAPE — the fields and operators, not the
+// values. So { status: "paid" } and { status: "cancelled" } share a plan.
+// If one value is 90% of the collection and another is 0.01%, the cached
+// plan may suit one and not the other. This is parameter sniffing under a
+// different name, and the symptom is a query that is fast for most inputs
+// and inexplicably slow for a few.
+
+// The cache is cleared automatically by: index changes, a restart, enough
+// writes to the collection, or the plan performing much worse than at
+// trial time.
+
+// Force an index, for diagnosis only:
+db.orders.find({ … }).hint({ status: 1, placedAt: -1 });
+// A permanent hint freezes a decision that should adapt as data changes.
+// Same argument as the PostgreSQL unit's chapter 7.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">A fast query on a small collection tells you nothing</span>
+  <p><code>COLLSCAN</code> on ten thousand documents takes a few milliseconds, so a missing index is invisible in development and in most test suites. The scan grows linearly and the indexed alternative barely grows at all, so the query that was fine at ten thousand documents is a serious problem at ten million — and it degrades gradually rather than breaking, which is why it is usually found by a user rather than by a test. <b>Read <code>explain</code> against production-scale data</b>, or at minimum treat any <code>COLLSCAN</code> on a collection that will grow as a defect regardless of how fast it currently runs.</p>
+</div>
+
+<h2><span class="h-rule"></span>Explaining an aggregation</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">what got rewritten, and where the index stopped helping</span><button class="copy">Copy</button></div>
+<pre><code>db.orders.explain("executionStats").aggregate([ … ]);
+
+// The output shows the pipeline AS EXECUTED, which is not always what you
+// wrote — the optimiser moves some $match stages earlier, merges adjacent
+// $sort and $limit into a top-N, and pushes some $project stages down.
+// Comparing your pipeline to the executed one is the fastest way to see
+// whether the optimisation you were relying on actually happened.
+
+// What to look for:
+//   * the FIRST stage should be an IXSCAN, not a COLLSCAN
+//   * "$cursor" holds the initial find, with its own executionStats
+//   * a $lookup shows the plan used for EACH lookup — if it says COLLSCAN,
+//     the foreign field is unindexed and you are doing one collection scan
+//     per input document
+//   * "usedDisk": true on a blocking stage means it exceeded 100 MB and
+//     spilled — since 6.0 that happens silently instead of erroring
+
+// Slow queries are also logged automatically, with these numbers attached:
+db.setProfilingLevel(1, { slowms: 100 });
+db.system.profile.find().sort({ ts: -1 }).limit(10);
+
+//   level 0  off (the default; slow ops above 100ms still go to the log)
+//   level 1  log operations slower than slowms
+//   level 2  log EVERYTHING — for a short diagnostic window only
+//
+// The profiler writes to a capped collection in the same database, so it
+// costs write throughput. Use level 1 with a sensible threshold, or read
+// the ordinary log, which contains the same fields.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>A method</h2>
+
+<div class="flow stack">
+  <div class="step"><b>1 · <code>explain("executionStats")</code></b><span>Never <code>queryPlanner</code> alone — it has no numbers</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Read the three numbers first</b><span>Returned, keys, docs. The ratios name the problem</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Find the FETCH stage's filter</b><span>Those conditions are your index gap, listed explicitly</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Look for a SORT stage</b><span>If present, the index does not supply the order. Apply ESR</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Design the index from the query</b><span>Equality, sort, range — chapter 7</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>6 · Re-explain and compare the numbers</b><span>The ratios should approach 1</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>7 · Check the other queries on that collection</b><span>A new index changes plan selection for all of them</span></div>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Read the numbers before the tree</span>
+  <p>The stage tree is where attention naturally goes and it is the second thing to look at. The three numbers tell you <em>whether</em> there is a problem and <em>which kind</em> in about five seconds; the tree tells you where. Reversing the order means reading a plan carefully to discover it was fine, or getting absorbed in stage names when <code>docsExamined: 2,400,000</code> and <code>nReturned: 12</code> had already said everything. Numbers first, then the tree, then the fix.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Always <code>explain("executionStats")</code></b>. <code>queryPlanner</code> has no actuals.</li>
+    <li>Three numbers: <b>nReturned, totalKeysExamined, totalDocsExamined</b>. Equal is ideal.</li>
+    <li><b>keys ÷ returned above 1</b> means the index is wrong or wrongly ordered.</li>
+    <li><b>docs ÷ returned above 1</b> means filtering happened after fetching — the expensive kind.</li>
+    <li><b><code>docsExamined: 0</code> is a covered query.</b> It needs <code>_id: 0</code> and a non-multikey index.</li>
+    <li><b>The FETCH stage's <code>filter</code> names your index gap</b> explicitly.</li>
+    <li>Plans are <b>cached by query shape, not by value</b> — so one shape can be fast for most inputs and slow for a few.</li>
+    <li><b>A fast query on a small collection tells you nothing.</b> Treat <code>COLLSCAN</code> on a growing collection as a defect.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("08-explain.html");
+
+(function(){
+  const root = document.getElementById("exp");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const C = {
+    ideal: {ret:20, keys:20, docs:20, ms:1,
+      tree:["LIMIT","  FETCH","    IXSCAN  { status: 1, placedAt: -1 }"],
+      dx:"healthy",
+      note:"All three numbers equal. Every index entry read led to a document, every document fetched was returned, nothing was read and discarded.\n\nThe index supplies both the filter and the sort order, so there is no SORT stage — MongoDB walks the index in order and stops after 20 entries. This is what ESR produces (chapter 7).\n\nThere is nothing to improve here except covering the query, which is the next option in the dropdown."},
+    covered: {ret:20, keys:20, docs:0, ms:0,
+      tree:["LIMIT","  PROJECTION_COVERED","    IXSCAN  { status: 1, placedAt: -1, reference: 1 }"],
+      dx:"covered — optimal",
+      note:"totalDocsExamined: 0. The query never touched a document at all — every field it needed was in the index, so it was answered from index pages alone.\n\nOn a collection that fits in memory this is a modest improvement. On one that does not, it is dramatic: an index is far smaller than the documents it points at, so it is far more likely to be cached, and you avoid a random read per result.\n\nThe requirements are exacting. Every filter and projected field must be in the index, _id must be explicitly excluded, and the index must not be multikey — an array index has one entry per element and cannot reconstruct the array.\n\nThe cost is index size, and therefore write cost. Worth it for a very hot query on a large collection; not worth adding a field to an index just because you can."},
+    scan: {ret:12, keys:0, docs:2400000, ms:1840,
+      tree:["LIMIT","  SORT   memUsage: 28.1 MB","    COLLSCAN  filter: { status: 'paid', total: { $gt: 100 } }"],
+      dx:"no index",
+      note:"keysExamined is 0 — no index was used at all. COLLSCAN read 2.4 million documents, applied the filter to each, and returned 12.\n\nThe docs-to-returned ratio is 200,000:1. Every one of those documents was fetched from cache or disk and immediately discarded.\n\nNote the SORT above it, using 28 MB. That is close to the 32 MB ceiling, so this query is not just slow — it is about to start failing outright as the collection grows.\n\nThe fix is one index following ESR: equality on status, then the sort field, then the range on total. Both problems go away together, which is typical."},
+    wrongorder: {ret:20, keys:184000, docs:184000, ms:410,
+      tree:["LIMIT","  SORT   memUsage: 19.4 MB","    FETCH","      IXSCAN  { status: 1, total: 1, placedAt: -1 }"],
+      dx:"wrong field order",
+      note:"An index WAS used, and it examined 184,000 keys to return 20. That ratio is the signature of a compound index with its fields in the wrong order.\n\nThe index is { status, total, placedAt } — equality, RANGE, sort. Because total is a range, the index entries matching it span a wide section, and placedAt is only ordered within each individual total value. So the sort order is not available from the index and MongoDB fetches every candidate and sorts in memory.\n\nReorder to { status, placedAt, total } — equality, SORT, range — and the same query examines 20 keys with no SORT stage.\n\nThis is the case the ESR rule exists for, and it is invisible without explain: the query uses an index, the plan looks reasonable, and it is doing 9,000 times more work than it needs to."},
+    unselective: {ret:8400, keys:412000, docs:412000, ms:920,
+      tree:["FETCH  filter: { region: 'eu', total: { $gt: 100 } }","  IXSCAN  { status: 1 }"],
+      dx:"index too broad",
+      note:"The index on status alone matched 412,000 documents — \"paid\" is most of the collection — and the remaining conditions were applied after fetching each one.\n\nRead the FETCH stage's filter. Those two conditions, region and total, are exactly what is missing from the index. That filter line is the single most useful thing in explain output: it names your index gap rather than making you infer it.\n\nA compound index on { status: 1, region: 1, total: 1 } moves both conditions into the index scan, and the numbers collapse.\n\nWorth noting the general principle: an index on a low-cardinality field alone is rarely useful. If a value covers a third of the collection, an index that finds those documents has not narrowed much."},
+    sortmem: {ret:50, keys:50, docs:50, ms:6100,
+      tree:["LIMIT","  SORT   memUsage: 33.2 MB   ✗ QueryExceededMemoryLimit","    FETCH","      IXSCAN  { customerId: 1 }"],
+      dx:"sort exceeded 32 MB",
+      note:"The filter is well indexed — 50 keys, 50 docs, 50 returned — and the query fails anyway.\n\nThe sort is not served by the index, so MongoDB buffers matching documents to sort them, and blocking sorts are capped at 32 MB. Past it the query errors rather than degrading.\n\nThe failure mode is the awkward part: this works fine until a particular customer accumulates enough orders, then that one customer's page breaks while everyone else's is fine. It is data-dependent and arrives without warning.\n\nTwo fixes, and only one is right. Extend the index to supply the sort — { customerId: 1, placedAt: -1 } — and there is no SORT stage at all. Or pass allowDiskUse, which makes it work by spilling to disk and is much slower. Use the index."},
+    multikey: {ret:120, keys:96000, docs:96000, ms:280,
+      tree:["FETCH  filter: { items: { $elemMatch: { sku: 'MUG', qty: { $gte: 2 } } } }","  IXSCAN  { 'items.sku': 1 }   isMultiKey: true"],
+      dx:"multikey over-fetch",
+      note:"A multikey index on items.sku found every document containing that sku — 96,000 of them — and the qty condition was applied after fetching each document.\n\nTwo things are happening. The index has one entry per array element, so a document with ten items produces ten entries, and the same document can be examined more than once. And $elemMatch semantics cannot be fully resolved from the index: it can find documents where SOME element has the sku, but confirming that the SAME element also satisfies the qty condition requires the document (chapter 4).\n\nA compound multikey index on { 'items.sku': 1, 'items.qty': 1 } helps, and note it does not eliminate the fetch — MongoDB still verifies that one element satisfies both, because index entries for the two fields may come from different elements.\n\nAlso note isMultiKey: true rules out a covered query entirely, whatever the projection."}
+  };
+
+  function fmt(n){ return n.toLocaleString(); }
+
+  function render(){
+    const c = C[$("x-case").value];
+    const r1 = c.ret ? c.keys / c.ret : 0;
+    const r2 = c.ret ? c.docs / c.ret : 0;
+
+    const rows = [
+      ["nReturned", c.ret, "#25B7C4"],
+      ["totalKeysExamined", c.keys, r1 > 3 ? "#E2574C" : r1 > 1.2 ? "#F2A03D" : "#3FB984"],
+      ["totalDocsExamined", c.docs, c.docs === 0 ? "#3FB984" : r2 > 3 ? "#E2574C" : r2 > 1.2 ? "#F2A03D" : "#3FB984"],
+      ["executionTimeMillis", c.ms, c.ms > 500 ? "#E2574C" : c.ms > 100 ? "#F2A03D" : "#3FB984"]
+    ];
+    $("x-nums").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:16px 0 8px">' +
+      'executionStats</div>' +
+      '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px">' +
+      rows.map(([k, v, col]) =>
+        '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid ' + col +
+        ';border-radius:4px;padding:9px 12px">' +
+        '<div style="font-family:var(--mono);font-size:10.5px;color:#8FA0AF">' + k + '</div>' +
+        '<div style="font-family:var(--mono);font-size:17px;font-weight:700;color:' + col + ';margin-top:2px">' +
+        fmt(v) + '</div></div>').join("") + '</div>';
+
+    $("x-r1").textContent = r1 === 0 ? "0" : r1.toFixed(r1 < 10 ? 1 : 0) + "×";
+    $("x-r2").textContent = c.docs === 0 ? "0 — covered" : r2.toFixed(r2 < 10 ? 1 : 0) + "×";
+    $("x-dx").textContent = c.dx;
+
+    $("x-tree").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      'Stage tree — children run first</div>' +
+      '<pre style="background:#0C1D30;color:#CFE0EC;border-radius:5px;padding:11px 13px;margin:0 0 12px;' +
+      'font-family:var(--mono);font-size:12px;line-height:1.75;overflow-x:auto">' +
+      c.tree.map(l => {
+        const e = l.replace(/[<>&]/g, ch => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[ch]));
+        if(l.includes("COLLSCAN") || l.includes("✗"))
+          return '<span style="color:#FF9A8F">' + e + '</span>';
+        if(l.includes("SORT ") && l.includes("memUsage"))
+          return '<span style="color:#FFC46B">' + e + '</span>';
+        if(l.includes("COVERED"))
+          return '<span style="color:#7EE0AE">' + e + '</span>';
+        if(l.includes("filter:"))
+          return '<span style="color:#FFC46B">' + e + '</span>';
+        return e;
+      }).join("\n") + '</pre>';
+
+    let note = c.note;
+    if(r1 > 1.2 || r2 > 1.2)
+      note += "\n\nThe two ratios point at different fixes: keys ÷ returned is about the index fields and their order, docs ÷ returned is about how much filtering happened after fetching. Read both before touching anything.";
+    $("x-note").textContent = note;
+  }
+
+  $("x-case").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Reasoning and planning patterns — AI Agents</title>
+<meta name="description" content="ReAct, chain of thought, plan-and-execute, replanning, tree of thought, DAG agents and reflection — assessed by what each actually costs.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 09 · Architectures</div>
+    <h1>Reasoning and planning patterns</h1>
+    <p class="standfirst">Every named pattern in this chapter is a different answer to one question: how much should the agent think before it acts, and how much should it commit to in advance? The answers differ mainly in what they cost, which is how they should be chosen.</p>
+    <div class="chap-meta">
+      <span class="tagpill">react</span>
+      <span class="tagpill">plan-execute</span>
+      <span class="tagpill">replanning</span>
+      <span class="tagpill">tree search</span>
+      <span class="tagpill">reflection</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The spectrum</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Pattern</th><th>Commits to</th><th>Adapts</th><th>Extra calls</th></tr></thead>
+<tbody>
+<tr><td><b>ReAct</b> — reason and act</td><td>One step at a time</td><td>Continuously</td><td>None</td></tr>
+<tr><td><b>Plan and execute</b></td><td>The whole plan, up front</td><td>Not at all</td><td>+1</td></tr>
+<tr><td><b>Plan, execute, replan</b></td><td>The next few steps</td><td>At checkpoints</td><td>+1 per replan</td></tr>
+<tr><td><b>Decomposition</b></td><td>A set of subtasks</td><td>Within each subtask</td><td>+1, plus a run per subtask</td></tr>
+<tr><td><b>Tree of thought</b></td><td>Nothing — explores branches</td><td>By backtracking</td><td>×3 to ×10</td></tr>
+<tr><td><b>Reflection</b></td><td>An answer, then revises it</td><td>Once, after the fact</td><td>+2 per round</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">Most production agents should be ReAct with a first-step plan</span>
+  <p>That is the honest summary of this chapter. Ask the model to sketch an approach on step one — it improves the whole trajectory and gives you something to show the user and to log — then let it proceed one step at a time, adapting. The elaborate patterns below earn their cost in specific, recognisable situations, and are a liability outside them.</p>
+</div>
+
+<h2><span class="h-rule"></span>ReAct</h2>
+
+<p>Interleave reasoning with action. The model states what it is thinking, calls a tool, reads the result, thinks again. Native tool calling does this implicitly; making the reasoning explicit still helps on hard tasks and helps enormously when reading traces.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">encouraging explicit reasoning without a special format</span><button class="copy">Copy</button></div>
+<pre><code># Modern models emit reasoning alongside tool calls if you ask for it in the
+# system prompt. You rarely need the classic Thought/Action/Observation parser.
+
+SYSTEM += """
+Before each tool call, state in one sentence what you are trying to establish
+and why this tool answers it. If a result surprises you, say so and explain how
+it changes your approach.
+"""
+
+# The value is threefold:
+#   1. quality - a stated intention constrains the choice that follows
+#   2. debugging - traces become readable, and wrong turns become explicable
+#   3. UX - the sentence is what you stream to the user as progress
+#
+# The cost is ~40 output tokens per step. On a 10-step run at workhorse pricing
+# that is well under a cent, and it is the best value in this chapter.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Planning up front</h2>
+
+<p>A plan written before any action is coherent, inspectable and easy to approve. It is also written in ignorance of everything the tools are about to reveal — which is why pure plan-and-execute fails in exactly the situations that justified using an agent.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">plan.py — plan, execute, and replan when reality diverges</span><button class="copy">Copy</button></div>
+<pre><code>class Plan(BaseModel):
+    goal_restated: str
+    steps: list[str] = Field(max_length=8, description="Each step one action")
+    unknowns: list[str] = Field(description="What you do not yet know that could change this")
+    done_when: str = Field(description="Objective, checkable completion criterion")
+
+PLAN_PROMPT = """Plan how to accomplish this task with the tools available.
+Do not call any tools yet.
+
+Task: {goal}
+Tools: {tool_summaries}
+
+Keep it to the fewest steps that would actually work. List what you do not know
+that might invalidate the plan. State a completion criterion someone else could
+check."""
+
+def run_planned(goal, ctx, tools, budget):
+    plan = structured_call(Plan, PLAN_PROMPT.format(...))
+    emit_progress(plan)                             # show it; log it; maybe approve it
+
+    messages = base_messages(goal, plan)
+    for n in range(budget.max_steps):
+        reply = step(messages, tools)
+        ...
+        # Replan when the world disagrees with the plan, not on a timer.
+        if diverged(reply, plan):
+            plan = structured_call(Plan, REPLAN_PROMPT.format(
+                original=plan, learned=recent_findings(messages)))
+            messages.append({"role": "user",
+                             "content": f"Revised plan:\n{render(plan)}"})
+
+def diverged(reply, plan) -> bool:
+    return (reply.tool_error                        # a step failed
+            or reply.mentions_surprise              # the model said so
+            or reply.tool not in expected_tools(plan))   # it went off-plan</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">The plan is worth having even when you ignore it</span>
+  <p>Even in a pure ReAct agent, generating a plan on step one pays for itself. It gives the user visible structure instead of a spinner, it gives you a diff when a run goes wrong ("it planned four steps and took eleven — why?"), and it creates a natural human approval point before anything executes. Treat it as an artefact of the run rather than a schedule the agent must follow.</p>
+</div>
+
+<h2><span class="h-rule"></span>Search: tree of thought and its relatives</h2>
+
+<p>Instead of committing to one line of reasoning, generate several, evaluate them, and pursue the best — backtracking when a branch fails. Genuinely powerful for problems with a large solution space and a cheap way to score a candidate.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Requirement</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><b>A scoring function</b></td><td>Without one, "evaluate the branches" is another model call with no ground truth, and the search wanders. Tests passing, a constraint satisfied, a numeric objective — something real</td></tr>
+<tr><td><b>Cheap, reversible steps</b></td><td>You cannot backtrack a sent email or an issued refund. Search is for exploration, not for actions with side effects</td></tr>
+<tr><td><b>A large branching factor that matters</b></td><td>If there are two plausible approaches, just try one. Search pays when there are many and most are wrong</td></tr>
+<tr><td><b>Budget for 3–10× the cost</b></td><td>This is the honest multiplier. Decide whether the problem is worth it before building it</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="demo" id="pat">
+  <div class="demo-head">
+    <b>Pattern cost and fit</b>
+    <span>The same task under different patterns. Success estimates are illustrative; the cost ratios are the point.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="p-task">Task shape</label>
+        <select id="p-task">
+          <option value="lookup">Lookup chain — 4 dependent steps, one right answer</option>
+          <option value="investigate" selected>Investigation — path depends on findings</option>
+          <option value="search">Solution search — many candidates, verifier available</option>
+          <option value="write">Draft and refine — quality is subjective</option>
+        </select>
+      </div>
+      <div>
+        <label for="p-verify">Objective verifier available?</label>
+        <select id="p-verify">
+          <option value="yes">Yes — tests, schema, constraint check</option>
+          <option value="no" selected>No — a human judges it</option>
+        </select>
+      </div>
+    </div>
+    <div id="p-out"></div>
+    <div class="out" id="p-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>DAG agents</h2>
+
+<p>Some tasks decompose into subtasks with a known dependency structure: three lookups that are independent, then a synthesis that needs all three. Expressing that as a directed graph rather than a linear loop gets you parallelism for free and makes the structure testable.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">a graph where the shape is known, agents where it is not</span><button class="copy">Copy</button></div>
+<pre><code>import asyncio
+
+async def billing_investigation(order_ref: str, ctx) -> Report:
+    # Level 1 - independent, run concurrently. No agent needed: the steps are known.
+    order, payments, policy = await asyncio.gather(
+        get_order(order_ref, ctx),
+        list_payments(order_ref, ctx),
+        search_policy("duplicate charge refund", ctx),
+    )
+
+    # Level 2 - depends on level 1, and here the path genuinely varies.
+    if looks_anomalous(payments):
+        finding = await run_agent(
+            goal=f"Determine why order {order_ref} has {len(payments)} captures "
+                 f"and what remedy the policy requires.",
+            ctx=ctx.with_facts(order=order, payments=payments, policy=policy),
+            budget=Budget(max_steps=6))
+    else:
+        finding = Finding.no_anomaly(order, payments)
+
+    return compose_report(order, payments, policy, finding)
+
+# The lesson: use a graph for the parts whose shape you know, and an agent only
+# for the parts whose shape you do not. Most real tasks are mostly known shape
+# with one genuinely uncertain region in the middle.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Reflection</h2>
+
+<p>Produce an answer, critique it, revise. Real gains on writing and code; roughly doubles cost, and the second round of critique adds almost nothing over the first.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">reflect.py — one round, with concrete criteria</span><button class="copy">Copy</button></div>
+<pre><code>CRITIQUE = """Review this draft against the criteria. For each, decide pass or fail
+and quote the specific text that fails. Do not rewrite it.
+
+<task>{goal}</task>
+<draft>{draft}</draft>
+
+Criteria:
+{criteria}
+
+If everything passes, say PASS and nothing else."""
+
+def with_reflection(goal: str, criteria: list[str], ctx) -> str:
+    draft = generate(goal, ctx)
+
+    critique = model.complete(CRITIQUE.format(goal=goal, draft=draft,
+                                              criteria=bullet(criteria)),
+                              temperature=0).text
+    if critique.strip().startswith("PASS"):
+        return draft                                  # ~40% of the time, in practice
+
+    return model.complete(
+        f"Revise the draft to address every point raised. Change only what the "
+        f"critique identifies.\n\n<draft>{draft}</draft>\n<critique>{critique}</critique>",
+        temperature=0).text
+
+# Two things make this work rather than produce circular self-congratulation:
+#   - explicit criteria, so the critique has something to check against
+#   - the critique must quote failing text, so it cannot be vague approval
+# Without both, a model asked to critique its own output mostly says it is good.</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Self-critique without criteria is theatre</span>
+  <p>"Review your answer and improve it" produces a longer answer, not a better one. Models are poor at spotting their own factual errors and good at adding qualifications, so unguided reflection reliably increases length and confidence while leaving mistakes in place. The version that works has named criteria, demands quoted evidence for each failure, and permits a clean PASS. If you cannot write the criteria, reflection is not the tool you need.</p>
+</div>
+
+<h2><span class="h-rule"></span>Choosing</h2>
+
+<div class="flow stack">
+  <div class="step"><b>Can you enumerate the steps?</b><span>Yes → write a chain or a DAG. Not an agent at all</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Does the path depend on findings?</b><span>Yes → ReAct with a first-step plan. This is the default and covers most cases</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Are there many candidate solutions and a real verifier?</b><span>Yes → search, and budget 3–10× the cost</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Is quality subjective and improvable by critique?</b><span>Yes → one round of reflection against written criteria</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Are there independent subtasks producing a lot of noise?</b><span>Yes → decompose into isolated sub-runs (chapter 10)</span></div>
+</div>
+
+<ul class="check">
+  <li><b>Add one pattern at a time and measure.</b> Teams routinely stack planning, reflection and search, then cannot say which helped. Chapter 13 is the measurement.</li>
+  <li><b>Count the multiplier before building.</b> A pattern that triples cost needs to triple something you care about.</li>
+  <li><b>Patterns do not fix bad tools.</b> If the agent picks wrong tools, more reasoning produces better-argued wrong choices. Fix chapter 4 first.</li>
+  <li><b>Log the plan and the critique</b> as first-class trace events. They are the most readable explanation of why a run went the way it did.</li>
+  <li><b>Prefer structure you wrote</b> over structure the model improvises. A DAG you can test beats an agent that usually gets the order right.</li>
+</ul>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Every pattern answers one question: <b>how much to think before acting, and how much to commit to</b>.</li>
+    <li>The default that fits most production agents is <b>ReAct with a plan generated on step one</b>.</li>
+    <li>Explicit reasoning costs about forty tokens a step and pays back in <b>quality, readable traces and streamable progress</b>.</li>
+    <li>A plan written before any tool call is <b>ignorant by construction</b>. Replan when reality diverges, not on a timer.</li>
+    <li>Search needs <b>a real scoring function and reversible steps</b>, and costs 3–10×. Without both, it wanders expensively.</li>
+    <li>Use a <b>DAG for the parts whose shape you know</b>, and an agent only for the uncertain region.</li>
+    <li>Reflection works with <b>named criteria and quoted evidence</b>; without them it makes answers longer, not better.</li>
+    <li><b>Add one pattern at a time and measure.</b> Patterns cannot compensate for badly described tools.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("09-reasoning.html");
+
+(function(){
+  const root = document.getElementById("pat");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const PATTERNS = [
+    {k:"react",   n:"ReAct (with step-1 plan)", mult:1.1},
+    {k:"plan",    n:"Plan and execute",          mult:1.2},
+    {k:"replan",  n:"Plan, execute, replan",     mult:1.5},
+    {k:"tot",     n:"Tree of thought",           mult:5.0},
+    {k:"reflect", n:"ReAct + one reflection",    mult:2.1},
+    {k:"dag",     n:"DAG + agent for the gap",   mult:0.7}
+  ];
+
+  // Illustrative fit by task shape and verifier availability.
+  const FIT = {
+    lookup:      {react:0.90, plan:0.92, replan:0.92, tot:0.92, reflect:0.90, dag:0.96},
+    investigate: {react:0.84, plan:0.62, replan:0.86, tot:0.87, reflect:0.85, dag:0.80},
+    search:      {react:0.55, plan:0.48, replan:0.62, tot:0.86, reflect:0.60, dag:0.52},
+    write:       {react:0.68, plan:0.70, replan:0.71, tot:0.74, reflect:0.84, dag:0.62}
+  };
+
+  function render(){
+    const task = $("p-task").value;
+    const verifier = $("p-verify").value === "yes";
+    const base = FIT[task];
+
+    const rows = PATTERNS.map(p => {
+      let success = base[p.k];
+      // Search and reflection lean heavily on having something objective to check against.
+      if(!verifier && p.k === "tot")     success -= 0.22;
+      if(!verifier && p.k === "reflect") success -= 0.08;
+      if(verifier && p.k === "tot")      success += 0.03;
+      success = Math.max(0.2, Math.min(0.97, success));
+      const cost = 0.042 * p.mult;
+      return {p, success, cost, per: cost / success};
+    });
+
+    const best = rows.reduce((a, b) => a.per < b.per ? a : b);
+    const maxPer = Math.max.apply(null, rows.map(r => r.per));
+
+    $("p-out").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">Cost per successful task</div>' +
+      rows.map(r =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px' +
+        (r === best ? ';font-weight:600' : '') + '">' +
+        '<span style="min-width:186px;font-size:13px">' + r.p.n + (r === best ? ' ★' : '') + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + (r.per/maxPer*100).toFixed(0) +
+        '%' + (r === best ? ';background:#3FB984' : '') + '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:118px;text-align:right">$' +
+        r.per.toFixed(3) + ' · ' + Math.round(r.success*100) + '%</span></div>').join("");
+
+    const notes = [];
+    notes.push("Best cost-per-success here: " + best.p.n + " at $" + best.per.toFixed(3) +
+               " (" + Math.round(best.success*100) + "% success, " + best.p.mult.toFixed(1) + "× base cost).");
+
+    if(task === "lookup")
+      notes.push("Four dependent steps with one right answer is not really an agent problem. A DAG or a plain chain wins because the shape is known — " +
+                 "you get parallelism where steps are independent, and every stage is separately testable. Reaching for an agent here adds latency and removes determinism for nothing.");
+    if(task === "investigate")
+      notes.push("Investigation is the case agents exist for. Pure plan-and-execute does badly because the plan is written before the first lookup reveals anything. " +
+                 "Replanning recovers most of that, and ReAct with a step-one plan gets close for less.");
+    if(task === "search" && verifier)
+      notes.push("Many candidates plus a real verifier is the one situation where tree search clearly earns its 5× cost — it can try, score, discard and backtrack. " +
+                 "Note it only works because steps are reversible: you cannot backtrack a sent email.");
+    if(task === "search" && !verifier)
+      notes.push("Search without a verifier is expensive wandering. \"Evaluate the branches\" becomes another model call with no ground truth, " +
+                 "so you pay 5× to explore and still cannot tell which branch was better. Build the verifier first, or do not search.");
+    if(task === "write")
+      notes.push("Subjective quality is reflection's home ground — but only with named criteria and quoted evidence. " +
+                 "Unguided self-critique makes drafts longer and more hedged, not better.");
+    if(!verifier)
+      notes.push("With no objective verifier, every pattern is working blind and the differences between them shrink. " +
+                 "Building a checkable criterion — even a crude one — usually beats choosing a cleverer pattern.");
+
+    notes.push("Success figures here are illustrative. The cost multipliers are not: those follow directly from how many model calls each pattern makes, and they are the part to budget for.");
+    $("p-note").textContent = notes.join("\n\n");
+  }
+
+  ["p-task","p-verify"].forEach(id => $(id).addEventListener("change", render));
+  render();
+})();
+</script>
+</body>
+</html>

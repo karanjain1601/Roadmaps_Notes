@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Servers, proxies and concurrency — Backend Notes</title>
+<meta name="description" content="What a reverse proxy is for, three concurrency models under load, Little's Law, and sizing a connection pool with real queueing maths.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%233FB984' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/notes.css">
+</head>
+<body>
+<div class="readbar"></div>
+
+<header class="top">
+  <div class="top-inner">
+    <a class="home" href="../../index.html"><span class="mark"></span>All roadmaps</a>
+    <span class="top-sep">/</span>
+    <a class="home" href="index.html" style="color:var(--band-text)">Backend</a>
+    <span class="top-spacer"></span>
+    <button class="rail-toggle" aria-expanded="false">Contents</button>
+    <nav class="top-nav" aria-label="Chapter navigation"></nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail" id="rail" aria-label="Chapter and section navigation"></aside>
+
+  <article>
+    <p class="crumb">Part 2 · Serving requests &nbsp;·&nbsp; <b>Chapter 04</b></p>
+    <h1>Servers, proxies and concurrency</h1>
+    <p class="standfirst">Between the socket and your route handler sit two things that determine your capacity ceiling: a reverse proxy doing work your application should not, and a concurrency model deciding how many requests can be in flight at once. Most "we need more servers" conversations are actually about one of the numbers in this chapter.</p>
+    <div class="meta">
+      <span>~32 min read</span>
+      <span>Proxies · concurrency models · pools</span>
+      <span>2 interactive panels</span>
+      <span>Prerequisite: chapters 1–3</span>
+    </div>
+
+    <div class="body">
+
+      <h2><span class="h2n">4.1</span>What is listening</h2>
+
+      <p>A server binds a socket to a port and calls <code>accept()</code>. Every connection that arrives is a file descriptor the process must do something with, and the something is the concurrency model. Everything else in this chapter follows from that one decision.</p>
+
+      <p>In production there are almost always at least two processes in the path: a <b>reverse proxy</b> facing the internet and your <b>application</b> behind it. Occasionally they are the same thing, and it is nearly always a mistake — the proxy is optimised for many slow connections and your application is optimised for executing your code, and those are different problems.</p>
+
+      <h2><span class="h2n">4.2</span>The reverse proxy</h2>
+
+      <div class="tw">
+        <table>
+          <caption>What nginx, Envoy, Caddy or a cloud load balancer does for you</caption>
+          <thead><tr><th>Job</th><th>Why not in the application</th></tr></thead>
+          <tbody>
+            <tr><td><b>TLS termination</b></td><td>Certificate management in one place; the proxy is written in C and does it faster</td></tr>
+            <tr><td><b>Load balancing</b></td><td>Spreading across application processes, with health checks and ejection</td></tr>
+            <tr><td><b>Request buffering</b></td><td>The critical one. A slow client uploading over a mobile connection ties up a proxy connection, not an application worker</td></tr>
+            <tr><td><b>Static files</b></td><td><code>sendfile()</code> copies disk to socket in the kernel. Your framework cannot compete</td></tr>
+            <tr><td><b>Compression</b></td><td>CPU-intensive and completely generic</td></tr>
+            <tr><td><b>Rate limiting and connection limits</b></td><td>Cheapest to reject before any application work happens</td></tr>
+            <tr><td><b>Header manipulation</b></td><td>Adding <code>X-Forwarded-*</code>, stripping hop-by-hop headers, injecting a request id</td></tr>
+            <tr><td><b>Timeouts everywhere</b></td><td>A backstop independent of whatever your application forgot to configure</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <span class="lab">Buffering is the one that saves you</span>
+        <p>Without a buffering proxy, a client on a poor connection uploading a 5 MB file holds an application worker for the entire upload — thirty seconds of a worker doing nothing but receiving bytes. A hundred such clients exhausts a hundred-worker pool and the service is down, with the CPU idle. With buffering, the proxy absorbs the slow read into memory or disk and hands your application a complete request it can process in milliseconds. The same applies in reverse for slow readers. This is also the defence against <b>Slowloris</b>, the attack that consists entirely of being slow on purpose.</p>
+      </div>
+
+      <h2><span class="h2n">4.3</span>Three concurrency models</h2>
+
+      <p>Given a connection, the question is what resource handles it. There are three answers in wide use, and each has a characteristic shape under load.</p>
+
+      <div class="tw">
+        <table>
+          <caption>The models, honestly</caption>
+          <thead><tr><th></th><th>Thread or process per request</th><th>Event loop</th><th>Lightweight threads</th></tr></thead>
+          <tbody>
+            <tr><td>Examples</td><td>Classic Java, Rails/Puma, PHP-FPM, Python WSGI</td><td>Node.js, nginx, Python asyncio, Netty</td><td>Go, Erlang/Elixir, Java 21 virtual threads, Kotlin coroutines</td></tr>
+            <tr><td>Cost per concurrent request</td><td class="no">~1 MB stack, plus a scheduler slot</td><td class="yes">A few KB of heap</td><td class="yes">~2–8 KB, growable stack</td></tr>
+            <tr><td>Realistic concurrency ceiling</td><td class="no">Hundreds</td><td class="yes">Tens of thousands</td><td class="yes">Hundreds of thousands</td></tr>
+            <tr><td>Blocking I/O</td><td class="yes">Fine — the thread just parks</td><td class="no">Catastrophic — it stalls every other request</td><td class="yes">Fine — the runtime parks the lightweight thread</td></tr>
+            <tr><td>CPU-bound work</td><td class="yes">Fine, up to core count</td><td class="no">Blocks the loop; needs a worker pool</td><td class="yes">Fine — the runtime uses all cores</td></tr>
+            <tr><td>Mental model</td><td class="yes">Simplest. Sequential code, real stack traces</td><td class="no">Hardest. Async colouring, split stack traces</td><td class="yes">Sequential code with high concurrency</td></tr>
+            <tr><td>Fails by</td><td>Running out of threads while idle</td><td>One synchronous call freezing everything</td><td>Unbounded growth — nothing pushes back</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The decisive variable is <b>how much of a request is waiting</b>. From <a href="01-what-a-backend-does.html">Chapter 1</a>, a typical request spends 2% of its time computing and 98% waiting on the network and disk. A thread-per-request server holds a megabyte of stack and a scheduler slot for the whole 98%, which is why its ceiling is low. The other two models release the resource during the wait, which is the entire point of both.</p>
+
+      <div class="note trap">
+        <span class="lab">One blocking call in an event loop</span>
+        <p>An event loop is a single thread running a queue of callbacks. Any operation that does not yield — a synchronous file read, a CPU-heavy JSON parse of a large payload, a bcrypt hash, a regular expression that backtracks — occupies that thread and <b>every other in-flight request stops</b>. A 200 ms synchronous call in a server handling 500 requests a second delays roughly a hundred of them. The failure is not a crash; it is a latency graph with unexplained spikes, and the cause is invisible in the code because the offending line looks ordinary. Move CPU work to a worker pool, and treat any synchronous library call as a defect.</p>
+      </div>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Concurrency models under load</h4>
+          <p>The same workload through each model. Throughput is capped by whichever resource runs out first.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="cm-rps">Arrival rate <b><span id="cm-rpsv">600</span> req/s</b></label>
+              <input type="range" id="cm-rps" min="10" max="20000" step="10" value="600">
+            </div>
+            <div class="ctrl">
+              <label for="cm-cpu">CPU time per request <b><span id="cm-cpuv">4</span> ms</b></label>
+              <input type="range" id="cm-cpu" min="1" max="200" step="1" value="4">
+            </div>
+            <div class="ctrl">
+              <label for="cm-wait">Waiting time per request <b><span id="cm-waitv">80</span> ms</b></label>
+              <input type="range" id="cm-wait" min="0" max="2000" step="5" value="80">
+            </div>
+            <div class="ctrl">
+              <label for="cm-cores">CPU cores <b><span id="cm-coresv">4</span></b></label>
+              <input type="range" id="cm-cores" min="1" max="64" step="1" value="4">
+            </div>
+            <div class="ctrl">
+              <label for="cm-threads">Thread pool size <b><span id="cm-threadsv">200</span></b></label>
+              <input type="range" id="cm-threads" min="1" max="2000" step="1" value="200">
+            </div>
+            <div class="ctrl">
+              <label for="cm-block">Milliseconds of the CPU work that blocks the event loop <b><span id="cm-blockv">4</span></b></label>
+              <input type="range" id="cm-block" min="0" max="200" step="1" value="4">
+            </div>
+          </div>
+          <div class="bars" id="cm-bars"></div>
+          <div class="out">
+            <div class="stats" id="cm-stats"></div>
+            <p id="cm-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">4.4</span>Little's Law</h2>
+
+      <p>The most useful formula in capacity planning, and it is one line:</p>
+
+      <div class="codewrap">
+        <span class="lang">L = λ × W</span>
+        <pre><code>concurrency  =  arrival rate  ×  time in system
+
+600 req/s × 84 ms  =  50.4 requests in flight at any moment
+
+So you need at least 51 of whatever unit handles a request —
+threads, goroutines, pool slots. Fewer and a queue forms.
+
+It works in every direction:
+  · How many threads do I need?        L = λW
+  · What arrival rate can N threads take?   λ = L / W
+  · What latency does my concurrency imply? W = L / λ
+
+And it holds regardless of distribution, scheduling policy or
+what the system is doing internally. It is an identity, not a
+model — which is why it is worth memorising.</code></pre>
+      </div>
+
+      <p>Two applications worth having at hand. <b>Sizing:</b> if you know your traffic and your p50 latency, you know your required concurrency, and if your thread pool is smaller than that number you are queueing by construction. <b>Diagnosis:</b> if concurrency is pinned at exactly the pool size, the pool is the bottleneck; if it is well below and latency is still high, the bottleneck is downstream.</p>
+
+      <h2><span class="h2n">4.5</span>Connection pools</h2>
+
+      <p>Your application does not open a database connection per request — a connection costs a TCP handshake, TLS, authentication and server-side memory, several milliseconds and a few megabytes each. Instead a fixed set is opened at start and borrowed.</p>
+
+      <p>Which makes pool size a real decision, and the intuition is backwards. <b>A bigger pool is usually slower.</b> Each connection is a server-side process or thread doing work; past the point where the database's cores and disks are saturated, adding connections adds context switching and lock contention without adding throughput — while every client thinks it is making progress.</p>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Pool sizing, with the queueing maths</h4>
+          <p>An M/M/c queue — c servers, Poisson arrivals. The Erlang C formula gives the probability of waiting and the average wait.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="p-rps">Queries per second <b><span id="p-rpsv">2000</span></b></label>
+              <input type="range" id="p-rps" min="10" max="20000" step="10" value="2000">
+            </div>
+            <div class="ctrl">
+              <label for="p-svc">Mean query time <b><span id="p-svcv">12</span> ms</b></label>
+              <input type="range" id="p-svc" min="1" max="500" step="1" value="12">
+            </div>
+            <div class="ctrl">
+              <label for="p-size">Pool size <b><span id="p-sizev">8</span></b></label>
+              <input type="range" id="p-size" min="1" max="300" step="1" value="8">
+            </div>
+            <div class="ctrl">
+              <label for="p-inst">Application instances sharing the database <b><span id="p-instv">4</span></b></label>
+              <input type="range" id="p-inst" min="1" max="60" step="1" value="4">
+            </div>
+            <div class="ctrl">
+              <label for="p-max">Database max_connections <b><span id="p-maxv">100</span></b></label>
+              <input type="range" id="p-max" min="10" max="1000" step="10" value="100">
+            </div>
+          </div>
+          <div class="bars" id="p-bars"></div>
+          <div class="out">
+            <div class="stats" id="p-stats"></div>
+            <p id="p-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <div class="note good">
+        <span class="lab">The rule of thumb, and why it is so small</span>
+        <p>A well-known starting formula for a database pool is <code>connections = ((core_count × 2) + effective_spindle_count)</code>, which for a modern 8-core server on SSDs gives about <b>17</b> — far smaller than most people set. The reasoning: a query is either using a core or waiting for I/O, and once you have enough connections to keep every core busy plus a few to cover I/O waits, more connections only add contention. The counter-intuitive part is that <b>reducing an over-sized pool usually improves throughput and latency at the same time</b>, because the queue moves from inside the database, where it causes contention, to inside the application, where it is just a wait. Also multiply by your instance count before comparing against <code>max_connections</code> — that arithmetic is what an autoscaler quietly breaks.</p>
+      </div>
+
+      <h2><span class="h2n">4.6</span>Timeouts, and the budget that shrinks</h2>
+
+      <p>From <a href="01-what-a-backend-does.html">Chapter 1</a>: every remote call needs a timeout. The refinement is that timeouts must form a <b>budget that shrinks as you go deeper</b>, or the outer call gives up while inner calls keep holding resources.</p>
+
+      <div class="codewrap">
+        <span class="lang">A worked timeout budget</span>
+        <pre><code>User's patience                       3000 ms
+  Proxy read timeout                  2500 ms   ← always shorter
+    Application request deadline      2200 ms
+      Payment provider call            800 ms   ← + 1 retry = 1600
+      Database query                   250 ms
+      Cache lookup                      50 ms
+      Connection acquisition           100 ms
+
+WRONG, and extremely common:
+  proxy 30 s, app no deadline, db 30 s, http client default (none)
+
+  A dependency stalls. Every layer waits. Workers fill. The
+  health check queues behind them and fails. The load balancer
+  removes the instance. Traffic moves to the others, which fill
+  the same way. One slow dependency, total outage.
+
+RULES
+  · Each layer's timeout < its caller's remaining budget.
+  · Pass the deadline down, do not re-derive it per layer.
+  · Budget for retries: 800 ms × 2 attempts needs 1600 ms.
+  · Connection acquisition needs its OWN timeout, separate from
+    the query timeout — otherwise "the database is slow" and
+    "the pool is empty" look identical and have opposite fixes.</code></pre>
+      </div>
+
+      <h2><span class="h2n">4.7</span>Graceful shutdown</h2>
+
+      <p>A deployment replaces every process. Done carelessly, each replacement drops in-flight requests, and with a dozen deploys a day that is a steady trickle of errors nobody can reproduce. The sequence that avoids it:</p>
+
+      <ol>
+        <li><b>Receive SIGTERM.</b> The orchestrator sends this and starts a countdown to SIGKILL — usually 30 seconds by default.</li>
+        <li><b>Fail the readiness probe immediately,</b> but keep serving. The load balancer needs a few seconds to notice and stop sending new work; until it does you must still answer.</li>
+        <li><b>Wait out the propagation delay</b> — typically 5–15 seconds, and this step is the one people omit. Closing the listener the instant SIGTERM arrives drops every request the balancer sends in the interval.</li>
+        <li><b>Stop accepting new connections,</b> and finish the in-flight ones.</li>
+        <li><b>Drain background work:</b> stop consuming from queues, let current jobs finish or return them for redelivery.</li>
+        <li><b>Close pools and flush telemetry,</b> then exit — before the SIGKILL deadline, or you get killed mid-request anyway.</li>
+      </ol>
+
+      <p>The two constraints that must line up: your shutdown must complete faster than the orchestrator's grace period, and your grace period must exceed your longest legitimate request. If a request can take 60 seconds and the grace period is 30, you will drop requests on every deploy no matter how correct the sequence is.</p>
+
+      <h2><span class="h2n">4.8</span>Backpressure and shedding</h2>
+
+      <p>When arrivals exceed capacity, something must give. There are exactly three options and you are choosing one whether or not you decide to.</p>
+
+      <div class="tw">
+        <table>
+          <caption>What happens when you are overloaded</caption>
+          <thead><tr><th>Option</th><th>Mechanism</th><th>Result</th></tr></thead>
+          <tbody>
+            <tr><td><b>Queue</b></td><td>Accept everything and let it wait</td><td class="no">Latency grows without bound; memory grows; clients time out but the work is still queued and gets done for nobody. The default, and the worst</td></tr>
+            <tr><td><b>Shed</b></td><td>Reject beyond a threshold with 429 or 503</td><td class="yes">Some requests fail fast and the rest are served normally. Almost always correct</td></tr>
+            <tr><td><b>Push back</b></td><td>Slow the producer down — TCP flow control, bounded queues, rate limits at the edge</td><td class="yes">Best where the producer is under your control</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The insight that makes shedding obvious once seen: <b>an unbounded queue converts an overload into an outage.</b> If clients time out at 3 seconds and your queue holds 10 seconds of work, every request you are processing is for a client that has already given up — you are at 100% CPU with a 0% success rate, and the only escape is to stop accepting. A bounded queue with fast rejection keeps the success rate at whatever your actual capacity is, which is the best achievable outcome.</p>
+
+      <p>Practically: cap the accept queue, cap the pool wait, return 429 with <code>Retry-After</code> rather than hanging, and prefer to shed the lowest-value traffic first — a health check and a batch export are not equally important. <a href="../systemdesign/20-resilience.html">The System Design unit</a> covers prioritised shedding and deadline-aware rejection.</p>
+
+      <details class="check">
+        <summary>Your Node.js service has p50 latency of 12 ms and occasional p99 spikes of 400 ms with no corresponding database slowness. What would you look for?</summary>
+        <div class="ans">
+          <p>Something blocking the event loop. In a single-threaded runtime, any operation that does not yield stops every in-flight request, so the victims are not the request doing the work — they are the ones that happened to be queued behind it, which is why the spike appears on unrelated endpoints and correlates with nothing downstream. The usual culprits: <code>JSON.parse</code> or <code>JSON.stringify</code> on a large payload, synchronous filesystem calls (<code>readFileSync</code> in a request path, often inside a library), <code>crypto.pbkdf2Sync</code> or a bcrypt call with a high work factor, a regular expression that backtracks catastrophically on certain inputs, and large synchronous loops over arrays. The diagnostic is an event-loop lag metric — sample the delay on a fixed-interval timer and you will see the lag spike exactly when the latency does. Then find it with a CPU profile taken during the spike, or with <code>--prof</code>. The fixes are to move the work to a worker thread, stream rather than buffer, use the async variant, or precompute. Note that adding instances does not help: each one has the same single loop, so the spike simply follows the traffic.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Why can reducing your connection pool from 100 to 20 make the application faster?</summary>
+        <div class="ans">
+          <p>Because the database is the constrained resource, not the pool, and a large pool moves the queue to the worst possible place. A database server has a fixed number of cores and a fixed disk; it can genuinely execute only so many queries at once. With 100 connections all issuing work, the server is context-switching between 100 backends, contending on shared buffers and locks, and each individual query takes longer — so the same total throughput arrives with much worse per-query latency, and lock contention can reduce throughput outright. With 20 connections the server runs near its actual parallelism, each query completes quickly, and the excess demand waits in the application's pool queue instead. Total throughput is the same or better, per-query latency is dramatically better, and the waiting is now visible as a pool-acquisition metric you can alert on rather than hidden as generalised slowness. The counter-intuitive summary is that <b>the queue has to exist somewhere, and it is cheaper outside the database than inside it</b>. This is also why a connection proxy such as PgBouncer helps: it lets many application instances share a small number of real backends.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>You deploy twelve times a day and see a handful of 502s each time. What is the likely cause?</summary>
+        <div class="ans">
+          <p>Almost certainly the propagation gap during shutdown — the process closes its listener as soon as it receives SIGTERM, while the load balancer is still sending it traffic. Health-check propagation is not instantaneous: the balancer polls every few seconds and usually requires two or three consecutive failures, so there is a window of five to fifteen seconds after SIGTERM in which requests are still arriving at a process that has stopped accepting them, and each one becomes a 502. The fix is the sequencing in §4.7: on SIGTERM, immediately fail the readiness probe but <em>keep serving</em>, sleep for longer than the propagation window, and only then stop accepting and drain. Two adjacent causes worth ruling out. If the numbers are larger, check that the grace period exceeds your longest request — a 30-second grace with a 60-second export means the export is killed every time. And check the proxy's upstream keep-alive: if the proxy holds an idle connection to a process that exits, the next request on that connection fails, which is fixed by having the application's keep-alive timeout be shorter than the proxy's so the application always closes first.</p>
+        </div>
+      </details>
+
+      <div class="recap">
+        <h2>Recap</h2>
+        <ol>
+          <li><b>A buffering reverse proxy absorbs slow clients,</b> so a 30-second upload costs a proxy connection rather than an application worker.</li>
+          <li><b>The concurrency ceiling follows from what a waiting request holds.</b> A thread holds a megabyte; a goroutine holds a few kilobytes.</li>
+          <li><b>One synchronous call stalls an entire event loop,</b> and the symptom is latency spikes on unrelated endpoints.</li>
+          <li><b>L = λW.</b> Concurrency equals arrival rate times latency, always, and it sizes every pool you have.</li>
+          <li><b>A bigger connection pool is usually slower,</b> because the queue moves into the database where it causes contention.</li>
+          <li><b>Multiply pool size by instance count</b> before comparing with <code>max_connections</code> — this is what autoscaling breaks.</li>
+          <li><b>Timeouts must shrink with depth,</b> and connection acquisition needs its own, separate from the query timeout.</li>
+          <li><b>Graceful shutdown needs a deliberate wait</b> after failing the readiness probe, or you drop what the balancer sends in the gap.</li>
+          <li><b>An unbounded queue converts overload into an outage.</b> Shed early and fast.</li>
+        </ol>
+      </div>
+
+      <nav class="pn" aria-label="Previous and next chapter"></nav>
+    </div>
+  </article>
+</div>
+
+<script src="assets/notes.js"></script>
+<script>
+function st4b(k, v, tone) {
+  var d = document.createElement("div"); d.className = "stat";
+  var a = document.createElement("div"); a.className = "k"; a.textContent = k;
+  var b = document.createElement("div"); b.className = "v"; b.textContent = v;
+  if (tone) b.style.color = tone;
+  d.append(a, b); return d;
+}
+function bar4b(label, pct, value, colour) {
+  var row = document.createElement("div"); row.className = "bar";
+  var k = document.createElement("span"); k.textContent = label;
+  var t = document.createElement("span"); t.className = "track";
+  var f = document.createElement("span"); f.className = "fill";
+  f.style.width = Math.max(0.4, Math.min(100, pct)) + "%";
+  if (colour) f.style.background = colour;
+  t.appendChild(f);
+  var v = document.createElement("span"); v.className = "val"; v.textContent = value;
+  row.append(k, t, v); return row;
+}
+function num4(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "k";
+  return Math.round(n).toString();
+}
+
+/* ---------- concurrency models ---------- */
+(function () {
+  var rps = document.getElementById("cm-rps"), cpu = document.getElementById("cm-cpu"),
+      wait = document.getElementById("cm-wait"), cores = document.getElementById("cm-cores"),
+      threads = document.getElementById("cm-threads"), block = document.getElementById("cm-block"),
+      bars = document.getElementById("cm-bars"), stats = document.getElementById("cm-stats"),
+      note = document.getElementById("cm-note");
+
+  function draw() {
+    var L = +rps.value, C = +cpu.value, W = +wait.value, K = +cores.value,
+        T = +threads.value, B = Math.min(+block.value, +cpu.value);
+    if (+block.value > +cpu.value) block.value = cpu.value;
+    document.getElementById("cm-rpsv").textContent = L;
+    document.getElementById("cm-cpuv").textContent = C;
+    document.getElementById("cm-waitv").textContent = W;
+    document.getElementById("cm-coresv").textContent = K;
+    document.getElementById("cm-threadsv").textContent = T;
+    document.getElementById("cm-blockv").textContent = B;
+
+    var svc = C + W;                       /* ms per request, start to finish */
+    var needed = L * svc / 1000;           /* Little's Law */
+
+    /* ceiling 1: CPU. total CPU demand vs available core-milliseconds */
+    var cpuCeiling = K * 1000 / C;
+
+    /* thread-per-request: capped by pool size AND by CPU */
+    var threadCeiling = Math.min(T * 1000 / svc, cpuCeiling);
+    /* event loop: single-threaded for the blocking portion */
+    var loopCeiling = B > 0 ? 1000 / B : Infinity;
+    var eventCeiling = Math.min(loopCeiling, cpuCeiling);
+    /* lightweight threads: only CPU, plus a very high concurrency cap */
+    var lightCeiling = Math.min(cpuCeiling, 200000 * 1000 / svc);
+
+    function model(name, ceiling, extra) {
+      var served = Math.min(L, ceiling);
+      var util = L / ceiling;
+      /* simple M/M/1-ish latency inflation once utilisation approaches 1 */
+      var lat = util < 0.98 ? svc / (1 - Math.min(0.97, util)) : svc * 40;
+      return { n: name, cap: ceiling, served: served, util: util, lat: lat, extra: extra };
+    }
+    var M = [
+      model("Thread per request", threadCeiling, T + " threads"),
+      model("Event loop", eventCeiling, B + " ms blocking"),
+      model("Lightweight threads", lightCeiling, "runtime-scheduled")
+    ];
+    var best = Math.max.apply(null, M.map(function (m) { return m.cap; }));
+
+    bars.innerHTML = "";
+    M.forEach(function (m) {
+      var ok = m.cap >= L;
+      bars.appendChild(bar4b(m.n + " — " + m.extra, (m.cap / best) * 100,
+        num4(m.cap) + " req/s max",
+        ok ? "var(--ok)" : "var(--line)"));
+    });
+    bars.appendChild(bar4b("Offered load", (L / best) * 100, num4(L) + " req/s", "#6C63C4"));
+
+    var winner = M.slice().sort(function (a, b) { return b.cap - a.cap; })[0];
+    var failing = M.filter(function (m) { return m.cap < L; });
+
+    stats.innerHTML = "";
+    stats.appendChild(st4b("Concurrency needed (L = λW)", needed.toFixed(1),
+      needed > T ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st4b("Thread pool provides", T, T < needed ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st4b("CPU ceiling", num4(cpuCeiling) + " req/s"));
+    stats.appendChild(st4b("Event-loop ceiling", B > 0 ? num4(loopCeiling) + " req/s" : "no blocking",
+      loopCeiling < L ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st4b("Models that cope", (3 - failing.length) + " of 3",
+      failing.length ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st4b("Waiting share of a request", ((W / svc) * 100).toFixed(0) + "%"));
+
+    note.textContent = needed > T && threadCeiling < L
+      ? "Little's Law says you need " + needed.toFixed(0) + " requests in flight and the thread pool holds " + T + ". A thread-per-request server queues by construction here — and note that the CPU is only " + ((L * C / 1000 / K) * 100).toFixed(0) + "% busy, so it is idle while requests wait. This is the classic case where the answer is more threads or a different model, not more servers."
+      : B > 0 && loopCeiling < L
+      ? B + " ms of blocking work per request caps a single event loop at " + num4(loopCeiling) + " req/s, regardless of how many cores the machine has — the loop is one thread. At " + num4(L) + " req/s the loop is saturated and latency climbs steeply. Either move that work off the loop or run one process per core."
+      : W / svc > 0.9 && threadCeiling < lightCeiling * 0.2
+      ? ((W / svc) * 100).toFixed(0) + "% of each request is waiting, which is exactly the case where thread-per-request wastes the most: a megabyte of stack held to do nothing. The other two models release the resource during the wait, which is why their ceilings are " + (lightCeiling / threadCeiling).toFixed(0) + "× higher here."
+      : C > 20
+      ? "With " + C + " ms of CPU per request the workload is compute-bound, and all three models converge on the same ceiling of " + num4(cpuCeiling) + " req/s — because that is what " + K + " cores can do. Concurrency model choice stops mattering when the CPU is the constraint; only more cores help."
+      : "All three models cope at this load. The differences appear when you raise the arrival rate, lengthen the waiting time, or add blocking work to the event loop — each of which pushes a different model into its own failure mode first.";
+  }
+  [rps, cpu, wait, cores, threads, block].forEach(function (x) { x.addEventListener("input", draw); });
+  draw();
+})();
+
+/* ---------- pool sizing, Erlang C ---------- */
+(function () {
+  var rps = document.getElementById("p-rps"), svc = document.getElementById("p-svc"),
+      size = document.getElementById("p-size"), inst = document.getElementById("p-inst"),
+      mx = document.getElementById("p-max"),
+      bars = document.getElementById("p-bars"), stats = document.getElementById("p-stats"),
+      note = document.getElementById("p-note");
+
+  /* Erlang C, computed in log space so large c does not overflow */
+  function erlangC(c, a) {
+    if (a >= c) return 1;
+    var logTerms = [], logFact = 0;
+    for (var k = 0; k <= c; k++) {
+      if (k > 0) logFact += Math.log(k);
+      logTerms.push(k * Math.log(a) - logFact);
+    }
+    var maxL = Math.max.apply(null, logTerms);
+    var sumLower = 0;
+    for (var i = 0; i < c; i++) sumLower += Math.exp(logTerms[i] - maxL);
+    var top = Math.exp(logTerms[c] - maxL) * (c / (c - a));
+    return top / (sumLower + top);
+  }
+
+  function draw() {
+    var L = +rps.value, S = +svc.value / 1000, C = +size.value,
+        I = +inst.value, MX = +mx.value;
+    document.getElementById("p-rpsv").textContent = L;
+    document.getElementById("p-svcv").textContent = +svc.value;
+    document.getElementById("p-sizev").textContent = C;
+    document.getElementById("p-instv").textContent = I;
+    document.getElementById("p-maxv").textContent = MX;
+
+    var perInstance = L / I;
+    var a = perInstance * S;               /* offered load in erlangs, per instance */
+    var rho = a / C;
+    var pWait = rho >= 1 ? 1 : erlangC(C, a);
+    var wq = rho >= 1 ? Infinity : pWait / (C / S - perInstance) * 1000;  /* ms */
+    var total = rho >= 1 ? Infinity : wq + S * 1000;
+
+    var totalConns = C * I;
+    var headroom = MX - totalConns;
+
+    bars.innerHTML = "";
+    bars.appendChild(bar4b("Pool utilisation", Math.min(100, rho * 100),
+      (rho * 100).toFixed(0) + "%",
+      rho > 0.9 ? "var(--line)" : rho > 0.7 ? "#B87A17" : "var(--ok)"));
+    bars.appendChild(bar4b("Chance of waiting for a connection", pWait * 100,
+      (pWait * 100).toFixed(1) + "%",
+      pWait > 0.3 ? "var(--line)" : pWait > 0.1 ? "#B87A17" : "var(--ok)"));
+    bars.appendChild(bar4b("Connections vs max_connections", Math.min(100, (totalConns / MX) * 100),
+      totalConns + " of " + MX,
+      totalConns > MX ? "var(--line)" : totalConns > MX * 0.8 ? "#B87A17" : "var(--ok)"));
+
+    stats.innerHTML = "";
+    stats.appendChild(st4b("Offered load", a.toFixed(2) + " erlangs"));
+    stats.appendChild(st4b("Min pool to be stable", Math.ceil(a) + " (⌈a⌉)",
+      C <= a ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st4b("Mean queue wait", rho >= 1 ? "unbounded" : wq.toFixed(2) + " ms",
+      rho >= 1 || wq > 20 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st4b("Total time to get a query done", rho >= 1 ? "—" : total.toFixed(1) + " ms",
+      rho >= 1 ? "var(--line)" : ""));
+    stats.appendChild(st4b("Total connections", totalConns + " across " + I + " instances",
+      totalConns > MX ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st4b("Headroom", headroom >= 0 ? headroom + " spare" : "OVER by " + (-headroom),
+      headroom < 0 ? "var(--line)" : headroom < MX * 0.2 ? "#B87A17" : "var(--ok)"));
+
+    note.textContent = totalConns > MX
+      ? "Pool size × instances = " + totalConns + " connections against a limit of " + MX + ". Once the limit is hit, new connections are refused and the errors look like random database failures rather than a configuration problem. This is the arithmetic an autoscaler breaks silently: it adds instances, each bringing its own pool, and nothing recalculates the total."
+      : rho >= 1
+      ? "Offered load is " + a.toFixed(2) + " erlangs against " + C + " connections — the pool cannot keep up, so the queue grows without bound and every request eventually times out waiting for a connection. You need at least " + Math.ceil(a) + " connections just to be stable, and more than that to have acceptable waiting."
+      : pWait > 0.4
+      ? "A " + (pWait * 100).toFixed(0) + "% chance of waiting means most requests queue before they even reach the database. Note the shape of the Erlang C curve: going from " + C + " to " + (C + 2) + " connections cuts the wait far more than the extra 2 suggests, because queueing is highly non-linear near saturation."
+      : rho < 0.3 && C > 20
+      ? "Utilisation is only " + (rho * 100).toFixed(0) + "% with " + C + " connections, so the pool is much larger than the workload needs. That is not free: each connection is a server-side backend consuming memory and adding contention. Try halving it — throughput usually holds and per-query latency improves."
+      : "Comfortable. Utilisation of " + (rho * 100).toFixed(0) + "% with a " + (pWait * 100).toFixed(1) + "% chance of waiting is a healthy operating point. Watch the total-connections figure as instances scale, and remember the rule of thumb — around (cores × 2) + spindles per instance is a much smaller number than most defaults.";
+  }
+  [rps, svc, size, inst, mx].forEach(function (x) { x.addEventListener("input", draw); });
+  draw();
+})();
+</script>
+</body>
+</html>

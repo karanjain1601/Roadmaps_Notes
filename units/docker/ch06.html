@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6 · The build cache — Docker</title>
+<meta name="description" content="How Docker decides a layer is cached, what invalidates one, why instruction order is a performance decision, BuildKit cache mounts, and cache backends for CI.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Crect x='6' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='19' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='10' width='5' height='5' fill='%23fff'/%3E%3Cpath d='M4 22h22a5 5 0 004-4' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch06">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Docker
+    </a>
+    <div class="chno"><b>Chapter 6</b><span>Building images</span></div>
+    <h1>The build cache</h1>
+    <p class="lede">Two Dockerfiles can produce the same image and differ by a minute per build. <b>The difference is where you put <code>COPY</code>.</b> The cache rule is simple — once a step misses, every step after it misses — and it turns instruction order from a matter of taste into the main performance decision in the file.</p>
+    <div class="meta"><span>28 min</span><span>2 demos</span><span>8 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="how">
+      <h2 data-nav="How the cache works">How the cache works</h2>
+      <p class="sub">Each step gets a key, and the key includes its parent's key.</p>
+      <p>For every instruction the builder computes a cache key. If a previous build produced a result under the same key, that result is reused and the instruction does not run. The key is built from the <strong>parent step's key</strong> plus something about this step:</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Instruction</th><th>Key includes</th><th>Consequence</th></tr></thead>
+          <tbody>
+            <tr><td><code>FROM</code></td><td>The resolved base image digest</td><td>A new base invalidates the whole file</td></tr>
+            <tr><td><code>RUN</code></td><td><b>The command string, and nothing else</b></td><td>Docker never inspects what the command did — see the trap below</td></tr>
+            <tr><td><code>COPY</code> / <code>ADD</code></td><td>A checksum of the copied files' contents and modes</td><td>Editing a copied file invalidates from there down</td></tr>
+            <tr><td><code>ENV</code>, <code>LABEL</code>, <code>USER</code>, …</td><td>The instruction text</td><td>Cheap to run, but still a cache boundary</td></tr>
+            <tr><td><code>ARG</code></td><td>The value, for instructions that <em>use</em> it</td><td>Changing an unused ARG invalidates nothing</td></tr>
+            <tr><td><code>--mount=type=cache</code></td><td>Not part of any key</td><td>Persists across builds and invalidates nothing</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="key">
+        <span class="lbl">The rule that follows from parent keys</span>
+        <p><strong>A cache miss cascades downward and never upward.</strong> If step 4 misses, steps 5 to 12 also miss even though nothing about them changed — their keys depend on step 4's result. Nothing above step 4 is affected. That single asymmetry is why the ordering advice in this chapter works, and it is the same reasoning as chapter 3's digest chain: identity depends on everything beneath you.</p>
+      </div>
+      <div class="trap">
+        <span class="lbl"><code>RUN apt-get update</code> in its own instruction</span>
+        <p>The cache key for a <code>RUN</code> is the literal command text, so <code>RUN apt-get update</code> stays cached for months while the package lists it wrote go stale. A later <code>RUN apt-get install -y curl</code> then fails with "404 Not Found" for a version that no longer exists — a build that worked yesterday, broken by a cache hit. Always combine them: <code>RUN apt-get update &amp;&amp; apt-get install -y --no-install-recommends curl &amp;&amp; rm -rf /var/lib/apt/lists/*</code>. One instruction, one cache key, no stale window — and the cleanup is in the same layer, per chapter 3.</p>
+      </div>
+    </section>
+
+    <section id="ordering">
+      <h2 data-nav="Ordering">Ordering is the whole game</h2>
+      <p class="sub">Stable instructions at the top, volatile ones at the bottom.</p>
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Cache invalidation simulator</h3>
+          <span class="hint">The same build, two orderings, one change — and the cost of each</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl" id="c-events"></div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(268px,1fr));gap:11px">
+            <div>
+              <div style="font-size:12px;color:var(--text-2);margin-bottom:5px">naive ordering — <code>COPY . .</code> first</div>
+              <div class="term" id="c-bad" style="min-height:auto;font-size:11.3px"></div>
+            </div>
+            <div>
+              <div style="font-size:12px;color:var(--text-2);margin-bottom:5px">dependency-aware ordering</div>
+              <div class="term" id="c-good" style="min-height:auto;font-size:11.3px"></div>
+            </div>
+          </div>
+          <div class="rgrid" id="c-out"></div>
+          <p class="readout" id="c-note"></p>
+        </div>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">the pattern, per ecosystem</span><button class="copy">Copy</button></div>
+<pre data-lang="dockerfile"># Node
+COPY package*.json ./
+RUN npm ci
+COPY . .
+
+# Python
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+
+# Go
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+# Rust — cargo needs a dummy source to resolve dependencies alone
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src &amp;&amp; echo 'fn main(){}' &gt; src/main.rs &amp;&amp; cargo build --release &amp;&amp; rm -rf src
+COPY . .
+
+# Java / Maven
+COPY pom.xml ./
+RUN mvn -B dependency:go-offline
+COPY . .</pre>
+      </div>
+      <p>Every one of these is the same shape: <strong>copy the file that lists dependencies, install them, then copy the source.</strong> Dependency manifests change weekly; source changes hourly. Putting the expensive step between them means it only reruns when it genuinely needs to.</p>
+    </section>
+
+    <section id="checksums">
+      <h2 data-nav="What COPY hashes">What <code>COPY</code> actually hashes</h2>
+      <p class="sub">Contents, not timestamps — with a few things that catch people anyway.</p>
+      <p>BuildKit hashes the <em>contents</em> and modes of the files being copied, so touching a file without changing it does not invalidate the cache. What does invalidate it, sometimes surprisingly:</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Cause</th><th>Why</th><th>Fix</th></tr></thead>
+          <tbody>
+            <tr><td><code>COPY . .</code> with no <code>.dockerignore</code></td><td>Any file in the tree is part of the checksum — including <code>.git</code>, which changes on every commit</td><td>A real <code>.dockerignore</code> (chapter 5)</td></tr>
+            <tr><td>Build output in the context</td><td><code>dist/</code> changes on every local build, invalidating the copy</td><td>Ignore it</td></tr>
+            <tr><td>A file mode change</td><td>Mode is part of the hash, so <code>chmod +x</code> counts</td><td>Nothing — it is genuinely a change</td></tr>
+            <tr><td>Generated files with embedded timestamps</td><td>Content differs each time even with identical inputs</td><td>Generate inside the build, or make it reproducible</td></tr>
+            <tr><td>Editor swap and lock files</td><td>They appear and vanish inside the context</td><td>Ignore <code>*.swp</code>, <code>.DS_Store</code>, <code>*~</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">proving what is in your context</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker build --progress=plain . 2&gt;&amp;1 | grep -E 'transferring context|CACHED|DONE'
+#8 [internal] load build context
+#8 transferring context: 48.21MB 2.1s          &lt;- before .dockerignore
+#8 transferring context: 1.84MB 0.1s            &lt;- after
+
+# what would be sent? build a throwaway image that just lists it
+$ docker build -f - -o type=local,dest=./ctx . &lt;&lt;'EOF'
+FROM scratch
+COPY . /
+EOF
+$ du -sh ctx &amp;&amp; find ctx -maxdepth 1 | head -20</pre>
+      </div>
+    </section>
+
+    <section id="cachemounts">
+      <h2 data-nav="Cache mounts">Cache mounts</h2>
+      <p class="sub">A package manager's cache that survives builds and never lands in the image.</p>
+      <p>Ordering fixes "do not rerun <code>npm ci</code> unnecessarily". Cache mounts fix the harder case: when it <em>does</em> rerun, it should not re-download everything. A <code>--mount=type=cache</code> directory is provided by the builder, persists between builds, and is not part of any layer:</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">cache mounts, per ecosystem</span><button class="copy">Copy</button></div>
+<pre data-lang="dockerfile"># syntax=docker/dockerfile:1
+
+# Node
+RUN --mount=type=cache,target=/root/.npm npm ci
+
+# Python
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+
+# Go — the module cache and the build cache
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build -o /app ./cmd/server
+
+# Debian/Ubuntu — needs the auto-clean hook disabled first
+RUN rm -f /etc/apt/apt.conf.d/docker-clean
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update &amp;&amp; apt-get install -y --no-install-recommends curl
+
+# Alpine
+RUN --mount=type=cache,target=/var/cache/apk apk add --no-cache curl</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Option</th><th>Means</th></tr></thead>
+          <tbody>
+            <tr><td><code>target=</code></td><td>Where to mount it inside the build step. The only required option</td></tr>
+            <tr><td><code>id=</code></td><td>Names the cache, so different targets can share or stay separate</td></tr>
+            <tr><td><code>sharing=shared</code> (default)</td><td>Concurrent builds use it simultaneously</td></tr>
+            <tr><td><code>sharing=locked</code></td><td>Concurrent builds wait — required for apt, which is not concurrency-safe</td></tr>
+            <tr><td><code>sharing=private</code></td><td>Each concurrent build gets its own copy</td></tr>
+            <tr><td><code>uid=</code>, <code>gid=</code>, <code>mode=</code></td><td>Ownership, for when the build step does not run as root</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="key">
+        <span class="lbl">Two properties worth stating separately</span>
+        <p><strong>The cache mount is not in the image.</strong> A package cache mounted this way never becomes a layer, so chapter 3's "clean up in the same RUN" problem disappears — there is nothing to clean up. And <strong>its contents are not part of the cache key</strong>, so a warm cache mount neither invalidates a step nor makes one hit. It only makes the step faster when it does run.</p>
+      </div>
+      <div class="warn">
+        <span class="lbl">And one thing it is not</span>
+        <p>A cache mount is not a build secret and not a way to share files into the image. Anything the step writes to <code>target=</code> is discarded from the layer, so <code>RUN --mount=type=cache,target=/app/node_modules npm ci</code> produces an image with <em>no</em> <code>node_modules</code> — a genuinely common mistake. Cache the package manager's download cache, never the installed output.</p>
+      </div>
+    </section>
+
+    <section id="remote">
+      <h2 data-nav="Cache in CI">Cache in CI</h2>
+      <p class="sub">A fresh runner has no cache at all, and that is a solvable problem.</p>
+      <p>Every local speed-up in this chapter assumes a builder that remembers the previous build. CI runners are usually clean, so the cache has to be imported from somewhere:</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>CI cache backend model</h3>
+          <span class="hint">Which backend, what it restores, and what the transfer costs — assumptions listed underneath</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:88px">backend</span>
+            <span id="r-backend" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:88px">the change</span>
+            <span id="r-change" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl">
+            <label for="r-net" style="min-width:88px">network <b id="r-netv">80</b> MB/s</label>
+            <input type="range" id="r-net" min="5" max="400" step="5" value="80" style="width:130px">
+          </div>
+          <div id="r-table" style="overflow-x:auto"></div>
+          <div class="rgrid" id="r-out"></div>
+          <p class="readout" id="r-note"></p>
+        </div>
+      </div>
+
+      <div class="code">
+        <div class="code-top"><span class="tag">the flags</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># registry-backed, exporting every intermediate stage
+$ docker buildx build \
+    --cache-from type=registry,ref=ghcr.io/acme/api:buildcache \
+    --cache-to   type=registry,ref=ghcr.io/acme/api:buildcache,mode=max \
+    -t ghcr.io/acme/api:$GIT_SHA --push .
+
+# inline: cache metadata travels inside the image itself. Simple, min mode only
+$ docker buildx build --cache-to type=inline --cache-from type=registry,ref=… .
+
+# GitHub Actions cache backend
+$ docker buildx build --cache-from type=gha --cache-to type=gha,mode=max .
+
+# local directory, for a self-hosted runner with persistent disk
+$ docker buildx build --cache-to type=local,dest=/var/cache/buildkit,mode=max \
+                       --cache-from type=local,src=/var/cache/buildkit .</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Backend</th><th>Stores</th><th>Best for</th></tr></thead>
+          <tbody>
+            <tr><td><code>inline</code></td><td>Cache metadata inside the pushed image. <b>Final stage only</b></td><td>Single-stage builds; zero extra setup</td></tr>
+            <tr><td><code>registry</code>, <code>mode=min</code></td><td>Layers in the final image, as a separate tag</td><td>Same coverage as inline, but does not bloat the image</td></tr>
+            <tr><td><code>registry</code>, <code>mode=max</code></td><td><b>Every intermediate stage</b></td><td>Multi-stage builds — the usual right answer</td></tr>
+            <tr><td><code>gha</code></td><td>GitHub's own cache service</td><td>GitHub Actions, subject to the repository cache quota</td></tr>
+            <tr><td><code>local</code></td><td>A directory on the builder</td><td>Self-hosted runners with persistent disk</td></tr>
+            <tr><td><code>s3</code>, <code>azblob</code></td><td>Object storage</td><td>Large teams wanting one shared cache</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="trap">
+        <span class="lbl"><code>mode=min</code> and multi-stage builds do almost nothing</span>
+        <p><code>min</code> exports only the layers that ended up in the final image — and in a multi-stage build the expensive steps (<code>npm ci</code>, compilation) happen in a builder stage whose layers are <em>not</em> in the final image. So the cache restores the cheap final layers and rebuilds everything that mattered. <code>mode=max</code> exports the intermediate stages too, which is what actually helps; it costs more upload and more registry storage, and that trade is nearly always worth it.</p>
+      </div>
+    </section>
+
+    <section id="busting">
+      <h2 data-nav="Busting it deliberately">Busting the cache deliberately</h2>
+      <p class="sub">Sometimes you need a miss, and there are precise ways to get one.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">from broadest to narrowest</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker build --no-cache .                       # everything
+$ docker build --no-cache-filter deps .            # one named stage only
+$ docker build --pull .                             # re-resolve the base image tag
+
+# a cache-busting ARG: change the value to invalidate from that point down
+$ docker build --build-arg CACHEBUST=$(date +%s) .</pre>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">and in the Dockerfile</span><button class="copy">Copy</button></div>
+<pre data-lang="dockerfile"># everything below this line rebuilds when CACHEBUST changes
+ARG CACHEBUST=1
+RUN git clone --depth 1 https://github.com/acme/plugins.git /opt/plugins</pre>
+      </div>
+      <p>That pattern exists because of the <code>RUN</code> key rule: a <code>git clone</code> of a moving branch is cached forever otherwise. It is a workaround rather than a design — pinning a commit or a release tarball with a checksum is better, because then a cache hit is <em>correct</em> rather than merely fast.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">inspecting and pruning the cache</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker builder du                              # how big is it, by record
+$ docker builder du --verbose | head -30          # per-step, with last-used times
+$ docker builder prune --filter until=168h        # older than a week
+$ docker builder prune --keep-storage 20GB         # bound it instead
+$ docker buildx du --builder default</pre>
+      </div>
+      <p>The build cache is invisible to <code>docker image prune</code> and grows without limit by default, so it is the usual answer to "the disk filled up and I deleted all my images and it did not help" (chapter 3).</p>
+    </section>
+
+    <section id="debug">
+      <h2 data-nav="Debugging a miss">Debugging a cache miss</h2>
+      <p class="sub">When a step rebuilds and you cannot see why.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">the plain progress output tells you where it stopped hitting</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker build --progress=plain -t my-app . 2&gt;&amp;1 | grep -E '^#[0-9]+ (\[|CACHED|DONE)'
+#5 [2/6] WORKDIR /app
+#5 CACHED
+#6 [3/6] COPY package*.json ./
+#6 CACHED
+#7 [4/6] RUN npm ci
+#7 CACHED
+#8 [5/6] COPY . .
+#8 DONE 0.4s              &lt;- the first miss. Everything below rebuilds.
+#9 [6/6] RUN npm run build
+#9 DONE 21.8s</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Symptom</th><th>Usual cause</th></tr></thead>
+          <tbody>
+            <tr><td>The first <code>COPY</code> always misses</td><td>Something volatile in the context — <code>.git</code>, <code>dist/</code>, editor files</td></tr>
+            <tr><td>Everything misses, every time</td><td>A different builder each run (CI), or a moving base tag with <code>--pull</code></td></tr>
+            <tr><td>Cached locally, never in CI</td><td>No <code>--cache-from</code>, or <code>mode=min</code> on a multi-stage build</td></tr>
+            <tr><td>A step misses only sometimes</td><td>An <code>ARG</code> whose value varies — a commit SHA, a timestamp</td></tr>
+            <tr><td>Cached when it should not be</td><td>The <code>RUN</code> text is unchanged though the world moved (<code>apt-get update</code>, <code>git clone</code>)</td></tr>
+            <tr><td>Hits locally, misses after <code>docker pull</code></td><td>The base image digest changed under the same tag (chapter 3)</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 6 in eight lines</h2>
+        <ul>
+          <li>Each step's cache key includes its <b>parent's key</b>, so a miss cascades downward and never upward.</li>
+          <li>A <code>RUN</code>'s key is <b>the command text only</b> — Docker never looks at what it did.</li>
+          <li>Hence <code>apt-get update</code> alone caches stale package lists and breaks a later install. Combine them into one <code>RUN</code>.</li>
+          <li><code>COPY</code> hashes file <b>contents and modes</b>, so ordering dependency manifests before source is what makes the expensive step cacheable.</li>
+          <li>An unused <code>ARG</code> invalidates nothing; a used one invalidates from that instruction down.</li>
+          <li><code>--mount=type=cache</code> persists between builds, <b>never becomes a layer</b>, and is not part of any cache key.</li>
+          <li>Never cache-mount the installed output (<code>node_modules</code>) — only the package manager's download cache.</li>
+          <li>In CI, <b><code>mode=max</code></b> is what caches a multi-stage build; <code>mode=min</code> and <code>inline</code> restore only the final image's layers.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary>A build that worked last month now fails at <code>apt-get install -y libpq-dev</code> with a 404. Nothing in the Dockerfile changed.</summary>
+        <div class="ans"><p><code>RUN apt-get update</code> is a separate instruction and its cache key is just that text, so it has been a cache hit for weeks while the package lists it produced went stale. The distribution has since published new package versions and removed the old files, so the install requests a URL that no longer exists. Fix by combining them in one <code>RUN</code> with <code>&amp;&amp;</code>, which gives the pair a single cache key — and add <code>rm -rf /var/lib/apt/lists/*</code> to the same instruction so the lists do not ship in the layer (chapter 3).</p></div>
+      </details>
+      <details class="chk">
+        <summary>Local builds take 4 seconds; CI takes 90 every time, with <code>--cache-from type=registry</code> configured. What is likely wrong?</summary>
+        <div class="ans"><p>Almost certainly <code>mode=min</code> on the <code>--cache-to</code> side — the default. It exports only the layers present in the final image, and in a multi-stage build the expensive steps live in a builder stage that contributes no layers to the final image. So CI restores the cheap tail and rebuilds the dependency install every run. Switch to <code>mode=max</code>. If that is already set, check whether the cache is being written at all: a fork or a pull request often lacks registry push permission, so <code>--cache-to</code> silently fails while <code>--cache-from</code> keeps finding nothing.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Why does <code>RUN --mount=type=cache,target=/app/node_modules npm ci</code> produce a broken image?</summary>
+        <div class="ans"><p>Because a cache mount is not part of the resulting layer. Everything <code>npm ci</code> writes to <code>/app/node_modules</code> goes into the builder's cache directory and is discarded when the step finishes, so the image ships with an empty <code>node_modules</code> and the application cannot start. Cache mounts are for the package manager's <em>download</em> cache — <code>/root/.npm</code> — which is a pure accelerator that nothing at runtime needs. The installed output must be a real layer.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Your first <code>COPY</code> misses on every build even when you change nothing. How do you find out why?</summary>
+        <div class="ans"><p>Look at the context size with <code>docker build --progress=plain</code> — if "transferring context" is tens of megabytes, something volatile is in it. The usual culprit is <code>.git</code>, whose contents change on every commit and every <code>git status</code>, followed by a local <code>dist/</code> or <code>node_modules</code>. Since <code>COPY</code> hashes contents and modes, any of those makes the checksum differ. Write a <code>.dockerignore</code>, re-run, and watch both the transfer size and the cache behaviour change. A <code>chmod</code> counts too, because mode is part of the hash.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Chapter 7 removes the build tools from the shipped image altogether: multi-stage builds, and an honest comparison of alpine, slim, distroless and scratch.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li><code>docker build --progress=plain .</code> — find your first miss.</li>
+        <li><code>docker builder du</code> — how large has it grown?</li>
+        <li>Move <code>COPY . .</code> below your dependency install and time both.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>Docker's build cache and cache-invalidation documentation, the Dockerfile <code>RUN --mount</code> reference, and the buildx cache backend guides.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — cache invalidation, two orderings side by side
+   ============================================================ */
+(function () {
+  /* dep: which inputs each step depends on */
+  var BAD = [
+    { inst: "FROM node:22-alpine", secs: 0.0, dep: ["base"] },
+    { inst: "WORKDIR /app", secs: 0.1, dep: [] },
+    { inst: "COPY . .", secs: 1.2, dep: ["src", "manifest"] },
+    { inst: "RUN npm ci", secs: 48.0, dep: [] },
+    { inst: "RUN npm run build", secs: 21.8, dep: [] },
+    { inst: "ENV NODE_ENV=production", secs: 0.1, dep: ["env"] },
+    { inst: 'CMD ["node","dist/server.js"]', secs: 0.1, dep: [] }
+  ];
+  var GOOD = [
+    { inst: "FROM node:22-alpine", secs: 0.0, dep: ["base"] },
+    { inst: "WORKDIR /app", secs: 0.1, dep: [] },
+    { inst: "COPY package*.json ./", secs: 0.2, dep: ["manifest"] },
+    { inst: "RUN npm ci", secs: 48.0, dep: [] },
+    { inst: "COPY . .", secs: 1.2, dep: ["src", "manifest"] },
+    { inst: "RUN npm run build", secs: 21.8, dep: [] },
+    { inst: "ENV NODE_ENV=production", secs: 0.1, dep: ["env"] },
+    { inst: 'CMD ["node","dist/server.js"]', secs: 0.1, dep: [] }
+  ];
+
+  var EVENTS = [
+    { id: "none", label: "no change", changed: [] },
+    { id: "src", label: "edit src/index.js", changed: ["src"] },
+    { id: "manifest", label: "add a dependency", changed: ["manifest", "src"] },
+    { id: "base", label: "new base image digest", changed: ["base"] },
+    { id: "env", label: "change the ENV value", changed: ["env"] },
+    { id: "arg", label: "change an unused ARG", changed: [] }
+  ];
+  var event = "src";
+
+  var host = document.getElementById("c-events");
+  var badEl = document.getElementById("c-bad");
+  var goodEl = document.getElementById("c-good");
+  var out = document.getElementById("c-out");
+  var note = document.getElementById("c-note");
+
+  EVENTS.forEach(function (e) {
+    var b = document.createElement("button");
+    b.className = "btn" + (e.id === event ? " on" : "");
+    b.textContent = e.label;
+    b.addEventListener("click", function () {
+      event = e.id;
+      Array.prototype.forEach.call(host.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      render();
+    });
+    host.appendChild(b);
+  });
+
+  function evaluate(steps, changed) {
+    var missed = false;
+    return steps.map(function (s) {
+      if (!missed && s.dep.some(function (d) { return changed.indexOf(d) !== -1; })) missed = true;
+      return { inst: s.inst, secs: s.secs, cached: !missed, rebuilt: missed };
+    });
+  }
+
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+
+  function paint(el, rows, total) {
+    el.innerHTML = rows.map(function (r, i) {
+      var tag = r.cached ? '<span class="g">CACHED</span>' : '<span class="y">' + r.secs.toFixed(1) + "s</span>";
+      return '<span class="d">#' + (i + 1) + "</span> " + esc(r.inst) + "\n     " + tag;
+    }).join("\n") + '\n\n<span class="p">total</span> ' +
+      (total < 1 ? '<span class="g">' + total.toFixed(1) + "s</span>" : '<span class="y">' + total.toFixed(1) + "s</span>");
+  }
+
+  function render() {
+    var e = EVENTS.filter(function (x) { return x.id === event; })[0];
+    var bad = evaluate(BAD, e.changed);
+    var good = evaluate(GOOD, e.changed);
+    var badT = bad.reduce(function (a, r) { return a + (r.cached ? 0 : r.secs); }, 0);
+    var goodT = good.reduce(function (a, r) { return a + (r.cached ? 0 : r.secs); }, 0);
+
+    paint(badEl, bad, badT);
+    paint(goodEl, good, goodT);
+
+    var badMiss = bad.filter(function (r) { return !r.cached; }).length;
+    var goodMiss = good.filter(function (r) { return !r.cached; }).length;
+
+    out.innerHTML = "";
+    tile("Naive build", badT.toFixed(1) + "s", badMiss + " steps rebuilt", badT < 1);
+    tile("Ordered build", goodT.toFixed(1) + "s", goodMiss + " steps rebuilt", goodT < 1);
+    tile("Saved", (badT - goodT).toFixed(1) + "s", "per build", badT - goodT > 1);
+    tile("Speed-up", goodT > 0.05 ? (badT / goodT).toFixed(1) + "×" : "—", "", badT / goodT > 1.5);
+
+    var msgs = [];
+    if (event === "src") {
+      msgs.push("<b>This is the case that happens all day.</b> In the naive file <code>COPY . .</code> sits above <code>npm ci</code>, so editing one source file invalidates the dependency install and the build — " +
+        badT.toFixed(0) + " seconds. In the ordered file the source copy is <em>below</em> the install, so only the compile reruns: " +
+        goodT.toFixed(0) + " seconds. Same image, same instructions, " + (badT - goodT).toFixed(0) + " seconds of difference every time anyone edits a line.");
+    } else if (event === "manifest") {
+      msgs.push("Adding a dependency changes <code>package.json</code>, so <code>npm ci</code> genuinely must rerun and <b>both orderings pay it</b>. Ordering does not make dependency changes cheap — it makes them <em>rare</em>, because only they trigger the expensive step. This is also where a cache mount on <code>/root/.npm</code> earns its keep: the install reruns but re-downloads nothing.");
+    } else if (event === "base") {
+      msgs.push("A new base image digest invalidates <code>FROM</code>, and therefore everything: <b>no ordering can protect you</b>, because every key depends on the parent's. This is why a moving tag like <code>node:22</code> produces surprise full rebuilds (chapter 3) and why base updates belong on a deliberate schedule.");
+    } else if (event === "env") {
+      msgs.push("<code>ENV</code> is a cache boundary even though it adds no bytes (chapter 3). It sits near the bottom in both files, so only the trailing cheap instructions rebuild — which is precisely why metadata instructions belong at the end.");
+    } else if (event === "arg") {
+      msgs.push("An <code>ARG</code> that no instruction references contributes to no cache key, so changing it invalidates <b>nothing</b>. Only args actually used by an instruction affect that instruction's key downward.");
+    } else {
+      msgs.push("With nothing changed both builds are fully cached and cost essentially nothing. Pick a change above to see how far the invalidation cascades in each ordering — and note it only ever cascades <b>downward</b>.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13.5px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — CI cache backend model
+   ============================================================ */
+(function () {
+  /* the build, as stages. "builder" steps contribute no layers to the final image */
+  var STEPS = [
+    { name: "FROM node:22-alpine", stage: "builder", secs: 3.0, finalLayer: false, dep: [] },
+    { name: "COPY package*.json", stage: "builder", secs: 0.2, finalLayer: false, dep: ["manifest"] },
+    { name: "RUN npm ci", stage: "builder", secs: 48.0, finalLayer: false, dep: [] },
+    { name: "COPY . .", stage: "builder", secs: 1.2, finalLayer: false, dep: ["src", "manifest"] },
+    { name: "RUN npm run build", stage: "builder", secs: 21.8, finalLayer: false, dep: [] },
+    { name: "FROM node:22-alpine (runtime)", stage: "final", secs: 0.2, finalLayer: true, dep: [] },
+    { name: "COPY --from=builder /app/dist", stage: "final", secs: 0.6, finalLayer: true, dep: ["src", "manifest"] },
+    { name: "COPY --from=builder node_modules", stage: "final", secs: 2.4, finalLayer: true, dep: ["manifest"] }
+  ];
+
+  var BACKENDS = [
+    { id: "none", label: "no cache", restores: "nothing", pullMB: 0, pushMB: 0 },
+    { id: "inline", label: "type=inline", restores: "final", pullMB: 190, pushMB: 0 },
+    { id: "min", label: "registry mode=min", restores: "final", pullMB: 190, pushMB: 190 },
+    { id: "max", label: "registry mode=max", restores: "all", pullMB: 430, pushMB: 430 },
+    { id: "gha", label: "type=gha mode=max", restores: "all", pullMB: 430, pushMB: 430 }
+  ];
+  var CHANGES = [
+    { id: "src", label: "code change", changed: ["src"] },
+    { id: "manifest", label: "dependency change", changed: ["manifest", "src"] },
+    { id: "none", label: "no change (rerun)", changed: [] }
+  ];
+  var backend = "min", change = "src";
+
+  var table = document.getElementById("r-table");
+  var out = document.getElementById("r-out");
+  var note = document.getElementById("r-note");
+
+  function group(host, list, get, set) {
+    list.forEach(function (item) {
+      var b = document.createElement("button");
+      b.className = "btn mono" + (get() === item.id ? " on" : "");
+      b.textContent = item.label;
+      b.addEventListener("click", function () {
+        set(item.id);
+        Array.prototype.forEach.call(host.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+        b.classList.add("on");
+        render();
+      });
+      host.appendChild(b);
+    });
+  }
+  group(document.getElementById("r-backend"), BACKENDS, function () { return backend; }, function (v) { backend = v; });
+  group(document.getElementById("r-change"), CHANGES, function () { return change; }, function (v) { change = v; });
+
+  function model() {
+    var B = BACKENDS.filter(function (x) { return x.id === backend; })[0];
+    var C = CHANGES.filter(function (x) { return x.id === change; })[0];
+    var net = parseInt(document.getElementById("r-net").value, 10);
+
+    /* a step can be restored only if the backend covers its stage AND
+       nothing it depends on changed above it */
+    var missed = false;
+    var rows = STEPS.map(function (s) {
+      if (!missed && s.dep.some(function (d) { return C.changed.indexOf(d) !== -1; })) missed = true;
+      var covered = B.restores === "all" || (B.restores === "final" && s.finalLayer);
+      var cached = !missed && covered;
+      return { name: s.name, stage: s.stage, secs: s.secs, cached: cached, covered: covered, missed: missed };
+    });
+
+    var buildSecs = rows.reduce(function (a, r) { return a + (r.cached ? 0 : r.secs); }, 0);
+    var pull = B.pullMB / net;
+    var push = B.pushMB / net;
+    return { B: B, C: C, rows: rows, buildSecs: buildSecs, pull: pull, push: push,
+             total: buildSecs + pull + push, net: net };
+  }
+
+  function render() {
+    document.getElementById("r-netv").textContent = document.getElementById("r-net").value;
+    var m = model();
+    var baseline = (function () {
+      var save = backend; backend = "none"; var r = model(); backend = save; return r;
+    })();
+
+    table.innerHTML = '<table class="tbl"><thead><tr><th>step</th><th>stage</th><th>covered by cache</th><th>result</th></tr></thead><tbody>' +
+      m.rows.map(function (r) {
+        return "<tr><td><code>" + r.name + "</code></td><td>" + r.stage + "</td><td>" +
+          (r.covered ? '<span style="color:var(--good)">yes</span>' : '<span style="color:var(--text-3)">no</span>') +
+          "</td><td>" + (r.cached ? '<span style="color:var(--good);font-weight:600">CACHED</span>'
+                                  : '<span style="color:var(--warn);font-weight:600">' + r.secs.toFixed(1) + "s</span>") +
+          "</td></tr>";
+      }).join("") + "</tbody></table>";
+
+    out.innerHTML = "";
+    tile("Build", m.buildSecs.toFixed(1) + "s", "steps that ran", m.buildSecs < 10);
+    tile("Cache transfer", (m.pull + m.push).toFixed(1) + "s", m.B.pullMB + "↓ " + m.B.pushMB + "↑ MB");
+    tile("Wall clock", m.total.toFixed(1) + "s", "per CI run", m.total < baseline.total);
+    tile("vs no cache", baseline.total > 0 ? ((1 - m.total / baseline.total) * 100).toFixed(0) + "%" : "—",
+      "faster", m.total < baseline.total);
+
+    var msgs = [];
+    var builderCached = m.rows.filter(function (r) { return r.stage === "builder" && r.cached; }).length;
+    if (backend === "none") {
+      msgs.push("A clean runner with no cache import rebuilds everything, every time — " + m.buildSecs.toFixed(0) +
+        " seconds regardless of how small the change was. This is the default in CI, and the reason a pipeline that takes four seconds locally takes two minutes there.");
+    } else if ((backend === "inline" || backend === "min") && change === "src") {
+      msgs.push("<b>The expensive steps are still rebuilding.</b> This backend restores only layers present in the final image, and <code>npm ci</code> lives in the builder stage, which contributes none — so " +
+        builderCached + " builder steps were restored and the 48-second install was not. Switch to <code>mode=max</code> and compare.");
+    } else if (backend === "max" || backend === "gha") {
+      if (change === "src") {
+        msgs.push("<b><code>mode=max</code> exports the intermediate stages</b>, so <code>npm ci</code> is restored and only the steps genuinely downstream of your edit run. The cost is a bigger cache to move — " +
+          m.B.pullMB + " MB down and " + m.B.pushMB + " MB up rather than " + BACKENDS[2].pullMB +
+          " — which at " + m.net + " MB/s adds " + (m.pull + m.push).toFixed(1) + " seconds. Nearly always worth it.");
+      } else if (change === "manifest") {
+        msgs.push("A dependency change invalidates <code>npm ci</code> itself, so even a perfect cache cannot skip it — the cache still helps by restoring the base and the steps above. Note the transfer cost is paid whether or not the cache hits, which is why <code>mode=max</code> can be marginally <em>slower</em> for a build whose dependencies change on every run.");
+      } else {
+        msgs.push("Nothing changed, so everything is restored and the run is pure transfer time. That is the best case for a cache and the honest measure of its overhead: " +
+          (m.pull + m.push).toFixed(1) + " seconds of network for a build that does no work.");
+      }
+    } else if (backend === "inline" && change === "none") {
+      msgs.push("<code>inline</code> carries its metadata inside the pushed image, so there is nothing extra to upload — the simplest setup, and adequate for a single-stage build. On a multi-stage build it leaves the expensive stage uncached.");
+    }
+    msgs.push("<b>Assumptions:</b> fixed step durations as shown, cache sizes of 190&nbsp;MB (final layers) and 430&nbsp;MB (all stages), transfer at the stated bandwidth with no compression benefit, and no registry latency. Measure your own — the shape is what transfers, not the seconds.");
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13.5px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  document.getElementById("r-net").addEventListener("input", render);
+  render();
+})();
+</script>
+</body>
+</html>

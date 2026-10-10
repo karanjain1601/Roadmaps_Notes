@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Relational data modelling — Backend Developer</title>
+<meta name="description" content="Keys and constraints, normalisation and the anomalies it removes, data types that cause outages, and zero-downtime migrations with expand and contract.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%233FB984' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">Backend Developer</a><span class="sep">/</span><span>Chapter 08</span></p>
+    <p class="chno">Chapter 08 · Data</p>
+    <h1>Relational data modelling</h1>
+    <p class="lede">Services get rewritten every few years. The database is still there a decade later with everyone's data in it, and every mistake you made in the schema is still being worked around. This is the most expensive part of the system to get wrong and the cheapest to get right, because it costs nothing but thought at the start.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>some SQL</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="keys">
+<h2>Keys and constraints</h2><div class="h2rule"></div>
+
+<p class="lead">A constraint is a rule the database will enforce no matter which service, script, migration or hurried manual fix touches the data. Application validation is a courtesy to the user; constraints are the actual guarantee.</p>
+
+<div class="code"><div class="code-top"><span class="code-lang">sql — a table with its invariants written down</span><button class="code-copy">Copy</button></div><pre><span class="k">CREATE TABLE</span> orders (
+  id            uuid <span class="k">PRIMARY KEY DEFAULT</span> gen_random_uuid(),
+  user_id       uuid <span class="k">NOT NULL REFERENCES</span> users(id) <span class="k">ON DELETE RESTRICT</span>,
+  status        text <span class="k">NOT NULL DEFAULT</span> <span class="s">'pending'</span>,
+  total_cents   bigint <span class="k">NOT NULL</span>,
+  currency      char(<span class="n">3</span>) <span class="k">NOT NULL</span>,
+  placed_at     timestamptz <span class="k">NOT NULL DEFAULT</span> now(),
+  cancelled_at  timestamptz,
+
+  <span class="k">CONSTRAINT</span> total_non_negative <span class="k">CHECK</span> (total_cents &gt;= <span class="n">0</span>),
+  <span class="k">CONSTRAINT</span> status_known       <span class="k">CHECK</span> (status <span class="k">IN</span> (<span class="s">'pending'</span>,<span class="s">'paid'</span>,<span class="s">'shipped'</span>,<span class="s">'cancelled'</span>)),
+  <span class="k">CONSTRAINT</span> cancelled_has_time <span class="k">CHECK</span> (
+      (status = <span class="s">'cancelled'</span>) = (cancelled_at <span class="k">IS NOT NULL</span>))  <span class="c">-- the good kind:</span>
+);                                                          <span class="c">-- two columns that</span>
+                                                            <span class="c">-- must agree, forever</span>
+<span class="c">-- a partial unique index: one active cart per user, any number of</span>
+<span class="c">-- historical ones. Expressing this in application code is a race condition;</span>
+<span class="c">-- expressing it here is a guarantee.</span>
+<span class="k">CREATE UNIQUE INDEX</span> one_open_cart <span class="k">ON</span> carts (user_id) <span class="k">WHERE</span> status = <span class="s">'open'</span>;</pre></div>
+
+<div class="tw">
+<table class="tight">
+<thead><tr><th>Choice</th><th>Take</th></tr></thead>
+<tbody>
+<tr><td><strong>Surrogate or natural key</strong></td><td class="yes">Surrogate, almost always. Natural keys change — email addresses, ISBNs, national identifiers all turn out to be mutable or non-unique eventually, and by then they are foreign keys in nine tables</td></tr>
+<tr><td><strong>Sequential integer or UUID</strong></td><td>Integers are compact and index beautifully; UUIDs avoid enumeration and can be generated client-side. Use UUIDv7 or ULID, which are time-ordered — random UUIDv4 primary keys scatter inserts across the whole index and hurt write throughput badly</td></tr>
+<tr><td><strong><code>ON DELETE</code> behaviour</strong></td><td><code>RESTRICT</code> by default so deletes fail loudly; <code>CASCADE</code> only where the child genuinely cannot exist alone, such as order line items</td></tr>
+<tr><td><strong>Soft delete</strong></td><td class="no">Adds <code>WHERE deleted_at IS NULL</code> to every query forever, and the one you forget is a data leak. Prefer moving rows to an archive table, or accept the cost knowingly</td></tr>
+<tr><td><strong>Enums</strong></td><td>A <code>CHECK</code> constraint or a lookup table beats a native enum type, which needs a migration to add a value and cannot remove one</td></tr>
+<tr><td><strong>Nullable columns</strong></td><td class="yes">Default to <code>NOT NULL</code>. Every nullable column is a branch in every query and a case somebody forgets</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="normal">
+<h2>Normalisation</h2><div class="h2rule"></div>
+
+<p class="lead">The formal definitions are less useful than the thing they prevent. Redundancy is not a storage problem — it is a correctness problem, because the same fact stored twice can disagree with itself.</p>
+
+<div class="demo" id="d-norm">
+  <div class="demo-top"><div class="demo-title">Three anomalies</div><div class="demo-hint">Try each operation against both designs</div></div>
+  <div class="demo-body">
+    <canvas id="cNorm" aria-label="A denormalised table showing update, insert and delete anomalies"></canvas>
+    <div class="ctrls" style="justify-content:center">
+      <div class="ctrl"><label>Design</label><select id="nmD">
+        <option value="flat" selected>one flat table</option>
+        <option value="norm">normalised</option></select></div>
+      <div class="ctrl"><label>Operation</label><select id="nmO">
+        <option value="none" selected>—</option>
+        <option value="update">change Ana's email</option>
+        <option value="insert">add a customer with no orders</option>
+        <option value="delete">delete Ben's only order</option></select></div>
+    </div>
+    <div class="rgrid" id="nmOut"></div>
+    <div class="readout" id="nmNote"></div>
+  </div>
+</div>
+
+<div class="tw">
+<table class="tight">
+<thead><tr><th>Form</th><th>Rule</th><th>In plain terms</th></tr></thead>
+<tbody>
+<tr><td><strong>1NF</strong></td><td>Atomic values; no repeating groups</td><td class="yes">No <code>tags</code> column holding <code>"red,blue,green"</code>. No <code>phone1, phone2, phone3</code></td></tr>
+<tr><td><strong>2NF</strong></td><td>No partial dependency on a composite key</td><td>If the key is (order_id, product_id), the product's name depends on only half of it — so it belongs elsewhere</td></tr>
+<tr><td><strong>3NF</strong></td><td>No transitive dependency</td><td class="yes">Storing <code>city</code> and <code>country</code> against a postcode means the postcode determines them, so they belong with the postcode</td></tr>
+<tr><td><strong>BCNF</strong></td><td>Every determinant is a candidate key</td><td>A stricter 3NF. Rarely the thing that bites you</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box intu"><b class="tag">Normalise first, then denormalise on evidence</b>
+<p style="margin-bottom:6px">3NF is the right starting point for essentially every transactional schema. It is easy to reason about, it makes each fact live in exactly one place, and it lets the database enforce consistency rather than hoping the application does.</p>
+<p style="margin:0">Denormalise when you have a measured problem, and when you do, follow two rules. <strong>Have one authoritative copy</strong> — the derived one must be reconstructible from it. <strong>Update it in the same transaction</strong>, or accept explicitly that it is eventually consistent and can be stale. The legitimate cases are real: a cached <code>comment_count</code> to avoid counting a million rows, a denormalised <code>seller_name</code> on an order so it reflects the name at the time of sale rather than today's, or a reporting table built for a dashboard. Each is a deliberate trade with a named benefit — not "joins are slow", which is usually a missing index. Chapter 9.</p>
+</div>
+</section>
+
+<section id="types">
+<h2>Types that cause incidents</h2><div class="h2rule"></div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Instead of</th><th>Use</th><th>Because</th></tr></thead>
+<tbody>
+<tr><td class="no"><code>float</code> for money</td><td class="yes"><code>bigint</code> of minor units, or <code>numeric</code></td><td>0.1 + 0.2 is not 0.3 in binary floating point. Rounding errors accumulate and accountants find them</td></tr>
+<tr><td class="no"><code>timestamp</code></td><td class="yes"><code>timestamptz</code>, always UTC</td><td>A timestamp without a zone is a number with no meaning. Store UTC, convert at the edge</td></tr>
+<tr><td class="no"><code>varchar(255)</code></td><td><code>text</code> with a <code>CHECK</code> if you need a limit</td><td>255 is an artefact of old MySQL, not a business rule. In Postgres there is no performance difference</td></tr>
+<tr><td class="no">A native <code>enum</code></td><td><code>text</code> + <code>CHECK</code>, or a lookup table</td><td>Adding a value needs a migration; removing one is close to impossible</td></tr>
+<tr><td class="no">Random <code>uuid</code> v4 as a primary key</td><td>UUIDv7 / ULID, or <code>bigint</code></td><td>Random keys insert all over the index instead of at the end, causing page splits and poor cache behaviour</td></tr>
+<tr><td class="no">A JSON column for core entities</td><td>Columns, with JSON for genuinely open-ended attributes</td><td>No constraints, no foreign keys, awkward indexing, and every consumer reimplements validation</td></tr>
+<tr><td class="no">A boolean pair like <code>is_active</code>, <code>is_archived</code></td><td>One <code>status</code> column</td><td>Two booleans permit four states and you meant three. The fourth is a bug waiting</td></tr>
+<tr><td class="no">A <code>tags</code> column of comma-separated text</td><td>A join table, or a native array type</td><td>You will need to query by tag, and <code>LIKE '%red%'</code> also matches "tired"</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn"><b class="tag">Time is worse than you think</b>
+<p style="margin:0">Store instants in UTC as <code>timestamptz</code> and convert only for display. But note that <em>future</em> local events are different: "the meeting is at 09:00 Berlin time on 3 March" cannot be stored as a UTC instant, because Germany may change its rules before then — and countries do this with a few months' notice. Store the local time and the IANA zone name separately, and resolve to an instant when you need one. Also: never store a zone as an offset like <code>+02:00</code>, because that is a fact about one moment rather than a place, and <code>Europe/Berlin</code> is the durable answer.</p>
+</div>
+</section>
+
+<section id="migrations">
+<h2>Migrations without downtime</h2><div class="h2rule"></div>
+
+<p class="lead">During a rolling deploy, the old and new versions of your code run at the same time against the same database. Every schema change must therefore be compatible with both — which rules out the obvious way to do almost everything.</p>
+
+<div class="demo" id="d-mig">
+  <div class="demo-top"><div class="demo-title">Renaming a column, twice</div><div class="demo-hint">Try the obvious way first</div></div>
+  <div class="demo-body">
+    <canvas id="cMig" aria-label="A column rename performed naively and with expand and contract"></canvas>
+    <div class="ctrls" style="justify-content:center">
+      <div class="ctrl"><label>Approach</label><select id="mgA">
+        <option value="naive" selected>rename it</option>
+        <option value="ec">expand and contract</option></select></div>
+      <button class="btn primary" id="mgNext">Step</button>
+      <button class="btn" id="mgAuto">Play</button>
+      <button class="btn" id="mgRst">Restart</button>
+    </div>
+    <div class="rgrid" id="mgOut"></div>
+    <div class="readout" id="mgNote"></div>
+  </div>
+</div>
+
+<div class="tw">
+<table class="tight">
+<thead><tr><th>Change</th><th>Safe?</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>Add a nullable column</td><td class="yes">Yes</td><td>Metadata-only in modern Postgres and MySQL</td></tr>
+<tr><td>Add a column with a default</td><td class="yes">Yes, since PG 11 / MySQL 8</td><td>Older versions rewrote the entire table. Check your version before assuming</td></tr>
+<tr><td>Add <code>NOT NULL</code> to an existing column</td><td class="no">No — full table scan under a lock</td><td>Add a <code>CHECK … NOT VALID</code>, validate it separately, then convert</td></tr>
+<tr><td>Rename a column or table</td><td class="no">Never, in one step</td><td>Expand and contract. The demo above</td></tr>
+<tr><td>Create an index</td><td class="no">Blocks writes</td><td class="yes">Use <code>CREATE INDEX CONCURRENTLY</code> — slower, no lock, and it can fail and leave an invalid index to clean up</td></tr>
+<tr><td>Add a foreign key</td><td class="no">Locks both tables to validate</td><td>Add <code>NOT VALID</code>, then <code>VALIDATE CONSTRAINT</code> — which takes a weaker lock</td></tr>
+<tr><td>Drop a column</td><td>Fast, and irreversible</td><td>Deploy code that stops referencing it first, and wait a full release cycle before dropping</td></tr>
+<tr><td>Change a column's type</td><td class="no">Usually a full rewrite</td><td>New column, backfill, switch, drop. The same expand-and-contract shape</td></tr>
+<tr><td>Backfill a large table</td><td class="no">Not in one statement</td><td class="yes">Batch it — a few thousand rows per transaction, with a pause. One giant <code>UPDATE</code> holds locks and bloats the write-ahead log</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box tip"><b class="tag">The migration checklist</b>
+<ol style="margin-bottom:0">
+<li><strong>Is it backwards compatible?</strong> The currently-deployed code must keep working after the migration and before the next deploy.</li>
+<li><strong>Does it take a lock, and for how long?</strong> A lock held for two seconds on a busy table queues every query behind it, and the queue may not drain.</li>
+<li><strong>Set a lock timeout.</strong> <code>SET lock_timeout = '3s'</code> so the migration fails fast instead of blocking production while it waits for a long-running transaction to finish.</li>
+<li><strong>Is the backfill batched?</strong> With a pause between batches, and restartable if it dies halfway.</li>
+<li><strong>Can it be rolled back?</strong> Not every migration can — dropping a column is not reversible — which is precisely why the drop comes a release <em>after</em> the code change.</li>
+</ol>
+</div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>Why is redundancy a correctness problem rather than a storage one?
+<button class="reveal">Show answer</button><div class="ans">Because two copies of the same fact can disagree. Storing a customer's email on every one of their order rows means updating an email is a multi-row write, and any path that misses a row leaves the database asserting two different emails for one person — with no way to tell which is right. Disk is cheap; a system that contradicts itself is not. Normalisation makes each fact live in exactly one place, so it cannot be half-updated.</div></li>
+
+<li>When is denormalisation justified, and what two rules apply?
+<button class="reveal">Show answer</button><div class="ans">When you have measured a problem that normalisation causes — counting a million rows for a comment count, or a report that cannot meet its latency budget. The rules: keep one authoritative copy so the derived one can always be rebuilt, and either update it in the same transaction or state explicitly that it is eventually consistent. "Joins are slow" is not evidence; it is usually a missing index.</div></li>
+
+<li>Why should money never be a float?
+<button class="reveal">Show answer</button><div class="ans">Because binary floating point cannot represent most decimal fractions exactly — 0.1 + 0.2 is 0.30000000000000004 — so errors accumulate across arithmetic and totals stop reconciling. Use an integer count of minor units (cents, pence) or a fixed-point <code>numeric</code> type. Integers are usually simpler: exact, fast, and they make you think about rounding at the one point where it matters rather than everywhere.</div></li>
+
+<li>Why is renaming a column unsafe during a rolling deploy?
+<button class="reveal">Show answer</button><div class="ans">Because both versions of the code run simultaneously against the one database. The instant the rename commits, every still-running old instance references a column that no longer exists, and its queries fail — a period of errors lasting until the rollout finishes, which is exactly when you cannot roll back either, since reverting the code breaks against the new name. Expand and contract keeps both names valid across the overlap.</div></li>
+
+<li>What does "expand and contract" actually consist of?
+<button class="reveal">Show answer</button><div class="ans">Add the new column without removing the old one. Deploy code that writes to both and reads the old. Backfill existing rows in batches. Deploy code that reads the new column, still writing both. Then, a release later, stop writing the old one and drop it. Each step is compatible with the version before and after it, so at no point does a running instance depend on something that does not exist.</div></li>
+
+<li>Why avoid a native enum type in favour of a CHECK constraint?
+<button class="reveal">Show answer</button><div class="ans">Because a native enum requires a schema migration to add a value, and removing one ranges from awkward to impossible — which matters because status values change more often than anyone expects. A text column with a CHECK gives the same validation, and altering the constraint is a cheap operation. A lookup table goes further: values become data, so adding one is an insert, and you get somewhere to hang labels and ordering.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin:0">Chapter 9 is the one most likely to change how your systems perform: what an index is, and the several reasons the one you created is being ignored.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 08</h2><p>Relational data modelling. Part of the Backend Developer unit — <a href="index.html">all 22 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 09 (indexes on these tables), 10 (constraints and transactions), 21 (running migrations in a pipeline).</p></div>
+    <div><h2>Going deeper</h2><p>The <em>Postgres is Enough</em> and <em>strong_migrations</em> gem documentation both list unsafe operations exhaustively and are worth bookmarking.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: normalisation anomalies ============ */
+(function(){
+  const cv=document.getElementById("cNorm"); if(!cv) return;
+  const dEl=document.getElementById("nmD"), oEl=document.getElementById("nmO"),
+        out=document.getElementById("nmOut"), note=document.getElementById("nmNote");
+  function draw(){
+    const flat=dEl.value==="flat", op=oEl.value;
+    const w=cv.clientWidth||660, h=flat?200:224, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h);
+    ctx.textBaseline="middle";
+    function table(x,y,title,cols,rows,widths,marks){
+      ctx.fillStyle="#54677A"; ctx.font="600 10.5px Archivo, Arial"; ctx.textAlign="left";
+      ctx.fillText(title,x,y-9);
+      let cx=x;
+      cols.forEach((c,i)=>{
+        ctx.fillStyle="#F2F5F7"; ctx.strokeStyle="#E1E7EC"; ctx.lineWidth=1;
+        ctx.fillRect(cx,y,widths[i],20); ctx.strokeRect(cx+.5,y+.5,widths[i],20);
+        ctx.fillStyle="#54677A"; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+        ctx.fillText(c,cx+5,y+10); cx+=widths[i];
+      });
+      rows.forEach((r,ri)=>{
+        let rx=x; const mk=marks&&marks[ri];
+        r.forEach((v,i)=>{
+          const m = mk && (mk.cols===undefined||mk.cols.includes(i));
+          ctx.fillStyle= m? (mk.kind==="bad"?"#FBEAE9": mk.kind==="warn"?"#FFF6E8":"#E7F7EF") :"#fff";
+          ctx.strokeStyle= m? (mk.kind==="bad"?"#D9534F": mk.kind==="warn"?"#D98324":"#3FB984"):"#E1E7EC";
+          ctx.lineWidth= m?1.7:1;
+          ctx.fillRect(rx,y+20+ri*21,widths[i],21); ctx.strokeRect(rx+.5,y+20.5+ri*21,widths[i],21);
+          ctx.fillStyle= v==="—"?"#C3CDD5":"#16232F"; ctx.font="10px ui-monospace, monospace"; ctx.textAlign="left";
+          ctx.fillText(v,rx+5,y+30.5+ri*21); rx+=widths[i];
+        });
+      });
+    }
+    let issues=0, facts=0, msg="";
+    if(flat){
+      let rows=[
+        ["o-1","Ana","ana@mail.com","Widget","19.99"],
+        ["o-2","Ana","ana@mail.com","Gadget","34.50"],
+        ["o-3","Ana","ana@mail.com","Widget","19.99"],
+        ["o-4","Ben","ben@mail.com","Gizmo","12.00"]
+      ];
+      let marks=null;
+      if(op==="update"){
+        rows=[["o-1","Ana","ana@work.com","Widget","19.99"],
+              ["o-2","Ana","ana@work.com","Gadget","34.50"],
+              ["o-3","Ana","ana@mail.com","Widget","19.99"],
+              ["o-4","Ben","ben@mail.com","Gizmo","12.00"]];
+        marks={0:{kind:"ok",cols:[2]},1:{kind:"ok",cols:[2]},2:{kind:"bad",cols:[2]}};
+        issues=1;
+        msg="<b>Update anomaly.</b> Ana's email is stored three times, so changing it is a three-row write. The update touched two rows and missed the third — a partial failure, a <code>LIMIT</code> someone added, a bug in a filter, it does not matter which. The database now asserts two different emails for one person and has no way to say which is correct. Nothing violated a constraint, so nothing complained.";
+      } else if(op==="insert"){
+        rows=rows.concat([["—","Cass","cass@mail.com","—","—"]]);
+        marks={4:{kind:"bad"}};
+        issues=1;
+        msg="<b>Insert anomaly.</b> Cass has signed up but has not ordered anything. There is nowhere to put her: the row needs an order id, a product and a price that do not exist. The options are a row full of nulls that every query must now filter out, or not recording the customer at all. The table conflates two things — customers and orders — so you cannot have one without the other.";
+      } else if(op==="delete"){
+        rows=rows.slice(0,3);
+        marks=null; issues=1;
+        msg="<b>Delete anomaly.</b> Ben's order was cancelled and the row removed. Ben has now vanished from the database entirely — his name and email existed only as a side effect of having ordered something. A routine deletion silently destroyed unrelated data, and no constraint could have prevented it, because the fact was never stored in its own right.";
+      } else {
+        msg="<b>One table holding two kinds of fact: who the customer is, and what they ordered.</b> Notice <code>ana@mail.com</code> appearing three times. That repetition is not a storage concern — it is three chances for the copies to disagree. Try each operation in the dropdown.";
+      }
+      facts=rows.length*5;
+      table(16,34,"orders — everything in one place",
+            ["order","customer","email","product","price"],rows,
+            [Math.min(70,(w-32)*0.14),Math.min(90,(w-32)*0.18),Math.min(150,(w-32)*0.3),Math.min(100,(w-32)*0.2),Math.min(80,(w-32)*0.16)],marks);
+    } else {
+      const cw=(w-46)/2;
+      let cust=[["c-1","Ana","ana@mail.com"],["c-2","Ben","ben@mail.com"]];
+      let ord=[["o-1","c-1","Widget","19.99"],["o-2","c-1","Gadget","34.50"],
+               ["o-3","c-1","Widget","19.99"],["o-4","c-2","Gizmo","12.00"]];
+      let cm=null, om=null;
+      if(op==="update"){ cust=[["c-1","Ana","ana@work.com"],["c-2","Ben","ben@mail.com"]]; cm={0:{kind:"ok",cols:[2]}};
+        msg="<b>One row changed, and the change is complete.</b> Ana's email exists in exactly one place, so there is no partial-update state to reach and no possibility of the copies disagreeing. The operation went from a multi-row write that could half-succeed to a single-row write that cannot."; }
+      else if(op==="insert"){ cust=cust.concat([["c-3","Cass","cass@mail.com"]]); cm={2:{kind:"ok"}};
+        msg="<b>Cass exists as a customer with no orders, which is a perfectly ordinary state.</b> Customers and orders are separate facts stored separately, so one can exist without the other. No nulls, no placeholder row, nothing for future queries to filter around."; }
+      else if(op==="delete"){ ord=ord.slice(0,3); om=null;
+        msg="<b>Ben's order is gone and Ben is not.</b> Deleting an order removes only order data. His customer record was never a side effect of having ordered something, so nothing unrelated was destroyed. The foreign key would also have stopped you deleting Ben while orders referenced him, if you had tried it the other way round."; }
+      else msg="<b>The same information as two relations.</b> Each customer appears once; orders point at them by id. Every fact now lives in exactly one place, which is the entire content of third normal form. Run the three operations and compare.";
+      facts=cust.length*3+ord.length*4;
+      table(16,34,"customers",["id","name","email"],cust,[cw*0.22,cw*0.28,cw*0.5],cm);
+      table(30+cw,34,"orders",["id","customer","product","price"],ord,[cw*0.2,cw*0.26,cw*0.3,cw*0.24],om);
+      ctx.strokeStyle="#3FB984"; ctx.lineWidth=1.6; ctx.setLineDash([4,3]);
+      ctx.beginPath(); ctx.moveTo(16+cw*0.22*0.5+8,34+62); ctx.lineTo(30+cw+cw*0.2+8,34+62); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle="#1F7A52"; ctx.font="600 9px Archivo, Arial"; ctx.textAlign="center";
+      ctx.fillText("foreign key", (16+cw*0.11+30+cw+cw*0.2)/2, 34+74);
+    }
+    const dupes = flat? 3:1;
+    out.innerHTML=
+      '<div><span>design</span><b>'+(flat?"one table":"3NF")+'</b></div>'+
+      '<div><span>copies of Ana\'s email</span><b style="color:'+(dupes>1?"#D9534F":"#1F7A52")+'">'+dupes+'</b></div>'+
+      '<div><span>values stored</span><b>'+facts+'</b></div>'+
+      '<div><span>anomaly</span><b style="color:'+(issues?"#D9534F":"#1F7A52")+'">'+(op==="none"?"—":issues?"yes":"none")+'</b></div>';
+    note.innerHTML=msg;
+  }
+  [dEl,oEl].forEach(e=>e.addEventListener("change",draw));
+  draw(); debounceResize(draw);
+})();
+
+/* ============ demo 2: migrations ============ */
+(function(){
+  const cv=document.getElementById("cMig"); if(!cv) return;
+  const aEl=document.getElementById("mgA"), out=document.getElementById("mgOut"), note=document.getElementById("mgNote");
+  let k=0, timer=null;
+  const NAIVE=[
+    {cols:["name"],old:100,new:0,fail:0,sql:"—",
+     note:"<b>Version 1 is deployed on every instance and reads and writes <code>name</code>.</b> The plan is to rename it to <code>full_name</code>, then deploy version 2 which uses the new name."},
+    {cols:["full_name"],old:100,new:0,fail:100,sql:"ALTER TABLE users RENAME COLUMN name TO full_name;",
+     note:"<b>The migration runs, and every request starts failing.</b> All 100% of traffic is still served by version 1, which is asking for a column that no longer exists. The migration completed in two milliseconds and broke the entire service, because the schema changed under code that was still running."},
+    {cols:["full_name"],old:50,new:50,fail:50,sql:"—",
+     note:"<b>The rollout begins. Half the fleet is on version 2 and working; half is still on version 1 and failing.</b> Note that rolling back is now also broken — reverting the code returns every instance to asking for <code>name</code>, which is gone. You are committed to going forwards, during an outage, which is the worst possible time to be committed to anything."},
+    {cols:["full_name"],old:0,new:100,fail:0,fin:true,
+     note:"<b>The rollout finishes and errors stop.</b> Total damage: several minutes of a fully broken service, proportional to how long a deploy takes — which on a large fleet is not several minutes. Nothing here was a mistake in the SQL. The mistake was assuming one version of the code runs at a time."}
+  ];
+  const EC=[
+    {cols:["name"],old:100,new:0,fail:0,sql:"—",
+     note:"<b>The same starting point.</b> Version 1 everywhere, reading and writing <code>name</code>. This time the column will never disappear while anything still needs it."},
+    {cols:["name","full_name"],old:100,new:0,fail:0,sql:"ALTER TABLE users ADD COLUMN full_name text;",
+     note:"<b>Expand: add the new column, nullable, alongside the old.</b> Adding a nullable column is a metadata change — no table rewrite, no lock worth measuring. Version 1 has never heard of <code>full_name</code> and is entirely unaffected, which is the property that makes this safe."},
+    {cols:["name","full_name"],old:40,new:60,fail:0,sql:"— deploy v2: write both, read name",
+     note:"<b>Deploy version 2, which writes both columns and still reads <code>name</code>.</b> During the rollout the two versions coexist: v1 writes only <code>name</code>, v2 writes both, and both read <code>name</code> — so every instance sees correct data regardless of which wrote the row. The overlap is handled by design rather than survived."},
+    {cols:["name","full_name"],old:0,new:100,fail:0,sql:"UPDATE … WHERE full_name IS NULL LIMIT 5000;  -- repeat",
+     note:"<b>Backfill the rows written before v2, in batches.</b> A few thousand rows per transaction with a pause between them, restartable if it dies. One <code>UPDATE</code> across the whole table would hold locks for minutes and bloat the write-ahead log — and would have to start again from the beginning if interrupted."},
+    {cols:["name","full_name"],old:0,new:100,fail:0,sql:"— deploy v3: write both, read full_name",
+     note:"<b>Deploy version 3, which reads <code>full_name</code> and still writes both.</b> This is the switch, and it is reversible: if something is wrong, rolling back to v2 works perfectly because both columns are still populated and correct. That reversibility is the reason for the extra deploy."},
+    {cols:["name","full_name"],old:0,new:100,fail:0,sql:"— deploy v4: full_name only",
+     note:"<b>Deploy version 4, which stops writing <code>name</code> altogether.</b> The old column is now dead weight, still present and no longer maintained. Leave it that way for a release cycle — long enough that rolling back to v3 is still possible if a problem surfaces late."},
+    {cols:["full_name"],old:0,new:100,fail:0,fin:true,sql:"ALTER TABLE users DROP COLUMN name;",
+     note:"<b>Contract: drop the old column.</b> Nothing has referenced it for a full release, so the drop is safe and, notably, irreversible — which is exactly why it comes last and alone. Total cost: four deploys and a backfill instead of one migration. Total downtime: none, at any point, including if you had needed to roll back."}
+  ];
+  function steps(){ return aEl.value==="naive"?NAIVE:EC; }
+  function draw(){
+    const S=steps(), s=S[Math.min(k,S.length-1)];
+    const w=cv.clientWidth||660, h=196, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h);
+    ctx.textBaseline="middle";
+    ctx.fillStyle="#54677A"; ctx.font="600 10px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("users table", 16, 18);
+    let x=16;
+    ["id","email"].concat(s.cols).forEach(c=>{
+      const isNew=c==="full_name", isOld=c==="name";
+      const cw=Math.min(120,Math.max(62,c.length*9+30));
+      ctx.fillStyle= isNew?"#E7F7EF": isOld?"#FFF6E8":"#F2F5F7";
+      ctx.strokeStyle= isNew?"#3FB984": isOld?"#D98324":"#E1E7EC"; ctx.lineWidth=(isNew||isOld)?1.9:1;
+      ctx.fillRect(x,28,cw,26); ctx.strokeRect(x+.5,28.5,cw,26);
+      ctx.fillStyle="#16232F"; ctx.font="600 10.5px ui-monospace, monospace"; ctx.textAlign="center";
+      ctx.fillText(c,x+cw/2,41); x+=cw+5;
+    });
+    ctx.textAlign="left"; ctx.fillStyle="#54677A"; ctx.font="600 10px Archivo, Arial";
+    ctx.fillText("fleet", 16, 76);
+    const bx=64, bw=w-bx-16;
+    ctx.fillStyle="#F2F5F7"; ctx.fillRect(bx,66,bw,22);
+    if(s.old>0){ ctx.fillStyle= s.fail>0?"#E8908B":"#C3CDD5"; ctx.fillRect(bx,66,bw*s.old/100,22); }
+    if(s.new>0){ ctx.fillStyle="#3FB984"; ctx.fillRect(bx+bw*s.old/100,66,bw*s.new/100,22); }
+    ctx.strokeStyle="#E1E7EC"; ctx.lineWidth=1; ctx.strokeRect(bx+.5,66.5,bw,22);
+    ctx.font="600 10px Archivo, Arial"; ctx.textAlign="center";
+    if(s.old>8){ ctx.fillStyle="#fff"; ctx.fillText(s.fail>0?"old code · failing":"old code", bx+bw*s.old/200, 77); }
+    if(s.new>8){ ctx.fillStyle="#fff"; ctx.fillText("new code", bx+bw*s.old/100+bw*s.new/200, 77); }
+    ctx.textAlign="left"; ctx.fillStyle="#54677A"; ctx.font="600 10px Archivo, Arial";
+    ctx.fillText("error rate", 16, 112);
+    ctx.fillStyle="#F2F5F7"; ctx.fillRect(bx,102,bw,20);
+    if(s.fail>0){ ctx.fillStyle="#D9534F"; ctx.fillRect(bx,102,bw*s.fail/100,20); }
+    ctx.strokeStyle="#E1E7EC"; ctx.strokeRect(bx+.5,102.5,bw,20);
+    ctx.fillStyle= s.fail>12?"#fff":"#54677A"; ctx.font="600 11px ui-monospace, monospace"; ctx.textAlign="left";
+    ctx.fillText(s.fail+"%", s.fail>12?bx+8:bx+bw*s.fail/100+8, 112);
+    if(s.sql&&s.sql!=="—"){
+      ctx.fillStyle="#F5F8FA"; ctx.strokeStyle="#E1E7EC"; ctx.lineWidth=1;
+      ctx.fillRect(16,138,w-32,26); ctx.strokeRect(16.5,138.5,w-32,26);
+      ctx.fillStyle="#1F7A52"; ctx.font="10.5px ui-monospace, monospace"; ctx.textAlign="left";
+      const t=s.sql.length*5.6>w-46 ? s.sql.slice(0,Math.floor((w-52)/5.6))+"…" : s.sql;
+      ctx.fillText(t,26,151);
+    }
+    const totalFail=S.slice(0,k+1).filter(x=>x.fail>0).length;
+    out.innerHTML=
+      '<div><span>step</span><b>'+(Math.min(k,S.length-1)+1)+' / '+S.length+'</b></div>'+
+      '<div><span>columns</span><b>'+s.cols.join(", ")+'</b></div>'+
+      '<div><span>error rate</span><b style="color:'+(s.fail?"#D9534F":"#1F7A52")+'">'+s.fail+'%</b></div>'+
+      '<div><span>steps with errors</span><b style="color:'+(totalFail?"#D9534F":"#1F7A52")+'">'+totalFail+'</b></div>'+
+      '<div><span>rollback possible</span><b style="color:'+(s.fail>0?"#D9534F":"#1F7A52")+'">'+(s.fail>0?"no":"yes")+'</b></div>';
+    note.innerHTML=s.note;
+  }
+  function stop(){ if(timer){clearInterval(timer);timer=null;document.getElementById("mgAuto").textContent="Play";} }
+  document.getElementById("mgNext").addEventListener("click",()=>{ if(k<steps().length-1){k++;draw();} });
+  document.getElementById("mgRst").addEventListener("click",()=>{ stop(); k=0; draw(); });
+  document.getElementById("mgAuto").addEventListener("click",function(){
+    if(timer){stop();return;} this.textContent="Pause";
+    timer=setInterval(()=>{ if(k<steps().length-1){k++;draw();} else stop(); },1600);
+  });
+  aEl.addEventListener("change",()=>{ stop(); k=0; draw(); });
+  draw(); debounceResize(draw);
+})();
+</script>
+</body>
+</html>

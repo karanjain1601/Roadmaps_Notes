@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Cluster, nodes and shards — Elasticsearch</title>
+<meta name="description" content="Index, shard, segment, node — the four layers, how a document finds its shard, and why the number of shards is a decision you make once.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 02 · The model</div>
+    <h1>Cluster, nodes and shards</h1>
+    <p class="standfirst">An index is not a thing on disk. It is a name for a set of shards, each of which is a complete Lucene index, distributed across machines and replicated. Almost every capacity and availability question in this unit is really a question about that number.</p>
+    <div class="chap-meta">
+      <span class="tagpill">shards</span>
+      <span class="tagpill">replicas</span>
+      <span class="tagpill">node roles</span>
+      <span class="tagpill">quorum</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Four layers</h2>
+
+<div class="terms">
+  <div><dt>Cluster</dt><dd>One or more nodes sharing a <code>cluster.name</code>, holding one shared view of where everything is. One node is a valid cluster.</dd></div>
+  <div><dt>Node</dt><dd>One running Elasticsearch process. Usually one per machine, because it wants the whole machine's memory and page cache.</dd></div>
+  <div><dt>Index</dt><dd>A named, logical collection of documents — <code>articles</code>, <code>logs-2026.03</code>. Roughly a table, and unlike a table it is <em>only</em> a name and a mapping. The data is in the shards.</dd></div>
+  <div><dt>Shard</dt><dd>A complete, independent Lucene index. This is the unit that actually holds documents, gets allocated to a node, gets copied, and gets searched.</dd></div>
+</div>
+
+<p>Below shards there is one more layer that matters operationally: a shard is made of <b>segments</b>, which are immutable files. Writing a document does not modify a segment; it creates a new one, and background merging combines them. That immutability is inherited from Lucene and it explains updates, deletes, refresh behaviour and a good deal of the disk I/O (chapters 6 and 14).</p>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the layers, from the outside in</span><button class="copy">Copy</button></div>
+<pre><code>GET /_cluster/health
+{
+  "cluster_name": "prod",
+  "status": "green",              # green | yellow | red
+  "number_of_nodes": 5,
+  "number_of_data_nodes": 3,
+  "active_primary_shards": 30,
+  "active_shards": 60,            # primaries + replicas
+  "unassigned_shards": 0
+}
+
+GET /_cat/indices?v
+GET /_cat/shards/articles?v
+# index    shard prirep state   docs  store node
+# articles 0     p      STARTED 41291 122mb node-1
+# articles 0     r      STARTED 41291 122mb node-2
+# articles 1     p      STARTED 40873 119mb node-2
+# articles 1     r      STARTED 40873 119mb node-3
+
+GET /_cat/nodes?v
+GET /_cat/segments/articles?v
+
+# STATUS MEANS:
+#   green   every primary and every replica is assigned
+#   yellow  every primary is assigned; at least one replica is not.
+#           FULLY FUNCTIONAL — you can read and write everything. It means
+#           you have lost your redundancy, not your data
+#   red     at least one PRIMARY is unassigned. Part of your data is
+#           unreachable and writes to that shard fail
+#
+# A single-node cluster with replicas configured is permanently yellow,
+# because a replica is never allocated to the same node as its primary.
+# That is correct behaviour and it alarms people on day one.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Where a document goes</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">the routing formula</span><button class="copy">Copy</button></div>
+<pre><code>    shard = hash(_routing) % number_of_primary_shards
+
+_routing defaults to the document's _id.
+
+Three consequences follow immediately, and they are the whole reason shard
+count is a serious decision:
+
+1. THE SHARD COUNT IS IN THE FORMULA. Change it and every document hashes
+   somewhere new, so the existing data is in the wrong place. This is why
+   number_of_shards cannot be changed on a live index — you reindex into a
+   new one instead (chapter 6).
+
+2. DISTRIBUTION IS AUTOMATIC AND YOU CANNOT STEER IT. A hash of an id
+   spreads documents evenly, which is what you want and means you cannot
+   co-locate related documents by default.
+
+3. UNLESS YOU OVERRIDE _routing:
+
+     PUT /orders/_doc/8842?routing=customer-41
+     GET /orders/_search?routing=customer-41
+
+   Now every document for that customer is on one shard, and a search
+   restricted to that routing value touches ONE shard instead of all of
+   them. On a large cluster that is a very large difference.
+
+   The cost is skew: a customer with a hundred times more orders than the
+   others makes one shard a hundred times larger. Same trade as a hash tag
+   in Redis Cluster, and the same failure mode.
+
+READS go to any copy — primary or replica, chosen adaptively. WRITES always
+go to the primary, which then replicates to its replicas synchronously
+before acknowledging. That last point is a real difference from Redis and
+from MongoDB's default: an Elasticsearch write is not acknowledged until
+the in-sync replicas have it.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>What survives what</h2>
+
+<div class="demo" id="cl">
+  <div class="demo-head">
+    <b>Shard allocation and failure</b>
+    <span>Set the shape of the cluster, then take nodes away. The health colour is what your monitoring will show you.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="c-nodes">Data nodes — <span id="c-nodesv">3</span></label>
+        <input type="range" id="c-nodes" min="1" max="6" step="1" value="3">
+      </div>
+      <div>
+        <label for="c-pri">Primary shards — <span id="c-priv">3</span></label>
+        <input type="range" id="c-pri" min="1" max="6" step="1" value="3">
+      </div>
+      <div>
+        <label for="c-rep">Replicas per shard — <span id="c-repv">1</span></label>
+        <input type="range" id="c-rep" min="0" max="2" step="1" value="1">
+      </div>
+      <div>
+        <label for="c-down">Nodes down — <span id="c-downv">0</span></label>
+        <input type="range" id="c-down" min="0" max="5" step="1" value="0">
+      </div>
+    </div>
+    <div id="c-grid"></div>
+    <div class="stat">
+      <div><b id="c-health">—</b><span>cluster health</span></div>
+      <div><b id="c-total">—</b><span>shard copies</span></div>
+      <div><b id="c-disk">—</b><span>disk multiplier</span></div>
+      <div><b id="c-tol">—</b><span>node failures tolerated</span></div>
+    </div>
+    <div class="out" id="c-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Primaries are permanent, replicas are free to change</span>
+  <p><code>number_of_shards</code> is fixed at index creation and cannot be altered afterwards, because it is in the routing formula. <code>number_of_replicas</code> can be changed at any moment with one call, and the cluster will create or drop copies to match. That asymmetry is worth committing to memory: <b>the decision you must get right at creation time is the primary count; the replica count is a dial you can turn later</b>. It is also why the common advice for a bulk load is to set replicas to 0, index everything, then set them back — you avoid replicating every document as it arrives, and the copies are built from the finished shards instead.</p>
+</div>
+
+<h2><span class="h-rule"></span>How many shards</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">the guidance, and why it is what it is</span><button class="copy">Copy</button></div>
+<pre><code>TARGET 10-50 GB PER SHARD. Up to 50 GB for search workloads, and time-series
+data is routinely run larger. Below about 10 GB you are usually paying more
+in overhead than you gain in parallelism.
+
+WHY THERE IS AN UPPER BOUND: a shard is the unit of recovery and relocation.
+A 200 GB shard has to be copied in full when a node fails or the cluster
+rebalances, which is slow and saturates the network. It is also the unit of
+parallelism — one shard is searched by one thread, so an oversized shard
+makes a single query slow with no way to speed it up.
+
+WHY THERE IS A LOWER BOUND: every shard costs memory for its own Lucene
+index structures, file handles, and a slot in the cluster state. A query
+against an index fans out to every shard and the coordinating node merges
+the results, so 200 tiny shards means 200 requests and 200 result sets to
+merge for every search.
+
+THE HEAP RULE: aim for UNDER 20 SHARDS PER GB OF HEAP on each node. A node
+with 30 GB of heap should hold at most ~600 shards, and comfortably fewer.
+Clusters that ignore this develop slow cluster-state updates, long recovery
+times and mysterious master instability.
+
+  ------------------------------------------------------------------
+  A WORKED EXAMPLE
+    200 GB of data, expected to reach 400 GB
+    400 GB / 40 GB per shard = 10 primary shards
+    with 1 replica       = 20 shard copies, 800 GB of disk
+    across 5 data nodes  = 4 copies per node. Comfortable.
+  ------------------------------------------------------------------
+
+FOR TIME-SERIES DATA, do not agonise. Use a data stream with rollover
+(chapter 15) — each backing index is small, you set a size threshold, and
+the shard count per index can be 1. The problem solves itself.
+
+FOR SEARCH DATA, size for the data you will have in a year, not today. You
+cannot change it later without a reindex, and a reindex of a live search
+index is a project.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Oversharding is the most common self-inflicted Elasticsearch problem</span>
+  <p>The instinct is that more shards means more parallelism means faster, so people create 20 shards for 5 GB of data. What actually happens: every search fans out to 20 shards and merges 20 result sets, cluster state grows, recovery gets slower, heap fills with per-shard overhead, and the master node starts struggling to propagate updates. <b>The symptoms appear months later and look like general cluster sickness rather than a configuration mistake</b>, which is why it is so persistent. Elasticsearch's default was reduced from 5 primaries to 1 in version 7 precisely because the old default was oversharding almost everybody.</p>
+</div>
+
+<h2><span class="h-rule"></span>Node roles</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Role</th><th>Does</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>master</code></td><td>Cluster state — where shards are, what the mappings are</td><td>Only one is elected active. Needs an odd number eligible</td></tr>
+<tr><td><code>data</code></td><td>Holds shards, executes queries against them</td><td>The workhorse. Wants memory and fast disks</td></tr>
+<tr><td><code>data_hot</code> / <code>warm</code> / <code>cold</code> / <code>frozen</code></td><td>Tiered storage by age</td><td>Drives ILM placement (chapter 15)</td></tr>
+<tr><td><code>ingest</code></td><td>Runs ingest pipelines before indexing</td><td>Separate these if pipelines are heavy</td></tr>
+<tr><td><code>ml</code></td><td>Machine learning jobs, and inference for semantic search</td><td>Wants its own nodes; competes for CPU</td></tr>
+<tr><td><code>coordinating</code></td><td>No roles at all — routes requests and merges results</td><td>The default for a node with every role disabled</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="yaml">
+<div class="code-head"><span class="lang">elasticsearch.yml</span><button class="copy">Copy</button></div>
+<pre><code>cluster.name: prod
+node.name: node-1
+node.roles: [ master, data, ingest ]      # small cluster: everything
+# node.roles: [ master ]                  # dedicated master
+# node.roles: [ data_hot, data_content ]  # dedicated data node
+# node.roles: [ ]                         # coordinating-only
+
+network.host: 10.0.1.10
+discovery.seed_hosts: [ "10.0.1.10", "10.0.1.11", "10.0.1.12" ]
+cluster.initial_master_nodes: [ "node-1", "node-2", "node-3" ]
+# ^ ONLY on first ever startup. Remove it afterwards, or a cluster that is
+#   restarted from empty data directories can form a second, separate cluster
+
+path.data: /var/lib/elasticsearch
+path.logs: /var/log/elasticsearch
+bootstrap.memory_lock: true               # never swap the heap
+
+# UNTIL YOU HAVE SIX OR MORE NODES, do not bother with dedicated roles.
+# Three nodes running every role is a good, simple, resilient cluster and
+# is what most deployments should be. Split roles when you can point at the
+# resource contention that requires it.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Split brain, and why it is solved</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">the historical problem and the current answer</span><button class="copy">Copy</button></div>
+<pre><code>THE PROBLEM. A network partition splits a cluster. Each side notices the
+master is gone and elects its own. Both sides accept writes. When the
+partition heals, two divergent cluster states must be reconciled — and one
+side's writes are discarded.
+
+BEFORE VERSION 7 you prevented this by hand:
+
+    discovery.zen.minimum_master_nodes: 2      # (N/2)+1, set MANUALLY
+
+Setting it wrong — or forgetting to update it when adding nodes — caused
+real, well-documented data loss. It was the single most common serious
+Elasticsearch misconfiguration.
+
+SINCE VERSION 7 the setting is gone. Elasticsearch uses a proper consensus
+algorithm with an explicit VOTING CONFIGURATION that the cluster maintains
+itself. A master can only act if it holds a majority of votes, and the
+minority side of a partition cannot elect one — it goes read-only and waits.
+
+    GET /_cluster/state/metadata?filter_path=metadata.cluster_coordination
+
+WHAT YOU STILL HAVE TO GET RIGHT:
+
+  * an ODD NUMBER of master-eligible nodes. Three is the standard answer.
+    Two is worse than one, because two cannot form a majority when one
+    fails — exactly the arithmetic from Redis Cluster and MongoDB
+  * master-eligible nodes on SEPARATE failure domains — different hosts,
+    ideally different racks or zones
+  * on very large clusters, DEDICATED masters, so a heavy query on a data
+    node cannot destabilise cluster coordination
+  * do not run exactly two master-eligible nodes and then wonder why a
+    single failure takes the cluster read-only. It is doing what it should
+
+Note this protects CLUSTER STATE, not documents. A partition can still lose
+in-flight writes on the minority side. Elasticsearch's consistency model
+(chapter 6) is not a transactional database's, and no amount of correct
+quorum configuration changes that.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Index templates, so the settings apply to indices that do not exist yet</span>
+  <p>Shard count and mappings are set at index creation, and for time-series data the indices are created automatically as data arrives — which means there is no moment at which you could set them by hand. <b>An index template attaches settings and mappings to a name pattern in advance</b>, so <code>logs-2026.03.15</code> is created with your configuration the first time a document for that day is written. This is not an advanced feature to defer: any index created implicitly by an incoming document gets whatever the defaults are, dynamic mapping and all, and by the time you notice, you have a month of indices with the wrong shard count and inferred field types (chapters 4 and 15).</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>An index is a name for a set of shards.</b> Each shard is a complete, independent Lucene index.</li>
+    <li><b><code>shard = hash(_routing) % primaries</code></b>, which is why the primary count cannot change on a live index.</li>
+    <li><b>Custom routing co-locates related documents</b> and turns an all-shard search into a one-shard search, at the cost of skew.</li>
+    <li><b>Yellow means you lost redundancy, red means you lost access.</b> A single node with replicas is permanently yellow and that is correct.</li>
+    <li><b>Target 10–50 GB per shard</b>, and under 20 shards per GB of heap per node.</li>
+    <li><b>Oversharding is the common self-inflicted problem</b>, and its symptoms show up months later as general cluster sickness.</li>
+    <li><b>Replicas can be changed any time.</b> Set them to 0 for a bulk load and back afterwards.</li>
+    <li><b>Odd number of master-eligible nodes, three by default.</b> Version 7 removed the setting that used to cause split-brain data loss.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("02-cluster-and-shards.html");
+
+(function(){
+  const root = document.getElementById("cl");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  function render(){
+    const nodes = parseInt($("c-nodes").value, 10);
+    const pri   = parseInt($("c-pri").value, 10);
+    const rep   = parseInt($("c-rep").value, 10);
+    let   down  = parseInt($("c-down").value, 10);
+    if(down >= nodes) down = nodes - 1;
+
+    $("c-nodesv").textContent = nodes;
+    $("c-priv").textContent   = pri;
+    $("c-repv").textContent   = rep;
+    $("c-downv").textContent  = down;
+
+    const live = nodes - down;
+    const copies = rep + 1;                 // copies of each shard
+
+    // allocate: shard s copy c -> node (s + c*offset) % nodes, avoiding same node
+    const alloc = [];                       // alloc[node] = [{shard, primary}]
+    for(let n = 0; n < nodes; n++) alloc.push([]);
+    for(let s = 0; s < pri; s++){
+      for(let c = 0; c < copies; c++){
+        if(c >= nodes) break;               // cannot place more copies than nodes
+        const n = (s + c) % nodes;
+        alloc[n].push({shard:s, primary:c === 0});
+      }
+    }
+
+    // nodes 0..down-1 are down
+    const downSet = new Set();
+    for(let i = 0; i < down; i++) downSet.add(i);
+
+    // for each shard, do any copies remain? is a primary-capable copy alive?
+    let unassigned = 0, lostPrimaries = 0;
+    const shardAlive = [];
+    for(let s = 0; s < pri; s++){
+      let aliveCopies = 0, placed = 0;
+      for(let c = 0; c < copies; c++){
+        if(c >= nodes) break;
+        placed++;
+        if(!downSet.has((s + c) % nodes)) aliveCopies++;
+      }
+      shardAlive.push(aliveCopies);
+      unassigned += (copies - aliveCopies);
+      if(aliveCopies === 0) lostPrimaries++;
+    }
+
+    const health = lostPrimaries > 0 ? "red" : (unassigned > 0 ? "yellow" : "green");
+    const HC = {green:"#3FB984", yellow:"#F2A03D", red:"#E2574C"};
+
+    $("c-health").textContent = health;
+    $("c-health").style.color = HC[health];
+    $("c-total").textContent  = (pri * Math.min(copies, nodes)) + " copies";
+    $("c-disk").textContent   = Math.min(copies, nodes) + "×";
+    $("c-tol").textContent    = copies >= nodes ? (nodes - 1) : (Math.min(copies, nodes) - 1);
+
+    $("c-grid").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin:16px 0 8px">Allocation</div>' +
+      '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px">' +
+      alloc.map((shards, n) => {
+        const dead = downSet.has(n);
+        return '<div style="background:' + (dead ? "#FBEDEC" : "#fff") + ';border:2px solid ' +
+          (dead ? "#E2574C" : "#E1E7EC") + ';border-radius:6px;padding:10px;text-align:center;' +
+          (dead ? "opacity:.75" : "") + '">' +
+          '<div style="font-family:var(--mono);font-size:11.5px;font-weight:700;color:' +
+          (dead ? "#E2574C" : "#16232F") + '">node-' + (n+1) + (dead ? " ✕" : "") + '</div>' +
+          '<div style="display:flex;flex-wrap:wrap;gap:4px;justify-content:center;margin-top:8px;min-height:24px">' +
+          shards.map(s =>
+            '<span style="font-family:var(--mono);font-size:10.5px;font-weight:700;padding:2px 6px;' +
+            'border-radius:3px;background:' + (dead ? "#E5E9ED" : (s.primary ? "#25B7C4" : "#D6EFF3")) +
+            ';color:' + (dead ? "#8FA0AF" : (s.primary ? "#fff" : "#0F7A85")) + '">' +
+            (s.primary ? "P" : "R") + s.shard + '</span>').join("") +
+          '</div></div>';
+      }).join("") + '</div>' +
+      '<div style="display:flex;gap:14px;margin-top:9px;font-size:11px;color:#54677A">' +
+      '<span><b style="color:#0F7A85">P</b> primary</span>' +
+      '<span><b style="color:#0F7A85">R</b> replica</span>' +
+      '<span>' + unassigned + ' unassigned</span></div>';
+
+    const notes = [];
+
+    if(copies > nodes)
+      notes.push("You have asked for " + copies + " copies of each shard across only " + nodes +
+        " node" + (nodes > 1 ? "s" : "") + ". A replica is never placed on the same node as its primary, so " +
+        (copies - nodes) * pri + " copies cannot be allocated and the cluster is permanently yellow.\n\nThis is the single-node case that alarms everyone on day one: an index with the default 1 replica on a one-node cluster shows yellow forever. Nothing is wrong — the cluster is telling you accurately that you have no redundancy. Set number_of_replicas to 0 for a development cluster and the colour goes green.");
+
+    if(health === "green" && down === 0)
+      notes.push("Every primary and every replica is allocated. " + pri + " shards × " + copies +
+        " copies = " + (pri*copies) + " shard copies across " + nodes + " nodes.\n\nDisk usage is " + copies +
+        "× your data size, which is the part people forget when planning capacity: one replica means you buy twice the storage.\n\nDrag the failure slider to see what this shape survives.");
+    else if(health === "green")
+      notes.push("Still green with " + down + " node" + (down > 1 ? "s" : "") +
+        " down. Every shard has at least one surviving copy AND the cluster has been able to promote and re-replicate to full redundancy in this arrangement.\n\nThis is the state you are paying replicas for.");
+
+    if(health === "yellow")
+      notes.push("YELLOW: " + unassigned + " shard copies are unassigned, but every shard still has at least one live copy.\n\nThis is a fully functional cluster. You can read everything, write everything, and search everything — you have lost redundancy, not data.\n\nThat distinction matters during an incident. A yellow cluster is not an emergency; it is a warning that the next failure might be. Elasticsearch will start rebuilding the missing copies on surviving nodes automatically if there is room, and the cluster returns to green on its own.");
+
+    if(health === "red")
+      notes.push("RED: " + lostPrimaries + " shard" + (lostPrimaries > 1 ? "s have" : " has") +
+        " no surviving copy. That portion of the index is unreachable — searches return partial results and writes routed to those shards fail.\n\nThe data is not necessarily lost. If the nodes come back with their disks intact, the shards recover. If they do not, you restore from a snapshot (chapter 15), and this is the moment you find out whether you had one.\n\nNote what searches do here: by default a search across a red index returns the results it CAN reach, with a shard failure count in the response. Silently partial results are worse than an error for most applications — set allow_partial_search_results to false if correctness matters more than availability.");
+
+    if(rep === 0 && down === 0)
+      notes.push("With zero replicas you have one copy of everything. Disk usage is minimal and any single node failure takes the cluster red immediately.\n\nThis is the right setting for two situations: a development cluster, and a bulk load where you plan to raise the replica count afterwards. It is the wrong setting for anything you care about, because replicas are not just redundancy — they also serve reads, so zero replicas means no read scaling either.");
+
+    if(pri > nodes * 2 && nodes > 1)
+      notes.push("Note " + pri + " primaries across " + nodes + " nodes is a lot of shards per node for an illustration, and the real version of this is the most common self-inflicted Elasticsearch problem.\n\nEvery search fans out to every shard and the coordinating node merges all the result sets. More shards than you need means more requests, more merging, more per-shard memory overhead and a larger cluster state — with the symptoms appearing months later as general cluster sickness rather than as an obvious configuration mistake.\n\nTarget 10-50 GB per shard and work backwards from your expected data volume.");
+
+    $("c-note").textContent = notes.join("\n\n");
+  }
+
+  ["c-nodes","c-pri","c-rep","c-down"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Operating it — Redis</title>
+<meta name="description" content="Security defaults that have caused breaches, configuration, upgrades, the metrics worth watching, and a diagnostic playbook.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 17 · Running it</div>
+    <h1>Operating it</h1>
+    <p class="standfirst">Redis is unusually easy to run and unusually easy to expose. A default installation has no authentication, several commands that will take it down, and a configuration file where the important settings are the ones nobody changed.</p>
+    <div class="chap-meta">
+      <span class="tagpill">security</span>
+      <span class="tagpill">acl</span>
+      <span class="tagpill">metrics</span>
+      <span class="tagpill">playbook</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Security</h2>
+
+<div class="note key">
+  <span class="note-t">An unauthenticated Redis on the internet is a compromised machine, not a leaked database</span>
+  <p>Redis has no authentication by default. Worse than the data exposure: an attacker with write access can use <code>CONFIG SET dir</code> and <code>dbfilename</code> to write an RDB file anywhere the process can write — commonly an SSH <code>authorized_keys</code> file or a cron directory — and get shell access. This has been exploited at scale for a decade, and it is why <b>protected mode</b> exists: since 3.2, a Redis with no password and no explicit <code>bind</code> refuses connections from anything but localhost. That default has prevented a great many incidents and it is routinely disabled by a Docker image or a quickstart guide that binds <code>0.0.0.0</code> to make things work.</p>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the settings that matter</span><button class="copy">Copy</button></div>
+<pre><code># redis.conf
+bind 127.0.0.1 10.0.1.15          # never 0.0.0.0 on a reachable network
+protected-mode yes                # keep it
+port 6379
+requirepass <long-random-string>  # or better, ACL users below
+
+# TLS — separate port, off by default
+tls-port 6380
+port 0                            # disable the plaintext port entirely
+tls-cert-file /etc/ssl/redis.crt
+tls-key-file  /etc/ssl/redis.key
+tls-ca-cert-file /etc/ssl/ca.crt
+tls-auth-clients yes              # require client certificates
+
+# RENAME OR DISABLE the dangerous commands:
+rename-command FLUSHALL ""
+rename-command FLUSHDB  ""
+rename-command CONFIG   "CONFIG_9f2a41"
+rename-command DEBUG    ""
+rename-command KEYS     ""
+# CONFIG is the one that matters most — it is the command that turns read
+# access into remote code execution via the dir/dbfilename trick.
+# ACLs (below) are the better mechanism; rename-command is the blunt version
+# that works on any version.
+
+# THE NETWORK IS THE REAL CONTROL. Redis auth is a single shared secret with
+# no rate limiting and no lockout, so it is a speed bump rather than a wall.
+# Put the instance on a private subnet with a default-deny firewall and treat
+# authentication as the second layer, not the first.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>ACLs</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">real users, since Redis 6</span><button class="copy">Copy</button></div>
+<pre><code># Before 6.0 there was one password and everyone had full access. ACLs give
+# you users, command permissions and key patterns.
+
+ACL SETUSER cache-app on >secret ~cache:* +@read +@write +@keyspace -@dangerous
+ACL SETUSER readonly  on >secret ~* +@read
+ACL SETUSER metrics   on >secret allkeys +info +ping +client|list
+ACL SETUSER worker    on >secret ~jobs:* ~{jobs}:* +@list +@stream
+
+ACL LIST
+ACL GETUSER cache-app
+ACL WHOAMI
+ACL CAT                    # the command categories
+ACL CAT dangerous          # what is in one
+
+#   ~pattern       key patterns this user may touch
+#   %R~ / %W~      read-only / write-only key patterns (7.0+)
+#   &channel       pub/sub channels (7.0+)
+#   +@read +@write +@admin +@dangerous +@keyspace ... categories
+#   +get -set      individual commands
+#   allkeys / allcommands / nopass — the blunt instruments
+
+# Persist them in a separate file rather than redis.conf:
+aclfile /etc/redis/users.acl
+ACL SAVE
+ACL LOAD
+
+# THE DEFAULT USER is what an unauthenticated client becomes. Lock it down:
+ACL SETUSER default off
+# or, if you must keep it:
+ACL SETUSER default on >password ~* +@all
+
+# WHAT TO ACTUALLY DO: one user per service, with the narrowest key pattern
+# and command set that works. -@dangerous alone removes FLUSHALL, CONFIG,
+# DEBUG, SHUTDOWN, KEYS and the rest, which is most of the risk for one flag.
+
+ACL LOG                    # authentication failures and denied commands.
+ACL LOG RESET              # worth alerting on — it is your intrusion signal</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>The dashboard</h2>
+
+<div class="demo" id="ops">
+  <div class="demo-head">
+    <b>What to watch</b>
+    <span>Twelve metrics that between them predict nearly every Redis incident in this unit.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="m-metric">Metric</label>
+        <select id="m-metric">
+          <option value="mem" selected>used_memory against maxmemory</option>
+          <option value="evict">evicted_keys</option>
+          <option value="hit">Hit rate</option>
+          <option value="lat">Latency and the slowlog</option>
+          <option value="conn">connected_clients</option>
+          <option value="blocked">blocked_clients</option>
+          <option value="frag">mem_fragmentation_ratio</option>
+          <option value="rdb">rdb_last_bgsave_status</option>
+          <option value="fork">rdb_last_fork_usec</option>
+          <option value="repl">Replication offset lag</option>
+          <option value="sync">sync_full</option>
+          <option value="rejected">rejected_connections</option>
+        </select>
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="m-alert">—</b><span>alert when</span></div>
+      <div><b id="m-sev">—</b><span>severity</span></div>
+      <div><b id="m-ch">—</b><span>covered in</span></div>
+    </div>
+    <div id="m-cmd"></div>
+    <div class="out" id="m-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Configuration worth setting</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Setting</th><th>Default</th><th>Set to</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><code>maxmemory</code></td><td>0 — unlimited</td><td>A real number</td><td>Otherwise the OOM killer decides (chapter 12)</td></tr>
+<tr><td><code>maxmemory-policy</code></td><td><code>noeviction</code></td><td>Deliberately</td><td>The default is a write outage for a cache</td></tr>
+<tr><td><code>bind</code></td><td>127.0.0.1</td><td>Specific interfaces</td><td>Never <code>0.0.0.0</code></td></tr>
+<tr><td><code>requirepass</code> / ACLs</td><td>none</td><td>Always</td><td></td></tr>
+<tr><td><code>timeout</code></td><td>0 — never</td><td>300</td><td>Reap abandoned connections</td></tr>
+<tr><td><code>tcp-keepalive</code></td><td>300</td><td>Keep</td><td>Detect dead peers</td></tr>
+<tr><td><code>repl-backlog-size</code></td><td>1mb</td><td>64mb+</td><td>Avoids full resyncs (chapter 15)</td></tr>
+<tr><td><code>latency-monitor-threshold</code></td><td>0 — off</td><td>100</td><td>It is what explains spikes (chapter 14)</td></tr>
+<tr><td><code>slowlog-log-slower-than</code></td><td>10000 µs</td><td>5000</td><td>Catch more</td></tr>
+<tr><td><code>appendfsync</code></td><td><code>everysec</code></td><td>Keep, or off entirely</td><td>Chapter 13</td></tr>
+<tr><td><code>stop-writes-on-bgsave-error</code></td><td>yes</td><td>Depends</td><td><code>no</code> on a cache; a disk problem should not stop writes</td></tr>
+<tr><td><code>lazyfree-lazy-*</code></td><td>no</td><td>yes</td><td>Free large objects off the main thread</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">and the settings outside Redis</span><button class="copy">Copy</button></div>
+<pre><code># Redis warns about the first two at startup and both are routinely ignored.
+
+vm.overcommit_memory = 1     # or fork() can fail during a background save
+                             # even though copy-on-write means it would fit
+net.core.somaxconn = 1024    # the accept backlog. Redis's tcp-backlog cannot
+                             # exceed this, so a burst of connections is
+                             # dropped at the kernel
+vm.swappiness = 0            # never swap an in-memory database. A
+                             # fragmentation ratio below 1.0 means you are
+                             # already doing it (chapter 12)
+
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+# THP makes the copy-on-write fork copy 2 MB pages instead of 4 KB, which
+# inflates memory and latency during every save (chapter 13).
+
+ulimit -n 65535              # file descriptors: maxclients + replicas +
+                             # persistence + headroom
+
+# UPGRADES are undramatic. Minor versions are drop-in; major versions have
+# changed the RDB format in ways that are forward-compatible but not
+# backward, so a newer Redis reads an older dump and not the reverse.
+#
+# Rolling upgrade of a replicated setup:
+#   1. upgrade each REPLICA: stop, replace the binary, start, wait for
+#      master_link_status:up and the offset to catch up
+#   2. failover to an upgraded replica
+#   3. upgrade the former primary
+#
+# Check the release notes for defaults that changed. Between 6 and 7 the AOF
+# layout changed to multi-part, and 7.0 changed several cluster and script
+# behaviours — none of it breaking, all of it worth reading.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>The first five minutes</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">four commands, before forming a theory</span><button class="copy">Copy</button></div>
+<pre><code># 1. Is it memory?
+INFO memory
+#   used_memory vs maxmemory, mem_fragmentation_ratio
+INFO stats | grep evicted
+
+# 2. Is something blocking the thread?
+SLOWLOG GET 20
+LATENCY LATEST
+INFO persistence | grep -E 'bgsave_in_progress|rewrite_in_progress|fork_usec'
+
+# 3. Who is connected, and what are they doing?
+CLIENT LIST
+INFO clients
+#   connected_clients, blocked_clients, client_recent_max_output_buffer
+
+# 4. Is replication healthy?
+INFO replication
+#   role, connected_slaves, master_repl_offset, lag
+
+# Then, if you still do not know:
+redis-cli --latency          # what the client actually experiences
+redis-cli --bigkeys          # is one key the problem
+INFO commandstats            # sorted by total usec, not per-call
+
+# NEVER run MONITOR to investigate. It streams every command to your client
+# and measurably slows the server — you will make the incident worse and
+# then leave it running.
+
+CLIENT UNPAUSE               # in case someone paused writes and forgot
+CLIENT KILL ID 42            # kill one connection
+SCRIPT KILL                  # a runaway Lua script — only if it has NOT
+                             # written. If it has, SHUTDOWN NOSAVE is the
+                             # only way out (chapter 8)</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>The playbook</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Symptom</th><th>Check</th><th>Usual cause</th></tr></thead>
+<tbody>
+<tr><td>Uniform latency, empty slowlog</td><td><code>LATENCY LATEST</code>, fork stats</td><td>A fork, a Lua script, a big <code>UNLINK</code> (chapter 14)</td></tr>
+<tr><td>OOM errors on writes</td><td><code>maxmemory-policy</code></td><td><code>noeviction</code>, or <code>volatile-*</code> with no TTLs (chapter 12)</td></tr>
+<tr><td>Hit rate falling</td><td><code>evicted_keys</code></td><td>The working set no longer fits</td></tr>
+<tr><td>Memory climbing forever</td><td><code>INFO keyspace</code></td><td>Keys with no TTL — the <code>SET</code> trap (chapter 2)</td></tr>
+<tr><td>Latency spikes every few minutes</td><td><code>rdb_last_fork_usec</code></td><td>Background saves, made worse by THP (chapter 13)</td></tr>
+<tr><td>Cannot connect</td><td><code>rejected_connections</code>, <code>maxclients</code></td><td>Client pool leak, or a client per request</td></tr>
+<tr><td>Replica constantly resyncing</td><td><code>sync_full</code>, backlog size</td><td><code>repl-backlog-size</code> too small (chapter 15)</td></tr>
+<tr><td>Writes rejected, disk fine</td><td><code>rdb_last_bgsave_status</code></td><td>Saves failing, <code>stop-writes-on-bgsave-error</code></td></tr>
+<tr><td>One node hot in a cluster</td><td><code>--hotkeys</code>, slot distribution</td><td>A hot key, or a coarse hash tag (chapter 16)</td></tr>
+<tr><td>Everything slow after a deploy</td><td><code>INFO commandstats</code></td><td>A new O(N) command in a hot path</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Check whether it is Redis at all</span>
+  <p>Three things present as "Redis is slow" and are not, and all three produce metrics that look like a database problem. <b>An exhausted client connection pool</b> — every operation queues in your application while Redis shows low CPU, few connections and an empty slowlog. <b>Serialisation cost</b> — the JSON encode and decode around each value taking longer than the round trip. <b>The machine</b> — <code>redis-cli --intrinsic-latency</code> on an oversubscribed cloud instance routinely reports milliseconds of scheduler jitter, which is a ceiling no configuration improves. Rule out all three before tuning anything (chapter 14).</p>
+</div>
+
+<h2><span class="h-rule"></span>What to record before you need it</h2>
+
+<ul class="check">
+  <li><b>The twelve dashboard metrics</b> as a time series, with a year of history.</li>
+  <li><b><code>INFO commandstats</code> snapshotted on a schedule</b>, so "which command changed on Tuesday" is answerable.</li>
+  <li><b>Key-pattern memory</b> from <code>--memkeys</code> or a sampled scan, weekly.</li>
+  <li><b>The key-pattern document</b> from chapter 2 — pattern, type, writer, reader, TTL, expected size.</li>
+  <li><b>Configuration in version control</b>, so "what changed" has an answer.</li>
+  <li><b>Restore test duration</b>, trended. The RDB load time grows with the dataset.</li>
+  <li><b>Failover test results</b>, dated. Monthly (chapter 15).</li>
+  <li><b><code>ACL LOG</code></b>, shipped somewhere — it is your intrusion signal.</li>
+</ul>
+
+<div class="note tip">
+  <span class="note-t">One instance, one purpose — again</span>
+  <p>It has come up in chapters 12, 13 and 16 and it belongs in the operations chapter too, because most of the incidents above are made worse by mixing workloads. Separate instances let each one have the <code>maxmemory</code>, eviction policy and persistence configuration its data actually wants; they stop a cache surge from evicting your sessions; they isolate a slow command to one workload rather than all of them; and on one machine they use more than one core. The cost is a few hundred megabytes of process overhead and a little more configuration. <b>It is the cheapest structural improvement available to most Redis deployments</b>, and it does not require clustering, more hardware or a migration.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>An exposed Redis is remote code execution</b>, not just a data leak — via <code>CONFIG SET dir</code> and a written RDB.</li>
+    <li><b>The network is the real control.</b> Auth is a shared secret with no rate limiting; put it on a private subnet.</li>
+    <li><b>ACLs since 6.0</b> — one user per service, and <code>-@dangerous</code> removes most of the risk in one flag.</li>
+    <li><b>Set <code>maxmemory</code>, a policy, <code>repl-backlog-size</code> and <code>latency-monitor-threshold</code></b>. All four defaults are wrong for production.</li>
+    <li><b>Fix the kernel settings Redis warns about</b> — overcommit, somaxconn, and transparent huge pages off.</li>
+    <li><b>Never <code>MONITOR</code> during an incident.</b> It makes the incident worse.</li>
+    <li><b>Alert on <code>evicted_keys</code>, not <code>used_memory</code></b>. Full is normal; evicting is the signal.</li>
+    <li><b>One instance, one purpose.</b> The cheapest structural improvement available.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("17-operations.html");
+
+(function(){
+  const root = document.getElementById("ops");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const M = {
+    mem: {alert:"above 90% of maxmemory", sev:"ticket", ch:"chapter 12",
+      cmd:'INFO memory\n#   used_memory\n#   used_memory_rss\n#   used_memory_peak\n#   maxmemory\n#   maxmemory_policy',
+      note:"Worth tracking and a poor alert on its own. A correctly-sized cache sits near its limit permanently — that is what full means, and an alert on it fires forever and gets muted.\n\nWhat matters is the relationship between used_memory and used_memory_rss. RSS well above used_memory is fragmentation or a fork in progress; RSS BELOW used_memory means part of the process has been swapped to disk, which for an in-memory database is an emergency.\n\nAnd if maxmemory is 0, that is the finding: the real limit is the machine's RAM and the failure mode is the OOM killer."},
+    evict: {alert:"any sustained rate", sev:"page", ch:"chapter 12",
+      cmd:'INFO stats\n#   evicted_keys      cumulative — track the RATE\n#   expired_keys      TTL expiry. Different, and normal\n\nINFO memory | grep policy',
+      note:"The signal that used_memory is not. Keys being evicted means the working set no longer fits and Redis is discarding data that would have been hits.\n\nThere is no error and nothing in the logs. The hit rate simply degrades, requests start going to the origin more often, and the first symptom is usually elevated database load rather than anything Redis reports.\n\nDistinguish it from expired_keys, which is TTL expiry doing exactly what it should. A rising evicted_keys with a flat expired_keys is a capacity signal; the reverse is normal operation.\n\nAnd check the policy: if it is volatile-* and you are seeing OOM errors rather than evictions, there are no TTL'd candidates to evict and the instance is refusing writes instead."},
+    hit: {alert:"a step change", sev:"ticket", ch:"chapter 7",
+      cmd:'INFO stats\n#   keyspace_hits\n#   keyspace_misses\n\n# rate = hits / (hits + misses)',
+      note:"Global, cumulative, and dominated by whichever key pattern is most cacheable — so an aggregate of 94% can hide a pattern at 12% that accounts for most of your traffic.\n\nTrack it per pattern from your application, not just globally. The overall number tells you something changed; only per-pattern tracking tells you what.\n\nA step change after a deploy usually means new keys with no reuse, or an invalidation that is now firing too aggressively. A gradual decline usually means eviction — check evicted_keys alongside it.\n\nAnd be prepared to REMOVE a cache with a low hit rate. It costs a round trip on every request, memory for entries nobody reads, and an invalidation path to maintain, in exchange for nothing."},
+    lat: {alert:"p99 above your budget", sev:"page", ch:"chapter 14",
+      cmd:'SLOWLOG GET 20\nLATENCY LATEST\nLATENCY DOCTOR\nINFO latencystats        # p50/p99 per command, 7.0+\n\nredis-cli --latency',
+      note:"The slowlog records EXECUTION time only — not queueing, not network. So the most confusing incident is uniform latency across every operation with an empty slowlog: every command waited its turn and each executed quickly, so none of them looks slow.\n\nThat pattern means the thread was occupied. LATENCY LATEST covers what the slowlog cannot, tracking fork, aof-fsync-always, expire-cycle, eviction-cycle and active-defrag events.\n\nTurn on latency-monitor-threshold — it is 0 by default, which means off, and it is the setting that explains spikes.\n\nINFO latencystats in 7.0+ gives per-command percentiles, which is the best available view of what clients actually experience."},
+    conn: {alert:"approaching maxclients", sev:"page", ch:"chapter 14",
+      cmd:'INFO clients\n#   connected_clients\n#   maxclients\n\nCLIENT LIST\n#   age, idle, cmd, omem per connection',
+      note:"Steady growth in connected_clients with no traffic increase is a connection leak — usually a client that creates a connection per request rather than using a pool, or one that never closes them.\n\nCLIENT LIST with high `age` and high `idle` on many connections confirms it: those are connections nobody is using and nobody will close.\n\nSet `timeout 300` so Redis reaps them itself. The default is 0, meaning never.\n\nWatch omem too — the per-client output buffer. A few hundred slow pub/sub subscribers can hold gigabytes there, charged against your instance's memory (chapter 11)."},
+    blocked: {alert:"unexpected growth", sev:"ticket", ch:"chapters 4, 6",
+      cmd:'INFO clients\n#   blocked_clients\n\nCLIENT LIST | grep -E "BLPOP|BRPOP|XREAD"',
+      note:"Clients waiting in BLPOP, BRPOP, BZPOPMIN or XREADGROUP. This is NORMAL — it is what a blocking consumer looks like, and a healthy worker pool has a stable count equal to the number of idle workers.\n\nWhat is informative is a change. A rising count means workers are idle because no work is arriving, which may mean the producer has stopped. A falling count to zero means every worker is busy, which means the queue is backing up.\n\nSo it is a useful proxy for queue health without needing to inspect the queue itself. Track it alongside the queue length — LLEN or XLEN — and the two together tell you whether you are producer-bound or consumer-bound."},
+    frag: {alert:"above 1.5, or below 1.0", sev:"ticket", ch:"chapter 12",
+      cmd:'INFO memory\n#   mem_fragmentation_ratio    rss / used_memory\n#   allocator_frag_ratio\n\nCONFIG SET activedefrag yes',
+      note:"Above 1.5 means the allocator holds memory it cannot reuse — common with high churn and variable value sizes, because jemalloc keeps freed space in size-class pools.\n\nBELOW 1.0 is the one to act on immediately: it means part of the process has been swapped to disk. For an in-memory database that destroys the latency profile entirely, and it will not recover on its own. Set vm.swappiness=0 and size the instance properly.\n\nActive defragmentation moves objects to compact the heap incrementally, at the cost of CPU on the single thread. It works, and the simpler fix on a replicated setup is often to fail over and rebuild the old primary — a freshly loaded dataset is compact.\n\nNote the ratio is inflated during a background save, because the COW pages count towards RSS. Do not diagnose fragmentation from a sample taken mid-fork."},
+    rdb: {alert:"any err value", sev:"page", ch:"chapter 13",
+      cmd:'INFO persistence\n#   rdb_last_bgsave_status\n#   aof_last_bgrewrite_status\n#   aof_last_write_status\n#   rdb_changes_since_last_save',
+      note:"An err value here means saves are failing — usually a full disk, missing permissions on the data directory, or the fork failing because of vm.overcommit_memory.\n\nThe consequence is worse than losing the backup. With stop-writes-on-bgsave-error yes, which is the default, Redis REFUSES ALL WRITES when the last save failed. So a disk problem presents as an application-wide write outage with no obvious connection to disk.\n\nThat default is right for a datastore and wrong for a cache — a cache should keep serving even if it cannot persist data it did not need persisted.\n\nAlso watch rdb_changes_since_last_save: a large and growing number means saves are not happening at all, which on the default schedule can mean the instance is too quiet to trigger one."},
+    fork: {alert:"above ~200 ms", sev:"ticket", ch:"chapter 13",
+      cmd:'INFO persistence\n#   rdb_last_fork_usec\n#   rdb_bgsave_in_progress\n#   aof_rewrite_in_progress\n\nLATENCY HISTORY fork',
+      note:"The fork call itself blocks the main thread while the kernel copies page tables, and the cost is proportional to the dataset size. On a 64 GB instance that can be hundreds of milliseconds of total unavailability, once per save.\n\nThis is the most common explanation for periodic latency spikes with an empty slowlog. LATENCY HISTORY fork correlates them directly.\n\nTwo things make it dramatically worse. Transparent huge pages mean the kernel copies 2 MB pages instead of 4 KB, inflating both the fork time and the copy-on-write memory. And a large dataset with heavy write traffic maximises both terms.\n\nOn a pure cache the real fix is to disable persistence entirely, which removes the fork and the spike together."},
+    repl: {alert:"sustained byte lag", sev:"page", ch:"chapter 15",
+      cmd:'INFO replication\n#   master_repl_offset      on the primary\n#   slave0:...offset=...    per replica\n#   lag=N                   seconds since last contact\n\n# The offset difference IS your data-loss window.',
+      note:"The difference between the primary's offset and each replica's is, in bytes, exactly how much data you lose if the primary dies right now. That framing is more useful than a seconds figure, because it does not depend on write rate.\n\nReplication is asynchronous, so this is never zero and does not need to be. What matters is whether it is stable or growing.\n\nSustained growth means the replica cannot keep up — slower storage, a saturated network, or a replica doing its own background saves. A replica that is behind also cannot be promoted safely, so your failover options have quietly narrowed.\n\nAlert on the byte lag, not the seconds. The seconds figure is derived from the last contact time and behaves oddly on an idle primary."},
+    sync: {alert:"any increase", sev:"ticket", ch:"chapter 15",
+      cmd:'INFO stats\n#   sync_full           full resyncs\n#   sync_partial_ok\n#   sync_partial_err\n\nCONFIG GET repl-backlog-size',
+      note:"Each full resync forks the primary, produces an RDB, and ships the entire dataset — all of chapter 13's fork cost, triggered by a replica reconnecting.\n\nA rising sync_full with sync_partial_err also rising means the replication backlog is too small for your disconnection pattern. The backlog defaults to 1 MB, which on an instance writing 10 MB/s covers a tenth of a second — any network blip longer than that forces a full resync.\n\nRaise repl-backlog-size to 64 MB or more. It is memory well spent: it converts a momentary hiccup from a fork-and-transfer event into a few commands replayed.\n\nsync_partial_ok climbing while sync_full stays flat is the healthy pattern."},
+    rejected: {alert:"any value above zero", sev:"page", ch:"chapter 14",
+      cmd:'INFO stats\n#   rejected_connections\n\nINFO clients\n#   maxclients\n\nCONFIG GET maxclients\nulimit -n',
+      note:"Connections refused because maxclients was reached. Every one is a request that failed before Redis did any work.\n\nmaxclients is capped by the process file descriptor limit, and Redis silently lowers it at startup if ulimit -n is too small — so a configured maxclients of 10,000 with a ulimit of 1,024 gives you roughly 1,000. Check what it actually settled on rather than what you configured.\n\nAlso check net.core.somaxconn: Redis's tcp-backlog cannot exceed it, so a burst of simultaneous connections is dropped at the kernel before Redis sees them, and this metric will not even record it.\n\nThe underlying cause is almost always a client creating connections per request rather than pooling."}
+  };
+
+  function render(){
+    const m = M[$("m-metric").value];
+    $("m-alert").textContent = m.alert;
+    $("m-sev").textContent   = m.sev;
+    $("m-ch").textContent    = m.ch;
+
+    const col = m.sev === "page" ? "#E2574C" : "#F2A03D";
+    $("m-cmd").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid ' + col +
+      ';border-radius:5px;padding:11px 13px;margin:14px 0 12px;font-family:var(--mono);' +
+      'font-size:12px;line-height:1.65;overflow-x:auto">' +
+      m.cmd.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>';
+
+    $("m-note").textContent = m.note +
+      "\n\nRecord this as a time series rather than checking it. Nearly everything in INFO is a cumulative counter or a point-in-time reading, and the useful signal is the rate of change — which only exists if you were collecting before the problem started.";
+  }
+
+  $("m-metric").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

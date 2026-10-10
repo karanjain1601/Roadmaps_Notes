@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Observability — PostgreSQL</title>
+<meta name="description" content="The statistics views worth knowing, what to log and what not to, pgBadger, and the dashboard that catches problems early.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 17 · At scale</div>
+    <h1>Observability</h1>
+    <p class="standfirst">Postgres exposes an unusual amount about itself through ordinary SQL. The problem is not access to data — it is knowing which dozen numbers predict trouble, and having them recorded before the trouble arrives.</p>
+    <div class="chap-meta">
+      <span class="tagpill">statistics views</span>
+      <span class="tagpill">metrics</span>
+      <span class="tagpill">logging</span>
+      <span class="tagpill">alerting</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The dashboard</h2>
+
+<div class="demo" id="obs">
+  <div class="demo-head">
+    <b>What to watch, and what it means</b>
+    <span>Twelve metrics that between them predict nearly every Postgres incident in this unit.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="o-metric">Metric</label>
+        <select id="o-metric">
+          <option value="conn" selected>Connections in use</option>
+          <option value="lag">Replication lag</option>
+          <option value="xact">Longest transaction</option>
+          <option value="xid">Transaction id age</option>
+          <option value="dead">Dead tuples</option>
+          <option value="cache">Cache hit ratio</option>
+          <option value="wal">pg_wal size</option>
+          <option value="slots">Replication slots</option>
+          <option value="ckpt">Checkpoints requested</option>
+          <option value="temp">Temp file bytes</option>
+          <option value="dead2">Deadlocks per minute</option>
+          <option value="backup">Backup and archive age</option>
+        </select>
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="o-alert">—</b><span>alert when</span></div>
+      <div><b id="o-sev">—</b><span>severity</span></div>
+      <div><b id="o-ch">—</b><span>covered in</span></div>
+    </div>
+    <div id="o-query"></div>
+    <div class="out" id="o-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>The statistics views</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>View</th><th>Answers</th></tr></thead>
+<tbody>
+<tr><td><code>pg_stat_activity</code></td><td>What is running right now, and what each backend is waiting on</td></tr>
+<tr><td><code>pg_stat_statements</code></td><td>Which queries consume the database (chapter 10)</td></tr>
+<tr><td><code>pg_stat_user_tables</code></td><td>Per-table reads, writes, dead tuples, last vacuum and analyse</td></tr>
+<tr><td><code>pg_stat_user_indexes</code></td><td>Index usage — the source for finding unused ones</td></tr>
+<tr><td><code>pg_statio_user_tables</code></td><td>Cache hits against disk reads, per table</td></tr>
+<tr><td><code>pg_stat_database</code></td><td>Per-database commits, rollbacks, deadlocks, temp files, conflicts</td></tr>
+<tr><td><code>pg_stat_bgwriter</code></td><td>Checkpoint behaviour (split into <code>pg_stat_checkpointer</code> in PG17)</td></tr>
+<tr><td><code>pg_stat_replication</code></td><td>Per-standby lag, from the primary</td></tr>
+<tr><td><code>pg_replication_slots</code></td><td>WAL retained and cleanup held back, per slot</td></tr>
+<tr><td><code>pg_stat_archiver</code></td><td>Whether WAL archiving is working</td></tr>
+<tr><td><code>pg_locks</code></td><td>What holds what, and who is blocked</td></tr>
+<tr><td><code>pg_stat_progress_*</code></td><td>Live progress of vacuum, index builds, <code>COPY</code>, base backups</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the progress views, which are underused</span><button class="copy">Copy</button></div>
+<pre><code>-- "Is this vacuum going to finish?" — answerable, rather than a guess.
+SELECT p.pid, c.relname, p.phase,
+       pg_size_pretty(p.heap_blks_total * 8192)      AS total,
+       pg_size_pretty(p.heap_blks_scanned * 8192)    AS scanned,
+       round(100.0 * p.heap_blks_scanned /
+             nullif(p.heap_blks_total, 0), 1)        AS pct,
+       p.index_vacuum_count
+FROM pg_stat_progress_vacuum p JOIN pg_class c ON c.oid = p.relid;
+
+-- index_vacuum_count above 1 means maintenance_work_mem was too small to
+-- track all the dead tuples in one pass, so it is walking every index
+-- repeatedly. That single number often explains a vacuum taking hours
+-- (chapters 3 and 8).
+
+SELECT * FROM pg_stat_progress_create_index;   -- CREATE INDEX / REINDEX
+SELECT * FROM pg_stat_progress_copy;           -- bulk loads
+SELECT * FROM pg_stat_progress_basebackup;     -- backups
+SELECT * FROM pg_stat_progress_cluster;        -- CLUSTER / VACUUM FULL
+SELECT * FROM pg_stat_progress_analyze;</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Counters are cumulative, so record them over time</span>
+  <p>Nearly every statistic here is a total since the last reset. A single reading of <code>n_dead_tup</code> or <code>checkpoints_req</code> tells you almost nothing; the <em>rate of change</em> is the signal. Scrape these into a time-series system on a schedule — Prometheus with <code>postgres_exporter</code> is the common answer — and suddenly "when did this start" becomes answerable. Without history, every incident begins with reconstructing what normal looked like, from memory, under pressure.</p>
+</div>
+
+<h2><span class="h-rule"></span>Wait events</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">not "what is slow" but "what is it waiting for"</span><button class="copy">Copy</button></div>
+<pre><code>SELECT wait_event_type, wait_event, state, count(*)
+FROM pg_stat_activity
+WHERE backend_type = 'client backend' AND state <> 'idle'
+GROUP BY 1,2,3
+ORDER BY count(*) DESC;
+
+--  wait_event_type    means
+--  ---------------    -----------------------------------------------
+--  (null)             actually running on CPU
+--  Lock               waiting for a heavyweight lock — another transaction
+--  LWLock             internal contention, often buffer or WAL related
+--  IO                 reading or writing. DataFileRead is the common one
+--  Client             waiting for the application  <- ClientRead while
+--                     'idle in transaction' is the classic problem
+--  IPC                waiting for another backend, e.g. a parallel worker
+--  Timeout            deliberate sleeping, e.g. vacuum's cost delay
+--
+-- Sampling this every second and aggregating gives you a poor man's
+-- always-on profiler. It answers "the database was slow at 14:20 — doing
+-- what?" which no other view does.
+--
+-- pg_wait_sampling does this properly if you can install it; a cron job
+-- inserting the query above into a table works and costs nothing.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Logging</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">a configuration that is useful and not overwhelming</span><button class="copy">Copy</button></div>
+<pre><code># Without a proper prefix, log analysis is guesswork and pgBadger cannot
+# parse timings at all. This is the single most important logging setting.
+log_line_prefix = '%m [%p] %q%u@%d %a %h '
+
+log_min_duration_statement = '1s'      # slow queries
+log_checkpoints = on                   # PG15+ default
+log_autovacuum_min_duration = '1s'     # chapter 3
+log_lock_waits = on                    # anything waiting past deadlock_timeout
+log_temp_files = '10MB'                # work_mem too small for these queries
+log_connections = off                  # noisy behind a pooler
+log_disconnections = off
+
+log_destination = 'stderr'
+logging_collector = on
+log_rotation_age = '1d'
+log_rotation_size = '500MB'
+
+# Or, for anything feeding a log aggregator:
+log_destination = 'jsonlog'            # PG15+, structured and parseable
+
+# LEAVE OFF unless actively debugging:
+#   log_statement = 'all'
+# It logs every statement including parameter values — a volume problem and a
+# data-protection problem both, since passwords and personal data end up in a
+# system with weaker access control than the database (SQL chapter 15).</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Set application_name from every service</span>
+  <p>It costs nothing, it appears in <code>pg_stat_activity</code> and in every log line if your prefix includes <code>%a</code>, and it converts "some backend is running this query" into "the orders API is running this query" — which tells you what to roll back. Set it in the connection string (<code>application_name=orders-api</code>) or the <code>PGAPPNAME</code> environment variable. During an incident it is frequently the difference between a five-minute diagnosis and an hour of asking around.</p>
+</div>
+
+<h2><span class="h-rule"></span>Log analysis</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">pgBadger, and what to look at first</span><button class="copy">Copy</button></div>
+<pre><code>pgbadger -j 4 -o report.html /var/log/postgresql/postgresql-*.log
+
+# It produces an HTML report with, in rough order of usefulness:
+#   * slowest queries, normalised and ranked
+#   * queries by total time — the same argument as pg_stat_statements
+#   * temp file usage per query        -> work_mem candidates (chapter 8)
+#   * lock waits, with the blocking query
+#   * checkpoint behaviour over time   -> max_wal_size (chapter 4)
+#   * autovacuum activity per table    -> tuning candidates (chapter 3)
+#   * error and connection distribution by hour
+#
+# Run it nightly and keep the reports. It is complementary to
+# pg_stat_statements rather than a replacement: pg_stat_statements aggregates
+# everything cheaply, pgBadger shows individual slow executions WITH their
+# parameter values and the surrounding context.
+#
+# Incremental mode, for a continuously updated report:
+pgbadger --incremental --outdir /var/www/pgbadger /var/log/postgresql/*.log</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Alerting</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Page immediately</th><th>Ticket in the morning</th></tr></thead>
+<tbody>
+<tr><td>Primary unreachable</td><td>Cache hit ratio drifting down</td></tr>
+<tr><td>Disk above 85%, or <code>pg_wal</code> growing</td><td>Bloat above 20% on a large table</td></tr>
+<tr><td>Transaction id age above 150 million</td><td>Unused indexes accumulating</td></tr>
+<tr><td>Replication broken, or lag over the RPO</td><td>Slow queries appearing in the top ten</td></tr>
+<tr><td>WAL archiving failing</td><td>Autovacuum falling behind on one table</td></tr>
+<tr><td>Connections above 85% of the limit</td><td>Deadlock rate rising slowly</td></tr>
+<tr><td>Backup older than a day</td><td>A restore test not run this month</td></tr>
+<tr><td>An inactive replication slot retaining WAL</td><td>A new long-running query pattern</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Alert on causes with lead time, not only on symptoms</span>
+  <p>"The database is down" is a symptom, and by the time it fires you have an outage. Nearly every failure in this unit is preceded by a metric moving in one direction for days: transaction id age climbing, <code>pg_wal</code> growing, a slot retaining more each hour, bloat increasing, backup age advancing. <b>Those give you days of warning and they are trivially cheap to watch.</b> A dashboard of twelve leading indicators, reviewed weekly, prevents more incidents than any amount of alerting on the outage itself.</p>
+</div>
+
+<h2><span class="h-rule"></span>Tooling</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Tool</th><th>For</th></tr></thead>
+<tbody>
+<tr><td><b>postgres_exporter + Prometheus + Grafana</b></td><td>The standard open-source metrics stack. Custom queries supported</td></tr>
+<tr><td><b>pgwatch2 / temBoard / pgAdmin</b></td><td>Postgres-specific monitoring with dashboards included</td></tr>
+<tr><td><b>pgBadger</b></td><td>Log analysis, offline</td></tr>
+<tr><td><b>pgcenter</b></td><td>A <code>top</code>-like live view. Excellent during an incident</td></tr>
+<tr><td><b>pg_activity</b></td><td>Similar, interactive, easy to run ad hoc</td></tr>
+<tr><td><b>pg_wait_sampling</b></td><td>Continuous wait-event sampling — a real profiler</td></tr>
+<tr><td><b>explain.dalibo.com / depesz</b></td><td>Plan visualisation (SQL chapter 13)</td></tr>
+<tr><td><b>Managed service dashboards</b></td><td>Convenient; usually shallower than the raw views</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>What to record before you need it</h2>
+
+<ul class="check">
+  <li><b><code>pg_stat_statements</code> snapshotted every 15 minutes</b> into a table, so you can diff two points in time (chapter 10).</li>
+  <li><b>Wait events sampled every second</b>, or as close as you can manage.</li>
+  <li><b>The twelve dashboard metrics</b>, as a time series with at least a year of history.</li>
+  <li><b>Plans for your critical queries</b>, captured before every upgrade and every major deploy.</li>
+  <li><b>Table and index sizes weekly</b>, so growth is a trend rather than a surprise.</li>
+  <li><b>Configuration in version control</b>, so "what changed" has an answer.</li>
+  <li><b>Restore test duration</b>, trended (chapter 12).</li>
+  <li><b>Failover test results</b>, dated (chapter 14).</li>
+</ul>
+
+<div class="note key">
+  <span class="note-t">The question you will be asked is "when did this start"</span>
+  <p>Almost every serious investigation reduces to it, and answering requires history you were recording before anyone knew there was a problem. Everything in the list above is cheap to set up on a quiet afternoon and impossible to obtain retroactively. The single highest-value item is the <code>pg_stat_statements</code> snapshot: with it, "which query changed behaviour on Tuesday" is one query against your own table. Without it, it is guesswork and a deploy log.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Twelve metrics predict nearly every incident in this unit. <b>Watch causes with lead time</b>, not just the outage.</li>
+    <li><b>Counters are cumulative.</b> Scrape them into a time series or a single reading tells you nothing.</li>
+    <li><b>Wait events answer "waiting for what"</b>, which no other view does. Sample them continuously.</li>
+    <li>The <b>progress views</b> turn "will this vacuum ever finish" into a number — and <code>index_vacuum_count</code> often explains why it is slow.</li>
+    <li><b><code>log_line_prefix</code> is the most important logging setting.</b> Without it, log analysis is guesswork.</li>
+    <li><b>Set <code>application_name</code> everywhere.</b> It converts "some backend" into "which service to roll back".</li>
+    <li>Keep <code>log_statement = 'all'</code> off — <b>a volume problem and a data-protection problem</b>.</li>
+    <li><b>Snapshot <code>pg_stat_statements</code> on a schedule.</b> "When did this start" is the question you will be asked.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("17-observability.html");
+
+(function(){
+  const root = document.getElementById("obs");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const M = {
+    conn: {alert:"above 85% of max", sev:"page", ch:"chapter 9",
+      q:"SELECT count(*) FILTER (WHERE state = 'active')      AS active,\n       count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_txn,\n       count(*)                                        AS total,\n       current_setting('max_connections')::int         AS limit\nFROM pg_stat_activity WHERE backend_type = 'client backend';",
+      note:"Pool exhaustion presents as total unavailability rather than slowness — every new request waits, health checks time out, and the application falls over while the database is technically fine.\n\nWatch the idle_in_transaction count as closely as the total. Those backends are checked out and doing nothing, and a rising count is usually the actual cause of a saturated pool rather than genuine load.\n\nWhen it saturates, check query duration before raising the pool size. More concurrency past the knee reduces throughput."},
+    lag: {alert:"above your RPO", sev:"page", ch:"chapter 13",
+      q:"-- On the primary, per standby\nSELECT application_name, state, sync_state,\n       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS bytes_behind,\n       replay_lag\nFROM pg_stat_replication;",
+      note:"Lag matters for two separate reasons: stale reads if you route queries to replicas, and a data-loss window if the primary fails.\n\nAlert on BYTE lag as well as time lag. The time-based figure grows steadily on an idle primary — there is nothing new to replay, so the timestamp of the last replayed transaction simply gets older — and alerting on it alone fires every quiet Sunday until someone silences the whole alert.\n\nA standby that falls behind and never catches up usually means its storage is slower than the primary's, since replay is single-threaded."},
+    xact: {alert:"above 5 minutes", sev:"page", ch:"chapters 2, 3",
+      q:"SELECT pid, now() - xact_start AS age, state, wait_event,\n       left(query, 80)\nFROM pg_stat_activity\nWHERE xact_start IS NOT NULL AND backend_type = 'client backend'\nORDER BY xact_start\nLIMIT 10;",
+      note:"The most under-monitored number in Postgres, and the cause of a remarkable share of mysterious problems.\n\nThe oldest open transaction in the cluster holds back vacuum for EVERY table in EVERY database. A session left idle in transaction for two hours means two hours of accumulating dead tuples with nothing able to reclaim them — and vacuum will run, report success, and free nothing.\n\nSet idle_in_transaction_session_timeout so this cannot happen unattended, and alert on this number so you notice when a legitimate long query is doing it."},
+    xid: {alert:"above 150 million", sev:"page", ch:"chapters 2, 3",
+      q:"SELECT datname, age(datfrozenxid) AS xid_age,\n       round(100.0 * age(datfrozenxid) / 2000000000, 1) AS pct_to_limit\nFROM pg_database ORDER BY xid_age DESC;",
+      note:"The one that eventually stops the database accepting writes entirely, and the one that gives you weeks of visible warning first.\n\nThe progression: an anti-wraparound autovacuum starts at autovacuum_freeze_max_age and CANNOT be cancelled by a conflicting lock request — so it will block your migration on your largest table for hours. Then warnings on every commit. Then, at about 3 million transactions remaining, refusal to accept writes and a single-user-mode recovery.\n\nIt is entirely preventable and the causes are always the same three: a long transaction, an abandoned replication slot, or autovacuum too slow on a large table."},
+    dead: {alert:"above 20% on a large table", sev:"ticket", ch:"chapter 3",
+      q:"SELECT relname, n_live_tup, n_dead_tup,\n       round(100.0 * n_dead_tup /\n             nullif(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,\n       last_autovacuum\nFROM pg_stat_user_tables\nWHERE n_dead_tup > 10000\nORDER BY n_dead_tup DESC;",
+      note:"Bloat degrades everything gradually: scans read more pages, the cache holds less real data, indexes grow, and vacuum takes longer each time.\n\nThe diagnostic that matters is the combination. Dead tuples high AND last_autovacuum recent means vacuum is running but cannot remove anything — look for a long transaction or a replication slot holding the horizon. Dead tuples high AND last_autovacuum old or null means autovacuum is not reaching this table at all, which is usually the default scale_factor of 0.2 being a percentage on a large table.\n\nDifferent causes, different fixes, and the one number alone does not distinguish them."},
+    cache: {alert:"sustained below 95%", sev:"ticket", ch:"chapter 8",
+      q:"SELECT round(100.0 * sum(heap_blks_hit) /\n             nullif(sum(heap_blks_hit) + sum(heap_blks_read), 0), 2) AS hit_pct\nFROM pg_statio_user_tables;",
+      note:"Above 99% is normal for OLTP. A sustained drop means the working set has outgrown memory, or a large scan is evicting everything useful.\n\nTwo caveats worth knowing. The 'read' figure counts pages that came from the operating system's page cache as well as from disk, so this number understates the true hit rate — Postgres cannot see the difference. And a single large sequential scan can wreck the ratio for hours without anything actually being wrong.\n\nTrend it rather than alerting on a threshold, and correlate a drop with what changed."},
+    wal: {alert:"above 2× max_wal_size", sev:"page", ch:"chapters 4, 12",
+      q:"SELECT pg_size_pretty(sum(size)) AS pg_wal_size\nFROM pg_ls_waldir();\n\nSELECT count(*) AS unarchived\nFROM pg_ls_dir('pg_wal/archive_status') f\nWHERE f LIKE '%.ready';",
+      note:"A full pg_wal stops all writes, and recovering from it is unpleasant precisely because you cannot write.\n\nWAL is retained for four reasons: a replication slot holding it, a failing archive_command, wal_keep_size set high, or a checkpoint not having happened yet. The first two account for nearly every real case.\n\nAlert on pg_wal as a percentage of the filesystem rather than an absolute size, and pair it with the slot and archiver checks — those tell you which of the four it is."},
+    slots: {alert:"any inactive slot retaining WAL", sev:"page", ch:"chapters 4, 13",
+      q:"SELECT slot_name, slot_type, active, wal_status,\n       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn))\n           AS retained,\n       age(xmin) AS xmin_age\nFROM pg_replication_slots;",
+      note:"The classic 3am page, and completely preventable.\n\nA standby is decommissioned or a logical subscriber stops consuming, and its slot stays behind. The primary retains every WAL segment since that slot's position — forever — because as far as it knows a consumer will return. Disk usage climbs for days with no other symptom, then the filesystem fills and the database stops accepting writes.\n\nA LOGICAL slot does worse: it also holds an xmin, so it blocks vacuum cluster-wide exactly like a long transaction. Two slow-motion failures from one forgotten object.\n\nSet max_slot_wal_keep_size so Postgres invalidates a runaway slot rather than sacrificing the primary for it."},
+    ckpt: {alert:"requested above 10% of total", sev:"ticket", ch:"chapter 4",
+      q:"SELECT checkpoints_timed, checkpoints_req,\n       round(100.0 * checkpoints_req /\n             nullif(checkpoints_timed + checkpoints_req, 0), 1) AS pct_forced,\n       buffers_checkpoint, buffers_backend\nFROM pg_stat_bgwriter;   -- pg_stat_checkpointer in PG17+",
+      note:"Volume-triggered checkpoints mean max_wal_size is too small for the write rate. They arrive whenever traffic dictates rather than on a predictable schedule, and each one triggers a fresh round of full-page writes — which produces more WAL, which triggers the next one sooner.\n\nAlso watch buffers_backend. A high figure means ordinary backends are flushing their own dirty pages because the background writer cannot keep up, and that cost lands directly on user query latency rather than on a background process."},
+    temp: {alert:"a sudden rise", sev:"ticket", ch:"chapter 8",
+      q:"SELECT datname, temp_files,\n       pg_size_pretty(temp_bytes) AS temp\nFROM pg_stat_database WHERE datname = current_database();",
+      note:"Sorts and hashes spilling to disk because work_mem is too small for them.\n\nSet log_temp_files = '10MB' so you learn WHICH queries, then raise work_mem for those specific roles rather than globally — the global setting is multiplied by connections, by nodes per query, and again by parallel workers.\n\nOne distinction worth knowing: a sort spilling degrades gracefully into an external merge, while a hash join spilling splits into batches and may re-read both inputs several times. If EXPLAIN shows a high Batches count on a Hash node, that query is worth a session-level increase far more than a sort showing an external merge."},
+    dead2: {alert:"any sustained increase", sev:"ticket", ch:"SQL chapter 10",
+      q:"SELECT datname, deadlocks, xact_rollback, xact_commit,\n       round(100.0 * xact_rollback /\n             nullif(xact_commit + xact_rollback, 0), 2) AS rollback_pct\nFROM pg_stat_database WHERE datname = current_database();",
+      note:"Deadlocks are normal in small numbers — the database detected a circular wait and resolved it by killing the cheaper victim, which is correct behaviour. Any code path that writes should retry them.\n\nWhat matters is the rate. A step change means a new lock-ordering bug shipped, and the fix is consistent lock ordering — sort by primary key before updating multiple rows.\n\nThe rollback percentage alongside is a useful companion signal: a rise there without a deploy usually means constraint violations or serialisation failures, both worth understanding."},
+    backup: {alert:"backup > 1 day, archive > 15 min", sev:"page", ch:"chapter 12",
+      q:"SELECT archived_count, last_archived_time,\n       failed_count, last_failed_time,\n       now() - last_archived_time AS since_last\nFROM pg_stat_archiver;",
+      note:"A failing archive_command has two separate consequences and neither is visible without this check: your recovery point stops advancing, and pg_wal grows until the disk fills.\n\nAlert on failed_count rising at all, not on a threshold — it should be zero.\n\nAnd add the fourth metric that has no view: how long since a restore was actually TESTED. A backup nobody has restored is a hope, and the restore duration is your real recovery time objective, whatever the policy document says. Trend it, because it grows with the database."}
+  };
+
+  function render(){
+    const m = M[$("o-metric").value];
+    $("o-alert").textContent = m.alert;
+    $("o-sev").textContent   = m.sev;
+    $("o-ch").textContent    = m.ch;
+
+    const col = m.sev === "page" ? "#E2574C" : "#F2A03D";
+    $("o-query").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid ' + col +
+      ';border-radius:5px;padding:11px 13px;margin:14px 0 12px;font-family:var(--mono);' +
+      'font-size:12px;line-height:1.6;overflow-x:auto">' +
+      m.q.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>';
+
+    $("o-note").textContent = m.note +
+      "\n\nRecord this as a time series rather than checking it. Nearly every value here is a cumulative counter or a point-in-time reading, and the useful signal is the rate of change — which only exists if you were collecting before the problem started.";
+  }
+
+  $("o-metric").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

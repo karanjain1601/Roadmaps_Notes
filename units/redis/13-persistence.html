@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Persistence — Redis</title>
+<meta name="description" content="RDB, AOF and what durability means for a system whose whole pitch is speed — plus the fork that doubles your memory when you least expect it.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 13 · Making it work</div>
+    <h1>Persistence</h1>
+    <p class="standfirst">Redis can write its data to disk, and the question is not whether to enable it but what guarantee you are buying and what it costs. The honest starting position: <b>Redis is not a durable datastore</b>, and configuring persistence narrows the gap rather than closing it.</p>
+    <div class="chap-meta">
+      <span class="tagpill">rdb</span>
+      <span class="tagpill">aof</span>
+      <span class="tagpill">fsync</span>
+      <span class="tagpill">fork</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Two mechanisms</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">a snapshot, and a log</span><button class="copy">Copy</button></div>
+<pre><code># RDB — a point-in-time binary snapshot of the whole dataset.
+save 900 1        # snapshot if ≥1 key changed in 900 seconds
+save 300 10
+save 60 10000
+dbfilename dump.rdb
+rdbcompression yes
+rdbchecksum yes
+
+BGSAVE            # snapshot now, in a forked child
+SAVE              # snapshot now, ON THE MAIN THREAD. Never in production
+LASTSAVE          # unix time of the last successful save
+
+# AOF — an append-only log of every write command.
+appendonly yes
+appendfsync everysec        # always | everysec | no
+appendfilename "appendonly.aof"
+appenddirname "appendonlydir"
+BGREWRITEAOF                # compact the log
+
+# THE SHAPE OF THE TRADE:
+#   RDB  compact, fast to load, cheap to run — and you lose everything since
+#        the last snapshot, which may be fifteen minutes
+#   AOF  loses at most a second — and the file is larger, needs periodic
+#        rewriting, and loads more slowly
+#
+# They are not alternatives. The usual production answer is BOTH: AOF for
+# the recovery point, RDB for fast restarts and portable backups.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>What each configuration actually buys</h2>
+
+<div class="demo" id="pers">
+  <div class="demo-head">
+    <b>Durability against cost</b>
+    <span>Pick a configuration and a failure. The window of lost writes is the number that matters.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="d-cfg">Configuration</label>
+        <select id="d-cfg">
+          <option value="none">Nothing — pure memory</option>
+          <option value="rdb">RDB only, default schedule</option>
+          <option value="aofsec" selected>AOF, appendfsync everysec</option>
+          <option value="aofalways">AOF, appendfsync always</option>
+          <option value="both">RDB + AOF everysec</option>
+        </select>
+      </div>
+      <div>
+        <label for="d-fail">Failure</label>
+        <select id="d-fail">
+          <option value="crash" selected>The process crashes</option>
+          <option value="power">The machine loses power</option>
+          <option value="disk">The disk fails</option>
+          <option value="restart">A clean restart</option>
+        </select>
+      </div>
+      <div>
+        <label for="d-size">Dataset — <span id="d-sizev">8 GB</span></label>
+        <input type="range" id="d-size" min="1" max="6" step="1" value="3">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="d-loss">—</b><span>writes lost</span></div>
+      <div><b id="d-boot">—</b><span>restart time</span></div>
+      <div><b id="d-cost">—</b><span>runtime cost</span></div>
+      <div><b id="d-mem">—</b><span>peak memory</span></div>
+    </div>
+    <div id="d-bar"></div>
+    <div class="out" id="d-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Even <code>appendfsync always</code> is not a database's durability</span>
+  <p>It fsyncs before replying, so a single-node crash loses nothing — and it costs a disk sync per write, which takes Redis from hundreds of thousands of operations per second to a few thousand, discarding the reason you chose it. More importantly, in any realistic deployment <b>replication is asynchronous</b> (chapter 15), so a primary that dies after acknowledging a write can still lose it during failover even with <code>always</code>. Redis's durability story is "very little loss, very fast" rather than "no loss". If a write genuinely cannot be lost, the durable record belongs in a database with synchronous commit, and Redis holds a derived copy.</p>
+</div>
+
+<h2><span class="h-rule"></span>The fork</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the operational hazard people meet by surprise</span><button class="copy">Copy</button></div>
+<pre><code># BGSAVE and BGREWRITEAOF both fork a child process. The child writes the
+# snapshot while the parent keeps serving.
+#
+# The fork itself uses COPY-ON-WRITE: parent and child share physical pages
+# until one of them writes, at which point the kernel copies that page.
+#
+# So the memory overhead is proportional to HOW MUCH IS WRITTEN during the
+# save, not to the dataset size. An idle instance forks almost for free. An
+# instance under heavy write load can approach 2× the dataset in RSS before
+# the child finishes.
+
+INFO persistence
+#   rdb_last_fork_usec          how long the fork call itself took
+#   rdb_bgsave_in_progress
+#   aof_rewrite_in_progress
+#   rdb_last_bgsave_status      err means saves are FAILING
+
+INFO memory
+#   used_memory_rss             includes the COW pages during a save
+
+# THREE WAYS THIS BITES:
+#
+# 1. THE OOM KILLER. maxmemory set to 80% of RAM, a save forks under load,
+#    RSS climbs past 100%, the kernel kills the largest process — which is
+#    Redis. This is the single most common Redis outage caused by
+#    persistence, and the fix is sizing (chapter 12).
+#
+# 2. FORK LATENCY. The fork copies page tables, so it is O(memory) and
+#    blocks the main thread. On a 64 GB instance that can be hundreds of
+#    milliseconds of total unavailability, once per save.
+#
+# 3. TRANSPARENT HUGE PAGES make both far worse. With 2 MB pages instead of
+#    4 KB, a single byte written copies 2 MB. Turn them off:
+      echo never > /sys/kernel/mm/transparent_hugepage/enabled
+#    Redis logs a warning about this at startup and it is routinely ignored.
+
+# The kernel setting that stops the fork failing outright:
+vm.overcommit_memory = 1
+# Without it, fork() can fail when the kernel thinks there is not enough
+# memory to duplicate the process — even though COW means there almost
+# certainly is. Redis also warns about this at startup.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>AOF in detail</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the log, the rewrite, and the fsync setting</span><button class="copy">Copy</button></div>
+<pre><code># Every write command is appended to the log. The log therefore grows without
+# bound, so Redis periodically REWRITES it — forking a child that produces a
+# minimal command sequence reproducing the current state.
+auto-aof-rewrite-percentage 100    # rewrite when the file doubles
+auto-aof-rewrite-min-size 64mb
+
+# Redis 7 changed the layout to a MULTI-PART AOF: a base file (RDB-format by
+# default) plus incremental files, tracked in a manifest, in appenddirname.
+# That removed the old rewrite buffer entirely, which used to be a source of
+# memory spikes during a rewrite. If you read older advice about
+# aof-rewrite-incremental-fsync buffers, it predates 7.0.
+aof-use-rdb-preamble yes           # base file in RDB format — smaller, faster
+
+# THE FSYNC SETTING is the whole durability decision:
+appendfsync always     # fsync before replying. ~1s of writes never at risk,
+                       # and throughput drops by orders of magnitude
+appendfsync everysec   # fsync once per second. Lose ≤1s. THE DEFAULT and
+                       # almost always the right answer
+appendfsync no         # let the OS decide. Typically 30s of exposure
+
+# A DETAIL WORTH KNOWING: with everysec, if the background fsync is still in
+# progress when new writes arrive, Redis can either block until it completes
+# or write into the buffer anyway:
+no-appendfsync-on-rewrite no
+# `yes` avoids latency spikes during a rewrite at the cost of a larger loss
+# window during it. On slow disks this is the setting that turns a rewrite
+# into a latency incident.
+
+# CHECKING AND REPAIRING:
+redis-check-aof --fix appendonlydir/appendonly.aof.1.incr.aof
+redis-check-rdb dump.rdb
+# A truncated AOF from an unclean shutdown is normal and Redis handles it:
+aof-load-truncated yes</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Choosing</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Instance is</th><th>Configuration</th><th>Reasoning</th></tr></thead>
+<tbody>
+<tr><td>A pure cache</td><td><code>save ""</code>, <code>appendonly no</code></td><td>Persisting data you are willing to lose costs fork memory and I/O for nothing</td></tr>
+<tr><td>Sessions</td><td>RDB only</td><td>Losing a few minutes logs some people out. Acceptable, and cheap</td></tr>
+<tr><td>Queues, rate limits, counters</td><td>AOF <code>everysec</code></td><td>One second of loss is tolerable; fifteen minutes is not</td></tr>
+<tr><td>A primary datastore</td><td>AOF + RDB, and a replica</td><td>And reconsider whether it should be Redis at all (chapter 18)</td></tr>
+<tr><td>A replica</td><td>Often nothing</td><td>The primary persists. A replica that also saves forks too</td></tr>
+<tr><td>Anything you back up</td><td>RDB</td><td>A single portable file, cheap to copy and restore</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Turning persistence off on a cache is a real win</span>
+  <p>It is worth being explicit because the instinct runs the other way. On a dedicated cache instance, <code>save ""</code> and <code>appendonly no</code> remove: the periodic fork and its latency spike, the copy-on-write memory overhead and the OOM risk that comes with it, the disk I/O competing with everything else on the box, and a whole category of "why did latency spike at 03:00" investigation. You are protecting data that is by definition reconstructible. The one thing to think through is the cold-start cost — a cache that restarts empty sends every request to the origin until it refills, so make sure the origin can survive that (chapter 7).</p>
+</div>
+
+<h2><span class="h-rule"></span>Backups</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the RDB file is your backup</span><button class="copy">Copy</button></div>
+<pre><code># An RDB is a single self-contained file. Copying it is the backup.
+BGSAVE
+# wait for rdb_bgsave_in_progress to become 0
+cp /var/lib/redis/dump.rdb /backup/redis-$(date +%F-%H%M).rdb
+
+# Better: take it from a REPLICA, so the primary never forks for backups
+# (chapter 15). A replica configured with save "" can still be told to
+# BGSAVE on demand.
+
+# RESTORE is: stop Redis, put the file in dbfilename's location, start.
+# Redis loads whichever is configured — AOF takes precedence over RDB if
+# appendonly is yes, which is a common surprise:
+#
+#   You restore dump.rdb, start Redis, and the data is not there — because
+#   appendonly yes is set and Redis loaded an empty AOF instead. Either
+#   disable AOF for the restore and BGREWRITEAOF afterwards, or restore the
+#   whole appendonlydir.
+
+# WHAT AN RDB BACKUP DOES NOT GIVE YOU:
+#   * point-in-time recovery. There is no WAL to replay to a chosen moment.
+#     The AOF is close, and it is not designed for it — no timestamps, no
+#     restore-to-time command
+#   * consistency across several Redis instances
+#   * protection against a bad write, unless a snapshot predates it
+#
+# So if you need PITR, Redis is not providing it. That is another form of
+# chapter 18's question.
+
+# TEST THE RESTORE. Same argument as every other unit: a backup nobody has
+# restored is a hope, and redis-check-rdb passing is not the same as the
+# data being correct and complete.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>What can go wrong</h2>
+
+<div class="terms">
+  <div><dt>Saves silently failing</dt><dd><code>rdb_last_bgsave_status:err</code> — usually a full disk or no write permission. By default Redis then <b>refuses writes</b> (<code>stop-writes-on-bgsave-error yes</code>), which is safe and confusing: a disk problem presents as an application-wide write outage.</dd></div>
+  <div><dt>The fork triggering the OOM killer</dt><dd><code>maxmemory</code> set too close to physical RAM, a save under write load, RSS doubles, the kernel kills Redis. Size for the fork.</dd></div>
+  <div><dt>Latency spikes at save time</dt><dd>The fork blocks the main thread for O(memory). Visible in <code>rdb_last_fork_usec</code> and in your p99. Worse with transparent huge pages on.</dd></div>
+  <div><dt>AOF growing unboundedly</dt><dd>Rewrites failing, or disabled. The file grows until the disk fills, and then saves fail, and then writes stop.</dd></div>
+  <div><dt>Restoring the wrong file</dt><dd>AOF takes precedence over RDB. Restoring a snapshot while <code>appendonly yes</code> is set loads nothing.</dd></div>
+  <div><dt>Disk too slow for <code>everysec</code></dt><dd>If an fsync takes longer than a second, writes queue behind it. On shared cloud storage with burst credits this can appear suddenly, weeks after deployment.</dd></div>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Replication is not a backup, and it is most of your durability</span>
+  <p>A replica holds a copy of the data and applies your <code>FLUSHALL</code> faithfully within milliseconds, so it protects against a machine failing and nothing else — the same argument as the PostgreSQL and MongoDB units. But it is worth being clear about the balance here: for most Redis deployments, <b>a replica plus AOF <code>everysec</code> provides more practical protection than any tuning of the fsync setting</b>, because the realistic failure is a machine dying rather than a clean process crash. Configure both, and keep periodic RDB copies somewhere else for the case a replica cannot help with.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>RDB is a snapshot, AOF is a log.</b> Production usually wants both — AOF for the recovery point, RDB for restarts and backups.</li>
+    <li><b><code>appendfsync everysec</code> is the right default.</b> <code>always</code> costs orders of magnitude of throughput.</li>
+    <li><b>Even <code>always</code> is not a database's durability</b>, because replication is asynchronous.</li>
+    <li><b>The fork is the operational hazard</b> — memory proportional to writes during the save, and a latency spike proportional to dataset size.</li>
+    <li><b>Turn transparent huge pages off</b> and set <code>vm.overcommit_memory = 1</code>. Redis warns about both and it is routinely ignored.</li>
+    <li><b>Turn persistence off on a pure cache.</b> It removes the fork, the COW memory and a class of latency incident.</li>
+    <li><b>AOF takes precedence over RDB on startup</b> — restoring a snapshot with <code>appendonly yes</code> loads nothing.</li>
+    <li><b>There is no point-in-time recovery.</b> If you need it, Redis is not providing it.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("13-persistence.html");
+
+(function(){
+  const root = document.getElementById("pers");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const SIZE = [1, 4, 8, 16, 32, 64];
+
+  const C = {
+    none: {cost:"none", boot:(g)=>0.1, mem:1.0,
+      loss:{crash:"everything", power:"everything", disk:"nothing extra", restart:"everything"},
+      note:"No persistence at all. The dataset exists only in memory, and any restart — planned or not — starts empty.\n\nFor a dedicated cache this is the correct configuration and an underrated one. It removes the periodic fork and its latency spike, the copy-on-write memory overhead and the OOM risk that comes with it, and the disk I/O competing with everything else on the box. You are protecting data that is reconstructible by definition.\n\nThe thing to think through is the cold start: a cache that restarts empty sends every request to the origin until it refills. Make sure the origin survives that, or use the stampede protections from chapter 7."},
+    rdb: {cost:"periodic fork", boot:(g)=>g*0.9, mem:1.5,
+      loss:{crash:"up to 15 min", power:"up to 15 min", disk:"since the last copy", restart:"nothing"},
+      note:"Snapshots on the default schedule: after 15 minutes if anything changed, 5 minutes if ten keys changed, 60 seconds if ten thousand did.\n\nA crash loses everything since the last snapshot, which under light write load can genuinely be fifteen minutes. Under heavy load the 60-second rule fires and the window is smaller — so the exposure varies inversely with how much you are writing, which is an odd property to reason about.\n\nWhat RDB is good at: the file is compact, loads far faster than an AOF, and is a single portable artefact you can copy anywhere. That makes it the right mechanism for backups even when AOF is handling your recovery point.\n\nA clean shutdown saves first, so a planned restart loses nothing."},
+    aofsec: {cost:"fsync/sec", boot:(g)=>g*2.2, mem:1.5,
+      loss:{crash:"≤1 second", power:"≤1 second", disk:"since the last backup", restart:"nothing"},
+      note:"Every write is appended to the log, and the log is fsynced once per second. A crash loses at most one second of writes.\n\nThis is the default and it is almost always the right answer. The cost is one fsync per second rather than one per write, which is negligible on any reasonable disk, and a file that grows until a rewrite compacts it.\n\nRedis 7 restructured the AOF into a base file plus incrementals under appenddirname, with the base in RDB format by default. That made rewrites cheaper and removed the old in-memory rewrite buffer entirely — advice about tuning that buffer predates 7.0.\n\nThe setting to watch on slow disks: no-appendfsync-on-rewrite. If an fsync takes longer than a second, writes queue behind it, and on cloud storage with burst credits that can start happening weeks after deployment with no configuration change."},
+    aofalways: {cost:"fsync per write", boot:(g)=>g*2.2, mem:1.5,
+      loss:{crash:"nothing", power:"nothing", disk:"since the last backup", restart:"nothing"},
+      note:"An fsync before every reply. A single-node crash loses nothing at all.\n\nThe cost is severe and worth stating plainly: throughput falls from hundreds of thousands of operations per second to a few thousand, because every write now waits on a disk sync. You have taken an in-memory database and given it disk latency, which discards the reason for choosing it.\n\nAnd the guarantee is narrower than it appears. In any replicated deployment replication is asynchronous (chapter 15), so a primary that dies after acknowledging a write can still lose it during failover — the fsync protected against a process crash, not against the node disappearing.\n\nIf a write genuinely cannot be lost, the durable record belongs in a database with synchronous commit and Redis holds a derived copy. This setting is the wrong tool for that requirement rather than an expensive way to meet it."},
+    both: {cost:"fsync/sec + forks", boot:(g)=>g*2.2, mem:1.6,
+      loss:{crash:"≤1 second", power:"≤1 second", disk:"since the last copy", restart:"nothing"},
+      note:"The usual production configuration, and the two mechanisms are doing different jobs rather than duplicating each other.\n\nThe AOF provides the recovery point — at most one second lost. The RDB provides fast restarts and a single portable file for backups, which the AOF is poor at on both counts.\n\nNote that AOF takes precedence on startup. If both exist, Redis loads the AOF and ignores the RDB, which is the right behaviour and a common surprise during a restore: put dump.rdb in place, start Redis with appendonly yes, and the data is not there because an empty AOF was loaded instead.\n\nTwo forks now compete for the same COW memory. Redis will not run an RDB save and an AOF rewrite simultaneously, so the peak is one fork's worth — but the frequency of forking is higher, and so is the number of latency spikes."}
+  };
+
+  function render(){
+    const k = $("d-cfg").value, c = C[k];
+    const f = $("d-fail").value;
+    const gi = parseInt($("d-size").value,10) - 1;
+    const gb = SIZE[gi];
+    $("d-sizev").textContent = gb + " GB";
+
+    const boot = c.boot(gb);
+    $("d-loss").textContent = c.loss[f];
+    $("d-boot").textContent = boot < 1 ? "instant" : boot.toFixed(0) + " s";
+    $("d-cost").textContent = c.cost;
+    $("d-mem").textContent  = (gb * c.mem).toFixed(1) + " GB peak";
+
+    const bars = [
+      ["Memory at rest", gb, "#25B7C4"],
+      ["Peak during a save", gb * c.mem, c.mem > 1.4 ? "#F2A03D" : "#3FB984"],
+      ["Restart load time (s)", boot, "#7C8CF8"]
+    ];
+    const max = Math.max.apply(null, bars.map(b => b[1]));
+    $("d-bar").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      'Cost profile</div>' +
+      bars.map(([lab, v, col]) =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px">' +
+        '<span style="min-width:170px;font-size:13px">' + lab + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + Math.max(1, v/max*100).toFixed(0) +
+        '%;background:' + col + '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:52px;text-align:right">' +
+        (lab.includes("time") ? v.toFixed(0) + "s" : v.toFixed(1) + " GB") + '</span></div>').join("");
+
+    const notes = [c.note];
+
+    if(f === "disk")
+      notes.push("A disk failure is the case persistence does not cover. Whatever was written locally is gone with the disk, so your exposure is everything since the last backup was copied ELSEWHERE.\n\nThis is why an RDB sitting next to the data directory is not a backup. Copy it off the machine, and take it from a replica so the primary never forks for backup purposes.");
+    else if(f === "restart" && k !== "none")
+      notes.push("A clean SHUTDOWN saves before exiting, so a planned restart loses nothing regardless of configuration. The number that matters here is the load time — " +
+                 boot.toFixed(0) + " seconds during which the instance is up and not serving.\n\nOn a large dataset that is a real maintenance window. AOF loads more slowly than RDB because it replays commands rather than deserialising a snapshot, which is one reason to keep RDB enabled alongside it.");
+    else if(f === "power" && k === "aofalways")
+      notes.push("appendfsync always does protect against this — the write is on disk before the client is told it succeeded, so a power cut loses nothing.\n\nProvided the disk is not lying about fsync. Consumer SSDs and some virtualised storage acknowledge a sync before the data is durable, which silently invalidates the guarantee. This is the same warning as the PostgreSQL unit's chapter 8, and it applies identically here.");
+
+    if(c.mem > 1.4)
+      notes.push("Peak memory during a save reaches roughly " + (gb*c.mem).toFixed(1) + " GB against " + gb +
+                 " GB at rest. The fork uses copy-on-write, so the overhead is proportional to how much is WRITTEN during the save rather than to the dataset size — an idle instance forks almost for free, a write-heavy one can approach 2×.\n\nThat is the most common Redis outage caused by persistence: maxmemory set to 80% of RAM, a save forks under load, RSS climbs past 100%, and the kernel kills the largest process. Size for the fork, set vm.overcommit_memory = 1, and turn transparent huge pages off — with 2 MB pages a single byte written copies 2 MB.");
+
+    if(k === "none")
+      notes.push("With nothing persisted, there is no fork, no COW overhead and no disk I/O. On a dedicated cache that is a genuine performance win and removes an entire class of latency investigation.");
+
+    $("d-note").textContent = notes.join("\n\n");
+  }
+
+  ["d-cfg","d-fail","d-size"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

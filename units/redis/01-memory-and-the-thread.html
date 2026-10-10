@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · Memory and the thread — Redis</title>
+<meta name="description" content="Two decisions explain nearly everything Redis does: the data lives in RAM, and one thread executes every command.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 01 · The model</div>
+    <h1>Memory and the thread</h1>
+    <p class="standfirst">Redis makes two decisions that almost nothing else makes together: the data lives in RAM, and one thread executes every command in sequence. Nearly every property people like about Redis, and every constraint that surprises them, follows from those two.</p>
+    <div class="chap-meta">
+      <span class="tagpill">in-memory</span>
+      <span class="tagpill">single-threaded</span>
+      <span class="tagpill">atomicity</span>
+      <span class="tagpill">licensing</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>What Redis actually is</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">not a key-value store — a data structure server</span><button class="copy">Copy</button></div>
+<pre><code># The usual description is "an in-memory key-value store", which is true and
+# tells you almost nothing. The values are not blobs. They are DATA STRUCTURES
+# with their own operations, executed on the server.
+
+SET   session:8842 "{...}"              # string
+LPUSH jobs:pending "job-01"             # list      — a queue
+HSET  user:41 name "Amara" tier "gold"  # hash      — an object
+SADD  online:now "u41" "u9"             # set       — membership
+ZADD  leaderboard 4820 "u41"            # sorted set — ranked
+XADD  events * type "click" user "u41"  # stream    — an append-only log
+PFADD visitors:today "u41"              # hyperloglog — approximate cardinality
+
+# The difference matters. This is one network round trip, atomic, and the
+# server does the work:
+ZINCRBY leaderboard 10 "u41"
+ZREVRANK leaderboard "u41"
+
+# In a plain key-value store, the same thing is: read the whole leaderboard,
+# modify it in your application, write it back — with a race condition in the
+# middle and the entire structure crossing the network twice.
+#
+# That is the pitch. Not "it is fast because it is in memory", but "the
+# operations happen where the data is, indivisibly".</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>One thread</h2>
+
+<div class="demo" id="thr">
+  <div class="demo-head">
+    <b>The single-threaded consequence</b>
+    <span>Every command queues behind every other. That is the guarantee and the hazard, and they are the same fact.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="t-cmd">A client runs</label>
+        <select id="t-cmd">
+          <option value="get" selected>GET user:41</option>
+          <option value="incr">INCR counter</option>
+          <option value="zadd">ZADD leaderboard 4820 u41</option>
+          <option value="lrange">LRANGE queue 0 99</option>
+          <option value="keys">KEYS user:*</option>
+          <option value="smembers">SMEMBERS big:set  (2M members)</option>
+          <option value="lua">EVAL a Lua script (10ms)</option>
+          <option value="flush">FLUSHALL  (10M keys)</option>
+        </select>
+      </div>
+      <div>
+        <label for="t-rate">Other clients issuing — <span id="t-ratev">50,000</span> ops/sec</label>
+        <input type="range" id="t-rate" min="1" max="6" step="1" value="4">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="t-dur">—</b><span>command duration</span></div>
+      <div><b id="t-block">—</b><span>everything else waits</span></div>
+      <div><b id="t-queued">—</b><span>commands queued behind it</span></div>
+      <div><b id="t-p99">—</b><span>effect on p99</span></div>
+    </div>
+    <div id="t-bar"></div>
+    <div class="out" id="t-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">The guarantee and the hazard are the same fact</span>
+  <p>Because one thread runs one command at a time to completion, <b>every single command is atomic for free</b>. No locks, no transactions, no read-modify-write races — <code>INCR</code> cannot lose an update, <code>SETNX</code> is a genuine test-and-set, <code>LPOP</code> hands the item to exactly one consumer. That is an enormous simplification and it is why Redis is good at coordination primitives. The same fact means <b>one slow command blocks the entire server</b>. There is no query running alongside yours; there is a queue. A 200ms command is 200ms of unavailability for every client, and chapter 14 is largely about that.</p>
+</div>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">what "single-threaded" does and does not mean</span><button class="copy">Copy</button></div>
+<pre><code>SINGLE-THREADED:
+  command execution. One command at a time, to completion, in arrival order.
+
+NOT SINGLE-THREADED, and has not been for years:
+  * I/O threads (6.0+) — reading and writing sockets can be parallel.
+    io-threads 4 helps when the network is the bottleneck, not the commands
+  * background saving — RDB and AOF rewrites happen in a forked child
+    (chapter 13)
+  * lazy freeing (4.0+) — UNLINK and async eviction free memory on a
+    background thread, so deleting a huge key does not block
+  * key expiry sampling, cluster bus, and various housekeeping
+
+Redis 8 extends threading further. The invariant that matters has not moved:
+COMMAND EXECUTION IS SERIAL, and reasoning about your data as though it were
+is correct.
+
+WHY SINGLE-THREADED AT ALL?
+  Because the bottleneck is almost never CPU. For an in-memory store, most
+  commands are a hash lookup and a pointer dereference — nanoseconds. The
+  time goes on the network and the syscalls. Adding threads to command
+  execution would buy little and cost locking on every data structure,
+  which would make the common case slower and the semantics far harder.
+
+  The way you use more cores is more PROCESSES: several Redis instances on
+  one machine, or cluster mode (chapter 16).</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Memory as the medium</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Because the data is in RAM</th><th>Consequence</th></tr></thead>
+<tbody>
+<tr><td>Reads and writes are memory access</td><td>Sub-millisecond, and the network dominates the latency</td></tr>
+<tr><td>Structures can be pointer-based</td><td>Skip lists, linked lists and hash tables with no page layout to worry about</td></tr>
+<tr><td><b>Capacity is your RAM</b></td><td>The hard constraint. A 64 GB machine holds under 64 GB of data</td></tr>
+<tr><td>Data is volatile</td><td>Persistence is a bolted-on option with real trade-offs (chapter 13)</td></tr>
+<tr><td>Memory must be reclaimed</td><td>Eviction policies, TTLs, and fragmentation (chapter 12)</td></tr>
+<tr><td>Cost per byte is high</td><td>RAM is roughly two orders of magnitude more expensive than disk</td></tr>
+<tr><td>A fork copies page tables</td><td>Background saves can double memory use under write load (chapter 13)</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Redis will not tell you it is nearly full until it is</span>
+  <p>A relational database with more data than memory gets slower. Redis with more data than memory either starts <b>evicting</b> — silently discarding keys according to a policy you may not have chosen — or starts <b>refusing writes</b> with an error. Neither degrades gracefully, and the default <code>maxmemory</code> is <em>unlimited</em>, which means the actual limit is the machine's RAM and the failure is the OOM killer terminating the process. <b>Set <code>maxmemory</code> and an eviction policy deliberately on day one.</b> Chapter 12 covers which, and it is the single most common operational omission in this unit.</p>
+</div>
+
+<h2><span class="h-rule"></span>What Redis is good at</h2>
+
+<div class="cols">
+  <div class="col good">
+    <h4>Natural fits</h4>
+    <ul>
+      <li><b>Caching</b> — the obvious one (chapter 7)</li>
+      <li><b>Counters and rate limits</b> — atomic increments, no contention</li>
+      <li><b>Sessions</b> — small, hot, expiring, tolerant of loss</li>
+      <li><b>Queues</b> — lists and streams, with blocking pops</li>
+      <li><b>Leaderboards and ranked data</b> — sorted sets, unmatched elsewhere</li>
+      <li><b>Locks and coordination</b> — atomicity is the whole primitive</li>
+      <li><b>Real-time counting</b> — HyperLogLog, bitmaps</li>
+      <li><b>Ephemeral pub/sub</b> — presence, live updates</li>
+    </ul>
+  </div>
+  <div class="col bad">
+    <h4>Poor fits</h4>
+    <ul>
+      <li><b>Your only datastore</b>, for anything you cannot lose</li>
+      <li><b>Data much larger than RAM</b></li>
+      <li><b>Ad-hoc querying</b> — there is no query language, by design</li>
+      <li><b>Relational data</b> — no joins, no constraints, no schema</li>
+      <li><b>Large values</b> — a 50 MB value blocks the thread to move it</li>
+      <li><b>Analytics over history</b> — it is not a warehouse</li>
+      <li><b>Guaranteed delivery</b> — without care, pub/sub drops messages</li>
+    </ul>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Getting a feel for it</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the first five minutes</span><button class="copy">Copy</button></div>
+<pre><code>docker run -d --name redis -p 6379:6379 redis:7-alpine
+redis-cli
+
+127.0.0.1:6379> SET greeting "hello"
+OK
+127.0.0.1:6379> GET greeting
+"hello"
+127.0.0.1:6379> TYPE greeting
+string
+127.0.0.1:6379> OBJECT ENCODING greeting        # how it is stored internally
+"embstr"
+
+127.0.0.1:6379> INCR visits
+(integer) 1
+127.0.0.1:6379> INCRBY visits 10
+(integer) 11
+
+127.0.0.1:6379> EXPIRE greeting 60
+127.0.0.1:6379> TTL greeting
+(integer) 57
+
+# Commands worth knowing on day one:
+INFO             # everything about the server. INFO memory, INFO stats, ...
+DBSIZE           # how many keys
+COMMAND DOCS GET # built-in documentation for any command
+MEMORY USAGE key # how many bytes this key costs
+SLOWLOG GET 10   # the ten slowest recent commands (chapter 14)
+MONITOR          # every command, live. NEVER in production — it is a
+                 # firehose that slows the server measurably
+
+# The command reference at redis.io lists time complexity for every command.
+# That number is the most important thing on the page: O(1) is safe to call
+# constantly, O(N) on a large N blocks everyone (chapter 14).</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>The licence, since it is a real consideration</h2>
+
+<div class="note trap">
+  <span class="note-t">Redis is not BSD any more, and there are forks</span>
+  <p>Redis was BSD-licensed for its first fifteen years. In <b>March 2024</b> the project relicensed to a dual RSALv2/SSPLv1 model — source-available rather than open source by the OSI definition — aimed at preventing cloud providers from offering managed Redis without a commercial arrangement. The Linux Foundation forked the last BSD version as <b>Valkey</b>, backed by AWS, Google and Oracle among others, and most major cloud providers moved their managed offerings to it. Redis subsequently <b>added AGPLv3 as an option in Redis 8</b> (2025), which restored an OSI-approved licence to the project.</p>
+  <p style="margin-top:.7em">For most people building an application this changes nothing — using Redis as a datastore is unaffected under any of these. It matters if you <em>redistribute</em> Redis, offer it as a service, or have a policy against source-available or copyleft licences. Valkey is API-compatible with Redis 7.2 and diverging slowly; chapter 18 covers the practical difference. Check the current state before committing, because this has moved twice already and may move again.</p>
+</div>
+
+<h2><span class="h-rule"></span>What the rest of this unit does</h2>
+
+<div class="flow stack">
+  <div class="step"><b>Chapters 2–6 · the structures</b><span>Which one to reach for, and what each costs. This is the actual product</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Chapters 7–11 · the patterns</b><span>Caching, atomicity, locks, rate limits, messaging — built on the structures</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Chapters 12–14 · the constraints</b><span>Memory, persistence and the thread. All three trace back to this chapter</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Chapters 15–17 · running it</b><span>Replication, cluster, security and operations</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Chapter 18 · when not to</b><span>The honest account, including the licence and the alternatives</span></div>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Redis is a <b>data structure server</b>, not a key-value store. The operations happen where the data is.</li>
+    <li><b>One thread executes every command in sequence.</b> That is why every command is atomic for free.</li>
+    <li>It is also why <b>one slow command blocks every client</b>. The guarantee and the hazard are the same fact.</li>
+    <li>I/O, background saves and lazy frees are threaded. <b>Command execution is serial</b>, and reasoning that way is correct.</li>
+    <li>More cores means <b>more processes</b>, not more threads — several instances, or cluster mode.</li>
+    <li><b>Capacity is your RAM.</b> Redis does not degrade gracefully past it; it evicts or refuses writes.</li>
+    <li><b>Set <code>maxmemory</code> and a policy on day one.</b> The default is unlimited, and the failure is the OOM killer.</li>
+    <li>The <b>licence changed in 2024</b> and Valkey forked. Mostly irrelevant to application use; check before redistributing.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("01-memory-and-the-thread.html");
+
+(function(){
+  const root = document.getElementById("thr");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const RATE = [1000, 5000, 20000, 50000, 150000, 500000];
+
+  const C = {
+    get:      {ms:0.02, big:false, lbl:"GET user:41",
+      note:"A hash-table lookup and a pointer dereference. Tens of microseconds inside the server, and the round trip over the network dominates the latency you actually observe.\n\nThis is what most Redis commands look like, and it is why the single thread is not usually a limitation: at this duration, tens of thousands of commands per second fit comfortably in one thread with room to spare."},
+    incr:     {ms:0.02, big:false, lbl:"INCR counter",
+      note:"Same cost as GET, and note what you get for free: this is a read, an addition and a write, and it is ATOMIC. A thousand clients incrementing concurrently produce exactly a thousand increments.\n\nIn a database with concurrent execution, the same operation needs either a lock, a transaction with the right isolation level, or an atomic UPDATE — and the naive read-modify-write version silently loses updates. Here the serial thread makes it impossible to get wrong.\n\nThat property is the foundation for counters, rate limiters and locks in chapters 9 and 10."},
+    zadd:     {ms:0.03, big:false, lbl:"ZADD leaderboard 4820 u41",
+      note:"O(log N) into a skip list — for a million-member sorted set that is around twenty comparisons. Still microseconds.\n\nThe interesting part is what it replaces. Maintaining a ranked leaderboard in an application means reading the structure, inserting, re-sorting and writing it back, with a race condition throughout. Here it is one atomic command and the server keeps it ordered. Chapter 5 is entirely about this type."},
+    lrange:   {ms:0.9, big:false, lbl:"LRANGE queue 0 99",
+      note:"O(N) where N is the number of elements returned — a hundred here, so still well under a millisecond, plus the cost of serialising them onto the wire.\n\nWorth noticing the shape though: the cost scales with what you ask for. LRANGE queue 0 -1 on a list of a million elements is the same command and roughly ten thousand times the work, and it blocks the server for all of it.\n\nThe rule for every O(N) command in Redis is to bound N in the command itself, not in your application after the fact."},
+    keys:     {ms:180, big:true, lbl:"KEYS user:*",
+      note:"KEYS scans the ENTIRE keyspace, every time, and it is O(N) in the total number of keys — not the number that match.\n\nOn ten million keys that is a couple of hundred milliseconds during which the server does nothing else. Every client waits. Health checks time out. It looks exactly like an outage, because it is one.\n\nKEYS should be treated as a command that does not exist in production. SCAN does the same job incrementally in bounded chunks, and chapter 2 covers it. This command is the most common way a working Redis deployment is taken down by someone investigating a problem."},
+    smembers: {ms:420, big:true, lbl:"SMEMBERS big:set",
+      note:"Returns every member of the set — two million of them. O(N) in the set size, plus serialising several megabytes onto the wire, all while holding the thread.\n\nThe insidious part is that this command is fine for years. It is written against a set with fifty members, it works perfectly, and the set grows. There is no warning and no gradual degradation — one day the set is large enough that the command takes half a second and the server stalls.\n\nUse SSCAN for iteration, SRANDMEMBER for sampling, SISMEMBER for the membership test you probably actually wanted. The same argument applies to HGETALL, LRANGE 0 -1 and ZRANGE 0 -1."},
+    lua:      {ms:10, big:true, lbl:"EVAL script",
+      note:"A Lua script runs atomically, which is exactly why you use one — several operations with no other client interleaving (chapter 8).\n\nIt is atomic BECAUSE it blocks everything else for its entire duration. A ten-millisecond script is ten milliseconds of total unavailability, and unlike a slow command you wrote by accident, this one you wrote on purpose.\n\nKeep scripts short and O(1)-ish. A loop over a large collection inside Lua is the most reliable way to produce mysterious latency spikes that no single command in the slowlog explains."},
+    flush:    {ms:2400, big:true, lbl:"FLUSHALL",
+      note:"Deletes every key. Synchronously, by default, freeing ten million objects one at a time on the main thread — seconds of complete unavailability.\n\nFLUSHALL ASYNC hands the freeing to a background thread and returns almost immediately, which is what you want on any real dataset. The same applies to UNLINK versus DEL for individual large keys.\n\nAnd the obvious point: this command exists, requires no confirmation, and is one typo away from DBSIZE in a terminal at 3am. Rename or disable it in production configuration (chapter 17)."}
+  };
+
+  function render(){
+    const k = $("t-cmd").value, c = C[k];
+    const rate = RATE[parseInt($("t-rate").value,10)-1];
+    $("t-ratev").textContent = rate.toLocaleString();
+
+    const queued = Math.round(c.ms / 1000 * rate);
+    $("t-dur").textContent    = c.ms < 1 ? (c.ms*1000).toFixed(0) + " µs" : c.ms.toFixed(0) + " ms";
+    $("t-block").textContent  = c.ms < 1 ? "negligible" : c.ms.toFixed(0) + " ms";
+    $("t-queued").textContent = queued.toLocaleString();
+    $("t-p99").textContent    = c.ms < 1 ? "none" : c.ms >= 100 ? "outage" : "+" + c.ms.toFixed(0) + " ms";
+
+    const pct = Math.min(100, Math.log10(c.ms * 1000 + 1) / Math.log10(2400000) * 100);
+    $("t-bar").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      'Time the single thread is occupied · log scale</div>' +
+      '<div style="background:#fff;border:1px solid #E1E7EC;border-radius:5px;padding:12px">' +
+      '<div style="height:24px;background:#EDF1F4;border-radius:4px;overflow:hidden">' +
+      '<div style="height:100%;width:' + pct.toFixed(1) + '%;background:' +
+      (c.ms >= 100 ? "#E2574C" : c.ms >= 1 ? "#F2A03D" : "#3FB984") + '"></div></div>' +
+      '<div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:10.5px;' +
+      'color:#8FA0AF;margin-top:5px"><span>10 µs</span><span>1 ms</span><span>100 ms</span>' +
+      '<span>2.4 s</span></div></div>';
+
+    const notes = [c.note];
+
+    if(c.big)
+      notes.push("At " + rate.toLocaleString() + " ops/sec from other clients, roughly " + queued.toLocaleString() +
+                 " commands pile up behind this one. They are not slow — they are waiting. Every one of them records a latency including the full block, which is why a single bad command shows up as a spike across every unrelated operation and makes the cause hard to find.");
+    else
+      notes.push("At " + rate.toLocaleString() + " ops/sec this command is invisible in the aggregate. This is the normal case, and it is why a single thread handles high throughput comfortably: when every command is tens of microseconds, serialising them costs nothing.");
+
+    notes.push("The general rule: check the time complexity in the command reference before using anything in a hot path. O(1) is safe to call constantly. O(N) is safe only when you control N — and \"N is small\" is a claim about today's data, not tomorrow's.");
+    $("t-note").textContent = notes.join("\n\n");
+  }
+
+  ["t-cmd","t-rate"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

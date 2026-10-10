@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Vector databases and search — AI Engineer</title>
+<meta name="description" content="HNSW and IVF indexes, recall versus latency, metadata filtering, hybrid search with BM25 and reciprocal rank fusion, reranking, and choosing a store.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 10 · Knowledge and retrieval</div>
+    <h1>Vector databases and search</h1>
+    <p class="standfirst">Finding the nearest vectors among millions, fast, while also filtering by tenant and date, and without missing the one document that used the exact term the user typed. The index is the easy part; the interesting decisions are filtering, hybrid retrieval and reranking.</p>
+    <div class="chap-meta">
+      <span class="tagpill">hnsw</span>
+      <span class="tagpill">recall vs latency</span>
+      <span class="tagpill">filtering</span>
+      <span class="tagpill">bm25</span>
+      <span class="tagpill">fusion</span>
+      <span class="tagpill">reranking</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Start by asking whether you need one</h2>
+
+<p>Exact nearest-neighbour search over 50,000 normalised vectors is a single matrix multiply. On a laptop that is a few milliseconds, with perfect recall, no index to tune and no service to operate.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">python — perfectly adequate for most corpora</span><button class="copy">Copy</button></div>
+<pre><code>import numpy as np
+
+V = np.load("vectors.npy")          # (50_000, 768) float32, already normalised — 150 MB
+scores = V @ query                  # ~4 ms, exact
+top = np.argpartition(-scores, 20)[:20]
+top = top[np.argsort(-scores[top])]</code></pre>
+</div>
+
+<p>You need a real vector store when one of these is true: the corpus is large enough that a scan is too slow or too big for memory; you need filtered search with correct results; you need concurrent writes and deletes with visibility guarantees; or you need it to survive a restart without a rebuild. Below roughly a hundred thousand chunks, "a numpy array plus a JSON file" is a legitimate architecture and a lot of teams over-engineer past it.</p>
+
+<h2><span class="h-rule"></span>How approximate search works</h2>
+
+<p>Above a few hundred thousand vectors, exact search stops being viable and you accept approximation: an index that finds <em>most</em> of the true nearest neighbours, much faster. The measure of "most" is <b>recall@k</b> — the proportion of the true top k the index actually returned.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Index</th><th>Idea</th><th>Strengths</th><th>Weaknesses</th></tr></thead>
+<tbody>
+<tr><td><b>Flat</b></td><td>Compare against everything</td><td>Perfect recall, no build step, trivially correct filtering</td><td>Linear in corpus size</td></tr>
+<tr><td><b>HNSW</b><br>hierarchical navigable small world</td><td>A layered proximity graph; start at a coarse layer, greedily walk toward the query, descend</td><td>Excellent recall-to-speed ratio, supports incremental inserts. The default nearly everywhere</td><td>Memory-hungry — the graph can exceed the vectors. Deletes are soft and need periodic compaction</td></tr>
+<tr><td><b>IVF</b><br>inverted file</td><td>Cluster vectors, search only the nearest few clusters</td><td>Compact, fast to build, tunable via probe count</td><td>Needs training on a representative sample; recall suffers near cluster boundaries</td></tr>
+<tr><td><b>IVF + PQ</b></td><td>IVF with product-quantised vectors</td><td>Enormous compression — billions of vectors on one machine</td><td>Real accuracy loss; usually needs a rescoring pass against full vectors</td></tr>
+<tr><td><b>DiskANN</b> and relatives</td><td>Graph index designed to live on SSD</td><td>Very large corpora without vast RAM</td><td>More operational complexity; latency depends on disk</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>The three knobs of HNSW</h3>
+
+<div class="terms">
+  <div><dt>M</dt><dd>Neighbours per node in the graph. Higher means better recall and more memory. 16 is a common default; 32–48 for high-dimensional or hard corpora.</dd></div>
+  <div><dt>ef_construction</dt><dd>How hard the builder searches when inserting. Higher gives a better graph and a slower build. 128–200 is typical. Build time is one-off; recall is forever.</dd></div>
+  <div><dt>ef_search</dt><dd>How hard a query searches. The one you tune at runtime: raise it for recall, lower it for latency. Must be at least k, and is usually 2–8× k.</dd></div>
+</div>
+
+<div class="demo" id="ann">
+  <div class="demo-head">
+    <b>The recall–latency trade-off</b>
+    <span>Illustrative curves for a one-million-vector HNSW index. The shape is what matters: recall is cheap up to about 95% and expensive after.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="aef">ef_search — <span id="aefv">64</span></label>
+        <input type="range" id="aef" min="10" max="512" step="2" value="64">
+      </div>
+      <div>
+        <label for="am">M (graph degree) — <span id="amv">16</span></label>
+        <input type="range" id="am" min="8" max="64" step="4" value="16">
+      </div>
+      <div>
+        <label for="an">Corpus size — <span id="anv">1M</span></label>
+        <input type="range" id="an" min="1" max="7" step="1" value="4">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="a-recall">—</b><span>recall@10</span></div>
+      <div><b id="a-lat">—</b><span>p50 query latency</span></div>
+      <div><b id="a-mem">—</b><span>index memory</span></div>
+      <div><b id="a-build">—</b><span>build time</span></div>
+    </div>
+    <div class="out" id="anote"></div>
+  </div>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Measure recall, do not assume it</span>
+  <p>Take 200 sample queries, run them against a brute-force scan to get ground truth, then compare with your index. If recall@10 is 0.86, roughly one in seven relevant passages never reaches the model — and you will misdiagnose that as a prompting problem for weeks. This measurement takes an hour and should be a scheduled job, because recall drifts as the corpus grows.</p>
+</div>
+
+<h2><span class="h-rule"></span>Filtering, and why it is the hard part</h2>
+
+<p>Real queries are almost never "nearest neighbours in the whole corpus". They are "nearest neighbours <em>within this tenant, in English, published after January, excluding archived documents</em>". How the store implements that determines whether your results are correct.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Strategy</th><th>How</th><th>Problem</th></tr></thead>
+<tbody>
+<tr><td><b>Post-filter</b></td><td>Fetch top 100 by vector, then discard non-matching</td><td>If the tenant is 0.1% of the corpus, you get zero results. Silent, common, and disastrous in multi-tenant systems</td></tr>
+<tr><td><b>Pre-filter</b></td><td>Find matching ids first, then search only those</td><td>Correct, but if the subset is large you are back to brute force</td></tr>
+<tr><td><b>Filtered graph traversal</b></td><td>Apply the predicate during the walk, skipping non-matching nodes</td><td>The good answer, and what mature stores do. Can degrade when the filter is very selective and the graph becomes disconnected</td></tr>
+<tr><td><b>Partitioning</b></td><td>A separate index (namespace, collection, partition) per tenant</td><td>Correct and fast, with strong isolation. Costs overhead per partition, so it does not suit a hundred thousand tiny tenants</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Multi-tenancy is a correctness requirement</span>
+  <p>Never rely on post-filtering for tenant isolation. Use a native partition or namespace per tenant where the store supports it, and enforce the filter server-side — never from a value the client sends. A retrieval bug that returns another customer's document is a data breach, not a relevance problem, and it will not show up in your quality metrics.</p>
+</div>
+
+<h2><span class="h-rule"></span>Hybrid search</h2>
+
+<p>Chapter 9 listed what embeddings miss: exact identifiers, rare jargon, product codes, error strings, names. Keyword search catches exactly those and misses everything vector search is good at. Running both and combining is not a refinement — on most real corpora it is worth more than any other single retrieval change.</p>
+
+<div class="cols">
+  <div class="col">
+    <h4>BM25 (keyword)</h4>
+    <p>Ranks by term overlap, weighting rare terms higher and normalising for document length.</p>
+    <ul>
+      <li>Finds <code>NW-8842</code>, <code>ERR_TLS_CERT</code>, "Vollkornbrot"</li>
+      <li>Zero results when vocabulary differs</li>
+      <li>No training, no embedding cost, instantly updatable</li>
+    </ul>
+  </div>
+  <div class="col">
+    <h4>Vector (semantic)</h4>
+    <p>Ranks by meaning in embedding space.</p>
+    <ul>
+      <li>Finds "billed twice" for "charged two times"</li>
+      <li>Blind to negation, numbers and exact strings</li>
+      <li>Needs an embedding pass and an index</li>
+    </ul>
+  </div>
+</div>
+
+<h3>Combining them: reciprocal rank fusion</h3>
+
+<p>The two score scales are incomparable — BM25 is unbounded, cosine sits in a narrow band — so do not add them. Fuse the <em>ranks</em> instead. Reciprocal rank fusion is three lines, has one parameter that barely matters, and is remarkably hard to beat.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">fusion.py — RRF, and why it works</span><button class="copy">Copy</button></div>
+<pre><code>def rrf(rankings: list[list[str]], k: int = 60) -> list[tuple[str, float]]:
+    """rankings: several ordered lists of document ids, best first."""
+    scores: dict[str, float] = {}
+    for ranking in rankings:
+        for position, doc_id in enumerate(ranking):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + position + 1)
+    return sorted(scores.items(), key=lambda kv: -kv[1])
+
+
+vector_hits  = [h.id for h in vector_search(query, limit=50)]
+keyword_hits = [h.id for h in bm25_search(query,  limit=50)]
+fused = rrf([vector_hits, keyword_hits])[:20]
+
+# k=60 flattens the difference between ranks 1 and 2 so that a document
+# appearing at rank 5 in BOTH lists outranks one that is first in only one.
+# That consensus behaviour is the entire value of the method.</code></pre>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">postgres — hybrid search in one query, no extra services</span><button class="copy">Copy</button></div>
+<pre><code>WITH semantic AS (
+  SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> :qvec) AS rank
+  FROM chunks
+  WHERE tenant_id = :tenant AND lang = :lang AND NOT archived
+  ORDER BY embedding <=> :qvec
+  LIMIT 50
+),
+keyword AS (
+  SELECT id, ROW_NUMBER() OVER (
+           ORDER BY ts_rank_cd(tsv, websearch_to_tsquery('english', :q)) DESC) AS rank
+  FROM chunks
+  WHERE tenant_id = :tenant AND lang = :lang AND NOT archived
+    AND tsv @@ websearch_to_tsquery('english', :q)
+  LIMIT 50
+)
+SELECT c.id, c.text, c.source, c.updated_at,
+       COALESCE(1.0 / (60 + s.rank), 0) + COALESCE(1.0 / (60 + k.rank), 0) AS score
+FROM chunks c
+LEFT JOIN semantic s ON s.id = c.id
+LEFT JOIN keyword  k ON k.id = c.id
+WHERE s.id IS NOT NULL OR k.id IS NOT NULL
+ORDER BY score DESC
+LIMIT 20;</code></pre>
+</div>
+
+<p>That query is worth studying because it is a complete production retrieval layer in one place: tenant isolation in the <code>WHERE</code> clause of both arms, vector and keyword retrieval, and rank fusion — with transactional consistency between your documents and your vectors, which a separate vector service cannot give you.</p>
+
+<h2><span class="h-rule"></span>Reranking</h2>
+
+<p>Retrieval is a recall problem: cast a wide net, get the right passage <em>somewhere</em> in the top 50. Reranking is a precision problem: take those 50 and order them properly before the top 5 go into the prompt.</p>
+
+<p>The difference in mechanism is the reason it works so well. An embedding model is a <b>bi-encoder</b> — it encodes query and document separately, so nothing about the query can influence how the document is read. A reranker is a <b>cross-encoder</b>: it reads the query and the document together in one pass and outputs a relevance score. That is far more accurate and far too slow to run over a whole corpus, which is exactly why it belongs in a second stage over a shortlist.</p>
+
+<div class="flow">
+  <div class="step"><b>Retrieve wide</b><span>Hybrid, top 50. Cheap, high recall, imprecise order</span></div>
+  <div class="arr">›</div>
+  <div class="step"><b>Rerank</b><span>Cross-encoder scores all 50 against the query. ~100ms</span></div>
+  <div class="arr">›</div>
+  <div class="step"><b>Take the top 5</b><span>Precise, small, cheap to put in the prompt</span></div>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">python — reranking, hosted or local</span><button class="copy">Copy</button></div>
+<pre><code># Hosted rerank endpoint
+ranked = cohere.rerank(model="rerank-v3.5", query=query,
+                       documents=[c.text for c in candidates], top_n=5)
+best = [candidates[r.index] for r in ranked.results if r.relevance_score > 0.3]
+
+# Or locally, with a small cross-encoder - a few hundred MB, runs on CPU
+from sentence_transformers import CrossEncoder
+reranker = CrossEncoder("BAAI/bge-reranker-v2-m3", max_length=512)
+scores = reranker.predict([(query, c.text) for c in candidates])
+best = [c for _, c in sorted(zip(scores, candidates), key=lambda p: -p[0])[:5]]</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Where reranking actually earns its keep</span>
+  <p>Unlike embedding similarity, a reranker sees both texts at once, so it handles negation, qualifiers and specificity — it can tell that "refunds are <em>not</em> available on sale items" does not answer "can I refund a sale item?". Adding a reranker is typically the single largest quality jump available to an existing RAG system, and it costs about 100ms and a fraction of a cent.</p>
+</div>
+
+<h2><span class="h-rule"></span>Choosing a store</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Option</th><th>Good when</th><th>Watch out for</th></tr></thead>
+<tbody>
+<tr><td><b>pgvector</b> (Postgres)</td><td>You already run Postgres and are under ~10M vectors. Transactional consistency between documents and vectors, real SQL filtering, full-text search in the same query, one backup story</td><td>Index build time on large tables; needs tuning; scaling past tens of millions gets awkward</td></tr>
+<tr><td><b>Qdrant</b></td><td>Self-hosted or cloud, strong filtered search, good payload model, quantisation built in</td><td>Another service to operate if self-hosting</td></tr>
+<tr><td><b>Pinecone</b></td><td>Fully managed, serverless scaling, minimal operational work</td><td>Cost at scale; your data lives with a third party; less control over index internals</td></tr>
+<tr><td><b>Weaviate</b></td><td>Built-in hybrid search and modules, GraphQL-ish query model</td><td>More concepts to learn than you may need</td></tr>
+<tr><td><b>Milvus</b></td><td>Very large scale, many index types, GPU acceleration</td><td>Heavyweight to operate; overkill under a hundred million vectors</td></tr>
+<tr><td><b>Elasticsearch / OpenSearch</b></td><td>You already run it for logs or search. BM25 and vectors in one system with mature filtering</td><td>Vector features arrived later; memory-hungry; know your version's limitations</td></tr>
+<tr><td><b>FAISS / hnswlib</b></td><td>In-process, batch jobs, notebooks, embedded use</td><td>A library, not a database: no persistence, no filtering, no concurrency story — you build those</td></tr>
+<tr><td><b>LanceDB / Chroma</b></td><td>Local development, embedded apps, quick prototypes</td><td>Verify the production story before depending on it</td></tr>
+<tr><td><b>MongoDB Atlas / Supabase</b></td><td>Already on that platform; vector search alongside your primary data</td><td>Feature depth trails specialists; check filtering semantics carefully</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The honest default: <b>if you run Postgres, start with pgvector.</b> Keeping vectors in the same transaction as the documents they came from removes an entire category of consistency bug — no dual-write problem, no "the document was deleted but its chunks are still being retrieved". Move to a specialist store when you have measured a specific limit, not in anticipation of one.</p>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">postgres — a schema that will not need re-ingesting</span><button class="copy">Copy</button></div>
+<pre><code>CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE chunks (
+  id            bigserial PRIMARY KEY,
+  tenant_id     uuid        NOT NULL,
+  document_id   uuid        NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  chunk_index   int         NOT NULL,
+  text          text        NOT NULL,
+  token_count   int         NOT NULL,
+  content_hash  text        NOT NULL,          -- skip re-embedding unchanged chunks
+  embedding     vector(768) NOT NULL,
+  embed_model   text        NOT NULL,          -- what needs rebuilding when you switch
+  lang          text        NOT NULL,
+  source_url    text,
+  section_path  text,                          -- "Billing > Refunds > Sale items"
+  updated_at    timestamptz NOT NULL DEFAULT now(),
+  archived      boolean     NOT NULL DEFAULT false,
+  tsv           tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED
+);
+
+CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 128);
+CREATE INDEX ON chunks USING gin  (tsv);
+CREATE INDEX ON chunks (tenant_id, document_id, chunk_index);
+
+-- Per query: SET LOCAL hnsw.ef_search = 100;   -- tune recall per request, not globally</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Operating it</h2>
+
+<ul class="check">
+  <li><b>Measure recall against brute force</b> on a sample, on a schedule. It drifts as the corpus grows.</li>
+  <li><b>Track p50 and p99 query latency</b> separately from the LLM call, so you know which half of a slow response to fix.</li>
+  <li><b>Plan for rebuilds.</b> Changing the embedding model, the dimensions or the chunking means a full re-index. Build behind a version field and swap atomically rather than mutating in place.</li>
+  <li><b>Handle deletes properly.</b> Most graph indexes only mark deletions; without compaction, removed documents keep consuming memory and can still be traversed.</li>
+  <li><b>Keep the source of truth outside the index.</b> The vector store should be rebuildable from your documents at any time. Treat it as a derived cache, not a database of record.</li>
+  <li><b>Log every retrieval</b> — query, filters, candidate ids, scores, what survived reranking. Without this, debugging a bad answer is guesswork (chapter 13).</li>
+</ul>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Under about a hundred thousand vectors, <b>a brute-force scan is exact, fast and simpler</b> than any index.</li>
+    <li>HNSW is the default approximate index. <b>ef_search is the runtime knob</b>; recall is cheap to about 95% and expensive after.</li>
+    <li><b>Measure recall against ground truth.</b> Missing passages get misdiagnosed as prompting problems.</li>
+    <li>Filtering strategy decides correctness. <b>Never post-filter for tenant isolation</b> — use native partitions and enforce server-side.</li>
+    <li><b>Hybrid search beats either half.</b> Fuse ranks with RRF rather than trying to reconcile incompatible score scales.</li>
+    <li>A <b>cross-encoder reranker over the top 50</b> is usually the single biggest quality win available, for 100ms.</li>
+    <li>If you already run Postgres, <b>start with pgvector</b>. Keep the index rebuildable and treat it as derived data.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("10-vector-search.html");
+
+(function(){
+  const root = document.getElementById("ann");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const SIZES = [10e3, 50e3, 200e3, 1e6, 5e6, 20e6, 100e6];
+  const LABELS = ["10K","50K","200K","1M","5M","20M","100M"];
+
+  function render(){
+    const ef = parseInt($("aef").value, 10);
+    const M  = parseInt($("am").value, 10);
+    const ni = parseInt($("an").value, 10) - 1;
+    const N  = SIZES[ni];
+
+    $("aefv").textContent = ef;
+    $("amv").textContent  = M;
+    $("anv").textContent  = LABELS[ni];
+
+    // Illustrative model: recall saturates with ef and improves with M,
+    // and degrades slowly as the corpus grows.
+    const sizePenalty = 1 - Math.log10(N / 1e4) * 0.018;
+    const mBoost = 0.86 + (M - 8) / 56 * 0.10;
+    const recall = Math.min(0.999, (1 - Math.exp(-ef / 42)) * mBoost * sizePenalty + 0.06);
+
+    // Latency grows with ef (more graph hops) and log(N).
+    const lat = (0.28 + ef * 0.0135) * (1 + Math.log10(N / 1e4) * 0.22);
+
+    // Memory: vectors (768d float32) + graph edges.
+    const vecGb = N * 768 * 4 / 1e9;
+    const graphGb = N * M * 2 * 4 / 1e9;
+    const mem = vecGb + graphGb;
+
+    const buildMin = N / 1e6 * (M / 16) * 6.5;
+
+    $("a-recall").textContent = (recall * 100).toFixed(1) + "%";
+    $("a-lat").textContent    = lat < 1 ? (lat * 1000).toFixed(0) + "µs" : lat.toFixed(1) + "ms";
+    $("a-mem").textContent    = mem < 1 ? (mem * 1000).toFixed(0) + "MB" : mem.toFixed(1) + "GB";
+    $("a-build").textContent  = buildMin < 1 ? "<1 min" : buildMin.toFixed(0) + " min";
+
+    const lines = [];
+    if(recall < 0.9)
+      lines.push("At " + (recall*100).toFixed(0) + "% recall, roughly " +
+                 Math.round((1-recall)*10) + " of every 10 relevant passages never reaches the model. " +
+                 "You will experience this as 'the model doesn't know things it should' and spend a week editing prompts.");
+    else if(recall > 0.985)
+      lines.push("Recall is essentially exact. Everything above about 98% is latency you are paying for nothing — try halving ef_search and re-measuring end-to-end quality.");
+    else
+      lines.push("A sensible operating point. Most systems are fine between 95% and 98% recall, because reranking recovers ordering mistakes anyway.");
+
+    if(graphGb > vecGb * 0.5)
+      lines.push("Note the graph is " + (graphGb/mem*100).toFixed(0) + "% of index memory at M=" + M +
+                 ". HNSW memory is not just your vectors — this surprises people at scale.");
+    if(N >= 5e6)
+      lines.push("At " + LABELS[ni] + " vectors, consider quantisation (int8 or binary with full-vector rescoring) or a disk-based index before buying more RAM.");
+    lines.push("Numbers are illustrative. Run the measurement on your own corpus: 200 queries, brute force for ground truth, compare.");
+    $("anote").textContent = lines.join("\n");
+  }
+
+  ["aef","am","an"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Scanning and the supply chain — Docker</title>
+<meta name="description" content="What a vulnerability scanner actually sees, reading a scan honestly, base image currency as the biggest lever, SBOM in practice, policy that blocks the right things, and supply chain integrity.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Crect x='6' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='19' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='10' width='5' height='5' fill='%23fff'/%3E%3Cpath d='M4 22h22a5 5 0 004-4' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch17">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Docker
+    </a>
+    <div class="chno"><b>Chapter 17</b><span>Security and operations</span></div>
+    <h1>Scanning and the supply chain</h1>
+    <p class="lede">A scanner tells you which packages are present and which have published advisories. It does not tell you whether any of it matters. <b>The gap between those two things is where most container security effort is wasted</b> — and closing it is mostly about rebuild cadence, not about the scanner.</p>
+    <div class="meta"><span>28 min</span><span>2 demos</span><span>8 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="what">
+      <h2 data-nav="What scanners see">What a scanner actually does</h2>
+      <p class="sub">Two lists and a join.</p>
+      <p>It enumerates the packages in the image — from the OS package database and from language manifests — and joins that inventory against vulnerability databases. That is genuinely useful and it is also the whole mechanism, which explains the blind spots exactly.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Sees</th><th>Does not see</th></tr></thead>
+          <tbody>
+            <tr><td>OS packages via <code>dpkg</code>, <code>rpm</code>, <code>apk</code></td><td>Software copied in without a package manager</td></tr>
+            <tr><td>Language dependencies from lockfiles</td><td><b>Vendored or statically linked</b> code with no manifest</td></tr>
+            <tr><td>Known versions with published advisories</td><td>Anything not yet published, or in a database it does not consult</td></tr>
+            <tr><td>Binaries it recognises (Go, Node, Java)</td><td>A binary you compiled yourself</td></tr>
+            <tr><td>—</td><td><b>Your own code.</b> No scanner finds your SQL injection</td></tr>
+            <tr><td>—</td><td>Misconfiguration — running as root, a mounted socket (chapter 18)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">the tools, and their useful flags</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ trivy image --severity HIGH,CRITICAL --ignore-unfixed ghcr.io/acme/api@sha256:4152…
+$ grype ghcr.io/acme/api@sha256:4152… --only-fixed
+$ docker scout cves --only-severity critical,high ghcr.io/acme/api:staging
+$ docker scout recommendations ghcr.io/acme/api:staging     # base image upgrades
+$ docker scout compare --to ghcr.io/acme/api:prod ghcr.io/acme/api:staging</pre>
+      </div>
+      <div class="key">
+        <span class="lbl">Scan the digest, not the tag</span>
+        <p>Chapter 16 made this point about pipelines; it applies to every scan. A report against <code>api:staging</code> describes whatever that tag pointed at when the scan ran, which may not be what is deployed by the time anyone reads it. Scan <code>@sha256:…</code> so the report and the artefact are permanently linked, and store the report alongside the digest.</p>
+      </div>
+    </section>
+
+    <section id="reading">
+      <h2 data-nav="Reading a scan">Reading a scan honestly</h2>
+      <p class="sub">Severity is a property of the vulnerability. Risk is a property of your deployment.</p>
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Triage funnel</h3>
+          <span class="hint">What each policy layer blocks, and how much of it is noise</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl" id="t-layers"></div>
+          <div id="t-table" style="overflow-x:auto"></div>
+          <div class="rgrid" id="t-out"></div>
+          <p class="readout" id="t-note"></p>
+        </div>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Signal</th><th>Tells you</th></tr></thead>
+          <tbody>
+            <tr><td><b>CVSS severity</b></td><td>How bad it is <em>if</em> exploited in a worst-case deployment. Not a priority</td></tr>
+            <tr><td><b>A fix exists</b></td><td>Whether you can do anything today. <code>--ignore-unfixed</code> filters on this</td></tr>
+            <tr><td><b>Reachability</b></td><td>Whether the vulnerable code path is loaded at all</td></tr>
+            <tr><td><b>EPSS</b></td><td>Estimated probability of exploitation soon. Most CVEs score very low</td></tr>
+            <tr><td><b>CISA KEV</b></td><td>Known to be exploited in the wild. <b>The strongest single signal</b></td></tr>
+            <tr><td>Shipped or not</td><td>A dev dependency in a build stage never reaches production (chapter 7)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="trap">
+        <span class="lbl">"Critical" in NVD, "not affected" in Debian</span>
+        <p>Distributions frequently backport a security fix <em>without</em> changing the upstream version number, so a naive version comparison against NVD reports a vulnerability the package no longer has. Distro-aware scanners consult the distribution's own security tracker and get this right; version-matching tools and homegrown checks do not. The corollary matters more: when a scanner and a distribution disagree, <strong>the distribution is usually right about its own package</strong>. The persistent false-positive source is elsewhere — vendored binaries and language dependencies with no manifest.</p>
+      </div>
+    </section>
+
+    <section id="currency">
+      <h2 data-nav="Base currency">Base image currency</h2>
+      <p class="sub">The single biggest lever, and it is not a security tool.</p>
+      <p>Most findings in a typical image come from the base, not from your code — so the highest-value action is usually rebuilding on a fresh base, which fixes dozens of advisories without a line of application change. That makes vulnerability count a function of two things you control: <strong>how much surface the base has</strong>, and <strong>how old your build is</strong>.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Base currency model</h3>
+          <span class="hint">Six months of drift, by base image and rebuild cadence</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:74px">base</span>
+            <span id="c-base" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:74px">rebuild</span>
+            <span id="c-cadence" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div id="c-chart" style="margin:6px 0 10px"></div>
+          <div class="rgrid" id="c-out"></div>
+          <p class="readout" id="c-note"></p>
+        </div>
+      </div>
+
+      <div class="code">
+        <div class="code-top"><span class="tag">automating currency</span><button class="copy">Copy</button></div>
+<pre data-lang="yaml"># .github/dependabot.yml — keeps FROM digests fresh with a pull request
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /
+    schedule: { interval: weekly }
+
+# and a scheduled rebuild, so a patched base reaches production without a code change
+on:
+  schedule: [{ cron: "0 3 * * 1" }]
+  workflow_dispatch:</pre>
+      </div>
+      <div class="key">
+        <span class="lbl">Pinning by digest and staying current are the same problem</span>
+        <p>Chapter 3 argued for pinning <code>FROM</code> by digest, and a pinned digest by definition never picks up a patched base. The resolution is not to unpin — it is to make the pin <strong>move on a schedule, visibly, through review</strong>. A bot raising a weekly pull request that bumps the digest gives you reproducibility and currency at once, with a commit recording each change. Unpinned tags give you currency and no record of what changed or when.</p>
+      </div>
+    </section>
+
+    <section id="sbom">
+      <h2 data-nav="SBOM">SBOM in practice</h2>
+      <p class="sub">The point is not the document; it is the query.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">generating and querying</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># at build time (chapter 8), or after the fact
+$ docker buildx build --sbom=true --provenance=mode=max -t ghcr.io/acme/api:x --push .
+$ syft ghcr.io/acme/api@sha256:4152… -o spdx-json &gt; sbom.json
+$ trivy image --format cyclonedx --output sbom.cdx.json ghcr.io/acme/api@sha256:4152…
+
+# the question you actually need answered, at 9am, about 200 images
+$ jq -r '.packages[] | select(.name=="log4j-core") | .versionInfo' sbom.json
+$ trivy sbom sbom.cdx.json --severity CRITICAL      # rescan without the image</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Because you stored SBOMs</th><th>Otherwise</th></tr></thead>
+          <tbody>
+            <tr><td>"Which images contain this package?" — a query, seconds</td><td>Pull and scan every image, hours to days</td></tr>
+            <tr><td>Rescan old images against today's database without rebuilding</td><td>The image may no longer build at all</td></tr>
+            <tr><td>Answer a customer's licence question from a record</td><td>Reconstruct it by hand</td></tr>
+            <tr><td>Diff two releases' dependency sets</td><td>Guess from the changelog</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Store the SBOM as an attestation attached to the image digest, so it travels with the artefact rather than living in a CI log that expires. The value is entirely in being able to ask a question across the fleet at the moment an advisory lands — which is a storage and indexing problem, not a scanning one.</p>
+    </section>
+
+    <section id="policy">
+      <h2 data-nav="Policy">Policy that works</h2>
+      <p class="sub">A gate everyone bypasses is worse than no gate.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Fail the build on</th><th>Warn only on</th></tr></thead>
+          <tbody>
+            <tr><td>Anything in the KEV catalogue</td><td>Unfixed vulnerabilities, with a review date</td></tr>
+            <tr><td>Critical or high <b>with a fix available</b> in shipped layers</td><td>Anything in a build-only stage</td></tr>
+            <tr><td><b>Newly introduced</b> by this change</td><td>The inherited backlog</td></tr>
+            <tr><td>An unsigned or unverifiable base image</td><td>Medium and low, at any volume</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">an exception list that expires</span><button class="copy">Copy</button></div>
+<pre data-lang="text"># .trivyignore
+# CVE-2025-11821 — glibc, unfixed in bookworm. Not reachable: we do not
+# call the affected iconv path. Reviewed 2026-08-14 by @karan.
+CVE-2025-11821 exp:2026-11-14
+
+# CVE-2025-30412 — in a build stage only, never shipped (multi-stage, ch. 7).
+CVE-2025-30412 exp:2026-10-01</pre>
+      </div>
+      <div class="warn">
+        <span class="lbl">The failure mode is social, not technical</span>
+        <p>A policy that fails builds on every high-severity finding produces a list nobody can act on, and within a fortnight someone adds a blanket ignore or an <code>|| true</code> — after which the gate reports nothing and everybody believes it is working. <strong>Block on the small set that is genuinely actionable</strong> (fixed, shipped, reachable, or known-exploited), warn on the rest, and require every exception to carry a justification and an expiry date. A gate that blocks three things a month gets respected; one that blocks ninety gets disabled.</p>
+      </div>
+      <p>Delta scanning is the other half: comparing this build against the previous release separates <em>what this change introduced</em> from the inherited backlog. Developers can act on the former immediately, and the latter belongs on a currency schedule rather than in a pull request review.</p>
+    </section>
+
+    <section id="supplychain">
+      <h2 data-nav="Supply chain">The wider supply chain</h2>
+      <p class="sub">Scanning assumes you got the right artefact in the first place.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Attack</th><th>Looks like</th><th>Defence</th></tr></thead>
+          <tbody>
+            <tr><td><b>Typosquatted base image</b></td><td><code>FROM pyhton:3.12</code>, or a lookalike namespace</td><td>Digest pins; an allowlist of approved bases</td></tr>
+            <tr><td><b>Compromised upstream package</b></td><td>A legitimate package, a malicious release</td><td>Lockfiles, delayed adoption, SBOM to find it after</td></tr>
+            <tr><td><b>Dependency confusion</b></td><td>A public package shadowing your internal name</td><td>Scoped names; a registry that prefers internal</td></tr>
+            <tr><td><b>Repointed tag</b></td><td>The same reference, different bytes (chapter 15)</td><td>Digest pins everywhere; signature verification</td></tr>
+            <tr><td><b>Compromised build</b></td><td>An image that does not match its source</td><td>Provenance attestations (chapter 8), verified at deploy</td></tr>
+            <tr><td><b>Stolen registry credentials</b></td><td>A malicious image under a name you trust</td><td>OIDC over stored tokens; signing (chapters 15, 16)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">enforcing at deploy time, which is the only place it counts</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># verify the signature and the provenance before anything runs
+$ cosign verify ghcr.io/acme/api@sha256:4152… \
+    --certificate-identity-regexp '^https://github\.com/acme/api/' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+$ cosign verify-attestation ghcr.io/acme/api@sha256:4152… \
+    --type slsaprovenance --certificate-oidc-issuer https://token.actions.githubusercontent.com</pre>
+      </div>
+      <p>All of chapters 8, 15 and 16 produce evidence — provenance, SBOMs, signatures — and none of it does anything unless something <strong>refuses to run an image that fails verification</strong>. On a single host that is a deploy script check; on a cluster it is an admission controller (chapter 22). Evidence without enforcement is documentation.</p>
+    </section>
+
+    <section id="runtime">
+      <h2 data-nav="What scanning misses">What scanning cannot cover</h2>
+      <p class="sub">And the cheap things that do.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Gap</th><th>Covered by</th><th>Chapter</th></tr></thead>
+          <tbody>
+            <tr><td>Your own code's flaws</td><td>SAST, code review, tests</td><td>—</td></tr>
+            <tr><td>Running as root, mounted sockets, added capabilities</td><td>Configuration checks and hardening</td><td>18</td></tr>
+            <tr><td>A process modified after start</td><td><code>--read-only</code>, drift detection</td><td>11, 19</td></tr>
+            <tr><td>Exploitation of an unknown vulnerability</td><td>Runtime detection, least privilege</td><td>18, 19</td></tr>
+            <tr><td>Exfiltration to an unexpected destination</td><td>Egress restriction, an <code>--internal</code> network</td><td>12</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>The ordering is worth stating plainly. A container built on a current slim base, running as a non-root user with a read-only filesystem, no capabilities and no outbound access it does not need, is in far better shape than one with a clean scan and none of that. <strong>Scanning tells you about known problems in known packages; the hardening in chapter 18 limits what any problem can do.</strong></p>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 17 in eight lines</h2>
+        <ul>
+          <li>A scanner joins a package inventory against advisory databases. It cannot see vendored code, your own bugs, or misconfiguration.</li>
+          <li>Severity describes the vulnerability; <b>risk depends on your deployment</b>. Fix availability, reachability, KEV and shipped-or-not are the useful filters.</li>
+          <li>NVD and a distribution can legitimately disagree, because distros backport without bumping versions.</li>
+          <li><b>Base currency is the biggest lever</b> — most findings come from the base, and a rebuild clears them with no code change.</li>
+          <li>Pin by digest <em>and</em> move the pin on a schedule through review. That is reproducibility and currency together.</li>
+          <li>SBOMs are worth storing for the query, not the document: "which of our images has this package" in seconds.</li>
+          <li><b>Block on the actionable few, warn on the rest</b>, and give every exception a justification and an expiry.</li>
+          <li>Provenance, SBOMs and signatures do nothing unless something <b>refuses to deploy</b> on failure.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary>A scan of your image reports 187 vulnerabilities, 34 of them high or critical. Where do you start?</summary>
+        <div class="ans"><p>Not with the list. First filter to what is <b>actionable</b>: has a fix, is in a shipped layer rather than a build stage, and is in something the application actually loads — then sort what remains by whether it is in the KEV catalogue and by EPSS rather than by CVSS. That usually leaves a handful. Second, check base currency: if the image is built on a base that is months old, rebuilding on a fresh one probably clears most of the 187 at once with no code change. Third, set a policy that blocks only the actionable set, so the number stays small enough to act on. The triage funnel above shows the ratios.</p></div>
+      </details>
+      <details class="chk">
+        <summary>You pin <code>FROM debian:12-slim@sha256:…</code> for reproducibility. A colleague says this guarantees you never get security patches. Are they right?</summary>
+        <div class="ans"><p>Right about the mechanism, wrong about the conclusion. A pinned digest cannot change, so a patched base will never arrive on its own — but unpinning trades that for a base that changes silently, with no record of when or to what, which breaks reproducibility (chapter 8) and makes an incident harder to investigate. The answer is to keep the pin and <b>automate moving it</b>: a bot raises a weekly pull request bumping the digest, so every change is a reviewed commit. Add a scheduled rebuild so a patched base reaches production without waiting for a code change.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Your build fails on 40 high-severity findings, none with fixes available. What is the least-bad policy?</summary>
+        <div class="ans"><p>Do not block on unfixed findings — there is no action a developer can take, so the gate only teaches people to bypass it. Warn on them, record them with a review date, and revisit when fixes appear. Meanwhile check whether a smaller base removes most of them outright (chapter 7): 40 unfixed findings in a full Debian base often becomes two or three on slim or distroless, because the packages are simply absent. Then block on the categories that <em>are</em> actionable — fixed, shipped, or known-exploited — so the gate keeps its credibility.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Your pipeline produces provenance, an SBOM and a cosign signature for every image. What does that prevent today?</summary>
+        <div class="ans"><p>By itself, nothing — it produces evidence, and evidence prevents nothing until something checks it. What it enables: verifying at deploy that an image was built by your pipeline from your source, and answering fleet-wide questions when an advisory lands. Both require enforcement — a deploy-time <code>cosign verify</code> that fails closed, or an admission controller rejecting unsigned images (chapter 22). Until that exists, the attestations are a good audit trail and not a control. Worth adding in that order, though: you cannot enforce what you do not produce.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Chapter 18 is hardening: capabilities, the root problem, seccomp and AppArmor, rootless Docker, and what the Docker socket really grants.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li><code>trivy image --severity HIGH,CRITICAL your-image</code>, then again with <code>--ignore-unfixed</code>.</li>
+        <li><code>docker scout recommendations your-image</code>.</li>
+        <li>Compare a scan of <code>python:3.12</code> against <code>python:3.12-slim</code>.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>The Trivy, Grype and Docker Scout documentation, the CISA KEV catalogue and EPSS model descriptions, SPDX and CycloneDX specifications, and the SLSA framework.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — triage funnel
+   ============================================================ */
+(function () {
+  /* a realistic finding set: severity, fix available, shipped layer,
+     reachable at runtime, EPSS, in the KEV catalogue */
+  var F = [
+    { id: "CVE-2025-11821", pkg: "glibc",        sev: "CRITICAL", fix: false, shipped: true,  reach: false, epss: 0.002, kev: false },
+    { id: "CVE-2025-30412", pkg: "gcc-12",       sev: "HIGH",     fix: true,  shipped: false, reach: false, epss: 0.001, kev: false },
+    { id: "CVE-2025-44190", pkg: "openssl",      sev: "CRITICAL", fix: true,  shipped: true,  reach: true,  epss: 0.410, kev: true  },
+    { id: "CVE-2025-21004", pkg: "libxml2",      sev: "HIGH",     fix: true,  shipped: true,  reach: false, epss: 0.008, kev: false },
+    { id: "CVE-2025-19773", pkg: "perl-base",    sev: "HIGH",     fix: false, shipped: true,  reach: false, epss: 0.001, kev: false },
+    { id: "CVE-2025-50881", pkg: "express",      sev: "HIGH",     fix: true,  shipped: true,  reach: true,  epss: 0.072, kev: false },
+    { id: "CVE-2025-33810", pkg: "webpack",      sev: "CRITICAL", fix: true,  shipped: false, reach: false, epss: 0.003, kev: false },
+    { id: "CVE-2025-28840", pkg: "zlib",         sev: "MEDIUM",   fix: true,  shipped: true,  reach: true,  epss: 0.011, kev: false },
+    { id: "CVE-2025-71120", pkg: "libtasn1",     sev: "HIGH",     fix: false, shipped: true,  reach: false, epss: 0.000, kev: false },
+    { id: "CVE-2025-60417", pkg: "tar",          sev: "HIGH",     fix: true,  shipped: true,  reach: false, epss: 0.004, kev: false },
+    { id: "CVE-2025-14477", pkg: "lodash",       sev: "MEDIUM",   fix: true,  shipped: true,  reach: false, epss: 0.002, kev: false },
+    { id: "CVE-2025-88203", pkg: "curl",         sev: "HIGH",     fix: true,  shipped: true,  reach: true,  epss: 0.190, kev: true  },
+    { id: "CVE-2025-40771", pkg: "systemd",      sev: "LOW",      fix: false, shipped: true,  reach: false, epss: 0.000, kev: false },
+    /* known-exploited, fixable, shipped — but reachability analysis says the
+       vulnerable path is not loaded. The case that breaks a reachability AND. */
+    { id: "CVE-2025-24016", pkg: "libssh2",      sev: "HIGH",     fix: true,  shipped: true,  reach: false, epss: 0.221, kev: true  },
+    { id: "CVE-2025-95514", pkg: "eslint",       sev: "MEDIUM",   fix: true,  shipped: false, reach: false, epss: 0.001, kev: false }
+  ];
+
+  var LAYERS = [
+    { id: "sev",     label: "severity ≥ HIGH", on: true },
+    { id: "fixed",   label: "--ignore-unfixed", on: false },
+    { id: "shipped", label: "shipped layers only", on: false },
+    { id: "reach",   label: "reachable at runtime", on: false },
+    { id: "expl",    label: "KEV or EPSS ≥ 0.05", on: false }
+  ];
+
+  var host = document.getElementById("t-layers");
+  var table = document.getElementById("t-table");
+  var out = document.getElementById("t-out");
+  var note = document.getElementById("t-note");
+
+  LAYERS.forEach(function (L) {
+    var b = document.createElement("button");
+    b.className = "btn mono" + (L.on ? " on" : "");
+    b.textContent = L.label;
+    b.addEventListener("click", function () { L.on = !L.on; b.classList.toggle("on", L.on); render(); });
+    host.appendChild(b);
+  });
+
+  function on(id) { return LAYERS.filter(function (L) { return L.id === id; })[0].on; }
+
+  /* "genuinely actionable" — the ground truth this demo measures noise against:
+     fixable, shipped, and either exploited in the wild or reachable with
+     non-trivial exploitation probability */
+  function actionable(f) {
+    return f.fix && f.shipped && (f.kev || (f.reach && f.epss >= 0.05));
+  }
+
+  function blocked(f) {
+    if (on("sev") && !(f.sev === "CRITICAL" || f.sev === "HIGH")) return false;
+    if (on("fixed") && !f.fix) return false;
+    if (on("shipped") && !f.shipped) return false;
+    if (on("reach") && !f.reach) return false;
+    if (on("expl") && !(f.kev || f.epss >= 0.05)) return false;
+    return true;
+  }
+
+  function render() {
+    var b = F.filter(blocked), a = F.filter(actionable);
+    var noise = b.filter(function (f) { return !actionable(f); });
+    var missed = a.filter(function (f) { return !blocked(f); });
+
+    table.innerHTML = '<table class="tbl"><thead><tr><th>finding</th><th>sev</th><th>fix</th><th>shipped</th><th>reachable</th><th>EPSS</th><th>KEV</th><th>blocked?</th></tr></thead><tbody>' +
+      F.map(function (f) {
+        var isB = blocked(f), isA = actionable(f);
+        return "<tr" + (isA ? ' style="background:var(--acc-wash)"' : "") + "><td><code>" + f.id +
+          "</code><br><span style='color:var(--text-3);font-size:11px'>" + f.pkg + "</span></td><td>" +
+          (f.sev === "CRITICAL" || f.sev === "HIGH" ? '<b style="color:var(--bad)">' + f.sev + "</b>" : f.sev) +
+          "</td><td>" + (f.fix ? '<span style="color:var(--good)">yes</span>' : '<span style="color:var(--text-3)">none</span>') +
+          "</td><td>" + (f.shipped ? "yes" : '<span style="color:var(--text-3)">build only</span>') +
+          "</td><td>" + (f.reach ? '<span style="color:var(--bad)">yes</span>' : '<span style="color:var(--text-3)">no</span>') +
+          "</td><td>" + f.epss.toFixed(3) +
+          "</td><td>" + (f.kev ? '<b style="color:var(--bad)">yes</b>' : "—") +
+          "</td><td>" + (isB ? '<b style="color:' + (isA ? "var(--good)" : "var(--warn)") + '">blocked</b>' : '<span style="color:var(--text-3)">passes</span>') +
+          "</td></tr>";
+      }).join("") + "</tbody></table>";
+
+    var precision = b.length ? ((b.length - noise.length) / b.length) * 100 : 100;
+
+    out.innerHTML = "";
+    tile("Blocked", String(b.length) + "/" + F.length, "of all findings");
+    tile("Genuinely actionable", String(a.length), "the ground truth", true);
+    tile("Noise", String(noise.length), "blocked, not actionable", noise.length === 0);
+    tile("Missed", String(missed.length), "actionable, not blocked", missed.length === 0);
+
+    var msgs = [];
+    var only = LAYERS.filter(function (L) { return L.on; }).map(function (L) { return L.id; });
+    if (only.length === 1 && only[0] === "sev") {
+      msgs.push("<b>The naive policy: block on high and critical.</b> It blocks " + b.length +
+        " findings of which only " + (b.length - noise.length) + " are actionable — so <b>" + noise.length +
+        " items have no action available</b>: unfixed, in a build stage that never ships, or in code the application does not load. This is the list that gets a blanket ignore added within a fortnight.");
+    } else if (noise.length === 0 && missed.length === 0) {
+      msgs.push("<b>Every blocked finding is actionable and nothing actionable slips through.</b> " + b.length +
+        " items, all of them fixable, shipped, and either exploited in the wild or plausibly exploitable. A gate that blocks this many keeps its credibility — and the rest of the report becomes a currency backlog rather than a build failure.");
+    } else if (missed.length > 0) {
+      msgs.push("<b>This policy misses " + missed.length + " actionable finding" + (missed.length > 1 ? "s" : "") +
+        ":</b> " + missed.map(function (f) { return "<code>" + f.id + "</code> (" + f.pkg + ")"; }).join(", ") +
+        (missed.some(function (f) { return f.kev; })
+          ? " — and at least one of them is in the <b>KEV catalogue</b>, meaning it is being exploited right now while a reachability check says the path is not loaded. That is the composition mistake: <b>reachability belongs as an AND for ordinary findings and must not gate a KEV rule</b>. Express it as \"block if (fixed AND shipped AND reachable) OR (in KEV)\" rather than ANDing everything together."
+          : ". Reachability analysis is not exhaustive, so it should narrow ordinary findings rather than gate the high-confidence signals."));
+    } else {
+      msgs.push("Precision is now " + precision.toFixed(0) + "%: " + b.length + " blocked, " +
+        noise.length + " of them without an available action. Each additional filter trades volume for focus.");
+    }
+    if (on("shipped")) {
+      msgs.push("Filtering to shipped layers alone removes the <code>gcc</code>, <code>webpack</code> and <code>eslint</code> findings — all real advisories, none of them in the runtime image, because a multi-stage build left them behind (chapter 7). Scanning the wrong target is a common way to generate this noise: scan the final stage, not the build stage.");
+    }
+    if (on("expl") && !on("fixed")) {
+      msgs.push("Note that an exploitability filter without <code>--ignore-unfixed</code> can still block something you cannot fix — which is a legitimate choice for a KEV entry, and needs a mitigation plan rather than a patch.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 7 ? "14px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — base currency model
+   ============================================================ */
+(function () {
+  var BASES = [
+    { id: "debian", label: "debian:12", pkgs: 420, rate: 3.9 },
+    { id: "slim", label: "debian:12-slim", pkgs: 95, rate: 1.1 },
+    { id: "alpine", label: "alpine:3.20", pkgs: 34, rate: 0.42 },
+    { id: "distroless", label: "distroless/static", pkgs: 6, rate: 0.09 }
+  ];
+  var CADENCES = [
+    { id: "never", label: "never", days: Infinity },
+    { id: "quarterly", label: "quarterly", days: 91 },
+    { id: "monthly", label: "monthly", days: 30 },
+    { id: "weekly", label: "weekly", days: 7 }
+  ];
+  var base = "debian", cadence = "never";
+  var WINDOW = 180, FIXABLE = 0.78;   /* share of advisories with a fix by rebuild time */
+
+  var baseHost = document.getElementById("c-base");
+  var cadHost = document.getElementById("c-cadence");
+  var chart = document.getElementById("c-chart");
+  var out = document.getElementById("c-out");
+  var note = document.getElementById("c-note");
+
+  function group(host, list, get, set) {
+    list.forEach(function (item) {
+      var b = document.createElement("button");
+      b.className = "btn mono" + (get() === item.id ? " on" : "");
+      b.textContent = item.label;
+      b.addEventListener("click", function () {
+        set(item.id);
+        Array.prototype.forEach.call(host.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+        b.classList.add("on");
+        render();
+      });
+      host.appendChild(b);
+    });
+  }
+  group(baseHost, BASES, function () { return base; }, function (v) { base = v; });
+  group(cadHost, CADENCES, function () { return cadence; }, function (v) { cadence = v; });
+
+  function simulate() {
+    var B = BASES.filter(function (x) { return x.id === base; })[0];
+    var C = CADENCES.filter(function (x) { return x.id === cadence; })[0];
+    var perDay = B.rate / 30;          /* advisories per day against this base */
+    var series = [], open = 0, sinceRebuild = 0, totalOpen = 0, peak = 0;
+    var ages = [];                      /* days each fixed advisory stayed open */
+    var pending = [];                   /* age of each currently-open advisory */
+
+    for (var d = 1; d <= WINDOW; d++) {
+      /* new advisories arrive */
+      open += perDay;
+      pending.push({ born: d, n: perDay });
+      sinceRebuild++;
+      if (C.days !== Infinity && sinceRebuild >= C.days) {
+        /* a rebuild clears the fixable share */
+        var cleared = 0;
+        pending.forEach(function (p) {
+          var c = p.n * FIXABLE;
+          cleared += c;
+          ages.push({ n: c, age: d - p.born });
+          p.n -= c;
+        });
+        open -= cleared;
+        pending = pending.filter(function (p) { return p.n > 1e-9; });
+        sinceRebuild = 0;
+      }
+      series.push(open);
+      totalOpen += open;
+      if (open > peak) peak = open;
+    }
+    var clearedTotal = ages.reduce(function (a, x) { return a + x.n; }, 0);
+    var mttr = clearedTotal > 0
+      ? ages.reduce(function (a, x) { return a + x.n * x.age; }, 0) / clearedTotal
+      : null;
+    return { B: B, C: C, series: series, avg: totalOpen / WINDOW, peak: peak,
+             end: open, mttr: mttr, arrived: perDay * WINDOW };
+  }
+
+  function render() {
+    var s = simulate();
+    var W = 470, H = 92, padL = 30;
+    var maxY = Math.max(1, s.peak * 1.12);
+    var x = function (d) { return padL + ((d - 1) / (WINDOW - 1)) * (W - padL - 10); };
+    var y = function (v) { return H - 16 - (v / maxY) * (H - 26); };
+
+    var svg = ['<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;max-width:' + W + 'px;height:auto;font-family:var(--mono)">'];
+    svg.push('<line x1="' + padL + '" y1="' + y(0) + '" x2="' + (W - 10) + '" y2="' + y(0) + '" stroke="#D8DEE4"/>');
+    svg.push('<text x="' + (padL - 4) + '" y="' + (y(maxY * 0.9) + 3) + '" font-size="8" fill="#7F8FA1" text-anchor="end">' +
+      Math.round(maxY * 0.9) + "</text>");
+    svg.push('<text x="' + (padL - 4) + '" y="' + (y(0) + 3) + '" font-size="8" fill="#7F8FA1" text-anchor="end">0</text>');
+    var path = s.series.map(function (v, i) { return (i ? "L" : "M") + x(i + 1) + " " + y(v); }).join(" ");
+    svg.push('<path d="' + path + '" fill="none" stroke="#3D4CC0" stroke-width="1.8"/>');
+    svg.push('<line x1="' + padL + '" y1="' + y(s.avg) + '" x2="' + (W - 10) + '" y2="' + y(s.avg) +
+      '" stroke="#B3372F" stroke-width="1.2" stroke-dasharray="4 3"/>');
+    svg.push('<text x="' + (W - 12) + '" y="' + (y(s.avg) - 3) + '" font-size="8" fill="#B3372F" text-anchor="end">mean ' +
+      s.avg.toFixed(1) + "</text>");
+    svg.push('<text x="' + padL + '" y="' + (H - 4) + '" font-size="8" fill="#7F8FA1">day 1</text>');
+    svg.push('<text x="' + (W - 10) + '" y="' + (H - 4) + '" font-size="8" fill="#7F8FA1" text-anchor="end">day 180</text>');
+    svg.push("</svg>");
+    chart.innerHTML = svg.join("");
+
+    out.innerHTML = "";
+    tile("Mean open", s.avg.toFixed(1), "over 180 days", s.avg < 3);
+    tile("At day 180", s.end.toFixed(1), "if never rebuilt after", s.end < 3);
+    tile("Advisories arrived", s.arrived.toFixed(0), "against this base");
+    tile("Mean time to patch", s.mttr === null ? "never" : Math.round(s.mttr) + " d", s.mttr === null ? "no rebuilds" : "for fixed ones", s.mttr !== null && s.mttr < 45);
+
+    var msgs = [];
+    var neverSame = (function () { var c = cadence; cadence = "never"; var r = simulate(); cadence = c; return r; })();
+    var distroSame = (function () { var b = base; base = "distroless"; var r = simulate(); base = b; return r; })();
+
+    if (cadence === "never") {
+      msgs.push("<b>Never rebuilding means the count only grows.</b> " + s.arrived.toFixed(0) +
+        " advisories landed against <code>" + s.B.label + "</code> over six months and every one is still open at day 180 — none of them because of anything you wrote. This is the number that makes a scan report unreadable.");
+    } else {
+      msgs.push("<b>Rebuilding " + s.C.label + " holds the mean at " + s.avg.toFixed(1) +
+        "</b> against " + neverSame.avg.toFixed(1) + " with no rebuilds — a " +
+        (neverSame.avg / Math.max(0.01, s.avg)).toFixed(1) + "× reduction from a scheduled job that changes no code. Mean time to patch is " +
+        Math.round(s.mttr) + " days against a " + s.C.days + "-day interval" +
+        (s.mttr > s.C.days / 2 + 0.5
+          ? " — <b>more than half of it</b>, because the " + Math.round((1 - FIXABLE) * 100) +
+            "% of advisories with no fix available at rebuild time carry over and are only cleared a cycle or more later."
+          : ", and the figure <b>understates</b> reality: at this interval only " +
+            Math.floor(WINDOW / s.C.days) + " rebuilds fit in the 180-day window, so advisories cleared on a later cycle are never observed. Shorten the cadence and the measured and true figures converge."));
+    }
+    msgs.push("<b>Base choice and cadence multiply.</b> The base sets the arrival rate (" +
+      s.B.rate.toFixed(2) + " a month for " + s.B.pkgs + " packages) and the cadence sets how long each one stays open — so <code>" +
+      s.B.label + "</code> at this cadence averages " + s.avg.toFixed(1) + ", while <code>distroless/static</code> at the same cadence averages " +
+      distroSame.avg.toFixed(1) + ". Neither lever alone gets you to a small number.");
+    msgs.push("<b>Assumptions:</b> advisories arrive at a constant rate proportional to package surface, " +
+      Math.round(FIXABLE * 100) + "% have a fix available when a rebuild happens, and a rebuild clears exactly those. Real arrivals are bursty and unfixed items persist across rebuilds — the shape holds, the precise figures will not.");
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 7 ? "14px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · What makes Postgres Postgres — PostgreSQL</title>
+<meta name="description" content="The process model, the memory layout, and the handful of design decisions that explain most of the operational behaviour you will meet.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 01 · The engine</div>
+    <h1>What makes Postgres Postgres</h1>
+    <p class="standfirst">Five design decisions account for most of what is distinctive about running PostgreSQL — the good parts and the operational sharp edges alike. Learn them once and the rest of this unit is largely consequences.</p>
+    <div class="chap-meta">
+      <span class="tagpill">process model</span>
+      <span class="tagpill">shared memory</span>
+      <span class="tagpill">extensibility</span>
+      <span class="tagpill">consequences</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The five decisions</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Decision</th><th>Consequence you will meet</th><th>Chapter</th></tr></thead>
+<tbody>
+<tr><td><b>A process per connection</b></td><td>Connections are expensive; pooling is mandatory, not an optimisation</td><td>09</td></tr>
+<tr><td><b>MVCC by tuple versioning</b></td><td>Readers never block writers — and dead rows accumulate</td><td>02</td></tr>
+<tr><td><b>Vacuum as a separate process</b></td><td>Bloat, autovacuum tuning, and transaction id wraparound</td><td>03</td></tr>
+<tr><td><b>Write-ahead logging</b></td><td>Durability, replication, and point-in-time recovery all come from one mechanism</td><td>04, 12, 13</td></tr>
+<tr><td><b>Extensibility as a first principle</b></td><td>Custom types, index methods and languages — the ecosystem is the product</td><td>10</td></tr>
+</tbody>
+</table>
+<caption>None of these is accidental, and each buys something real. The rest of this chapter is the first one; the next three chapters are the second, third and fourth.</caption>
+</div>
+
+<h2><span class="h-rule"></span>The process model</h2>
+
+<p>MySQL uses a thread per connection. SQL Server uses a scheduler over a thread pool. <b>PostgreSQL forks a separate operating-system process for every connection</b> — a decision from the 1980s that has survived because it buys real isolation: a crash in one backend cannot corrupt another's memory, and the postmaster can restart cleanly.</p>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">what is actually running</span><button class="copy">Copy</button></div>
+<pre><code>postgres                          ← the postmaster: listens, forks, supervises
+ ├─ postgres: checkpointer         flushes dirty buffers on a schedule  (ch 4)
+ ├─ postgres: background writer    trickles dirty buffers out between checkpoints
+ ├─ postgres: walwriter            flushes WAL to disk                  (ch 4)
+ ├─ postgres: autovacuum launcher  schedules vacuum workers             (ch 3)
+ │   └─ postgres: autovacuum worker: VACUUM public.orders
+ ├─ postgres: logical replication launcher                              (ch 13)
+ ├─ postgres: walsender  replica1  streams WAL to a standby             (ch 13)
+ ├─ postgres: stats collector      (merged into the postmaster in PG15+)
+ │
+ ├─ postgres: app orders 10.0.1.4(51234) idle           ← one BACKEND
+ ├─ postgres: app orders 10.0.1.7(51890) SELECT         ←  per client
+ └─ postgres: app orders 10.0.1.9(52001) idle in transaction   ← trouble (ch 3)
+
+-- Every row of pg_stat_activity is one of these processes. The ps output and
+-- the catalogue view are two views of the same list, which is occasionally
+-- very useful during an incident.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">A connection is not free, and this is why</span>
+  <p>Each backend is a fork with its own memory: several megabytes of private allocation before it does anything, a catalogue cache that grows as it touches tables, and a slot in shared memory. Establishing one costs single-digit milliseconds. So <b>a thousand idle connections is a gigabyte of memory and a scheduler full of processes</b>, and the fix is never to raise <code>max_connections</code> — it is a connection pooler in front (chapter 9). This one decision explains why Postgres advice about connections differs so sharply from MySQL advice.</p>
+</div>
+
+<h2><span class="h-rule"></span>Memory</h2>
+
+<div class="demo" id="mem">
+  <div class="demo-head">
+    <b>Where the memory goes</b>
+    <span>Shared memory is allocated once. Per-backend memory is allocated per connection — and <code>work_mem</code> is per operation, not per query.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="e-ram">Server RAM — <span id="e-ramv">32 GB</span></label>
+        <input type="range" id="e-ram" min="1" max="8" step="1" value="4">
+      </div>
+      <div>
+        <label for="e-conn">Concurrent connections — <span id="e-connv">100</span></label>
+        <input type="range" id="e-conn" min="10" max="1000" step="10" value="100">
+      </div>
+      <div>
+        <label for="e-work">work_mem — <span id="e-workv">4 MB</span></label>
+        <input type="range" id="e-work" min="1" max="10" step="1" value="3">
+      </div>
+      <div>
+        <label for="e-ops">Sort/hash nodes per query — <span id="e-opsv">2</span></label>
+        <input type="range" id="e-ops" min="1" max="8" step="1" value="2">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="e-shared">—</b><span>shared_buffers</span></div>
+      <div><b id="e-worst">—</b><span>worst-case work_mem</span></div>
+      <div><b id="e-total">—</b><span>worst-case total</span></div>
+      <div><b id="e-verdict">—</b><span>verdict</span></div>
+    </div>
+    <div id="e-bars"></div>
+    <div class="out" id="e-note"></div>
+  </div>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Area</th><th>Scope</th><th>Holds</th></tr></thead>
+<tbody>
+<tr><td><b>shared_buffers</b></td><td>Shared, allocated at startup</td><td>The buffer cache — 8 KB pages of tables and indexes</td></tr>
+<tr><td><b>WAL buffers</b></td><td>Shared</td><td>WAL records not yet written to disk</td></tr>
+<tr><td><b>Lock and proc arrays</b></td><td>Shared</td><td>Sized by <code>max_connections</code> and <code>max_locks_per_transaction</code></td></tr>
+<tr><td><b>work_mem</b></td><td><b>Per sort or hash node</b></td><td>One query with four sorts can use four times this</td></tr>
+<tr><td><b>maintenance_work_mem</b></td><td>Per maintenance operation</td><td>Vacuum, index builds. Set much higher than <code>work_mem</code></td></tr>
+<tr><td><b>temp_buffers</b></td><td>Per backend</td><td>Temporary tables</td></tr>
+<tr><td><b>Catalogue and plan caches</b></td><td>Per backend</td><td>Grows with the number of relations a backend touches</td></tr>
+<tr><td><b>OS page cache</b></td><td>The kernel's</td><td>Postgres relies on it heavily — hence <code>effective_cache_size</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">work_mem is the setting most often misread</span>
+  <p>It is not per connection and not per query — it is <b>per sort, hash join, or hash aggregate node in a plan</b>, and a parallel query multiplies it again by the number of workers. A query with three hash joins and two sorts running with two parallel workers can allocate fifteen times <code>work_mem</code>. Set it conservatively as a global, and raise it per session for the specific reports that need it. This is why the demo above shows a worst case that startles people the first time they compute it.</p>
+</div>
+
+<h2><span class="h-rule"></span>Double caching</h2>
+
+<p>Postgres reads through the operating system's page cache rather than using direct I/O, so a hot page frequently exists twice: once in <code>shared_buffers</code> and once in the kernel's cache. That sounds wasteful and is mostly deliberate.</p>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">why shared_buffers is not simply "all of RAM"</span><button class="copy">Copy</button></div>
+<pre><code>-- The conventional starting point is 25% of RAM, and the reasoning is:
+--   * the OS cache is also caching your data, and it is good at it
+--   * a large shared_buffers makes checkpoints write more at once (ch 4)
+--   * Postgres's own cache management is simpler than the kernel's
+--   * memory left free is available for work_mem, backends and the OS
+--
+-- Going higher can help on write-heavy workloads where you want pages to stay
+-- dirty in Postgres's cache longer. Going higher on a machine that also runs
+-- the application is usually a mistake.
+--
+-- effective_cache_size tells the PLANNER how much cache it can assume in
+-- total, including the OS. It allocates nothing. Set it to roughly 50-75%
+-- of RAM; too low and the planner avoids index scans it should choose.
+SHOW shared_buffers;         -- actual memory
+SHOW effective_cache_size;   -- a hint to the planner, not an allocation</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">effective_cache_size allocates nothing</span>
+  <p>Worth stating plainly because the name suggests otherwise. It is purely an input to the cost model: it tells the planner how likely a page is to be found in cache, which shifts the balance between index scans and sequential scans. Setting it too low makes the planner pessimistic about repeated index lookups and pushes it toward sequential scans on tables that are entirely cached. It is free to set correctly and it is left at the tiny default on a remarkable number of installations.</p>
+</div>
+
+<h2><span class="h-rule"></span>How a query travels</h2>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Parse</b><span>Text to a parse tree. Syntax errors surface here</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Analyse</b><span>Resolve names against the catalogue. "Column does not exist" comes from this stage</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Rewrite</b><span>Expand views and apply rules and row-level security policies</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Plan</b><span>Enumerate strategies, estimate costs from statistics, pick the cheapest (chapter 7)</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Execute</b><span>Pull rows through the plan tree, reading pages via shared_buffers</span></div>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">two things this pipeline explains</span><button class="copy">Copy</button></div>
+<pre><code>-- 1. A view is expanded at REWRITE, before planning. So a view is not an
+--    optimisation barrier and its predicates merge with yours — which is why
+--    a well-written view usually costs nothing.
+
+-- 2. Prepared statements skip parse and analyse on reuse, and after five
+--    executions Postgres may switch to a GENERIC plan that ignores the actual
+--    parameter values.
+PREPARE p AS SELECT * FROM orders WHERE status = $1;
+EXECUTE p('pending');    -- rare value: an index scan is right
+EXECUTE p('paid');       -- 40% of the table: a seq scan is right
+-- One plan cannot be right for both. If a prepared statement is intermittently
+-- slow, this is usually why. Control it explicitly:
+SET plan_cache_mode = 'force_custom_plan';   -- re-plan every time</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Extensibility</h2>
+
+<p>The system catalogue is itself a set of tables, and almost everything is registered in it — types, operators, functions, index access methods, procedural languages. That is what makes an extension able to add a genuinely new index type rather than a wrapper.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Extension point</th><th>What it enables</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td>Types and operators</td><td>New data types with full operator support</td><td><code>inet</code>, ranges, PostGIS geometry</td></tr>
+<tr><td>Index access methods</td><td>Entirely new index structures</td><td>GIN, BRIN, and <code>pgvector</code>'s HNSW</td></tr>
+<tr><td>Operator classes</td><td>Teach an existing index type about a new type</td><td><code>gin_trgm_ops</code> for trigram search</td></tr>
+<tr><td>Procedural languages</td><td>Write functions in another language</td><td>PL/pgSQL, PL/Python, PL/v8</td></tr>
+<tr><td>Foreign data wrappers</td><td>Query an external system as a table</td><td><code>postgres_fdw</code>, <code>file_fdw</code></td></tr>
+<tr><td>Hooks and background workers</td><td>Intercept planning or execution; run daemons</td><td><code>pg_stat_statements</code>, <code>auto_explain</code>, TimescaleDB</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">"Just use Postgres" is an architectural argument</span>
+  <p>Full-text search, JSON documents, geospatial queries, time-series, vector similarity, message queues and cron scheduling all have credible extension-based answers. Each is weaker than the dedicated system it competes with, and each removes an entire operational surface — another cluster to run, another backup regime, another consistency boundary between two stores that can disagree. <b>One database you understand deeply beats four you understand partially.</b> Reach for a specialised system when the Postgres answer has been measured and found wanting, not before.</p>
+</div>
+
+<h2><span class="h-rule"></span>Where things live on disk</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">the data directory</span><button class="copy">Copy</button></div>
+<pre><code>$PGDATA/
+  base/                one directory per database, one or more files per table
+    16384/             a database OID
+      16401            a relation — the FILENODE, not the table name
+      16401_fsm        free space map: which pages have room       (ch 5)
+      16401_vm         visibility map: which pages are all-visible (ch 3)
+      16401.1          a second 1 GB segment; tables are split at 1 GB
+  pg_wal/              the write-ahead log                          (ch 4)
+  pg_xact/             transaction commit status
+  global/              cluster-wide catalogues, e.g. pg_database
+  postgresql.conf      the main configuration file
+  postgresql.auto.conf written by ALTER SYSTEM; overrides the above
+  pg_hba.conf          who may connect, from where, authenticating how (ch 11)
+
+-- Filenames are OIDs, not table names. To map one:
+SELECT pg_relation_filepath('orders');
+SELECT relname FROM pg_class WHERE relfilenode = 16401;
+
+-- Never delete anything in here by hand, including in pg_wal — removing WAL
+-- files that have not been archived breaks recovery and replication both.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Configuration</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">where a setting came from, and how to change it</span><button class="copy">Copy</button></div>
+<pre><code>-- Settings have scopes. Some need a restart, most need only a reload.
+SELECT name, setting, unit, context, source, sourcefile, pending_restart
+FROM pg_settings
+WHERE name IN ('shared_buffers','work_mem','max_connections','wal_level');
+
+-- context tells you what a change requires:
+--   internal    fixed at compile time
+--   postmaster  RESTART   (shared_buffers, max_connections, wal_level)
+--   sighup      RELOAD    (most things, including autovacuum settings)
+--   superuser   SET, by a superuser
+--   user        SET, by anyone, per session
+
+SELECT pg_reload_conf();                       -- apply sighup-level changes
+ALTER SYSTEM SET work_mem = '16MB';            -- writes postgresql.auto.conf
+ALTER DATABASE reports SET work_mem = '256MB'; -- per database
+ALTER ROLE analyst SET work_mem = '256MB';     -- per role — often the best answer
+SET LOCAL work_mem = '512MB';                  -- one transaction only
+
+-- The per-role and per-database scopes are underused. A reporting role with a
+-- large work_mem and a long statement_timeout, alongside an application role
+-- with small values, is far better than one global compromise.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">ALTER SYSTEM writes a file that overrides your config management</span>
+  <p><code>postgresql.auto.conf</code> is read <em>after</em> <code>postgresql.conf</code>, so anything set with <code>ALTER SYSTEM</code> wins — including over the value your Ansible or Terraform run just deployed. The result is a setting that reverts every deploy and a setting that never takes effect, and hours spent finding out why. Pick one mechanism per cluster. If you manage configuration as code, use <code>ALTER SYSTEM</code> only for emergencies and reset it afterwards with <code>ALTER SYSTEM RESET name</code>.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Five decisions explain most of Postgres's behaviour: <b>process per connection, MVCC, vacuum, WAL, extensibility</b>.</li>
+    <li>A connection is <b>an operating-system process</b> costing megabytes. Pooling is mandatory, not an optimisation.</li>
+    <li><b><code>work_mem</code> is per sort or hash node</b>, multiplied again by parallel workers — not per query and not per connection.</li>
+    <li><b><code>effective_cache_size</code> allocates nothing.</b> It is a planner hint, and it is left at the default far too often.</li>
+    <li>Views are expanded before planning, so they are <b>not optimisation barriers</b>.</li>
+    <li>Prepared statements can switch to a <b>generic plan</b> after five executions — a common cause of intermittent slowness.</li>
+    <li>Extensibility reaches down to <b>index access methods and types</b>, which is why "just use Postgres" is often a serious answer.</li>
+    <li><b><code>ALTER SYSTEM</code> overrides your configuration management.</b> Pick one mechanism per cluster.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("01-architecture.html");
+
+(function(){
+  const root = document.getElementById("mem");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const RAM  = [2, 4, 8, 16, 32, 64, 128, 256];          // GB
+  const WORK = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];  // MB
+
+  function gb(mb){
+    return mb >= 1024 ? (mb/1024).toFixed(1) + " GB" : Math.round(mb) + " MB";
+  }
+
+  function render(){
+    const ram   = RAM[parseInt($("e-ram").value, 10) - 1];
+    const conns = parseInt($("e-conn").value, 10);
+    const work  = WORK[parseInt($("e-work").value, 10) - 1];
+    const ops   = parseInt($("e-ops").value, 10);
+    $("e-ramv").textContent  = ram + " GB";
+    $("e-connv").textContent = conns;
+    $("e-workv").textContent = gb(work);
+    $("e-opsv").textContent  = ops;
+
+    const ramMB    = ram * 1024;
+    const shared   = ramMB * 0.25;
+    const perBack  = 6;                       // MB of private memory per backend
+    const backends = conns * perBack;
+    const worstWork = conns * ops * work;
+    const maint    = 4 * Math.min(1024, ramMB * 0.05);
+    const total    = shared + backends + worstWork + maint;
+
+    $("e-shared").textContent = gb(shared);
+    $("e-worst").textContent  = gb(worstWork);
+    $("e-total").textContent  = gb(total);
+    const ratio = total / ramMB;
+    $("e-verdict").textContent = ratio > 1 ? "over RAM" : ratio > 0.8 ? "tight" : "headroom";
+
+    const rows = [
+      ["shared_buffers (25%)", shared],
+      ["Backend private (" + conns + " × " + perBack + " MB)", backends],
+      ["work_mem worst case", worstWork],
+      ["maintenance_work_mem", maint],
+      ["Left for OS cache", Math.max(0, ramMB - total)]
+    ];
+    const max = ramMB;
+    $("e-bars").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      'Against ' + ram + ' GB of RAM</div>' +
+      rows.map(([lab, v], i) =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px">' +
+        '<span style="min-width:210px;font-size:13px">' + lab + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + Math.min(100, Math.max(0.5, v/max*100)).toFixed(1) +
+        '%' + (i === 4 ? ';background:#3FB984' : i === 2 && worstWork > ramMB*0.3 ? ';background:#E2574C' : '') +
+        '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:66px;text-align:right">' +
+        gb(v) + '</span></div>').join("");
+
+    const notes = [];
+    notes.push("work_mem is allocated per sort or hash node, so " + conns + " connections × " + ops +
+               " nodes × " + gb(work) + " is a worst case of " + gb(worstWork) +
+               ". A parallel query multiplies it again by the number of workers, which this model does not include.");
+
+    if(ratio > 1)
+      notes.push("The worst case exceeds physical RAM. In practice not every connection runs a query with " + ops +
+                 " memory-hungry nodes simultaneously, so this rarely materialises — but it does under load spikes, which is exactly when you can least afford the OOM killer to choose the postmaster. " +
+                 "Lower the global work_mem and raise it per role for the queries that need it.");
+    else if(ramMB - total < ramMB * 0.15)
+      notes.push("Very little left for the operating system's page cache. Postgres reads through it, so squeezing it out means more physical reads even though shared_buffers looks generously sized. Leaving headroom is not waste here.");
+    else
+      notes.push(gb(ramMB - total) + " left for the OS page cache, which Postgres relies on heavily — a hot page is often cached twice, once in shared_buffers and once by the kernel, and that is by design rather than an oversight.");
+
+    if(conns > 300)
+      notes.push(conns + " backends is " + gb(backends) + " of private memory before any query runs, plus " + conns +
+                 " operating-system processes for the scheduler to manage. A pooler in front (chapter 9) typically cuts this to a few dozen actual backends " +
+                 "with no loss of application concurrency — and it is almost always the right fix rather than buying more RAM.");
+
+    if(work >= 64)
+      notes.push("A global work_mem of " + gb(work) + " is high. It is usually better set per role: a reporting role at 256MB and an application role at 4MB, rather than one compromise that is wrong for both.");
+
+    notes.push("Per-backend private memory is modelled at 6 MB, which is a rough middle — it grows as a backend touches more relations, because the catalogue and plan caches are per process and are never shrunk.");
+    $("e-note").textContent = notes.join("\n\n");
+  }
+
+  ["e-ram","e-conn","e-work","e-ops"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

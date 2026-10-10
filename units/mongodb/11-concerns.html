@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Read and write concerns — MongoDB</title>
+<meta name="description" content="The durability and consistency dials most people never touch, what each guarantees, and what the defaults actually give you.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 11 · Correctness</div>
+    <h1>Read and write concerns</h1>
+    <p class="standfirst">Two per-operation dials that decide what "the write succeeded" and "this is the current value" actually mean. Most applications never touch them, which is fine — the defaults are now good. It stops being fine the moment somebody changes one to make something faster.</p>
+    <div class="chap-meta">
+      <span class="tagpill">w</span>
+      <span class="tagpill">journal</span>
+      <span class="tagpill">readConcern</span>
+      <span class="tagpill">causal</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Write concern</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">what has to happen before you are told it worked</span><button class="copy">Copy</button></div>
+<pre><code>await coll.insertOne(doc, {
+  writeConcern: { w: "majority", j: true, wtimeout: 5000 }
+});
+
+//   w          how many members must have it
+//                1            the primary only
+//                "majority"   a majority of voting members   ← DEFAULT (5.0+)
+//                2, 3, …      a specific count
+//                a tag name   e.g. "eu" for two members in Europe
+//
+//   j          must it be in the on-disk journal?
+//                the default is true when w is "majority"
+//
+//   wtimeout   give up waiting after this. WITHOUT ONE, a write with
+//              w: "majority" can block indefinitely if members are down
+
+// Set it once on the client, override where it matters:
+new MongoClient(uri, { writeConcern: { w: "majority", wtimeout: 5000 } });
+await auditLog.insertOne(entry, { writeConcern: { w: 1 } });   // disposable</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">wtimeout is not a rollback</span>
+  <p>The subtlety that catches people: if <code>wtimeout</code> expires, the write <b>has already been applied on the primary</b>. You are told it timed out, and it may still replicate a moment later and become permanent. So a timeout means "I do not know", not "it did not happen" — the same ambiguity as a network failure. The correct response is to make the operation idempotent (chapter 6) and retry, not to assume failure and write something different. Treating a <code>wtimeout</code> as a rollback is how you get duplicates.</p>
+</div>
+
+<h2><span class="h-rule"></span>Read concern</h2>
+
+<div class="demo" id="con">
+  <div class="demo-head">
+    <b>What each combination guarantees</b>
+    <span>Pick a pair. The guarantees, the costs, and what can still go wrong.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="c-w">writeConcern</label>
+        <select id="c-w">
+          <option value="0">w: 0 — fire and forget</option>
+          <option value="1">w: 1 — the primary has it</option>
+          <option value="majority" selected>w: "majority" — the default</option>
+          <option value="majj">w: "majority", j: true</option>
+        </select>
+      </div>
+      <div>
+        <label for="c-r">readConcern</label>
+        <select id="c-r">
+          <option value="local" selected>"local" — the default</option>
+          <option value="available">"available"</option>
+          <option value="majority">"majority"</option>
+          <option value="linearizable">"linearizable"</option>
+          <option value="snapshot">"snapshot"</option>
+        </select>
+      </div>
+      <div>
+        <label for="c-pref">readPreference</label>
+        <select id="c-pref">
+          <option value="primary" selected>primary</option>
+          <option value="secondary">secondaryPreferred</option>
+        </select>
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="c-dur">—</b><span>survives primary loss?</span></div>
+      <div><b id="c-ryw">—</b><span>read your own writes?</span></div>
+      <div><b id="c-rb">—</b><span>can a read be rolled back?</span></div>
+      <div><b id="c-cost">—</b><span>latency cost</span></div>
+    </div>
+    <div id="c-verdict"></div>
+    <div class="out" id="c-note"></div>
+  </div>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>readConcern</th><th>Returns</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><code>"local"</code></td><td>The node's most recent data</td><td><b>The default.</b> May include writes that get rolled back</td></tr>
+<tr><td><code>"available"</code></td><td>The same, minus sharding consistency checks</td><td>Sharded only. Can return orphans. Rarely correct</td></tr>
+<tr><td><code>"majority"</code></td><td>Only data a majority has</td><td><b>Cannot be rolled back.</b> Slightly behind</td></tr>
+<tr><td><code>"linearizable"</code></td><td>The genuinely latest value</td><td>Primary only, single document, needs a write concern. Slow</td></tr>
+<tr><td><code>"snapshot"</code></td><td>A consistent point in time</td><td>Transactions, and multi-document reads</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-t">readConcern "local" can return data that later ceases to exist</span>
+  <p>The default returns whatever the node has, including writes not yet replicated to a majority. If the primary then fails, those writes are rolled back (chapter 10) — so your application read a value, acted on it, and the value never existed as far as the surviving cluster is concerned. This is rare and it is not theoretical. For a read that gates a consequential action — checking a balance before a transfer, confirming a booking is still free — use <code>readConcern: "majority"</code>, which by definition can only return data that cannot be rolled back. For a product listing, <code>"local"</code> is fine and faster.</p>
+</div>
+
+<h2><span class="h-rule"></span>Causal consistency</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">read-your-writes across nodes</span><button class="copy">Copy</button></div>
+<pre><code>// The problem: write to the primary, read from a secondary, and the write
+// may not have arrived. The user saves a form and the next page does not
+// show their change.
+
+const session = client.startSession({ causalConsistency: true });   // default
+
+await orders.insertOne(doc, { session });
+const found = await orders.findOne({ _id: doc._id }, {
+  session, readPreference: "secondaryPreferred"
+});
+// GUARANTEED to see the insert — the secondary waits until it has caught up
+// to the session's cluster time before answering.
+
+session.endSession();
+
+// The guarantees a causally consistent session provides:
+//   read your own writes
+//   monotonic reads      — never see time go backwards
+//   monotonic writes     — your writes apply in the order you issued them
+//   writes follow reads  — a write after a read lands after what you read
+//
+// The mechanism is an operation time carried on every reply and sent with
+// every subsequent request. The cost is that a read may WAIT for the
+// secondary to catch up, so a lagging secondary makes your read slow rather
+// than wrong — which is the right trade.
+//
+// To get the full guarantee the session also needs w: "majority" and
+// readConcern: "majority". With weaker settings it is best-effort.
+
+// The important practical note: sessions are PER LOGICAL USER FLOW, not per
+// application. A single shared session across all requests serialises
+// unrelated work and gives you nothing. Create one per request or per user
+// interaction, and pass it to every operation in that flow.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>What the defaults give you</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">and how they got there</span><button class="copy">Copy</button></div>
+<pre><code>// MongoDB 5.0 and later, out of the box:
+//   writeConcern:    { w: "majority" }
+//   readConcern:     "local"
+//   readPreference:  primary
+//   retryWrites:     true
+//   retryReads:      true
+
+// That combination means: acknowledged writes cannot be lost to a failover,
+// reads come from the primary and are current, and transient network errors
+// are retried automatically. It is a sensible default and it was not always
+// the default — before 2.6 the default was effectively w: 0, and the
+// reputation MongoDB acquired for losing data dates from that era.
+//
+// Anyone repeating that criticism today is describing a version from over a
+// decade ago. Anyone who has explicitly set w: 1 has reintroduced it.
+
+// Cluster-wide default, which overrides the driver's:
+db.adminCommand({
+  setDefaultRWConcern: 1,
+  defaultWriteConcern: { w: "majority", wtimeout: 5000 },
+  defaultReadConcern: { level: "local" }
+});
+db.adminCommand({ getDefaultRWConcern: 1 });
+
+// Worth running getDefaultRWConcern on any cluster you inherit. A cluster
+// default of w: 1 set years ago to fix a latency problem is invisible from
+// the application code, and it silently reintroduces rollback.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Choosing per operation</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Operation</th><th>Write concern</th><th>Read concern</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Placing an order</td><td><code>majority, j: true</code></td><td><code>majority</code></td><td>Money. Nothing may be lost</td></tr>
+<tr><td>Updating a profile</td><td><code>majority</code></td><td><code>local</code></td><td>Default. Fine</td></tr>
+<tr><td>Checking a balance before a transfer</td><td>—</td><td><code>majority</code></td><td>A rolled-back read would authorise a bad transfer</td></tr>
+<tr><td>Recording a page view</td><td><code>w: 1</code> or <code>w: 0</code></td><td>—</td><td>Losing some is genuinely acceptable</td></tr>
+<tr><td>Bulk import</td><td><code>w: 1</code>, then verify</td><td>—</td><td>Speed, with a majority-read check afterwards</td></tr>
+<tr><td>Rendering a product page</td><td>—</td><td><code>local</code></td><td>Staleness is invisible to the user</td></tr>
+<tr><td>Analytics on a secondary</td><td>—</td><td><code>local</code></td><td>Seconds of staleness do not matter</td></tr>
+<tr><td>A distributed lock</td><td><code>majority, j: true</code></td><td><code>linearizable</code></td><td>The one case that genuinely needs it</td></tr>
+</tbody>
+</table>
+<caption>The pattern: raise the concern for the small number of operations where being wrong is consequential, and leave everything else on the defaults. Applying <code>linearizable</code> everywhere is a performance decision disguised as a safety one.</caption>
+</div>
+
+<h2><span class="h-rule"></span>Retryable writes</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">on by default, and worth understanding</span><button class="copy">Copy</button></div>
+<pre><code>// A network failure between the server applying a write and your driver
+// receiving the acknowledgement is indistinguishable from the write never
+// happening. Drivers retry — once — and MongoDB makes that safe.
+
+// The mechanism: every retryable write carries a session id and a
+// statement id. The server records which statement ids it has executed, so
+// a retry of one it already ran returns the ORIGINAL result rather than
+// applying it twice.
+
+// What is retryable:
+//   insertOne, updateOne, deleteOne, replaceOne, findAndModify
+//   insertMany, bulkWrite (only if every operation is single-document)
+//
+// What is NOT:
+//   updateMany, deleteMany — multi-document, so a partial application
+//   cannot be safely resumed. These you must make idempotent yourself.
+
+// This works alongside your own idempotency and does not replace it. The
+// driver retries once, for one class of failure. An application-level retry
+// after a longer outage has no such protection, which is why the
+// construction matters (chapter 6):
+//   a conditional filter that only matches once
+//   a unique index on a client-supplied key
+//   $set rather than $inc, $addToSet rather than $push
+
+new MongoClient(uri, { retryWrites: true, retryReads: true });   // defaults</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">The cost of majority is smaller than it looks, and not zero</span>
+  <p>Within one datacentre, waiting for a second member typically adds a fraction of a millisecond — the members are close and the write is already going to disk. Across regions it is a round trip, and that changes the arithmetic completely: <code>w: "majority"</code> with a member on another continent adds that latency to <em>every write</em>. This is why multi-region deployments usually keep the majority within one region and treat the distant member as a disaster-recovery copy rather than a voting one. Measure it before assuming either that it is free or that it is expensive.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Write concern is <b>how many members must have it</b> before you are told it worked. <code>w: "majority"</code> since 5.0.</li>
+    <li><b><code>wtimeout</code> is not a rollback</b> — the write already applied on the primary and may still replicate. Retry idempotently.</li>
+    <li><b>Always set <code>wtimeout</code></b> with <code>w: "majority"</code>, or a write can block indefinitely.</li>
+    <li><b><code>readConcern: "local"</code> can return data that is later rolled back.</b> Use <code>"majority"</code> for reads that gate a consequential action.</li>
+    <li><b>Causal consistency</b> gives read-your-writes on secondaries — one session per user flow, not per application.</li>
+    <li>The current defaults are good. <b>Check <code>getDefaultRWConcern</code></b> on any cluster you inherit.</li>
+    <li><b>Retryable writes are on by default</b> and cover one retry of single-document operations. Not <code>updateMany</code>.</li>
+    <li><b>Raise the concern where being wrong is consequential</b>, and leave the rest alone.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("11-concerns.html");
+
+(function(){
+  const root = document.getElementById("con");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const WN = {
+    "0":        {dur:"no", cost:0,   lbl:'w: 0'},
+    "1":        {dur:"no", cost:0.3, lbl:'w: 1'},
+    "majority": {dur:"yes", cost:1.1, lbl:'w: "majority"'},
+    "majj":     {dur:"yes", cost:1.8, lbl:'w: "majority", j: true'}
+  };
+  const RN = {
+    local:        {rb:"yes", cost:0,   lbl:'readConcern: "local"'},
+    available:    {rb:"yes", cost:0,   lbl:'readConcern: "available"'},
+    majority:     {rb:"no",  cost:0.4, lbl:'readConcern: "majority"'},
+    linearizable: {rb:"no",  cost:2.6, lbl:'readConcern: "linearizable"'},
+    snapshot:     {rb:"no",  cost:0.6, lbl:'readConcern: "snapshot"'}
+  };
+
+  function render(){
+    const wk = $("c-w").value, rk = $("c-r").value, pref = $("c-pref").value;
+    const w = WN[wk], r = RN[rk];
+    const secondary = pref === "secondary";
+
+    const ryw = !secondary ? "yes"
+              : rk === "linearizable" ? "n/a — primary only"
+              : "NO — unless causal";
+    const cost = w.cost + r.cost + (secondary ? -0.2 : 0);
+
+    $("c-dur").textContent  = w.dur;
+    $("c-ryw").textContent  = ryw;
+    $("c-rb").textContent   = r.rb;
+    $("c-cost").textContent = cost <= 0.1 ? "none" : "+" + cost.toFixed(1) + " ms";
+
+    const problems = [], goods = [];
+    if(wk === "0") problems.push("Writes are not acknowledged at all — errors are invisible, including duplicate key violations");
+    if(wk === "1") problems.push("An acknowledged write can be rolled back if the primary fails before it replicates");
+    if(w.dur === "yes") goods.push("Acknowledged writes survive a primary failure");
+    if(wk === "majj") goods.push("Also survives a simultaneous power loss on a majority");
+    if(r.rb === "yes") problems.push("A read can return data that is later rolled back and ceases to exist");
+    if(r.rb === "no") goods.push("Reads can only return data that cannot be rolled back");
+    if(rk === "available") problems.push("On a sharded cluster this can return orphaned documents");
+    if(rk === "linearizable") problems.push("Primary only, single document only, and materially slower");
+    if(secondary && rk !== "linearizable") problems.push("Reads may be stale by the replication lag");
+    if(secondary) goods.push("Read load kept off the primary");
+
+    $("c-verdict").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:16px 0 8px">' +
+      w.lbl + ' · ' + r.lbl + (secondary ? ' · secondaryPreferred' : '') + '</div>' +
+      goods.map(g =>
+        '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid #3FB984;border-radius:4px;' +
+        'padding:7px 12px;margin-bottom:4px;font-size:13px">' + g + '</div>').join("") +
+      problems.map(p =>
+        '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid #E2574C;border-radius:4px;' +
+        'padding:7px 12px;margin-bottom:4px;font-size:13px">' + p + '</div>').join("");
+
+    const notes = [];
+
+    if(wk === "0")
+      notes.push("w: 0 does not wait for anything — the driver sends the write and moves on. You do not learn about duplicate keys, validation failures or the server being down.\n\nThere is a narrow legitimate use: high-volume telemetry where losing some is genuinely acceptable and the write path must not block. Everywhere else it is a way of not finding out about errors.");
+    else if(wk === "1")
+      notes.push("w: 1 waits for the primary and nothing else. It is roughly a millisecond faster than majority within a datacentre, and it reintroduces rollback: if the primary fails before replicating, an acknowledged write is moved to a file on disk and removed (chapter 10).\n\nThe application was told it succeeded. Nobody is told otherwise. This was the default before 5.0 and it is the source of MongoDB's historical reputation for losing writes — a reputation that is now only earned by explicitly choosing this.");
+    else
+      notes.push("w: \"majority\" is the default since 5.0 and the correct setting for essentially everything that matters. A write is not acknowledged until a majority holds it, and an election winner must be at least as fresh as every voter — so an acknowledged write cannot be rolled back.\n\nAlways pair it with wtimeout. Without one, a write can block indefinitely when members are down, turning a degraded cluster into an application-wide hang.");
+
+    if(wk === "majj")
+      notes.push("j: true additionally waits for the on-disk journal, so the write survives a simultaneous power loss across a majority — not just a process failure. It is implied when w is \"majority\" in most configurations, and setting it explicitly costs a fraction of a millisecond and removes the ambiguity.");
+
+    if(rk === "local")
+      notes.push("readConcern \"local\" returns whatever this node has, including writes not yet replicated to a majority. Fast, and the right default for most reads — a product page showing data a few milliseconds stale is fine.\n\nIt is the wrong choice for a read that gates a consequential action. Checking a balance before a transfer with \"local\" can read a deposit that is subsequently rolled back, and you have authorised a transfer against money that never existed.");
+    else if(rk === "majority")
+      notes.push("readConcern \"majority\" only returns data a majority of members holds, so by construction it cannot return anything that will later be rolled back.\n\nThe cost is that it is slightly behind — it excludes the most recent writes that have not yet reached a majority. That is the correct trade for reads that authorise something.");
+    else if(rk === "linearizable")
+      notes.push("\"linearizable\" is the strongest and most expensive: the primary confirms it is still the primary before answering, which means a round trip to a majority on every read.\n\nIt only works against the primary, only for single-document reads, and needs a write concern of majority. Use it for a genuine distributed lock or a leader check — and note that if you find yourself wanting it broadly, that is usually a signal the design needs the atomicity to live inside one document instead (chapter 12).");
+    else if(rk === "snapshot")
+      notes.push("\"snapshot\" reads from a single consistent point in time across every document it touches. This is what transactions use, and it is available outside them for multi-document reads that must agree with each other.");
+    else if(rk === "available")
+      notes.push("\"available\" skips the sharding consistency checks that \"local\" performs, which means it can return ORPHANED documents — copies left on a shard after a chunk migration (chapter 13). It is faster and it can return documents that do not logically exist. Rarely the right choice.");
+
+    if(secondary && rk !== "linearizable")
+      notes.push("Reading from a secondary means reads are stale by the replication lag — usually milliseconds, occasionally much more. Read-your-writes breaks: a user saves and the next page does not show their change, intermittently.\n\nThe proper fix is a causally consistent session, which makes the secondary wait until it has caught up to your session's cluster time before answering. That converts \"sometimes wrong\" into \"sometimes slightly slower\", which is the right trade. Set maxStalenessSeconds as well so the driver excludes badly lagging members.");
+
+    if(cost > 3)
+      notes.push("This combination adds roughly " + cost.toFixed(1) + " ms per operation. Within one datacentre that is usually acceptable for the operations that need it and wasteful applied everywhere. Across regions the majority wait becomes a full round trip, which is why multi-region deployments normally keep the voting majority in one region.");
+
+    $("c-note").textContent = notes.join("\n\n");
+  }
+
+  ["c-w","c-r","c-pref"].forEach(id => $(id).addEventListener("change", render));
+  render();
+})();
+</script>
+</body>
+</html>

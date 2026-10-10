@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Transactions — MongoDB</title>
+<meta name="description" content="Single-document atomicity, multi-document transactions and their real costs, and the design that usually avoids needing them.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 12 · Correctness</div>
+    <h1>Transactions</h1>
+    <p class="standfirst">MongoDB has had multi-document ACID transactions since 4.0, and they work. They are also slower and more constrained than the equivalent in a relational database, which means the interesting question is not how to use them but how often you should need to.</p>
+    <div class="chap-meta">
+      <span class="tagpill">document atomicity</span>
+      <span class="tagpill">sessions</span>
+      <span class="tagpill">limits</span>
+      <span class="tagpill">alternatives</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Start from what is already atomic</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">a single-document write needs no transaction</span><button class="copy">Copy</button></div>
+<pre><code>// Atomic. Every field changes together, or none does, and no reader ever
+// observes a partial state.
+await orders.updateOne(
+  { _id: id, status: "pending" },
+  { $set:  { status: "paid", paidAt: new Date() },
+    $inc:  { version: 1 },
+    $push: { events: { type: "payment", at: new Date() } } }
+);
+
+// Also atomic — the filter is part of the operation, so this is a
+// compare-and-set. If another process already moved the order out of
+// "pending", matchedCount is 0 and nothing happened.
+
+// The design consequence, which is the whole chapter in one line:
+//   the more invariants that live inside one document, the fewer
+//   transactions you need.
+//
+// That is not a workaround for a missing feature. It is what chapter 2 was
+// arguing for, arriving as a correctness property: an order and its line
+// items in one document are updated atomically by construction, where the
+// relational version needs a transaction spanning three tables.</code></pre>
+</div>
+
+<div class="demo" id="tx">
+  <div class="demo-head">
+    <b>Do you need a transaction?</b>
+    <span>Describe what must change together. Often the answer is a schema change rather than a transaction.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="t-what">What must change atomically</label>
+        <select id="t-what">
+          <option value="onedoc" selected>Several fields of one document</option>
+          <option value="parentchild">A parent and its children</option>
+          <option value="transfer">Move value between two accounts</option>
+          <option value="counter">A record plus a counter elsewhere</option>
+          <option value="inventory">Reserve stock and create an order</option>
+          <option value="crosscoll">Documents across three collections</option>
+          <option value="external">A document plus an external API call</option>
+        </select>
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="t-need">—</b><span>transaction needed?</span></div>
+      <div><b id="t-alt">—</b><span>better approach</span></div>
+      <div><b id="t-cost">—</b><span>relative cost</span></div>
+    </div>
+    <div id="t-code"></div>
+    <div class="out" id="t-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Using one</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">withTransaction, which handles the retries for you</span><button class="copy">Copy</button></div>
+<pre><code>const session = client.startSession();
+try {
+  await session.withTransaction(async () => {
+    await accounts.updateOne(
+      { _id: from, balance: { $gte: amount } },
+      { $inc: { balance: -amount } },
+      { session }                       // ← every operation needs this
+    );
+    await accounts.updateOne(
+      { _id: to }, { $inc: { balance: amount } }, { session }
+    );
+    await ledger.insertOne({ from, to, amount, at: new Date() }, { session });
+  }, {
+    readConcern:    { level: "snapshot" },
+    writeConcern:   { w: "majority" },
+    readPreference: "primary"
+  });
+} finally {
+  await session.endSession();
+}
+
+// USE withTransaction. The manual startTransaction/commitTransaction form
+// requires you to implement the retry loop for TransientTransactionError and
+// UnknownTransactionCommitResult yourself, and almost everyone gets it
+// slightly wrong. withTransaction retries both correctly.
+
+// THE CALLBACK MUST BE IDEMPOTENT. It can run several times — on a write
+// conflict, on a failover, on a network blip. Do not send an email, charge a
+// card or increment an application counter inside it.
+
+// Forgetting { session } on one operation is the classic mistake: that
+// operation executes OUTSIDE the transaction, commits immediately, and is
+// not rolled back if the transaction aborts. It produces exactly the
+// inconsistency the transaction was added to prevent, and it is silent.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Every operation needs the session, and the callback must be idempotent</span>
+  <p>Two rules, and they cause most transaction bugs in MongoDB codebases. An operation without <code>{ session }</code> is simply not in the transaction — it commits on its own and survives an abort, which is worse than having no transaction at all because the code reads as though it is protected. And the callback genuinely re-executes: <code>withTransaction</code> retries transient errors, so anything with an external side effect inside it will happen more than once. Reads and writes to MongoDB only; everything else goes after the commit.</p>
+</div>
+
+<h2><span class="h-rule"></span>What they cost</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Constraint</th><th>Detail</th></tr></thead>
+<tbody>
+<tr><td><b>60-second default lifetime</b></td><td><code>transactionLifetimeLimitSeconds</code>. Aborted past it</td></tr>
+<tr><td><b>16 MB oplog entry</b></td><td>The whole transaction's changes must fit. Large batches fail</td></tr>
+<tr><td><b>Write conflicts abort</b></td><td>Two transactions touching one document — one is retried</td></tr>
+<tr><td><b>Cache pressure</b></td><td>Uncommitted changes are held in the WiredTiger cache</td></tr>
+<tr><td><b>Replica set or sharded only</b></td><td>Not on a standalone <code>mongod</code></td></tr>
+<tr><td><b>Sharded is materially slower</b></td><td>Two-phase commit across shards (chapter 13)</td></tr>
+<tr><td><b>No DDL inside</b></td><td>Collection creation is implicit and allowed since 4.4; index builds are not</td></tr>
+<tr><td><b>Reads must go to the primary</b></td><td>No secondary reads in a transaction</td></tr>
+<tr><td><b>A long transaction blocks</b></td><td>Holds a snapshot, and can stall the majority commit point</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Keep them short and small</span>
+  <p>The failure mode is not that transactions are slow — it is that a long one degrades the whole cluster. An open transaction holds a WiredTiger snapshot, which prevents older versions being discarded and grows cache pressure; on a busy system a few long transactions can push the cache into eviction thrashing and slow every other operation. The guidance from MongoDB is <b>under a second and under a thousand documents</b>, and it is not conservative advice — a transaction that processes 100,000 documents is not a transaction you should be writing. Batch it into many small ones, each idempotent, and track progress in a document.</p>
+</div>
+
+<h2><span class="h-rule"></span>Write conflicts</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">optimistic, so contention costs retries</span><button class="copy">Copy</button></div>
+<pre><code>// MongoDB transactions use optimistic concurrency. If two transactions
+// modify the same document, one aborts with a TransientTransactionError and
+// withTransaction retries it. There is no lock queue and no waiting.
+//
+// That is fine at low contention and quadratically bad at high contention:
+// every retry re-executes the whole callback, and under load the retries
+// themselves collide.
+
+// The pathological shape — every transaction touching one hot document:
+await inventory.updateOne({ _id: "global-counter" },
+  { $inc: { total: 1 } }, { session });
+// A hundred concurrent transactions here spend most of their time retrying.
+
+// Three ways out, in order of preference:
+//   1. Move the contended change OUT of the transaction and make it a
+//      single-document atomic $inc, which never conflicts
+//   2. Shard the hot document across N documents and sum on read (chapter 3)
+//   3. Order operations consistently so transactions collide predictably
+//      rather than in a cycle
+
+// Diagnose it:
+db.serverStatus().transactions;
+//   totalStarted, totalCommitted, totalAborted
+//   a high abort ratio is contention, not errors
+db.serverStatus().metrics.operation.writeConflicts;</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Designing them away</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">three patterns that replace most transactions</span><button class="copy">Copy</button></div>
+<pre><code>// 1. PUT THE INVARIANT IN ONE DOCUMENT.
+//    Stock and reservations together, so the check and the decrement are
+//    one atomic compare-and-set:
+await inventory.updateOne(
+  { sku: "TSH-001", available: { $gte: qty } },
+  { $inc: { available: -qty, reserved: qty } }
+);
+// matchedCount === 0 means there was not enough stock. No transaction, no
+// race, no read-then-write window.
+
+// 2. THE OUTBOX PATTERN. When a write must trigger something elsewhere,
+//    record the intent in the SAME document, then act on it separately.
+await orders.insertOne({
+  _id: orderId, status: "paid",
+  outbox: [{ type: "send-receipt", at: new Date(), done: false }]
+});
+// A worker (or a change stream, chapter 14) picks up the outbox entry and
+// performs the side effect, marking it done. The order and the intent to
+// send commit together atomically; the side effect is retried until it
+// succeeds. This removes the dual-write problem entirely.
+
+// 3. THE SAGA. For a genuinely multi-step process, model the state machine
+//    explicitly with compensating actions rather than one long transaction.
+{ _id: bookingId, state: "flight-booked",
+  steps: [ { name: "flight", status: "done", ref: "…" },
+           { name: "hotel",  status: "pending" } ] }
+// Each step is a single-document atomic transition. If a later step fails,
+// run the compensating action for the earlier ones. More code than a
+// transaction, and the only thing that works when steps involve external
+// systems that cannot participate in one anyway.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">The outbox pattern is the one to internalise</span>
+  <p>Most requests for a transaction turn out to be a dual-write problem: change the database <em>and</em> send an email, publish an event, call a payment provider. A transaction does not help, because the external system is not in it — the classic failure is the transaction committing and the email failing, or the email sending and the transaction aborting. Writing the <em>intent</em> into the same document as the data makes the two atomic by construction, and a worker retries the side effect until it succeeds. It is more moving parts than a transaction and it is the version that is actually correct.</p>
+</div>
+
+<h2><span class="h-rule"></span>When to use one</h2>
+
+<div class="cols">
+  <div class="col good">
+    <h4>Genuinely appropriate</h4>
+    <ul>
+      <li>Moving value between two accounts</li>
+      <li>A migration that must not leave data half-converted</li>
+      <li>Maintaining a referenced pair where both must exist</li>
+      <li>An occasional operation spanning collections, not a hot path</li>
+      <li>Anywhere the invariant genuinely cannot fit in one document</li>
+    </ul>
+  </div>
+  <div class="col bad">
+    <h4>A signal to redesign</h4>
+    <ul>
+      <li>Every write in the application uses one</li>
+      <li>A transaction touching thousands of documents</li>
+      <li>A transaction wrapping an external API call</li>
+      <li>Transactions to compensate for a normalised document schema</li>
+      <li>High abort rates from contention on a hot document</li>
+    </ul>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Needing them everywhere means the schema is wrong</span>
+  <p>Transactions were added because there are real cases that need them, and their existence does not make a normalised document schema a good idea. If most operations in your application span several collections, you have built a relational schema in a document database — you are paying for distributed transactions to get consistency that a relational database would give you with a foreign key and a cheap local transaction. That is a legitimate finding, and the right response is either chapter 2's modelling or chapter 18's honest conclusion, not more transactions.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>A single-document write is already atomic</b>, however many fields it touches. Start there.</li>
+    <li><b>Use <code>withTransaction</code></b>, not the manual form — it implements the retry loop correctly.</li>
+    <li><b>Every operation needs <code>{ session }</code>.</b> One without it commits independently and is not rolled back.</li>
+    <li><b>The callback re-executes.</b> No external side effects inside it.</li>
+    <li><b>Under a second, under a thousand documents.</b> A long transaction degrades the whole cluster through cache pressure.</li>
+    <li><b>Conflicts abort and retry</b> rather than queueing, so a hot document under contention gets quadratically worse.</li>
+    <li><b>The outbox pattern</b> solves the dual-write problem that most transaction requests actually are.</li>
+    <li><b>Needing them everywhere is a schema signal</b>, not a usage pattern.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("12-transactions.html");
+
+(function(){
+  const root = document.getElementById("tx");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const T = {
+    onedoc: {need:"no", alt:"already atomic", cost:"1×",
+      code:'await orders.updateOne(\n  { _id: id, status: "pending" },\n  { $set:  { status: "paid", paidAt: new Date() },\n    $inc:  { version: 1 },\n    $push: { events: { type: "payment" } } }\n);',
+      note:"Nothing to do. A write to one document is atomic across every field it changes, and no reader ever sees a partial state.\n\nNote the filter includes status: \"pending\". That makes this a compare-and-set: if another process already moved the order on, matchedCount is 0 and nothing happened. Checking that return value is how you detect an invalid state transition (chapter 6).\n\nThis is the case the document model is built around, and it is why chapter 2's embedding decisions have correctness consequences and not just performance ones."},
+    parentchild: {need:"no — if embedded", alt:"embed the children", cost:"1×",
+      code:'// Embedded: one atomic write\nawait orders.updateOne({ _id: id }, {\n  $set:  { status: "shipped" },\n  $push: { items: newItem }\n});\n\n// Referenced: needs a transaction\nawait session.withTransaction(async () => {\n  await orders.updateOne({ _id: id }, { … }, { session });\n  await items.insertOne({ orderId: id, … }, { session });\n});',
+      note:"This is chapter 2's decision arriving as a correctness question rather than a performance one.\n\nEmbedded children are updated with the parent in one atomic operation — no transaction, no window where the two disagree. Referenced children need a transaction to change together, which is slower and adds a failure mode.\n\nIf a parent and its children must always be consistent, that is a strong argument for embedding, provided the array is bounded. If the children are unbounded and must be referenced, you have accepted that a transaction is sometimes required — which is fine, as long as it was a decision rather than an accident."},
+    transfer: {need:"YES", alt:"none — this is the real case", cost:"3-5×",
+      code:'await session.withTransaction(async () => {\n  const r = await accounts.updateOne(\n    { _id: from, balance: { $gte: amount } },\n    { $inc: { balance: -amount } }, { session });\n  if (r.matchedCount === 0) throw new Error("insufficient funds");\n\n  await accounts.updateOne({ _id: to },\n    { $inc: { balance: amount } }, { session });\n  await ledger.insertOne({ from, to, amount }, { session });\n});',
+      note:"The textbook case, and it is textbook because it is genuinely irreducible: two independently-addressable accounts, both of which must change or neither. No amount of document modelling merges two customers' balances into one document.\n\nNote the balance guard inside the update filter rather than as a separate read. That keeps the check and the decrement atomic — a read-then-write would leave a window for the balance to change in between.\n\nThrowing inside the callback aborts the transaction cleanly. Just make sure the error is a real failure rather than something transient, since withTransaction will retry transient ones and re-run everything."},
+    counter: {need:"no", alt:"$inc separately, reconcile", cost:"1×",
+      code:'// The record — must be correct\nawait comments.insertOne(doc);\n\n// The counter — approximate is fine\nawait posts.updateOne({ _id: postId },\n  { $inc: { commentCount: 1 } });\n\n// Plus a nightly reconciliation job that recomputes\n// and corrects any drift.',
+      note:"A transaction here is real cost for a guarantee you probably do not need. If the process dies between the two writes, the count is off by one — and a nightly reconciliation job that recomputes it fixes that permanently.\n\nThat job is the part people skip, and it is what makes this honest rather than merely fast. Chapter 3 made the same point: a computed field with no reconciliation is a number that will be wrong within a year with no way to say when it started.\n\nIf the count must be exact at every instant — it is a quota, or a limit that gates something — then either use a transaction or, better, put the count in the same document as the thing it counts."},
+    inventory: {need:"no", alt:"put the invariant in one document", cost:"1×",
+      code:'// Atomic reserve — the check IS the update\nconst r = await inventory.updateOne(\n  { sku, available: { $gte: qty } },\n  { $inc: { available: -qty, reserved: qty } }\n);\nif (r.matchedCount === 0) throw new OutOfStock();\n\n// Then create the order, referencing the reservation.\n// If order creation fails, release the reservation.',
+      note:"The instinct is a transaction: check stock, decrement it, create the order. But the stock check and decrement belong in ONE document, and putting them there makes the operation atomic with no transaction at all.\n\nThe filter { available: { $gte: qty } } is the check. If it does not match, matchedCount is 0 and nothing was decremented. There is no window between checking and reserving, which is exactly the race a transaction would have been protecting against.\n\nThe order creation afterwards is a separate step, and if it fails you release the reservation — a compensating action rather than a rollback. That is the saga pattern in miniature, and it is more robust here because it also handles the order failing for reasons the database never sees."},
+    crosscoll: {need:"probably", alt:"but ask why first", cost:"3-5×",
+      code:'await session.withTransaction(async () => {\n  await a.updateOne({ … }, { … }, { session });\n  await b.insertOne({ … }, { session });\n  await c.deleteOne({ … }, { session });\n});',
+      note:"A transaction will do this correctly. Before writing it, ask why three collections must change together — the answer often reveals a modelling decision worth revisiting.\n\nIf the three documents represent one conceptual thing, they may belong in one document (chapter 2). If they represent genuinely separate entities that occasionally need coordinating, a transaction is the right tool and this is fine.\n\nThe signal to watch is frequency. An occasional cross-collection operation is normal. If MOST operations in the application look like this, you have built a relational schema in a document database — and you are paying distributed-transaction costs for consistency a foreign key would have given you free (chapter 18)."},
+    external: {need:"NO — it cannot help", alt:"the outbox pattern", cost:"1×",
+      code:'// Write the data AND the intent, atomically\nawait orders.insertOne({\n  _id: orderId, status: "paid",\n  outbox: [{ type: "send-receipt", done: false }]\n});\n\n// A worker or change stream performs the side effect\n// and marks it done, retrying until it succeeds.',
+      note:"A transaction cannot help here and it is important to see why: the external system is not a participant. The transaction commits and the email fails, or the email sends and the transaction aborts. Either way the two disagree, and the transaction gave you nothing except a false sense that it was handled.\n\nThe outbox pattern makes it atomic by changing what is being made atomic. The order and the INTENT to send a receipt are written together in one document, so they cannot disagree. A separate worker reads pending outbox entries and performs the side effect, retrying until it succeeds and marking it done.\n\nThe side effect must be idempotent, since it may be attempted more than once — an idempotency key on the payment API, a deduplication id on the email.\n\nThis is the single most useful pattern in this chapter, because most requests for a transaction turn out to be this problem."}
+  };
+
+  function render(){
+    const t = T[$("t-what").value];
+    $("t-need").textContent = t.need;
+    $("t-alt").textContent  = t.alt;
+    $("t-cost").textContent = t.cost;
+
+    const needsTx = t.need === "YES" || t.need === "probably";
+    $("t-code").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid ' +
+      (needsTx ? "#F2A03D" : "#3FB984") +
+      ';border-radius:5px;padding:11px 13px;margin:14px 0 12px;font-family:var(--mono);' +
+      'font-size:12px;line-height:1.6;overflow-x:auto">' +
+      t.code.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>';
+
+    let note = t.note;
+    if(needsTx)
+      note += "\n\nIf you do use a transaction: withTransaction rather than the manual form, { session } on every single operation, no external side effects in the callback because it re-executes, and keep it under a second and under a thousand documents.";
+    $("t-note").textContent = note;
+  }
+
+  $("t-what").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

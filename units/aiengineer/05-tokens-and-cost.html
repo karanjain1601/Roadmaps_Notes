@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Tokens, context and money — AI Engineer</title>
+<meta name="description" content="Counting tokens, budgeting a context window, prompt caching, batch pricing, and working out what a feature costs per user per month.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 05 · Working with models</div>
+    <h1>Tokens, context and money</h1>
+    <p class="standfirst">Token accounting is the closest thing this field has to a performance profiler. It tells you what a feature costs, why a request is slow, why a prompt fails at the boundary, and which optimisation is worth doing. Most teams learn it after their first surprising invoice.</p>
+    <div class="chap-meta">
+      <span class="tagpill">counting</span>
+      <span class="tagpill">context budget</span>
+      <span class="tagpill">prompt caching</span>
+      <span class="tagpill">batch API</span>
+      <span class="tagpill">unit economics</span>
+      <span class="tagpill">rate limits</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>How you are billed</h2>
+
+<p>Almost every provider charges per million tokens, with four different rates:</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Rate</th><th>Applies to</th><th>Typical multiple</th></tr></thead>
+<tbody>
+<tr><td><b>Input</b></td><td>Everything you send: system prompt, history, retrieved documents, tool schemas, images</td><td>1×</td></tr>
+<tr><td><b>Cached input</b></td><td>A repeated prefix the provider has already processed</td><td>0.02–0.25× of input</td></tr>
+<tr><td><b>Cache write</b></td><td>Establishing that cached prefix, on some providers</td><td>1.25× of input, once</td></tr>
+<tr><td><b>Output</b></td><td>Tokens the model generates, including reasoning tokens you never see</td><td>3–5× of input</td></tr>
+</tbody>
+</table>
+<caption>Some providers also charge a premium above a context-length threshold, and offer a discount for asynchronous batch jobs.</caption>
+</div>
+
+<p>Two implications that shape design. Output is the expensive direction, so <b>asking for less is a real optimisation</b>: "reply with one word" versus "explain your reasoning then answer" can be a tenfold cost difference on a classification task. And cached input is nearly free, so <b>a stable prompt prefix is worth engineering for</b>.</p>
+
+<h2><span class="h-rule"></span>Counting before you send</h2>
+
+<p>Guessing token counts leads to two failures: requests rejected at the context boundary, and budget planning built on fiction. Count properly.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">python — exact counts, three ways</span><button class="copy">Copy</button></div>
+<pre><code># 1. OpenAI-family models, offline and instant
+import tiktoken
+enc = tiktoken.encoding_for_model("gpt-4o-mini")
+n = len(enc.encode("The deployment failed because the readiness probe timed out."))
+
+# 2. Any open-weight model, from its own tokeniser
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.3")
+n = len(tok.encode(text))
+
+# 3. Providers that do not publish a local tokeniser expose an endpoint
+n = client.messages.count_tokens(model=MODEL, system=SYSTEM, messages=msgs).input_tokens</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Message overhead is real</span>
+  <p>Counting only the content undercounts. Each message carries structural tokens for its role and boundaries, tool schemas are serialised into the prompt and charged, and images are converted to a token count based on their dimensions. Budget a few tokens per message plus the full serialised size of your tool definitions — a rich tool set can be 1,500 tokens before the user has said anything.</p>
+</div>
+
+<div class="demo" id="calc">
+  <div class="demo-head">
+    <b>Token and cost estimator</b>
+    <span>Paste a real prompt. The token count is an estimate — use the exact tokeniser for anything you rely on — but the economics are the point.</span>
+  </div>
+  <div class="demo-body">
+    <label for="ctext">Prompt text</label>
+    <textarea id="ctext" rows="5">You are a support assistant for an online store. Answer only from the CONTEXT below. If the answer is not there, say you don't know and offer to open a ticket. Always cite the source id in square brackets.</textarea>
+    <div id="ctoks" style="margin:10px 0 4px"></div>
+
+    <div class="row" style="margin-top:14px">
+      <div>
+        <label for="chist">Extra input tokens per request (history, retrieved docs, tool schemas)</label>
+        <input type="text" id="chist" value="6000" inputmode="numeric">
+      </div>
+      <div>
+        <label for="cout">Output tokens per request</label>
+        <input type="text" id="cout" value="350" inputmode="numeric">
+      </div>
+      <div>
+        <label for="creq">Requests per day</label>
+        <input type="text" id="creq" value="20000" inputmode="numeric">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="cin$">Input $ / million</label>
+        <input type="text" id="cin$" value="1.00" inputmode="decimal">
+      </div>
+      <div>
+        <label for="cout$">Output $ / million</label>
+        <input type="text" id="cout$" value="5.00" inputmode="decimal">
+      </div>
+      <div>
+        <label for="ccache">Cached prefix — <span id="ccachev">0</span>% of input, at 0.1×</label>
+        <input type="range" id="ccache" min="0" max="95" step="5" value="0">
+      </div>
+    </div>
+
+    <div class="stat">
+      <div><b id="c-req">—</b><span>cost per request</span></div>
+      <div><b id="c-day">—</b><span>per day</span></div>
+      <div><b id="c-mo">—</b><span>per month</span></div>
+      <div><b id="c-share">—</b><span>of spend is output</span></div>
+    </div>
+    <div class="out" id="cnote"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Budgeting the context window</h2>
+
+<p>Treat the window like a fixed memory allocation and give every consumer an explicit share. Without this, retrieval quietly grows until one long conversation with five documents blows the limit in production and nowhere else.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Allocation</th><th>Share of a 128k window</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>System prompt and rules</td><td>1,500</td><td>Stable, cacheable, worth keeping tight anyway — long prompts dilute attention</td></tr>
+<tr><td>Tool schemas</td><td>1,500</td><td>Grows fast. Ten tools with rich descriptions is easily 3,000</td></tr>
+<tr><td>Few-shot examples</td><td>2,000</td><td>Cacheable if fixed. Drop first if you are tight</td></tr>
+<tr><td>Retrieved passages</td><td>8,000</td><td>A hard cap, enforced by the retriever, not a hope</td></tr>
+<tr><td>Conversation history</td><td>12,000</td><td>Trimmed or summarised to fit (chapter 4)</td></tr>
+<tr><td>Reserved for output</td><td>4,000</td><td>Must be subtracted from the window before you fill anything else</td></tr>
+<tr><td>Safety margin</td><td>10%</td><td>Your counter is an estimate; the provider's is authoritative</td></tr>
+</tbody>
+</table>
+<caption>That is under 30k of a 128k window. Using far less than the maximum is normal and usually produces better answers.</caption>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">budget.py — enforce it rather than hoping</span><button class="copy">Copy</button></div>
+<pre><code>class ContextBudget:
+    def __init__(self, window: int, reserve_output: int, margin: float = 0.10):
+        self.available = int((window - reserve_output) * (1 - margin))
+        self.spent = {}
+
+    def take(self, name: str, text: str, counter) -> str:
+        n = counter(text)
+        if self.remaining < n:
+            raise ContextOverflow(f"{name} needs {n}, only {self.remaining} left: {self.spent}")
+        self.spent[name] = n
+        return text
+
+    def fit(self, name: str, chunks: list[str], counter, cap: int) -> list[str]:
+        """Take chunks in order until the section cap or the window is reached."""
+        out, used = [], 0
+        for c in chunks:
+            n = counter(c)
+            if used + n > min(cap, self.remaining):
+                break
+            out.append(c); used += n
+        self.spent[name] = used
+        return out
+
+    @property
+    def remaining(self): return self.available - sum(self.spent.values())</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Prompt caching</h2>
+
+<p>This is the highest-leverage cost optimisation available, and it is nearly free to adopt. The provider keeps the processed representation of a prompt prefix; when your next request starts with the identical prefix, that part is not recomputed and is billed at a fraction of the rate. It also cuts time to first token substantially.</p>
+
+<div class="flow">
+  <div class="step"><b>Stable prefix</b><span>System prompt, tool schemas, few-shot examples, a fixed document</span></div>
+  <div class="arr">›</div>
+  <div class="step"><b>Cache hit</b><span>Charged at ~10% of input, and not re-processed</span></div>
+  <div class="arr">›</div>
+  <div class="step"><b>Variable suffix</b><span>Retrieved passages, conversation, this turn's question</span></div>
+  <div class="arr">›</div>
+  <div class="step"><b>Full price</b><span>The only part you pay properly for</span></div>
+</div>
+
+<p>The rules that decide whether it works:</p>
+
+<ul>
+  <li><b>Matching is on an exact prefix</b>, byte for byte, from the very start of the request. One changed character anywhere in the prefix invalidates everything after it.</li>
+  <li><b>Order your prompt from most stable to least.</b> System rules, then tool definitions, then examples, then retrieved context, then history, then the current question. This ordering is the entire technique.</li>
+  <li><b>Remove volatility from the prefix.</b> A timestamp, a request id, a user name or a randomly ordered set of tools at the top of your system prompt reduces your hit rate to zero. Move them below the cached boundary.</li>
+  <li><b>There is a minimum length</b> — often around 1,000 tokens — below which caching does nothing.</li>
+  <li><b>Entries expire</b>, typically after a few minutes of inactivity, with longer options sometimes available. Bursty per-user traffic caches well; one request per user per hour does not.</li>
+  <li><b>Some providers require explicit markers</b> on the block you want cached; others cache automatically. Check, because the automatic ones still need the ordering discipline.</li>
+</ul>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">python — explicit cache markers and a cache-friendly layout</span><button class="copy">Copy</button></div>
+<pre><code>messages = [
+    # --- stable prefix: identical on every request, marked for caching -------
+    {"role": "system", "content": [
+        {"type": "text", "text": SYSTEM_RULES},                     # ~1,200 tokens
+        {"type": "text", "text": FEW_SHOT_EXAMPLES,
+         "cache_control": {"type": "ephemeral"}},                   # ~2,000 tokens, cached
+    ]},
+    # --- variable suffix: changes per request, paid in full -----------------
+    {"role": "user", "content": f"CONTEXT:\n{passages}\n\nQUESTION: {question}"},
+]
+
+# Verify it is working. If cache_read stays at 0, your prefix is not stable.
+r = client.messages.create(model=MODEL, messages=messages, max_tokens=800)
+log.info("cache_write=%s cache_read=%s uncached=%s",
+         r.usage.cache_creation_input_tokens,
+         r.usage.cache_read_input_tokens,
+         r.usage.input_tokens)</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Worked example</span>
+  <p>A support assistant with a 3,200-token stable prefix, 6,000 tokens of retrieved context and 350 tokens of output, at $1/$5 per million, costs <b>$0.0110</b> per request uncached. With the prefix cached at 0.1×, it costs <b>$0.0081</b> — a 26% saving for a change in prompt ordering and one parameter. On a million requests a month that is roughly $2,900. The estimator above will do this arithmetic for your numbers.</p>
+</div>
+
+<h2><span class="h-rule"></span>Batch processing</h2>
+
+<p>If a workload does not need an answer within seconds — nightly enrichment, back-filling classifications, generating embeddings for an existing corpus, running an eval suite — providers offer an asynchronous batch mode at roughly half price with a turnaround measured in hours.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">python — submit a batch, collect later</span><button class="copy">Copy</button></div>
+<pre><code>import json
+
+with open("batch.jsonl", "w") as f:
+    for doc in documents:                       # one request per line
+        f.write(json.dumps({
+            "custom_id": doc.id,                # how you match results back
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": {"model": MODEL, "temperature": 0, "max_tokens": 200,
+                     "messages": [{"role": "system", "content": SYSTEM},
+                                  {"role": "user", "content": doc.text}]},
+        }) + "\n")
+
+up  = client.files.create(file=open("batch.jsonl", "rb"), purpose="batch")
+job = client.batches.create(input_file_id=up.id, endpoint="/v1/chat/completions",
+                            completion_window="24h")
+
+# Poll, then stream the results file. Handle per-line failures: a batch can
+# partially succeed, and a missing custom_id is a silent data-quality bug.</code></pre>
+</div>
+
+<p>Rules of thumb: batch anything offline, never batch anything a user is waiting for, and always reconcile the returned <code>custom_id</code>s against what you submitted.</p>
+
+<h2><span class="h-rule"></span>The cost levers, in order of payoff</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>#</th><th>Lever</th><th>Typical saving</th><th>Effort</th><th>Risk</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><b>Route to a smaller model per task</b> — classification, routing and extraction rarely need the workhorse</td><td>50–90% on those calls</td><td>Low</td><td>Needs an eval to confirm quality holds</td></tr>
+<tr><td>2</td><td><b>Cut output length</b> — ask for the answer, not the reasoning; use a schema instead of prose</td><td>30–70%</td><td>Low</td><td>Can hurt accuracy on genuinely hard reasoning</td></tr>
+<tr><td>3</td><td><b>Prompt caching</b> — reorder the prompt and mark the prefix</td><td>20–50% of input cost</td><td>Low</td><td>None, if you verify the hit rate</td></tr>
+<tr><td>4</td><td><b>Retrieve less</b> — five good passages instead of twenty mediocre ones</td><td>30–60% of input</td><td>Medium (chapter 12)</td><td>Improves quality as often as it hurts</td></tr>
+<tr><td>5</td><td><b>Cache whole responses</b> for repeated identical requests — FAQs, popular queries</td><td>Depends entirely on your traffic shape</td><td>Medium</td><td>Staleness; needs invalidation</td></tr>
+<tr><td>6</td><td><b>Batch offline work</b></td><td>~50% on that workload</td><td>Low</td><td>Latency, obviously</td></tr>
+<tr><td>7</td><td><b>Trim conversation history</b> aggressively</td><td>Large on long sessions</td><td>Low</td><td>Losing context the user expects you to remember</td></tr>
+<tr><td>8</td><td><b>Cap agent loop iterations and tool result sizes</b></td><td>Prevents tail-risk blowups</td><td>Low</td><td>Tasks that legitimately need more steps fail</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Where the surprise bills come from</span>
+  <p>In roughly this order: an agent loop with no iteration cap; a retry loop with no deadline during a provider incident; a tool returning a 200,000-token API response straight into the context; an unauthenticated endpoint that proxies to a model; re-embedding an entire corpus after a chunking change; and a conversation feature with no history trimming. Every one is a bug in your code, not a pricing problem.</p>
+</div>
+
+<h2><span class="h-rule"></span>Unit economics</h2>
+
+<p>Convert cost per request into cost per user per month before you commit to a pricing model. The arithmetic is simple and the conclusions are often uncomfortable.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">python — the number your finance team will ask for</span><button class="copy">Copy</button></div>
+<pre><code>cost_per_request   = 0.0081                       # from the estimator above
+requests_per_user  = 40                           # per month, from your analytics
+heavy_user_factor  = 6                            # p95 users, not the mean
+
+typical = cost_per_request * requests_per_user            # $0.32 / user / month
+heavy   = typical * heavy_user_factor                     # $1.94 / user / month
+
+price   = 20.00
+print(f"gross margin, typical user: {(price - typical) / price:.1%}")   # 98.4%
+print(f"gross margin, heavy user:   {(price - heavy)   / price:.1%}")   # 90.3%
+print(f"break-even requests/month:  {price / cost_per_request:,.0f}")   # 2,469</code></pre>
+</div>
+
+<p>Three things this exercise reveals:</p>
+
+<ul>
+  <li><b>Plan by the tail, not the mean.</b> Usage of AI features is heavily skewed. A small proportion of users can account for most of the spend, and averages hide it entirely.</li>
+  <li><b>Unlimited plans need a limit somewhere.</b> Either a soft cap with a friendly message, a hard cap, degradation to a cheaper model, or usage-based pricing above a threshold. Decide before launch, not during an incident.</li>
+  <li><b>Free tiers are an attack surface.</b> An unauthenticated or trivially registered endpoint that proxies to a model is a way for strangers to spend your money — sometimes deliberately, by reselling access. Rate-limit per account and per IP, require verification, and alert on anomalies.</li>
+</ul>
+
+<h2><span class="h-rule"></span>Rate limits</h2>
+
+<p>Limits are usually expressed as requests per minute and tokens per minute, per model, per account tier. Tokens per minute is the one that surprises people: a job sending 30 requests a minute with 20,000-token prompts is consuming 600,000 tokens a minute and will be throttled long before the request limit matters.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">python — a token-aware limiter that keeps you under TPM</span><button class="copy">Copy</button></div>
+<pre><code>import time, threading
+
+class TokenBucket:
+    """Admit work only when the projected token spend fits the per-minute budget."""
+    def __init__(self, tokens_per_minute: int):
+        self.rate = tokens_per_minute / 60.0
+        self.capacity = tokens_per_minute
+        self.tokens = float(tokens_per_minute)
+        self.updated = time.monotonic()
+        self.lock = threading.Lock()
+
+    def acquire(self, estimated: int, timeout: float = 60.0):
+        deadline = time.monotonic() + timeout
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+                self.updated = now
+                if self.tokens >= estimated:
+                    self.tokens -= estimated
+                    return
+            if time.monotonic() > deadline:
+                raise TimeoutError("token budget unavailable")
+            time.sleep(0.05)
+
+# Estimate before the call, reconcile after it with the real usage figure.</code></pre>
+</div>
+
+<p>Beyond a limiter: keep a queue for bulk work so it cannot starve interactive traffic, request a limit increase well before you need it (approval is not instant), and spread heavy jobs across a longer window rather than firing them all at midnight.</p>
+
+<h2><span class="h-rule"></span>Instrumenting spend</h2>
+
+<p>Log usage on every call, in one place — the seam you built in chapter 4 — with enough dimensions to answer the questions you will be asked.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">the fields that make cost questions answerable</span><button class="copy">Copy</button></div>
+<pre><code>log.info("llm_call", extra={
+    "trace_id":       trace_id,          # one user request may make many calls
+    "feature":        "support_answer",  # which product surface
+    "step":           "generate",        # which step within it
+    "tenant_id":      tenant.id,         # who to bill or investigate
+    "model":          spec.id,           # exact pinned version
+    "input_tokens":   u.input_tokens,
+    "cached_tokens":  u.cached_input_tokens,
+    "output_tokens":  u.output_tokens,
+    "cost_usd":       cost(u, spec),     # computed once, centrally
+    "latency_ms":     latency,
+    "finish_reason":  finish,
+    "retry_count":    retries,
+    "cache_hit_rate": u.cached_input_tokens / max(1, u.input_tokens),
+})</code></pre>
+</div>
+
+<p>With those fields you can answer, without a new deploy: which feature costs the most, which tenant is anomalous, whether caching is actually working, how much of the bill is retries, and what a 10× growth in users would cost. Without them, cost work is archaeology.</p>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Output tokens cost several times input tokens. <b>Asking for less</b> is a first-class optimisation.</li>
+    <li>Count tokens with the <b>real tokeniser</b>, and remember message overhead, tool schemas and images.</li>
+    <li>Give the context window an <b>explicit budget per section</b> and enforce it. Reserve output space first.</li>
+    <li><b>Order the prompt stable-to-variable</b> and turn on caching. It is the cheapest large saving available.</li>
+    <li>Model routing beats every other lever: most calls in a mature system should be going to a <b>small model</b>.</li>
+    <li>Compute <b>cost per user per month at the p95</b>, not the mean, and cap something before launch.</li>
+    <li>Log tokens, cost, cache hit rate and model version on <b>every call</b>, with a feature and tenant dimension.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("05-tokens-and-cost.html");
+
+(function(){
+  const root = document.getElementById("calc");
+  if(!root) return;
+
+  /* A rough BPE-like estimator. Not exact — the point is the shape, not the digit. */
+  function estimate(text){
+    const parts = text.match(/\s+|[A-Za-z]+|[0-9]+|[^\sA-Za-z0-9]/g) || [];
+    const toks = [];
+    let pendingSpace = "";
+    for(const p of parts){
+      if(/^\s+$/.test(p)){ pendingSpace = p.includes("\n") ? "\n" : " "; continue; }
+      if(/^[A-Za-z]+$/.test(p)){
+        const n = p.length <= 4 ? 1 : Math.ceil(p.length / 4.2);
+        for(let i = 0; i < n; i++){
+          const size = Math.ceil(p.length / n);
+          toks.push((i === 0 ? pendingSpace : "") + p.slice(i * size, (i + 1) * size));
+        }
+      } else if(/^[0-9]+$/.test(p)){
+        const n = Math.ceil(p.length / 3);
+        for(let i = 0; i < n; i++) toks.push((i === 0 ? pendingSpace : "") + p.slice(i * 3, i * 3 + 3));
+      } else {
+        toks.push(pendingSpace + p);
+      }
+      pendingSpace = "";
+    }
+    return toks;
+  }
+
+  const ta = document.getElementById("ctext");
+  const view = document.getElementById("ctoks");
+  const cache = document.getElementById("ccache");
+  const ids = ["chist","cout","creq","cin$","cout$"].map(i => document.getElementById(i));
+
+  const num = el => {
+    const v = parseFloat(String(el.value).replace(/[^0-9.]/g, ""));
+    return isFinite(v) ? v : 0;
+  };
+  const money = v => v < 0.01 ? "$" + v.toFixed(5) : v < 1000 ? "$" + v.toFixed(2)
+                 : "$" + Math.round(v).toLocaleString();
+
+  function render(){
+    const toks = estimate(ta.value);
+    const shown = toks.slice(0, 220);
+    view.innerHTML =
+      '<div style="font-size:12.5px;color:#54677A;margin-bottom:6px">' +
+      '≈ <b style="color:#16232F">' + toks.length + '</b> tokens · ' + ta.value.length +
+      ' characters · ' + (ta.value.length / Math.max(1, toks.length)).toFixed(1) + ' chars per token</div>' +
+      shown.map(t => '<span class="tok">' + t.replace(/&/g,"&amp;").replace(/</g,"&lt;")
+        .replace(/ /g,"\u00b7").replace(/\n/g,"\u21b5") + '</span>').join("") +
+      (toks.length > shown.length ? '<span class="tok">+' + (toks.length - shown.length) + ' more</span>' : "");
+
+    const sysTok = toks.length;
+    const extra  = num(ids[0]);
+    const outTok = num(ids[1]);
+    const reqs   = num(ids[2]);
+    const inRate = num(ids[3]) / 1e6;
+    const outRate= num(ids[4]) / 1e6;
+
+    const inTok  = sysTok + extra;
+    const cachedShare = parseInt(cache.value, 10) / 100;
+    document.getElementById("ccachev").textContent = cache.value;
+
+    const cachedTok = inTok * cachedShare;
+    const fullTok   = inTok - cachedTok;
+    const inCost    = fullTok * inRate + cachedTok * inRate * 0.1;
+    const outCost   = outTok * outRate;
+    const per       = inCost + outCost;
+
+    document.getElementById("c-req").textContent   = money(per);
+    document.getElementById("c-day").textContent   = money(per * reqs);
+    document.getElementById("c-mo").textContent    = money(per * reqs * 30);
+    document.getElementById("c-share").textContent = per > 0 ? Math.round(outCost / per * 100) + "%" : "—";
+
+    const uncached = inTok * inRate + outCost;
+    const saving = uncached > 0 ? (1 - per / uncached) : 0;
+    const notes = [];
+    notes.push("Input " + Math.round(inTok).toLocaleString() + " tok · output " +
+               Math.round(outTok).toLocaleString() + " tok per request.");
+    if(cachedShare > 0)
+      notes.push("Caching " + cache.value + "% of the prefix saves " + (saving * 100).toFixed(0) +
+                 "% overall — " + money((uncached - per) * reqs * 30) + " a month.");
+    else
+      notes.push("Drag the cache slider: most systems can make 30-60% of their input a stable, cacheable prefix.");
+    if(outCost / Math.max(per, 1e-12) > 0.6)
+      notes.push("Output dominates your bill. Shortening the answer or dropping visible reasoning is your best lever.");
+    else if(inTok > 20000)
+      notes.push("Input dominates and it is large. Retrieving fewer, better passages will cut cost and usually improve quality.");
+    notes.push("At " + money(per) + " per request, break-even against a $20/month seat is " +
+               Math.round(20 / Math.max(per, 1e-9)).toLocaleString() + " requests per user per month.");
+    document.getElementById("cnote").textContent = notes.join("\n");
+  }
+
+  [ta, cache, ...ids].forEach(el => el.addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

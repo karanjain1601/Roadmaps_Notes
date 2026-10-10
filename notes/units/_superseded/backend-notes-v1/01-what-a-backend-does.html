@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · What a backend actually does — Backend Notes</title>
+<meta name="description" content="One request traced end to end with every hop timed, and the nine orders of magnitude between a CPU cache reference and a cross-ocean round trip.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%233FB984' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/notes.css">
+<style>
+  .hops{display:grid;gap:4px;margin:4px 0 12px}
+  .hop{display:grid;grid-template-columns:20px 176px 1fr 74px;gap:11px;align-items:center;
+    padding:6px 10px;border:1px solid var(--rule-2);border-radius:4px;background:var(--paper);
+    cursor:pointer;text-align:left;width:100%;transition:border-color .14s}
+  .hop:hover{border-color:var(--rule)}
+  .hop.sel{border-color:var(--line);background:var(--line-soft)}
+  .hop .ix{font-family:var(--mono);font-size:10.5px;color:var(--text-3)}
+  .hop .nm{font-family:var(--sans);font-size:12.9px;font-weight:600;line-height:1.25}
+  .hop .tr{position:relative;height:14px;background:var(--rule-2);border-radius:2px;overflow:hidden}
+  .hop .fl{position:absolute;top:0;bottom:0;border-radius:2px}
+  .hop .ms{font-family:var(--mono);font-size:11.5px;text-align:right;font-variant-numeric:tabular-nums}
+  .hop.net .fl{background:#6C63C4}
+  .hop.cpu .fl{background:var(--line)}
+  .hop.io  .fl{background:#B87A17}
+  .hop.wait .fl{background:var(--text-3)}
+</style>
+</head>
+<body>
+<div class="readbar"></div>
+
+<header class="top">
+  <div class="top-inner">
+    <a class="home" href="../../index.html"><span class="mark"></span>All roadmaps</a>
+    <span class="top-sep">/</span>
+    <a class="home" href="index.html" style="color:var(--band-text)">Backend</a>
+    <span class="top-spacer"></span>
+    <button class="rail-toggle" aria-expanded="false">Contents</button>
+    <nav class="top-nav" aria-label="Chapter navigation"></nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail" id="rail" aria-label="Chapter and section navigation"></aside>
+
+  <article>
+    <p class="crumb">Part 1 · Foundations &nbsp;·&nbsp; <b>Chapter 01</b></p>
+    <h1>What a backend actually does</h1>
+    <p class="standfirst">Someone clicks a button and 340 milliseconds later a page changes. Between those two events are roughly forty distinct steps across four machines, and almost none of the time is spent computing anything. This chapter walks that path once, in full, with numbers — because every remaining chapter in this unit is about one of those steps, and the numbers are what tell you which ones are worth your attention.</p>
+    <div class="meta">
+      <span>~28 min read</span>
+      <span>The request lifecycle, timed</span>
+      <span>2 interactive panels</span>
+      <span>Prerequisite: you have used a web browser</span>
+    </div>
+
+    <div class="body">
+
+      <h2><span class="h2n">1.1</span>The job description</h2>
+
+      <p>Strip away the frameworks and a backend does five things. Every chapter in this unit expands one of them.</p>
+
+      <div class="tw">
+        <table>
+          <caption>What the whole discipline reduces to</caption>
+          <thead><tr><th>Job</th><th>Means</th><th>Covered in</th></tr></thead>
+          <tbody>
+            <tr><td><b>Accept requests</b></td><td>Listen on a socket, parse the protocol, route to code, and survive more arrivals than you can handle at once</td><td>Chapters 2–4</td></tr>
+            <tr><td><b>Decide</b></td><td>Apply business rules to the request and the current state, and reject what is not allowed</td><td>Chapters 5, 7, 17</td></tr>
+            <tr><td><b>Remember</b></td><td>Store state so it survives the process, and retrieve it fast enough, correctly, under concurrency</td><td>Chapters 8–13</td></tr>
+            <tr><td><b>Talk to other systems</b></td><td>Payment providers, mail, other services — all of which are slow and sometimes down</td><td>Chapters 6, 15</td></tr>
+            <tr><td><b>Keep running</b></td><td>Under load, under attack, while being deployed, and tell you when it is not</td><td>Chapters 14, 18–22</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <span class="lab">The one property that shapes everything</span>
+        <p>A backend is <b>concurrent and shared</b>. At any moment it is handling many requests from people who do not know about each other, over state they all touch. Almost every difficulty specific to backend work — locking, isolation levels, race conditions, connection pools, cache stampedes, idempotency, rate limiting — exists because of that one sentence. Single-user code has none of these problems, which is why backend correctness feels harder than it looks.</p>
+      </div>
+
+      <h2><span class="h2n">1.2</span>The trace</h2>
+
+      <p>A signed-in user clicks "Place order" on a shop. Here is what happens, in order. Most of these steps get a chapter later; the point now is to see the shape and to notice where the time goes.</p>
+
+      <div class="codewrap">
+        <span class="lang">Browser → your server → database → back</span>
+        <pre><code>BEFORE THE REQUEST EXISTS
+ 1  The browser needs an IP for api.shop.com. It checks its own
+    cache, then the OS, then asks a resolver.            → ch 2
+ 2  The resolver walks root → .com → shop.com nameservers
+    unless something along the way is cached.            → ch 2
+ 3  TCP handshake: SYN, SYN-ACK, ACK. One round trip
+    before a single byte of your data moves.             → ch 2
+ 4  TLS handshake: certificate, key agreement. One more
+    round trip on TLS 1.3, two on 1.2.                   → ch 2
+
+THE REQUEST TRAVELS
+ 5  The browser writes the HTTP request: method, path,
+    headers, cookies, body.                              → ch 3
+ 6  It crosses the internet. This is physics — about
+    5 µs per kilometre of fibre, and never a straight line.
+ 7  A CDN or edge point-of-presence may answer without
+    ever reaching you. For a POST it will not.           → ch 13
+ 8  A load balancer picks one of your servers.           → ch 4
+
+YOUR SERVER
+ 9  The reverse proxy terminates TLS, checks the route,
+    applies rate limits, and forwards.                   → ch 4, 5
+10  Your application accepts the connection. Whether that
+    costs a thread, a goroutine or a callback is the
+    concurrency model, and it decides your ceiling.      → ch 4
+11  Middleware runs: parse the body, decode the session
+    cookie or verify the JWT, load the user.             → ch 7
+12  Authorisation: may THIS user place THIS order?       → ch 7
+13  Validation: is the request well-formed and sane?     → ch 5
+14  The route handler calls a use case.                  → ch 17
+
+THE DECISION
+15  Fetch the cart. Try the cache first.                 → ch 13
+16  Cache miss. Borrow a connection from the pool — and
+    wait if they are all busy.                           → ch 4
+17  Query the database. Parse, plan, execute, return.    → ch 9
+18  The planner picks an index, or does not.             → ch 9
+19  BEGIN. Re-check stock inside the transaction, insert
+    the order, decrement stock, COMMIT.                  → ch 10
+20  The commit waits for the write-ahead log to reach
+    disk. This is the durability guarantee, and it is
+    where the milliseconds are.                          → ch 10
+21  Call the payment provider. Someone else's network,
+    someone else's uptime. Timeout and retry policy
+    are your problem.                                    → ch 6, 15
+22  Enqueue "send confirmation email" rather than doing
+    it here. The user should not wait for SMTP.          → ch 15
+23  Invalidate the cache entries that are now stale.     → ch 13
+
+THE RESPONSE
+24  Serialise the result. Set status, headers, cookies.  → ch 3
+25  Back through the proxy, compressed.                  → ch 4
+26  Across the internet again.                           → ch 2
+27  The browser parses it and re-renders.
+
+AFTERWARDS, NOT ON THE CRITICAL PATH
+28  A worker picks up the email job and sends it.        → ch 15
+29  Metrics, logs and a trace span are recorded.         → ch 21
+30  A read replica catches up with the write.            → ch 12</code></pre>
+      </div>
+
+      <h2><span class="h2n">1.3</span>Where the time goes</h2>
+
+      <p>Thirty steps, and if you had to guess which one dominates you would probably guess wrong. Below is the same request as a waterfall with realistic numbers. Change the conditions and watch which segment grows.</p>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>The request waterfall</h4>
+          <p>Click any hop for detail. Purple is network, green is your code, amber is disk or an external system, grey is waiting.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="w-scenario">Scenario</label>
+              <select id="w-scenario">
+                <option value="warm" selected>Warm — everything cached, connection reused</option>
+                <option value="cold">Cold — first request from this browser</option>
+                <option value="miss">Cache miss on the cart</option>
+                <option value="slow">Slow query — the index is not used</option>
+                <option value="pool">Connection pool exhausted</option>
+                <option value="ext">Payment provider is slow</option>
+              </select>
+            </div>
+            <div class="ctrl">
+              <label for="w-dist">Distance to the server</label>
+              <select id="w-dist">
+                <option value="5">Same city — 5 ms round trip</option>
+                <option value="25" selected>Same continent — 25 ms</option>
+                <option value="90">Across an ocean — 90 ms</option>
+                <option value="180">The far side of the world — 180 ms</option>
+              </select>
+            </div>
+            <div class="ctrl">
+              <label for="w-sync">Send the email synchronously?</label>
+              <select id="w-sync">
+                <option value="0" selected>No — queue it</option>
+                <option value="1">Yes — wait for SMTP</option>
+              </select>
+            </div>
+          </div>
+          <div class="hops" id="w-hops"></div>
+          <div class="out">
+            <div class="stats" id="w-stats"></div>
+            <p id="w-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <div class="note trap">
+        <span class="lab">The thing the waterfall shows every time</span>
+        <p>Your code is almost never the bottleneck. In a healthy request, the CPU time your application spends is a few milliseconds out of a few hundred — the rest is <b>waiting</b>: for the network, for the disk, for another system, or for a resource someone else is holding. That is why backend performance work is mostly about <em>removing round trips and not waiting</em>, and why optimising an algorithm from O(n log n) to O(n) usually changes nothing at all. Measure before you assume otherwise; the profiler will point at waiting.</p>
+      </div>
+
+      <h2><span class="h2n">1.4</span>The numbers worth memorising</h2>
+
+      <p>Backend judgement is largely a feel for magnitudes. The operations you use every day differ in cost by a factor of a hundred million, and knowing roughly where each sits lets you dismiss most bad ideas in seconds.</p>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Latency across nine orders of magnitude</h4>
+          <p>Real times are impossible to feel. Scale them to human units and the reason for every caching decision becomes obvious.</p>
+        </div>
+        <div class="demo-body">
+          <div class="btnrow">
+            <button class="btn on" id="l-real">Real time</button>
+            <button class="btn" id="l-human">If 1 ns were 1 second</button>
+          </div>
+          <div class="bars" id="l-bars"></div>
+          <div class="out">
+            <div class="stats" id="l-stats"></div>
+            <p id="l-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <p>Three consequences fall straight out of that table, and they explain most backend architecture:</p>
+
+      <ol>
+        <li><b>A round trip is the unit of cost.</b> One query returning 500 rows is dramatically cheaper than 500 queries returning one row each, even though the same data moves. This is the N+1 problem, and it is the most common performance defect in the field — <a href="12-scaling-data.html">Chapter 12</a>.</li>
+        <li><b>Memory beats disk beats network beats a distant network.</b> Each step is roughly 100× worse. That single sentence is the entire justification for caching — <a href="13-caching.html">Chapter 13</a>.</li>
+        <li><b>Anything involving another company's server is in a different category.</b> 50–500 ms, occasionally never. It does not belong on a request the user is waiting for unless it must be — <a href="15-async-work.html">Chapter 15</a>.</li>
+      </ol>
+
+      <h2><span class="h2n">1.5</span>Stateless servers and where state actually lives</h2>
+
+      <p>The most consequential structural rule in backend work: <b>the application process should hold no state that matters.</b> Not the user's session, not a cached object another request needs, not an in-memory counter, not an uploaded file.</p>
+
+      <figure class="diagram">
+        <div class="mermaid">
+flowchart LR
+  C["Clients"] --> LB["Load balancer"]
+  LB --> A1["app 1"]
+  LB --> A2["app 2"]
+  LB --> A3["app 3"]
+  A1 --> S[("shared state<br/>database · cache · object store")]
+  A2 --> S
+  A3 --> S
+  N["Any app process can serve any request.<br/>Add one, kill one, redeploy — nothing is lost."]
+        </div>
+        <figcaption>Every app process is interchangeable, so the load balancer can send a request anywhere, a crashed process loses nothing, and scaling out is adding a process rather than a migration.</figcaption>
+      </figure>
+
+      <p>Four things stop working the moment a process holds state. You cannot add a second server, because half the requests land on the one without the data. You cannot deploy without losing whatever was held. A crash loses it too. And you cannot reproduce a bug, because the behaviour depends on which process happened to serve which earlier request.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Where each kind of state belongs</caption>
+          <thead><tr><th>State</th><th>Not here</th><th>Here</th></tr></thead>
+          <tbody>
+            <tr><td>User sessions</td><td>In-process memory</td><td>A signed cookie, or Redis — <a href="07-auth.html">ch 7</a></td></tr>
+            <tr><td>Cached values</td><td>A local dictionary</td><td>A shared cache, or a local cache you accept may differ per process — <a href="13-caching.html">ch 13</a></td></tr>
+            <tr><td>Uploaded files</td><td>The local disk</td><td>Object storage</td></tr>
+            <tr><td>Background work</td><td>A thread you started</td><td>A queue and a worker — <a href="15-async-work.html">ch 15</a></td></tr>
+            <tr><td>Scheduled jobs</td><td>An in-process timer</td><td>A scheduler with leader election, or an external trigger</td></tr>
+            <tr><td>Counters and rate limits</td><td>A local variable</td><td>The shared cache, atomically — <a href="05-rest-api-design.html">ch 5</a></td></tr>
+            <tr><td>Configuration</td><td>Hard-coded per host</td><td>Environment, identically for every process — <a href="19-config-and-environments.html">ch 19</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The exception worth naming: <b>connections</b> are legitimate process-local state. A connection pool, an open socket to a broker, a compiled template cache — these are per-process resources rather than application state, and they are re-established on start rather than lost. The distinction is whether losing it changes what a user sees.</p>
+
+      <h2><span class="h2n">1.6</span>Everything fails, and mostly it fails slowly</h2>
+
+      <p>The mental model that separates working backends from fragile ones is that <b>every remote call has three outcomes, not two</b>: it succeeds, it fails, or it hangs. The third is the dangerous one, because a hung call holds a thread, a connection and a memory allocation while contributing nothing — and if requests keep arriving, the resources run out and a slow dependency becomes a total outage.</p>
+
+      <div class="codewrap">
+        <span class="lang">The five rules that prevent most of it</span>
+        <pre><code>1  EVERY remote call has a timeout.
+   No exception. A call with no timeout is a promise to
+   wait forever, and something will eventually take it up.
+
+2  Timeouts shrink as you go deeper.
+   If the user's budget is 2 s, the database call gets less,
+   not the same. Otherwise the outer call times out while
+   the inner one is still holding resources.
+
+3  Retry only what is safe to repeat.
+   A GET, yes. A payment, only with an idempotency key.
+   Retrying a non-idempotent write turns one failure into
+   two charges.                                     → ch 5
+
+4  Retry with jitter, and only at ONE layer.
+   Three layers each retrying three times is 27 calls to a
+   service that is already struggling.
+
+5  Fail fast when a dependency is known to be down.
+   A circuit breaker turns a 30-second timeout into an
+   instant error, which is what protects the resources.</code></pre>
+      </div>
+
+      <p>This is the shortest possible version; <a href="../systemdesign/20-resilience.html">the System Design unit</a> works through the full set — bulkheads, load shedding, and the feedback loops that turn a slowdown into a cascade.</p>
+
+      <h2><span class="h2n">1.7</span>The shape of the rest of this unit</h2>
+
+      <p>Each part takes one segment of the trace and goes down into it.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Where each part sits on the path</caption>
+          <thead><tr><th>Part</th><th>Answers</th></tr></thead>
+          <tbody>
+            <tr><td><b>1 · Foundations</b></td><td>How does a request physically arrive, and what does the protocol let you say?</td></tr>
+            <tr><td><b>2 · Serving requests</b></td><td>What receives it, how many can be handled at once, what shape should the interface be, and who is allowed to call it?</td></tr>
+            <tr><td><b>3 · Data</b></td><td>How is state modelled, found quickly, changed safely under concurrency, and grown past one machine?</td></tr>
+            <tr><td><b>4 · Speed and safety</b></td><td>What can be avoided entirely, what is trying to break in, and what can be moved off the critical path?</td></tr>
+            <tr><td><b>5 · Architecture</b></td><td>How is the code arranged, when does it split, and where does its configuration come from?</td></tr>
+            <tr><td><b>6 · Operating</b></td><td>How do you know it works, what is it doing right now, and how does a change reach production safely?</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <details class="check">
+        <summary>Why does making your application code twice as fast usually not make the request twice as fast?</summary>
+        <div class="ans">
+          <p>Because application CPU time is a small fraction of the total. In the warm scenario above, the code executes for a handful of milliseconds inside a request lasting several hundred — the rest is network transit, TLS negotiation, waiting for a database round trip, waiting for a commit to reach disk, and waiting for an external service. Halving a component that accounts for 3% of the total buys 1.5%, which nobody will notice. This is Amdahl's law applied to a request, and it is why the productive backend optimisations are structural rather than algorithmic: remove a round trip, cache a result so the trip does not happen, batch N queries into one, move an external call off the critical path, or put a CDN nearer the user. Each of those attacks a segment that is actually large. The corollary is that you should always measure before optimising, because intuition about where the time goes is reliably wrong — and a trace or a flame graph will point at waiting, not at computing.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Your app stores the user's shopping cart in a module-level dictionary. What breaks, and when?</summary>
+        <div class="ans">
+          <p>Nothing, until the day it all breaks at once. With one process it works perfectly, which is why this survives into production. Then: you add a second server for capacity, and now roughly half of each user's requests land on the process without their cart, so items vanish and reappear depending on which machine answered — an intermittent bug that is nearly impossible to reproduce locally. You deploy, and every cart in memory is discarded, so customers mid-checkout lose everything. A process crashes or is restarted by the orchestrator for a routine reason, same result. Memory grows without bound because nothing removes abandoned carts, and eventually the process is killed for using too much. And you cannot use a zero-downtime deployment strategy, because every strategy involves running new processes alongside old ones. The fix is to move the cart to shared state — Redis with a TTL, or a database table — at which point every process is interchangeable and all six problems disappear together. The general rule: if losing it would change what a user sees, it does not belong in the process.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>A dependency starts responding in 30 seconds instead of 50 milliseconds. Why can that take down a service that has nothing to do with that dependency?</summary>
+        <div class="ans">
+          <p>Because the slow calls hold resources that everything else needs. Suppose the server has 200 worker threads and normally handles 400 requests a second, each taking 50 ms — that needs about 20 threads. Now one endpoint's dependency takes 30 seconds. Requests to that endpoint arrive at, say, 20 per second, and each holds a thread for 30 seconds, so within ten seconds it is holding 200 threads and there are none left. Requests to <em>every other endpoint</em> now queue behind them and time out, including the health check, at which point the load balancer marks the instance unhealthy and sends its traffic to the remaining instances, which fill up the same way. One slow dependency has become a total outage, and the mechanism is resource exhaustion rather than the dependency itself. The defences are the ones listed in §1.6 plus two more: a <b>bulkhead</b> limiting how many concurrent calls that one dependency may hold, so it can never consume more than its share, and a <b>circuit breaker</b> that stops calling it entirely once failures cross a threshold. Both are in <a href="../systemdesign/20-resilience.html">the System Design unit</a>.</p>
+        </div>
+      </details>
+
+      <div class="recap">
+        <h2>Recap</h2>
+        <ol>
+          <li><b>A backend accepts, decides, remembers, integrates and keeps running.</b> Every chapter here expands one of those.</li>
+          <li><b>It is concurrent and shared,</b> which is the source of nearly every difficulty specific to the work.</li>
+          <li><b>A request is about thirty steps across four machines,</b> and almost all the time is waiting rather than computing.</li>
+          <li><b>Memory, disk, network, distant network</b> — each roughly 100× the last. That single progression justifies caching.</li>
+          <li><b>A round trip is the unit of cost.</b> One query for 500 rows beats 500 queries for one.</li>
+          <li><b>Anything involving another company's server</b> is 50–500 ms and occasionally never; keep it off the critical path.</li>
+          <li><b>Application processes hold no state that matters,</b> so any process can serve any request. Connections are the legitimate exception.</li>
+          <li><b>Every remote call succeeds, fails, or hangs.</b> The third exhausts resources and turns a slow dependency into an outage.</li>
+        </ol>
+      </div>
+
+      <nav class="pn" aria-label="Previous and next chapter"></nav>
+    </div>
+  </article>
+</div>
+
+<script src="assets/notes.js"></script>
+<script>
+function stB(k, v, tone) {
+  var d = document.createElement("div"); d.className = "stat";
+  var a = document.createElement("div"); a.className = "k"; a.textContent = k;
+  var b = document.createElement("div"); b.className = "v"; b.textContent = v;
+  if (tone) b.style.color = tone;
+  d.append(a, b); return d;
+}
+function barB(label, pct, value, colour) {
+  var row = document.createElement("div"); row.className = "bar";
+  var k = document.createElement("span"); k.textContent = label;
+  var t = document.createElement("span"); t.className = "track";
+  var f = document.createElement("span"); f.className = "fill";
+  f.style.width = Math.max(0.4, Math.min(100, pct)) + "%";
+  if (colour) f.style.background = colour;
+  t.appendChild(f);
+  var v = document.createElement("span"); v.className = "val"; v.textContent = value;
+  row.append(k, t, v); return row;
+}
+function msB(x) {
+  if (x < 1) return x.toFixed(2) + " ms";
+  if (x < 1000) return x.toFixed(x < 10 ? 1 : 0) + " ms";
+  return (x / 1000).toFixed(2) + " s";
+}
+
+/* ---------- request waterfall ---------- */
+(function () {
+  var scen = document.getElementById("w-scenario"), dist = document.getElementById("w-dist"),
+      sync = document.getElementById("w-sync"), hops = document.getElementById("w-hops"),
+      stats = document.getElementById("w-stats"), note = document.getElementById("w-note");
+  var sel = -1;
+
+  function build() {
+    var S = scen.value, RTT = +dist.value, SY = +sync.value;
+    var cold = S === "cold";
+    var h = [];
+    var add = function (n, ms, kind, why) { h.push({ n: n, ms: ms, k: kind, why: why }); };
+
+    if (cold) {
+      add("DNS resolution", RTT * 1.6 + 20, "net", "Uncached, the resolver walks root → .com → shop.com. Once cached this is roughly zero for the whole TTL.");
+      add("TCP handshake", RTT, "net", "SYN, SYN-ACK, ACK. One full round trip before any of your data moves.");
+      add("TLS 1.3 handshake", RTT, "net", "One round trip on TLS 1.3, two on 1.2. Session resumption removes it on later connections.");
+    } else {
+      add("DNS (cached)", 0.1, "net", "Answered from the browser or OS cache. Free until the TTL expires.");
+      add("Connection reuse", 0.1, "net", "The TCP and TLS connection is already open — keep-alive saved two round trips.");
+    }
+    add("Request transit", RTT / 2, "net", "Physics: roughly 5 µs per kilometre of fibre, and the route is never straight.");
+    add("Load balancer + proxy", 1.2, "cpu", "Route match, rate-limit check, header rewrite, forward upstream.");
+    add("Framework + middleware", 2.5, "cpu", "Body parsing, session or token decoding, logging setup.");
+    add("Authorisation check", 0.4, "cpu", "May this user place this order? A rules check, not a query, if the claims are already loaded.");
+    add("Validation", 0.3, "cpu", "Shape, types, ranges. Cheap, and it prevents expensive work downstream.");
+
+    if (S === "miss" || S === "slow" || S === "pool") {
+      add("Cache lookup (miss)", 0.6, "io", "A round trip to Redis on the local network. Fast, and it returned nothing.");
+    } else {
+      add("Cache hit — cart", 0.6, "io", "Redis on the same network. This is the single cheapest way to avoid everything below it.");
+    }
+    if (S === "pool") add("Waiting for a connection", 180, "wait", "All pooled connections are in use, so the request queues. Nothing is computing — this is pure waiting, and it is what a pool exhaustion incident looks like from the inside.");
+    else add("Acquire DB connection", 0.2, "wait", "Borrowed from the pool. Opening a new one would cost several milliseconds plus a TLS handshake.");
+
+    if (S === "slow") add("SELECT — sequential scan", 340, "io", "The planner did not use the index, so it read every row. The same query with a usable index is under a millisecond.");
+    else if (S === "miss") add("SELECT cart + items", 3.1, "io", "Two indexed lookups and a join. Parse, plan, execute, return.");
+    else add("SELECT for the write", 1.1, "io", "Re-reading inside the transaction, because the cached copy is not a safe basis for a decision.");
+
+    add("BEGIN + stock re-check", 1.4, "io", "The check must happen inside the transaction, or two concurrent orders can both pass it.");
+    add("INSERT order + lines", 2.2, "io", "Index maintenance on every insert is part of this cost.");
+    add("COMMIT — fsync the WAL", 4.5, "io", "Waiting for the write-ahead log to reach durable storage. This is the durability guarantee, and it is why writes cost more than reads.");
+    add("Payment provider", S === "ext" ? 2400 : 220, "io",
+      S === "ext" ? "Someone else's network on a bad day. Note that it now dwarfs everything you control — and that a request holding a thread for 2.4 seconds is how pool exhaustion begins."
+                  : "Another company's server. Fast for what it is, and still by far the largest single item.");
+    if (SY) add("Send email over SMTP", 850, "io", "Doing this on the request path means the user waits for a mail server they will never see. Queue it instead — the response does not depend on it.");
+    else add("Enqueue email job", 0.5, "io", "One write to a queue. The worker sends it afterwards, and the user's response is not held up.");
+    add("Invalidate cache keys", 0.4, "io", "Delete rather than update, and do it after the commit — before it, and a concurrent read can repopulate stale data.");
+    add("Serialise response", 0.7, "cpu", "JSON encoding. Usually trivial; occasionally not, for very large payloads.");
+    add("Response transit", RTT / 2, "net", "Back across the same distance, compressed.");
+    return h;
+  }
+
+  function render() {
+    var h = build();
+    var total = h.reduce(function (a, x) { return a + x.ms; }, 0);
+    var max = Math.max.apply(null, h.map(function (x) { return x.ms; }));
+
+    hops.innerHTML = "";
+    h.forEach(function (x, i) {
+      var b = document.createElement("button");
+      b.type = "button"; b.className = "hop " + x.k + (i === sel ? " sel" : "");
+      var ix = document.createElement("span"); ix.className = "ix"; ix.textContent = i + 1;
+      var nm = document.createElement("span"); nm.className = "nm"; nm.textContent = x.n;
+      var tr = document.createElement("span"); tr.className = "tr";
+      var fl = document.createElement("span"); fl.className = "fl";
+      fl.style.width = Math.max(0.8, (x.ms / max) * 100) + "%";
+      tr.appendChild(fl);
+      var ms = document.createElement("span"); ms.className = "ms"; ms.textContent = msB(x.ms);
+      b.append(ix, nm, tr, ms);
+      b.addEventListener("click", function () { sel = (sel === i ? -1 : i); render(); });
+      hops.appendChild(b);
+    });
+
+    var byKind = { net: 0, cpu: 0, io: 0, wait: 0 };
+    h.forEach(function (x) { byKind[x.k] += x.ms; });
+    var biggest = h.slice().sort(function (a, b) { return b.ms - a.ms; })[0];
+
+    stats.innerHTML = "";
+    stats.appendChild(stB("Total", msB(total), total > 1000 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(stB("Your CPU time", msB(byKind.cpu) + " · " + (byKind.cpu / total * 100).toFixed(1) + "%", "var(--line)"));
+    stats.appendChild(stB("Network", msB(byKind.net) + " · " + (byKind.net / total * 100).toFixed(0) + "%"));
+    stats.appendChild(stB("Disk + external", msB(byKind.io) + " · " + (byKind.io / total * 100).toFixed(0) + "%"));
+    if (byKind.wait > 1) stats.appendChild(stB("Pure waiting", msB(byKind.wait), "var(--line)"));
+    stats.appendChild(stB("Largest single hop", biggest.n));
+
+    note.textContent = sel > -1
+      ? (sel + 1) + ". " + h[sel].n + " — " + h[sel].why
+      : scen.value === "pool"
+      ? "No connection was available, so the request sat in a queue doing nothing for " + msB(180) + ". Note that nothing is broken — the database is healthy, your code is fine — and the request is still slow. Pool exhaustion is the most common way a backend becomes slow without anything looking wrong."
+      : scen.value === "slow"
+      ? "One query without a usable index accounts for most of the request. This is the highest-return fix available in backend work: an index turns a sequential scan of every row into a handful of page reads, and the change is one line of DDL."
+      : scen.value === "ext"
+      ? "The payment provider is now " + (2400 / total * 100).toFixed(0) + "% of the request, and none of it is under your control. Two things follow: the timeout must be shorter than the user's patience, and enough concurrent slow calls will exhaust your workers — which is why a bulkhead limiting concurrency to that one dependency matters."
+      : scen.value === "cold"
+      ? "A cold connection pays DNS, TCP and TLS before a single byte of your request moves — three round trips at " + RTTLabel() + " each. This is why keep-alive, connection reuse and a CDN close to the user matter more than almost anything you can do in code."
+      : "Even on the happy path your own CPU time is " + (byKind.cpu / total * 100).toFixed(1) + "% of the request. Click any hop for what it is doing. The two largest items are the payment provider and the commit, and neither is code you would think to optimise.";
+  }
+  function RTTLabel() { return (+dist.value) + " ms"; }
+  [scen, dist, sync].forEach(function (x) { x.addEventListener("change", function () { sel = -1; render(); }); });
+  render();
+})();
+
+/* ---------- latency ladder ---------- */
+(function () {
+  var L = [
+    { n: "L1 cache reference", ns: 1, note: "The fastest thing a computer does." },
+    { n: "Branch mispredict", ns: 3 },
+    { n: "L2 cache reference", ns: 4 },
+    { n: "Mutex lock/unlock", ns: 17 },
+    { n: "Main memory reference", ns: 100, note: "100× slower than L1. This is why cache-friendly data layout matters in hot loops." },
+    { n: "Compress 1 KB", ns: 2000 },
+    { n: "Read 1 MB sequentially from memory", ns: 50000 },
+    { n: "SSD random read", ns: 100000, note: "1000× a memory reference. The first big cliff." },
+    { n: "Round trip within a datacentre", ns: 500000, note: "Your app to its database. Half a millisecond — cheap individually, ruinous 500 times." },
+    { n: "Read 1 MB sequentially from SSD", ns: 1000000 },
+    { n: "Disk seek (spinning)", ns: 10000000 },
+    { n: "Round trip, same continent", ns: 25000000, note: "25 ms. Nothing you do in code compares." },
+    { n: "Round trip, across an ocean", ns: 90000000, note: "90 ms of physics. No optimisation removes it — only moving the data closer does." },
+    { n: "Typical third-party API call", ns: 220000000, note: "Someone else's server, someone else's day." },
+    { n: "A slow query doing a sequential scan", ns: 340000000, note: "And this one is entirely your own fault, which is the good news." }
+  ];
+  var human = false;
+  var bars = document.getElementById("l-bars"), stats = document.getElementById("l-stats"),
+      note = document.getElementById("l-note");
+
+  function fmtReal(ns) {
+    if (ns < 1000) return ns + " ns";
+    if (ns < 1e6) return (ns / 1000).toFixed(ns < 1e4 ? 1 : 0) + " µs";
+    if (ns < 1e9) return (ns / 1e6).toFixed(ns < 1e7 ? 1 : 0) + " ms";
+    return (ns / 1e9).toFixed(2) + " s";
+  }
+  function fmtHuman(ns) {
+    var s = ns; /* 1 ns → 1 s */
+    if (s < 60) return s.toFixed(0) + " s";
+    if (s < 3600) return (s / 60).toFixed(1) + " min";
+    if (s < 86400) return (s / 3600).toFixed(1) + " h";
+    if (s < 31557600) return (s / 86400).toFixed(1) + " days";
+    return (s / 31557600).toFixed(1) + " years";
+  }
+
+  function render() {
+    var maxLog = Math.log10(L[L.length - 1].ns);
+    bars.innerHTML = "";
+    L.forEach(function (x) {
+      var pct = (Math.log10(x.ns) / maxLog) * 100;
+      var col = x.ns < 1e3 ? "var(--ok)" : x.ns < 1e6 ? "#B87A17" : "var(--line)";
+      bars.appendChild(barB(x.n, pct, human ? fmtHuman(x.ns) : fmtReal(x.ns), col));
+    });
+
+    stats.innerHTML = "";
+    stats.appendChild(stB("Range", "9 orders of magnitude"));
+    stats.appendChild(stB("Memory → SSD", "1 000×", "var(--line)"));
+    stats.appendChild(stB("SSD → datacentre RTT", "5×"));
+    stats.appendChild(stB("Datacentre → cross-ocean", "180×", "var(--line)"));
+    stats.appendChild(stB("L1 → slow query", "340 000 000×", "var(--line)"));
+
+    document.getElementById("l-real").classList.toggle("on", !human);
+    document.getElementById("l-human").classList.toggle("on", human);
+
+    note.textContent = human
+      ? "On this scale an L1 cache reference takes a second, reading from memory takes a minute and a half, and a query to your own database takes about six days. A cross-ocean round trip takes nearly three years, and the slow query takes almost eleven. That ratio is the reason a cache hit is worth so much: it is not a small improvement, it is skipping years of travel."
+      : "The bars are logarithmic — a linear scale would render the top eight items invisible. The two cliffs to remember are memory to SSD (1 000×) and same-datacentre to cross-ocean (180×). Switch to human scale to see what those ratios actually mean.";
+  }
+  document.getElementById("l-real").addEventListener("click", function () { human = false; render(); });
+  document.getElementById("l-human").addEventListener("click", function () { human = true; render(); });
+  render();
+})();
+</script>
+</body>
+</html>

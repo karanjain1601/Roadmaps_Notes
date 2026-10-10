@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Schema evolution — MongoDB</title>
+<meta name="description" content="Migrating data with no ALTER TABLE: versioned documents, lazy migration, backfills, and schema validation.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 17 · At scale</div>
+    <h1>Schema evolution</h1>
+    <p class="standfirst">There is no <code>ALTER TABLE</code>, and it is a mixed blessing. Adding a field is free and needs no migration at all; the flexibility that makes it free is the same flexibility that lets four document shapes accumulate in one collection with no record of which are still in use.</p>
+    <div class="chap-meta">
+      <span class="tagpill">versioning</span>
+      <span class="tagpill">lazy migration</span>
+      <span class="tagpill">backfill</span>
+      <span class="tagpill">validation</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The two halves of the trade</h2>
+
+<div class="cols">
+  <div class="col good">
+    <h4>Genuinely free</h4>
+    <ul>
+      <li><b>Adding a field</b> — write it on new documents, handle its absence on read</li>
+      <li><b>Adding a nested object or array</b> — same</li>
+      <li><b>Widening a type</b> — nothing enforces the old one</li>
+      <li>No table lock, no long-running DDL, no maintenance window</li>
+    </ul>
+  </div>
+  <div class="col bad">
+    <h4>Still work</h4>
+    <ul>
+      <li><b>Renaming</b> — every document, and every read path</li>
+      <li><b>Changing a type</b> — every document, and comparisons break in between</li>
+      <li><b>Splitting or merging documents</b> — a real migration</li>
+      <li><b>Removing a field</b> — safely, only once nothing reads it</li>
+      <li><b>Knowing what shapes exist</b> — no <code>information_schema</code></li>
+    </ul>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">The absence of a migration is not the absence of a change</span>
+  <p>In a relational database a schema change is a visible, reviewable, versioned artefact: a migration file, in the repository, applied in order. In MongoDB, adding a field is a code change in one service — no artefact, no review of the data implications, no record. That is convenient right up to the point where nobody can say which shapes exist in a collection or which code still reads the old one. <b>Keep a migration directory anyway</b>, even when the migration is a comment saying "v3 adds <code>shippingTier</code>, no backfill needed". The value is the record, not the mechanism.</p>
+</div>
+
+<h2><span class="h-rule"></span>Choosing a strategy</h2>
+
+<div class="demo" id="mig">
+  <div class="demo-head">
+    <b>How to make this change</b>
+    <span>Four strategies. Which one depends on the change, the collection size, and whether readers can tolerate both shapes.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="g-change">The change</label>
+        <select id="g-change">
+          <option value="add" selected>Add a field</option>
+          <option value="rename">Rename a field</option>
+          <option value="type">Change a field's type</option>
+          <option value="split">Split an embedded array into its own collection</option>
+          <option value="merge">Embed a referenced collection</option>
+          <option value="remove">Remove a field</option>
+        </select>
+      </div>
+      <div>
+        <label for="g-size">Collection size — <span id="g-sizev">10 million</span></label>
+        <input type="range" id="g-size" min="1" max="6" step="1" value="4">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="g-strat">—</b><span>strategy</span></div>
+      <div><b id="g-steps">—</b><span>deploys required</span></div>
+      <div><b id="g-risk">—</b><span>main risk</span></div>
+    </div>
+    <div id="g-code"></div>
+    <div class="out" id="g-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Schema versioning</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">a version field, and the discipline it enables</span><button class="copy">Copy</button></div>
+<pre><code>// Stamp every document with the shape it uses.
+{ _id: …, schemaVersion: 3, name: "Amara", contact: { email: …, phone: … } }
+
+// The read path handles the versions that exist:
+function normalise(doc) {
+  switch (doc.schemaVersion ?? 1) {
+    case 1: doc = { ...doc, contact: { email: doc.email } };  // v1 had a
+                                                              // flat email
+    case 2: doc.contact.phone ??= null;                       // v2 lacked
+                                                              // phone
+    case 3: break;
+  }
+  return doc;
+}
+// Note the deliberate fall-through: a v1 document is upgraded through every
+// step to the current shape.
+
+// Without a version field, the read path becomes a pile of defensive checks
+// — doc.contact?.email ?? doc.email ?? doc.emailAddress — that nobody can
+// ever safely delete, because nobody knows whether the shape it handles
+// still exists in the collection.
+
+// The version field makes that knowable:
+db.users.aggregate([
+  { $group: { _id: { $ifNull: ["$schemaVersion", 1] }, n: { $sum: 1 } } },
+  { $sort: { _id: 1 } }
+]);
+//   { _id: 1, n: 412 }     <- 412 documents still on v1
+//   { _id: 3, n: 8412903 }
+//
+// When the count for a version reaches zero, you can delete that branch of
+// the read path with confidence. That is the whole point, and it is the
+// thing an unversioned collection can never give you.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Lazy migration</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">upgrade documents as they are touched</span><button class="copy">Copy</button></div>
+<pre><code>// Migrate on read, when a document is loaded anyway:
+async function getUser(id) {
+  const doc = await users.findOne({ _id: id });
+  if ((doc.schemaVersion ?? 1) < 3) {
+    const upgraded = normalise(doc);
+    await users.replaceOne({ _id: id, schemaVersion: doc.schemaVersion },
+                           upgraded);         // guarded, so concurrent
+    return upgraded;                          // upgrades do not fight
+  }
+  return doc;
+}
+
+// WHAT IT BUYS: no bulk write, no load spike, and hot documents migrate
+// almost immediately because they are the ones being read.
+//
+// WHAT IT COSTS: the migration never finishes on its own. Cold documents
+// stay on the old shape indefinitely, so the read path can never be
+// simplified — which is the outcome the version field was supposed to
+// prevent.
+
+// The combination that actually works:
+//   1. deploy readers that handle both shapes
+//   2. write the new shape for all new documents
+//   3. lazy-migrate on read, so hot documents convert for free
+//   4. run a BACKGROUND BACKFILL for the cold tail
+//   5. wait until the version count hits zero
+//   6. delete the old branch of the read path
+//
+// Step 4 is the one people skip, and skipping it means step 6 never happens.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Backfills</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">resumable, throttled, verifiable</span><button class="copy">Copy</button></div>
+<pre><code>// Never a single updateMany across ten million documents. It generates an
+// enormous amount of oplog at once, floods replication, and cannot be
+// stopped or resumed.
+
+async function backfill() {
+  let lastId = await state.get("backfill:users") ?? MinKey;
+
+  while (true) {
+    const batch = await users.find(
+      { _id: { $gt: lastId }, schemaVersion: { $lt: 3 } }
+    ).sort({ _id: 1 }).limit(1000).toArray();
+    if (batch.length === 0) break;
+
+    await users.bulkWrite(batch.map(doc => ({
+      updateOne: {
+        filter: { _id: doc._id, schemaVersion: doc.schemaVersion },  // guard
+        update: { $set: toV3(doc) }
+      }
+    })), { ordered: false });
+
+    lastId = batch[batch.length - 1]._id;
+    await state.set("backfill:users", lastId);      // resumable
+    await sleep(50);                                 // throttled
+  }
+}
+
+// The five properties that matter:
+//   RESUMABLE   — progress persisted, so a crash costs one batch
+//   IDEMPOTENT  — the schemaVersion filter means a rerun is a no-op
+//   THROTTLED   — a pause between batches so replication keeps up
+//   OBSERVABLE  — log progress; a silent 6-hour job is unmanageable
+//   VERIFIABLE  — the version histogram tells you when it is done
+//
+// Watch replication lag WHILE it runs (chapter 16). If it climbs, increase
+// the sleep. A backfill that puts secondaries an hour behind has turned a
+// maintenance task into an availability problem.
+//
+// An update pipeline computes new values from old ones, server-side, with
+// no round trip per document:
+db.users.updateMany({ schemaVersion: { $lt: 3 } }, [
+  { $set: { contact: { email: "$email" }, schemaVersion: 3 } },
+  { $unset: "email" }
+]);
+// Still batch it — the pipeline form does not change the oplog volume.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Deploy readers before writers, always</span>
+  <p>The ordering rule that makes online migration safe. <b>First</b> deploy code that can read both the old and the new shape, and wait for it to be everywhere. <b>Then</b> deploy code that writes the new shape. Reverse it and, during the rollout window, an old instance reads a new-shape document and fails — usually as a null dereference in one endpoint, on a fraction of requests, which is exactly the kind of intermittent error that takes an afternoon to diagnose. The same rule applies to rollbacks: if you might roll back the writer, the reader must handle both shapes for at least as long.</p>
+</div>
+
+<h2><span class="h-rule"></span>Introducing validation</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">on a collection that already has bad data</span><button class="copy">Copy</button></div>
+<pre><code>// Chapter 1 argued for schema validation. Adding it to an existing
+// collection is where the argument meets reality, and there is a path.
+
+// 1. Find out what is actually in there.
+db.orders.aggregate([
+  { $group: { _id: { $type: "$amount" }, n: { $sum: 1 } } }
+]);
+//   { _id: "decimal", n: 412039 }
+//   { _id: "string",  n: 87 }      <- the import from 2024
+//   { _id: "double",  n: 12 }      <- someone in mongosh
+
+// 2. Add the validator in WARN mode. Nothing is rejected; violations are
+//    logged, so you learn which write paths are producing bad data.
+db.runCommand({ collMod: "orders",
+  validator: { $jsonSchema: { … } },
+  validationAction: "warn", validationLevel: "moderate" });
+
+// 3. Fix the write paths the log identifies.
+// 4. Backfill the existing bad documents.
+// 5. Switch to error, and moderate -> strict.
+db.runCommand({ collMod: "orders",
+  validationAction: "error", validationLevel: "strict" });
+
+//   validationLevel "moderate" validates only documents that ALREADY pass,
+//   so existing bad data can stay while new writes are checked. That is what
+//   makes this sequence possible on a live collection.
+//
+//   Note that validation applies to the WHOLE document on any update, so a
+//   $set touching one field of a non-conforming document will be rejected
+//   under strict. Under moderate it is allowed, which is usually what you
+//   want during a transition.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Discovering what you have</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">there is no information_schema, so build one</span><button class="copy">Copy</button></div>
+<pre><code>// Which fields exist, and how often — sampled, so it is cheap:
+db.orders.aggregate([
+  { $sample: { size: 10000 } },
+  { $project: { fields: { $objectToArray: "$$ROOT" } } },
+  { $unwind: "$fields" },
+  { $group: { _id: "$fields.k", n: { $sum: 1 },
+              types: { $addToSet: { $type: "$fields.v" } } } },
+  { $sort: { n: -1 } }
+]);
+//   { _id: "status", n: 10000, types: ["string"] }
+//   { _id: "legacyRef", n: 143, types: ["string", "null"] }   <- residue
+//   { _id: "amount", n: 10000, types: ["decimal", "string"] } <- drift
+
+// Documents missing an expected field:
+db.orders.countDocuments({ shippingTier: { $exists: false } });
+
+// Array length distribution — the growth check from chapter 9:
+db.orders.aggregate([
+  { $project: { n: { $size: { $ifNull: ["$items", []] } } } },
+  { $group: { _id: null, max: { $max: "$n" }, avg: { $avg: "$n" } } }
+]);
+
+// Run these on any collection you inherit, and again periodically. A field
+// appearing on 0.1% of documents is either a bug, a removed feature nobody
+// cleaned up, or a shape somebody added without telling anyone — and all
+// three are worth knowing about.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>A checklist</h2>
+
+<ul class="check">
+  <li><b>Keep a migration directory</b> even when there is nothing to run. The record is the point.</li>
+  <li><b>Add a <code>schemaVersion</code> field</b> before you need it. Retrofitting one is itself a migration.</li>
+  <li><b>Readers before writers</b>, with a wait between the deploys.</li>
+  <li><b>Backfill in batches</b>, resumable, throttled, watching replication lag.</li>
+  <li><b>Guard every migration update</b> with the version it expects, so reruns and concurrency are safe.</li>
+  <li><b>Verify with the version histogram</b>, not by assuming the job finished.</li>
+  <li><b>Remove the old read path</b> only when the count is zero — and actually remove it.</li>
+  <li><b>Add validation in warn mode first</b>, then moderate, then strict.</li>
+</ul>
+
+<div class="note tip">
+  <span class="note-t">The cleanup is the part that gets skipped</span>
+  <p>The migration is interesting and the cleanup is not, so codebases accumulate branches handling shapes that no longer exist anywhere — and each one makes the next change harder, because nobody can tell which are load-bearing. The version histogram is what makes deletion safe: when <code>schemaVersion: 1</code> returns zero documents, the v1 branch is provably dead and can go. <b>Put the cleanup in the backlog when you write the migration</b>, with the histogram query attached as the condition. Otherwise the flexibility this chapter opened with quietly becomes the debt it warned about.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Adding a field is free.</b> Renaming, retyping and restructuring are real migrations.</li>
+    <li><b>No migration artefact means no record.</b> Keep a migration directory anyway.</li>
+    <li><b>A <code>schemaVersion</code> field</b> is what makes old read paths safely deletable.</li>
+    <li><b>Lazy migration never finishes.</b> Pair it with a background backfill or the cleanup never happens.</li>
+    <li>Backfills must be <b>resumable, idempotent, throttled, observable and verifiable</b>.</li>
+    <li><b>Deploy readers before writers</b>, and keep both working as long as you might roll back.</li>
+    <li><b>Add validation in warn mode</b>, fix the write paths, backfill, then switch to strict.</li>
+    <li><b>Verify with the version histogram</b> and then actually delete the old branch.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("17-schema-evolution.html");
+
+(function(){
+  const root = document.getElementById("mig");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const N = [10000, 100000, 1000000, 10000000, 100000000, 1000000000];
+  const NL = ["10 thousand","100 thousand","1 million","10 million","100 million","1 billion"];
+
+  const C = {
+    add: {strat:"no migration", steps:"1", risk:"none",
+      code:'// Just start writing it. Handle absence on read.\nconst tier = doc.shippingTier ?? "standard";\n\n// Backfill only if you need to INDEX or QUERY it:\ndb.orders.updateMany(\n  { shippingTier: { $exists: false } },\n  { $set: { shippingTier: "standard" } }\n);',
+      note:"The case the document model handles best. New documents carry the field, old ones do not, and the read path supplies a default. No migration, no window, no coordination.\n\nTwo situations where you do need a backfill. If you want to INDEX the field, a partial index on { shippingTier: { $exists: true } } avoids it — otherwise documents without the field still occupy index entries. And if you want to QUERY on it, remember that { shippingTier: \"standard\" } does not match documents where the field is absent, which is a silent correctness gap between the default in your code and the data.\n\nStill worth a note in the migration directory. \"v4 adds shippingTier, default standard, no backfill\" costs nothing and answers a question someone will have."},
+    rename: {strat:"dual-write, then backfill", steps:"3", risk:"a missed read path",
+      code:'// Deploy 1 — readers handle both\nconst ref = doc.externalRef ?? doc.legacyRef;\n\n// Deploy 2 — write both\n{ $set: { externalRef: v, legacyRef: v } }\n\n// Backfill, in batches\ndb.orders.updateMany(\n  { externalRef: { $exists: false } },\n  [{ $set: { externalRef: "$legacyRef" } }]\n);\n\n// Deploy 3 — stop writing and reading legacyRef,\n// then $unset it once the count is zero.',
+      note:"Three deploys, and the order is not negotiable. Readers first, so no instance encounters a shape it cannot handle. Then dual writes, so both fields stay current regardless of which instance served the request. Then the backfill for historical documents. Then remove.\n\n$rename exists and does this atomically per document, which is useful for the backfill step — but it does not help with the deploy sequencing, which is where the risk actually is.\n\nThe risk named above is a read path nobody remembered: an analytics query, a report, an export job, another service. Grep for the old field name across every repository, not just the one you are changing."},
+    type: {strat:"new field, then swap", steps:"3-4", risk:"comparisons break mid-flight",
+      code:'// Do NOT change the type in place. Write a NEW field.\n// Deploy 1 — readers prefer the new one\nconst amount = doc.amountDecimal ?? toDecimal(doc.amount);\n\n// Deploy 2 — write amountDecimal on every write\n// Backfill:\ndb.orders.updateMany({ amountDecimal: { $exists: false } }, [\n  { $set: { amountDecimal: { $toDecimal: "$amount" } } }\n]);\n\n// Deploy 3 — drop the old field, optionally $rename.',
+      note:"Changing a type in place is the migration most likely to cause a silent correctness bug, because BSON compares across types by a fixed type order rather than by value (chapter 4).\n\nWhile a collection holds both strings and decimals in one field, { amount: { $gt: 100 } } matches every decimal above 100 and NO strings — strings sort after all numbers. Range queries silently return partial results, indexes contain both types, and nothing errors.\n\nSo do not convert in place. Write to a new field, backfill it, verify with the type histogram, and only then remove the old one. The transitional period is safe because each field has exactly one type throughout.\n\nVerify before removing:\n  db.orders.aggregate([{ $group: { _id: { $type: \"$amountDecimal\" }, n: { $sum: 1 } } }])"},
+    split: {strat:"copy out, dual-read, then remove", steps:"4", risk:"losing atomicity",
+      code:'// 1. Copy the embedded array into a new collection\ndb.orders.aggregate([\n  { $unwind: "$items" },\n  { $set: { orderId: "$_id", _id: "$$REMOVE" } },\n  { $replaceRoot: { newRoot: "$items" } },\n  { $merge: { into: "orderItems" } }\n]);\ndb.orderItems.createIndex({ orderId: 1 });\n\n// 2. Dual-write both places\n// 3. Switch reads to the new collection\n// 4. $unset the embedded array',
+      note:"The heaviest migration in this chapter, and worth pausing over before starting — because you are giving up something real.\n\nEmbedded items are updated atomically with their parent order. Referenced items are not: changing an order and its items together now requires a transaction (chapter 12), which is slower and adds a failure mode. Make sure you are getting something worth that — usually unbounded growth or the need to query items independently.\n\nThe $merge pipeline handles the copy in one server-side pass. Do it in batches by date range on a large collection, since the whole thing at once generates a great deal of oplog.\n\nDual-write in step 2 has its own hazard: the two copies can diverge if a write path updates one and not the other. Keep the window short and reconcile before switching reads."},
+    merge: {strat:"embed, dual-read, then drop", steps:"4", risk:"unbounded growth",
+      code:'// 1. Embed via $lookup into a new field\ndb.orders.aggregate([\n  { $lookup: { from: "orderItems", localField: "_id",\n               foreignField: "orderId", as: "items" } },\n  { $merge: { into: "orders", whenMatched: "merge" } }\n]);\n\n// 2. Dual-write\n// 3. Switch reads to the embedded array\n// 4. Drop the orderItems collection',
+      note:"The reverse direction, usually done to remove a $lookup from a hot read path or to regain atomic updates.\n\nBefore starting, check the array length distribution on the source collection. If any parent has thousands of children, embedding creates documents that are expensive to write and may approach the 16 MB limit — and the failure arrives on one unlucky document long after the migration completed (chapter 2).\n\n  db.orderItems.aggregate([\n    { $group: { _id: \"$orderId\", n: { $sum: 1 } } },\n    { $sort: { n: -1 } }, { $limit: 10 }\n  ])\n\nIf the tail is large, either embed a bounded subset and keep the rest referenced (chapter 3's subset pattern), or do not do this migration.\n\nRun the $merge in batches. A $lookup across the whole collection at once is a lot of work in one operation."},
+    remove: {strat:"stop reading, stop writing, then unset", steps:"3", risk:"a forgotten consumer",
+      code:'// 1. Remove all reads. Deploy. WAIT.\n// 2. Remove the writes. Deploy. WAIT.\n// 3. Only then:\ndb.orders.updateMany(\n  { legacyRef: { $exists: true } },\n  { $unset: { legacyRef: "" } }\n);\n\n// Confirm nothing still depends on it first:\ndb.orders.countDocuments({ legacyRef: { $exists: true } });',
+      note:"Straightforward, and the risk is entirely in what you did not know about. A field with no readers in the main application may still be read by an export job, a BI dashboard, another service, or a support script.\n\nWait between the steps — days, not minutes. A weekly report that breaks is much easier to notice and fix while the data still exists than after you have unset it everywhere.\n\nOne more consideration: $unset on a large collection rewrites every matching document, which generates oplog and takes time. Batch it like any other backfill. And if the field is only 200 bytes on 10 million documents, consider whether removing it is worth the write amplification at all — leaving it costs 2 GB and no risk."}
+  };
+
+  function render(){
+    const k = $("g-change").value, c = C[k];
+    const ni = parseInt($("g-size").value,10) - 1;
+    const n = N[ni];
+    $("g-sizev").textContent = NL[ni];
+
+    $("g-strat").textContent = c.strat;
+    $("g-steps").textContent = c.steps;
+    $("g-risk").textContent  = c.risk;
+
+    const heavy = k !== "add";
+    $("g-code").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid ' +
+      (heavy ? "#F2A03D" : "#3FB984") +
+      ';border-radius:5px;padding:11px 13px;margin:14px 0 12px;font-family:var(--mono);' +
+      'font-size:12px;line-height:1.6;overflow-x:auto">' +
+      c.code.replace(/[<>&]/g, ch => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[ch])) + '</pre>';
+
+    const notes = [c.note];
+
+    if(heavy && n >= 10000000){
+      const hrs = (n / 2000 / 3600).toFixed(1);
+      notes.push("At " + NL[ni] + " documents, the backfill is a background job of hours rather than a command you run and watch. Roughly " + hrs +
+                 " hours at a throttled 2,000 documents per second — and throttling is not optional, because an unthrottled bulk update generates enough oplog to put every secondary behind and can exhaust the oplog window (chapters 10 and 16).\n\nWatch replication lag while it runs and increase the sleep if it climbs. A backfill that puts secondaries an hour behind has converted a maintenance task into an availability problem.");
+    } else if(heavy && n <= 100000) {
+      notes.push("At " + NL[ni] + " documents the backfill is a few seconds and the sequencing is the only thing that matters. Still do the deploys in order — readers, then writers, then backfill — because the risk is a rollout window where instances disagree about the shape, and that window exists regardless of how small the collection is.");
+    }
+
+    if(heavy)
+      notes.push("Stamp a schemaVersion on the documents you migrate, and verify with the histogram rather than assuming the job finished:\n\n  db.orders.aggregate([{ $group: { _id: { $ifNull: [\"$schemaVersion\", 1] }, n: { $sum: 1 } } }])\n\nWhen the old version returns zero, the old branch of the read path is provably dead and can be deleted. Without that check, the branch stays forever because nobody can prove it is safe to remove — and every one of those makes the next migration harder.");
+
+    $("g-note").textContent = notes.join("\n\n");
+  }
+
+  ["g-change","g-size"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

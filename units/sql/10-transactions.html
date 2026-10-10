@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Transactions and isolation — SQL</title>
+<meta name="description" content="ACID in practice, the anomalies each isolation level permits, locking, deadlocks, and why SERIALIZABLE is not free.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 10 · Changing data</div>
+    <h1>Transactions and isolation</h1>
+    <p class="standfirst">A transaction promises that a group of changes happens completely or not at all. Isolation is the harder half of the promise — what your transaction sees while others are running — and the default in most databases permits several anomalies that will eventually cost you money.</p>
+    <div class="chap-meta">
+      <span class="tagpill">acid</span>
+      <span class="tagpill">isolation levels</span>
+      <span class="tagpill">locking</span>
+      <span class="tagpill">deadlocks</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>ACID, briefly</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Property</th><th>Promise</th><th>How much you should think about it</th></tr></thead>
+<tbody>
+<tr><td><b>Atomicity</b></td><td>All the statements, or none</td><td>A little. Know where your transaction boundaries are</td></tr>
+<tr><td><b>Consistency</b></td><td>Constraints hold before and after</td><td>Only via chapter 11 — this one is really about your constraints, not the engine</td></tr>
+<tr><td><b>Isolation</b></td><td>Concurrent transactions do not corrupt each other</td><td><b>A lot.</b> The rest of this chapter</td></tr>
+<tr><td><b>Durability</b></td><td>Committed means survives a crash</td><td>Rarely, unless you have tuned it away for speed</td></tr>
+</tbody>
+</table>
+<caption>Atomicity and durability are largely handled for you. Isolation is a spectrum you choose a point on — usually by accident, since almost nobody changes the default.</caption>
+</div>
+
+<h2><span class="h-rule"></span>The anomalies</h2>
+
+<div class="demo" id="iso">
+  <div class="demo-head">
+    <b>Two transactions, interleaved</b>
+    <span>Pick an anomaly and an isolation level, then step through and see whether the database prevents it.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="i-anom">Scenario</label>
+        <select id="i-anom">
+          <option value="dirty" selected>Dirty read</option>
+          <option value="nonrep">Non-repeatable read</option>
+          <option value="phantom">Phantom read</option>
+          <option value="lost">Lost update</option>
+          <option value="skew">Write skew</option>
+        </select>
+      </div>
+      <div>
+        <label for="i-level">Isolation level</label>
+        <select id="i-level">
+          <option value="ru">READ UNCOMMITTED</option>
+          <option value="rc" selected>READ COMMITTED</option>
+          <option value="rr">REPEATABLE READ</option>
+          <option value="ser">SERIALIZABLE</option>
+        </select>
+      </div>
+      <div style="display:flex;gap:7px;align-items:flex-end;flex-wrap:wrap">
+        <button class="btn" id="i-step">step</button>
+        <button class="btn ghost" id="i-reset">reset</button>
+      </div>
+    </div>
+    <div id="i-timeline"></div>
+    <div class="stat">
+      <div><b id="i-outcome">—</b><span>outcome</span></div>
+      <div><b id="i-prevented">—</b><span>anomaly prevented?</span></div>
+    </div>
+    <div class="out" id="i-note"></div>
+  </div>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Anomaly</th><th>What happens</th><th>Concrete cost</th></tr></thead>
+<tbody>
+<tr><td><b>Dirty read</b></td><td>You read a change another transaction later rolls back</td><td>Acting on data that never existed</td></tr>
+<tr><td><b>Non-repeatable read</b></td><td>You read a row twice and get different values</td><td>A report whose totals do not reconcile with its own line items</td></tr>
+<tr><td><b>Phantom read</b></td><td>You run the same query twice and new rows appear</td><td>A count that changes mid-transaction</td></tr>
+<tr><td><b>Lost update</b></td><td>Two read-modify-writes; one silently overwrites the other</td><td>Stock counts drift, balances go wrong. <b>Very common</b></td></tr>
+<tr><td><b>Write skew</b></td><td>Two transactions each read, each check a rule, each write — and together they break it</td><td>Two doctors both go off-call. The subtlest one</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>The levels, and what they actually give you</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Level</th><th>Dirty</th><th>Non-rep.</th><th>Phantom</th><th>Lost update</th><th>Write skew</th></tr></thead>
+<tbody>
+<tr><td><b>READ UNCOMMITTED</b></td><td>possible</td><td>possible</td><td>possible</td><td>possible</td><td>possible</td></tr>
+<tr><td><b>READ COMMITTED</b></td><td>no</td><td>possible</td><td>possible</td><td><b>possible</b></td><td>possible</td></tr>
+<tr><td><b>REPEATABLE READ</b></td><td>no</td><td>no</td><td>varies</td><td>varies</td><td>possible</td></tr>
+<tr><td><b>SERIALIZABLE</b></td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td></tr>
+</tbody>
+</table>
+<caption>The standard defines these by which anomalies they <em>permit</em>, not by implementation — so the same name behaves differently across engines. The "varies" cells are where that bites.</caption>
+</div>
+
+<div class="note warn">
+  <span class="note-t">The same level name means different things</span>
+  <p><b>PostgreSQL</b> defaults to READ COMMITTED, and its READ UNCOMMITTED is identical to it — dirty reads are simply not possible. Its REPEATABLE READ uses snapshot isolation, which prevents phantoms (stricter than the standard requires) but still allows write skew. <b>MySQL/InnoDB</b> defaults to REPEATABLE READ and uses gap locking, which prevents phantoms in a different way and has its own locking consequences. <b>Oracle</b> has no REPEATABLE READ at all. <b>SQL Server</b> defaults to READ COMMITTED with locking rather than versioning, so readers can block writers unless you enable RCSI. <b>Read your engine's documentation on this specific point</b> — the standard's names are not portable behaviour.</p>
+</div>
+
+<h2><span class="h-rule"></span>Lost updates, the one you will actually meet</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">three fixes, in order of preference</span><button class="copy">Copy</button></div>
+<pre><code>-- The bug, from chapter 9: read 10, both write 11, one decrement vanishes.
+
+-- FIX 1 — atomic statement. Best when expressible. No transaction needed.
+UPDATE products SET stock = stock - 1
+WHERE id = 42 AND stock > 0
+RETURNING stock;
+-- Zero rows back means it was already out of stock.
+
+-- FIX 2 — pessimistic lock. When you must compute in application code.
+BEGIN;
+SELECT stock FROM products WHERE id = 42 FOR UPDATE;   -- blocks other writers
+-- ... application logic ...
+UPDATE products SET stock = 7 WHERE id = 42;
+COMMIT;
+-- Correct, and it serialises everything touching that row. Keep it short.
+
+-- FIX 3 — optimistic lock. Best under low contention and across requests.
+UPDATE products SET stock = 7, version = version + 1
+WHERE id = 42 AND version = 3;
+-- Zero rows means someone else changed it since you read it. Re-read and retry.
+-- This is the only one that works when the user thinks between the read and
+-- the write, because it holds no lock while they do.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">READ COMMITTED does not prevent lost updates</span>
+  <p>Worth stating plainly, because it is the default nearly everywhere and it is widely assumed to be safe. Two transactions can both read a row, both compute a new value from it, and both write — the second overwrites the first, no error, no warning. Isolation level alone will not save you; you need one of the three patterns above. This is the most consequential thing in the chapter.</p>
+</div>
+
+<h2><span class="h-rule"></span>Write skew, and why SERIALIZABLE exists</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the anomaly no lower level catches</span><button class="copy">Copy</button></div>
+<pre><code>-- Rule: at least one doctor must remain on call.
+-- Two doctors, both on call, both try to go off at the same moment.
+
+-- Transaction A                          -- Transaction B
+BEGIN;                                    BEGIN;
+SELECT count(*) FROM shifts               SELECT count(*) FROM shifts
+ WHERE on_call = true;   -- 2              WHERE on_call = true;   -- 2
+-- "2 > 1, safe to go off"                -- "2 > 1, safe to go off"
+UPDATE shifts SET on_call = false         UPDATE shifts SET on_call = false
+ WHERE doctor = 'A';                       WHERE doctor = 'B';
+COMMIT;                                   COMMIT;
+-- Now nobody is on call. Both transactions were individually correct.
+
+-- Note that they never touched the same ROW, so row locks do not help and
+-- REPEATABLE READ does not help. Each read a set, made a decision about that
+-- set, and wrote something that invalidated the other's decision.
+
+-- FIX A — SERIALIZABLE. The database detects the conflict and aborts one.
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+...
+COMMIT;   -- may raise serialization_failure; the caller MUST retry
+
+-- FIX B — materialise the conflict so a lock exists to take.
+SELECT * FROM shifts WHERE on_call = true FOR UPDATE;   -- lock the rows you read
+-- Now both transactions contend on the same rows and one waits.
+
+-- FIX C — express the rule as a constraint the database enforces (chapter 11).
+-- Usually the most robust: no application code can bypass it.</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">SERIALIZABLE requires retry logic, and without it you have made things worse</span>
+  <p>Serialisable isolation does not make conflicts wait — it detects them and <b>aborts one transaction</b> with a serialisation failure. If your application does not catch that and retry, you have converted a rare silent corruption into a frequent user-visible error. The retry loop is not optional: catch the specific error code, back off briefly, and re-run the whole transaction from the beginning. Under heavy contention the abort rate can be high enough that throughput collapses, which is the real cost of the level.</p>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">the retry wrapper that makes SERIALIZABLE usable</span><button class="copy">Copy</button></div>
+<pre><code>import random, time
+import psycopg
+
+SERIALIZATION_FAILURE = "40001"
+DEADLOCK_DETECTED     = "40P01"
+
+def in_serializable(fn, attempts: int = 5):
+    for i in range(attempts):
+        try:
+            with conn.transaction():
+                conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                return fn(conn)
+        except psycopg.errors.OperationalError as e:
+            if e.sqlstate not in (SERIALIZATION_FAILURE, DEADLOCK_DETECTED):
+                raise
+            if i == attempts - 1:
+                raise
+            time.sleep((2 ** i) * 0.01 * (0.5 + random.random()))  # jitter
+    raise RuntimeError("unreachable")
+
+# Two requirements the wrapper imposes on fn:
+#   * it must be safe to run more than once (no side effects outside the
+#     transaction — no emails sent, no payments taken mid-way)
+#   * it must re-read everything; using values from the failed attempt
+#     defeats the point entirely</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Locks</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Lock</th><th>Taken by</th><th>Blocks</th></tr></thead>
+<tbody>
+<tr><td>Row share</td><td><code>SELECT … FOR SHARE</code></td><td>Writers to those rows</td></tr>
+<tr><td>Row exclusive</td><td><code>SELECT … FOR UPDATE</code>, <code>UPDATE</code>, <code>DELETE</code></td><td>Other writers and <code>FOR UPDATE</code> readers</td></tr>
+<tr><td>Table-level, light</td><td>Any read or write</td><td>Only DDL</td></tr>
+<tr><td><b>Access exclusive</b></td><td>Most <code>ALTER TABLE</code>, <code>DROP</code>, <code>VACUUM FULL</code></td><td><b>Everything, including reads</b></td></tr>
+<tr><td>Advisory</td><td><code>pg_advisory_lock(key)</code></td><td>Whatever you decide. For application-level mutual exclusion</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the FOR UPDATE variants that matter</span><button class="copy">Copy</button></div>
+<pre><code>-- Wait for the lock (default). Fine when contention is rare.
+SELECT * FROM jobs WHERE id = 7 FOR UPDATE;
+
+-- Fail immediately rather than queueing. Good for interactive paths where a
+-- fast error beats a slow success.
+SELECT * FROM jobs WHERE id = 7 FOR UPDATE NOWAIT;
+
+-- Skip rows someone else holds. The queue-worker idiom: several workers can
+-- each grab different jobs with no coordination and no contention.
+SELECT * FROM jobs
+WHERE status = 'pending'
+ORDER BY created_at
+LIMIT 10
+FOR UPDATE SKIP LOCKED;
+
+-- SKIP LOCKED is the single most useful of the three. It turns a table into a
+-- work queue that scales with the number of workers, and it is why "just use
+-- your database as the queue" is reasonable advice far more often than people
+-- assume.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Deadlocks</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the cause, and the fix</span><button class="copy">Copy</button></div>
+<pre><code>-- Transaction A            Transaction B
+UPDATE accounts             UPDATE accounts
+  SET … WHERE id = 1;         SET … WHERE id = 2;      -- each holds one lock
+UPDATE accounts             UPDATE accounts
+  SET … WHERE id = 2;         SET … WHERE id = 1;      -- each wants the other's
+-- Circular wait. The database detects it and kills one with a deadlock error.
+
+-- FIX: acquire locks in a consistent order, everywhere in the codebase.
+-- Sorting by primary key is the standard convention and costs nothing.
+UPDATE accounts SET … WHERE id = least(from_id, to_id);
+UPDATE accounts SET … WHERE id = greatest(from_id, to_id);
+
+-- Or lock both up front, ordered:
+SELECT * FROM accounts WHERE id IN (from_id, to_id) ORDER BY id FOR UPDATE;</code></pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Cause</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td>Inconsistent lock ordering</td><td>Always lock in primary-key order. The most common cause by far</td></tr>
+<tr><td>Long transactions holding many locks</td><td>Shorten them; do less inside</td></tr>
+<tr><td>Escalation from row to table locks</td><td>Smaller batches (chapter 9)</td></tr>
+<tr><td>Foreign keys locking parents</td><td>Index the foreign key; consider deferrable constraints</td></tr>
+<tr><td>Upserts under contention</td><td><code>ON CONFLICT</code> rather than check-then-insert</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">Deadlocks are normal; retry them</span>
+  <p>A deadlock is not a bug to be eliminated so much as a condition to be handled — the database detected a circular wait and resolved it by killing the cheaper victim, which is the correct behaviour. Any code path that writes should be wrapped in the same retry logic as serialisation failures, since the error codes and the correct response are identical. Then reduce the <em>rate</em> by fixing lock ordering, and alert if it climbs.</p>
+</div>
+
+<h2><span class="h-rule"></span>Keeping transactions short</h2>
+
+<div class="cols">
+  <div class="col bad">
+    <h4>Never inside a transaction</h4>
+    <ul>
+      <li>An HTTP call to another service</li>
+      <li>Waiting for user input</li>
+      <li>Sending an email or a webhook</li>
+      <li>A long computation you could do before <code>BEGIN</code></li>
+      <li>Sleeping, for any reason</li>
+    </ul>
+  </div>
+  <div class="col good">
+    <h4>Why it matters more than it looks</h4>
+    <ul>
+      <li>Locks are held for the whole transaction, not the statement</li>
+      <li>Long transactions prevent vacuum from cleaning dead rows, and the table bloats</li>
+      <li>Replicas can fall behind or cancel queries</li>
+      <li>Connection pools fill with transactions that are doing nothing</li>
+      <li>The rollback after a failure costs as much as the work did</li>
+    </ul>
+  </div>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Set a statement timeout, and an idle-in-transaction timeout</span>
+  <p><code>SET statement_timeout = '30s'</code> stops one runaway query taking the system with it. <code>idle_in_transaction_session_timeout</code> is the one people forget, and it is arguably more important: it kills sessions that opened a transaction and then went away — a crashed worker, a developer's abandoned psql window — which otherwise hold locks and block vacuum indefinitely. Both are one line of configuration and both have prevented real outages.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Atomicity and durability are handled for you. <b>Isolation is a choice</b>, and almost nobody makes it deliberately.</li>
+    <li><b>READ COMMITTED — the default nearly everywhere — permits lost updates.</b> That is the most consequential fact here.</li>
+    <li>Fix lost updates with an <b>atomic statement</b>, <code>FOR UPDATE</code>, or an <b>optimistic version column</b> — in that order of preference.</li>
+    <li><b>Write skew</b> needs no shared row, so row locks and REPEATABLE READ do not catch it. SERIALIZABLE, an explicit lock, or a constraint.</li>
+    <li><b>SERIALIZABLE aborts rather than waits.</b> Without retry logic you have made things worse, not better.</li>
+    <li><b><code>FOR UPDATE SKIP LOCKED</code></b> turns a table into a work queue that scales with workers.</li>
+    <li>Deadlocks come from <b>inconsistent lock ordering</b>. Lock in primary-key order, and retry the ones that happen anyway.</li>
+    <li><b>Never hold a transaction across a network call</b>, and set both statement and idle-in-transaction timeouts.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("10-transactions.html");
+
+(function(){
+  const root = document.getElementById("iso");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const SCEN = {
+    dirty: {
+      name: "Dirty read",
+      steps: [
+        {t:"A", s:"BEGIN;"},
+        {t:"B", s:"BEGIN;"},
+        {t:"A", s:"UPDATE products SET stock = 5 WHERE id = 1;  -- not committed"},
+        {t:"B", s:"SELECT stock FROM products WHERE id = 1;", read:true},
+        {t:"A", s:"ROLLBACK;  -- the change never happened"},
+        {t:"B", s:"COMMIT;"}
+      ],
+      prevented: lvl => lvl !== "ru",
+      bad:  "B read stock = 5, a value that was rolled back and never existed. Any decision B made from it was based on fiction.",
+      good: "B read the committed value, not A's uncommitted change. In PostgreSQL this is true even at READ UNCOMMITTED — the engine simply cannot produce a dirty read."
+    },
+    nonrep: {
+      name: "Non-repeatable read",
+      steps: [
+        {t:"A", s:"BEGIN;"},
+        {t:"A", s:"SELECT stock FROM products WHERE id = 1;  -- 10", read:true},
+        {t:"B", s:"UPDATE products SET stock = 3 WHERE id = 1;"},
+        {t:"B", s:"COMMIT;"},
+        {t:"A", s:"SELECT stock FROM products WHERE id = 1;  -- ?", read:true},
+        {t:"A", s:"COMMIT;"}
+      ],
+      prevented: lvl => lvl === "rr" || lvl === "ser",
+      bad:  "A read 10, then 3, inside one transaction. A report built this way does not reconcile with itself — the header total and the line items were computed from different states of the database.",
+      good: "A sees the same value both times. REPEATABLE READ and above give the transaction a consistent snapshot taken at its start, so concurrent commits are invisible to it."
+    },
+    phantom: {
+      name: "Phantom read",
+      steps: [
+        {t:"A", s:"BEGIN;"},
+        {t:"A", s:"SELECT count(*) FROM orders WHERE status = 'pending';  -- 4", read:true},
+        {t:"B", s:"INSERT INTO orders (status) VALUES ('pending');"},
+        {t:"B", s:"COMMIT;"},
+        {t:"A", s:"SELECT count(*) FROM orders WHERE status = 'pending';  -- ?", read:true},
+        {t:"A", s:"COMMIT;"}
+      ],
+      prevented: lvl => lvl === "rr" || lvl === "ser",
+      bad:  "A new row appeared inside A's transaction, so the same query returned a different count. Unlike a non-repeatable read, no row A had seen changed — a row was added to the set.",
+      good: "PostgreSQL's REPEATABLE READ uses snapshot isolation, which prevents phantoms as well as non-repeatable reads — stricter than the SQL standard requires. MySQL/InnoDB prevents them differently, using gap locks."
+    },
+    lost: {
+      name: "Lost update",
+      steps: [
+        {t:"A", s:"BEGIN;"},
+        {t:"B", s:"BEGIN;"},
+        {t:"A", s:"SELECT stock FROM products WHERE id = 1;  -- 10", read:true},
+        {t:"B", s:"SELECT stock FROM products WHERE id = 1;  -- 10", read:true},
+        {t:"A", s:"UPDATE products SET stock = 9 WHERE id = 1;"},
+        {t:"A", s:"COMMIT;"},
+        {t:"B", s:"UPDATE products SET stock = 9 WHERE id = 1;  -- also 10 - 1"},
+        {t:"B", s:"COMMIT;"}
+      ],
+      prevented: lvl => lvl === "ser",
+      bad:  "Two decrements, one unit of stock lost. Final value is 9 when it should be 8. Nothing errored, nothing logged, and the discrepancy surfaces weeks later during a stock count.",
+      good: "SERIALIZABLE detects that these two transactions cannot be ordered consistently and aborts one with a serialisation failure. Your application must catch that and retry, or you have swapped silent corruption for a visible error."
+    },
+    skew: {
+      name: "Write skew",
+      steps: [
+        {t:"A", s:"BEGIN;"},
+        {t:"B", s:"BEGIN;"},
+        {t:"A", s:"SELECT count(*) FROM shifts WHERE on_call;  -- 2, safe to leave", read:true},
+        {t:"B", s:"SELECT count(*) FROM shifts WHERE on_call;  -- 2, safe to leave", read:true},
+        {t:"A", s:"UPDATE shifts SET on_call = false WHERE doctor = 'A';"},
+        {t:"B", s:"UPDATE shifts SET on_call = false WHERE doctor = 'B';"},
+        {t:"A", s:"COMMIT;"},
+        {t:"B", s:"COMMIT;"}
+      ],
+      prevented: lvl => lvl === "ser",
+      bad:  "Nobody is on call. Each transaction was individually correct and they never touched the same row, so row locks would not have helped and REPEATABLE READ does not catch it. This is why SERIALIZABLE exists.",
+      good: "SERIALIZABLE tracks the read dependencies, not just the writes, and detects that the two transactions read a set the other then invalidated. One is aborted."
+    }
+  };
+
+  let step = 0;
+
+  function render(){
+    const sc = SCEN[$("i-anom").value];
+    const lvl = $("i-level").value;
+    const prevented = sc.prevented(lvl);
+    const shown = sc.steps.slice(0, step);
+
+    $("i-timeline").innerHTML =
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:16px 0 6px">' +
+      '<div style="font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:#0F7A85;font-weight:700">Transaction A</div>' +
+      '<div style="font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:#B0453B;font-weight:700">Transaction B</div>' +
+      sc.steps.map((s, i) => {
+        const active = i < step;
+        const isLast = i === step - 1;
+        const cell = '<div style="background:' + (active ? "#fff" : "#F7F9FA") +
+          ';border:1px solid ' + (isLast ? (s.t === "A" ? "#25B7C4" : "#E2574C") : "#E1E7EC") +
+          ';border-left:3px solid ' + (active ? (s.t === "A" ? "#25B7C4" : "#E2574C") : "#E1E7EC") +
+          ';border-radius:4px;padding:7px 10px;font-family:var(--mono);font-size:11.5px;line-height:1.45;' +
+          'color:' + (active ? "#25323E" : "#C4CDD5") + '">' +
+          s.s.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</div>';
+        const blank = '<div></div>';
+        return s.t === "A" ? cell + blank : blank + cell;
+      }).join("") + '</div>';
+
+    const done = step >= sc.steps.length;
+    $("i-outcome").textContent   = !done ? "running" : prevented ? "safe" : "anomaly";
+    $("i-prevented").textContent = !done ? "—" : prevented ? "yes" : "no";
+
+    const notes = [];
+    if(!done)
+      notes.push("Step " + step + " of " + sc.steps.length + ". Keep stepping to see the outcome at " +
+                 {ru:"READ UNCOMMITTED", rc:"READ COMMITTED", rr:"REPEATABLE READ", ser:"SERIALIZABLE"}[lvl] + ".");
+    else
+      notes.push((prevented ? "Prevented. " : "NOT prevented. ") + (prevented ? sc.good : sc.bad));
+
+    if(done && !prevented && lvl === "rc" && $("i-anom").value === "lost")
+      notes.push("This is the default isolation level in PostgreSQL, Oracle and SQL Server, and it does not prevent lost updates. " +
+                 "Most application code that reads a value, computes a new one and writes it back has this bug — it is simply rare enough not to have been noticed yet.");
+    if(done && !prevented && $("i-anom").value === "skew")
+      notes.push("Note that A and B updated different rows. There is no lock contention to resolve, which is why every level below SERIALIZABLE allows this. " +
+                 "The practical alternatives are locking the rows you READ with FOR UPDATE, or expressing the rule as a database constraint so no code path can violate it.");
+    if(done && prevented && lvl === "ser")
+      notes.push("SERIALIZABLE prevents this by ABORTING one transaction, not by making it wait. Your application sees a serialisation failure and must retry the whole thing from the beginning — " +
+                 "which means the transaction body has to be safe to run twice.");
+    if(done && lvl === "ru")
+      notes.push("Worth knowing: in PostgreSQL, READ UNCOMMITTED is treated as READ COMMITTED. Dirty reads are not implementable in its MVCC design, so requesting the weaker level buys you nothing.");
+
+    $("i-note").textContent = notes.join("\n\n");
+    $("i-step").disabled = done;
+    $("i-step").textContent = done ? "complete" : "step";
+  }
+
+  $("i-step").addEventListener("click", () => { step++; render(); });
+  $("i-reset").addEventListener("click", () => { step = 0; render(); });
+  ["i-anom","i-level"].forEach(id => $(id).addEventListener("change", () => { step = 0; render(); }));
+  render();
+})();
+</script>
+</body>
+</html>

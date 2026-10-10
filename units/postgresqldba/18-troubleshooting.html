@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · Troubleshooting — PostgreSQL</title>
+<meta name="description" content="A diagnostic playbook: the symptom, the query that identifies the cause, and the fix — for the failures that actually happen.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 18 · At scale</div>
+    <h1>Troubleshooting</h1>
+    <p class="standfirst">Everything so far, arranged by symptom. Twelve failures account for most Postgres incidents, and for each one there is a query that identifies the cause in seconds — provided you have it to hand rather than reconstructing it at 3am.</p>
+    <div class="chap-meta">
+      <span class="tagpill">playbook</span>
+      <span class="tagpill">first five minutes</span>
+      <span class="tagpill">locks</span>
+      <span class="tagpill">closing</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The first five minutes</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">four queries, in this order, before forming a theory</span><button class="copy">Copy</button></div>
+<pre><code>-- 1. What is running, longest first.
+SELECT pid, now() - query_start AS runtime, state,
+       wait_event_type, wait_event, left(query, 90)
+FROM pg_stat_activity
+WHERE state <> 'idle' AND pid <> pg_backend_pid()
+ORDER BY query_start;
+
+-- 2. Who is blocking whom. THE most useful query in an incident.
+SELECT blocked.pid          AS blocked_pid,
+       blocked.usename      AS blocked_user,
+       left(blocked.query, 60)  AS blocked_query,
+       blocking.pid         AS blocking_pid,
+       blocking.state       AS blocking_state,
+       now() - blocking.xact_start AS blocking_for,
+       left(blocking.query, 60) AS blocking_query
+FROM pg_stat_activity blocked
+JOIN pg_stat_activity blocking
+  ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
+WHERE cardinality(pg_blocking_pids(blocked.pid)) > 0;
+
+-- 3. Connections, by state.
+SELECT state, count(*), max(now() - state_change) AS longest
+FROM pg_stat_activity WHERE backend_type = 'client backend' GROUP BY state;
+
+-- 4. Disk and WAL.
+SELECT pg_size_pretty(sum(size)) FROM pg_ls_waldir();
+-- plus df on the data directory
+
+-- Keep these four in a file. Reconstructing pg_blocking_pids from memory at
+-- 3am is not a skill worth developing.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Ask whether it is the database at all</span>
+  <p>Before diagnosing Postgres, check the two things that make it look guilty when it is not. <b>Connection pool saturation</b> — if the pool is full, every request queues and the symptom is total unavailability while the database sits at 10% CPU (chapter 9). <b>A dependency</b> — an application holding transactions open across a slow HTTP call produces long-running transactions, exhausted pools and blocked vacuum, all originating outside the database. Both look exactly like "the database is slow" and neither is fixed by touching the database.</p>
+</div>
+
+<h2><span class="h-rule"></span>The playbook</h2>
+
+<div class="demo" id="tb">
+  <div class="demo-head">
+    <b>Symptom to cause</b>
+    <span>Pick what you are seeing. The query identifies which cause it is; the fix depends on that answer.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="d-sym">Symptom</label>
+        <select id="d-sym">
+          <option value="slow" selected>Everything is slow, all at once</option>
+          <option value="oneslow">One query got slow, nothing changed</option>
+          <option value="conn">Cannot connect — too many clients</option>
+          <option value="disk">Disk filling up</option>
+          <option value="bloat">A table keeps growing despite deletes</option>
+          <option value="wraparound">Wraparound warnings in the log</option>
+          <option value="lock">A migration or query is hung</option>
+          <option value="deadlock">Deadlock errors appearing</option>
+          <option value="replag">Replication lag climbing</option>
+          <option value="afterupgrade">Slow immediately after an upgrade</option>
+          <option value="oom">The server restarted on its own</option>
+          <option value="corrupt">Checksum or invalid page errors</option>
+        </select>
+      </div>
+    </div>
+    <div id="d-causes"></div>
+    <div id="d-query"></div>
+    <div class="out" id="d-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Locks</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the full picture, when the blocking query is not enough</span><button class="copy">Copy</button></div>
+<pre><code>SELECT l.pid, l.locktype, l.mode, l.granted,
+       CASE l.locktype
+            WHEN 'relation' THEN l.relation::regclass::text
+            WHEN 'transactionid' THEN l.transactionid::text
+            ELSE coalesce(l.objid::text, '')
+       END AS target,
+       now() - a.xact_start AS txn_age,
+       a.state, left(a.query, 70)
+FROM pg_locks l
+JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE NOT l.granted OR l.mode LIKE '%Exclusive%'
+ORDER BY l.granted, a.xact_start;
+
+-- Lock modes, in increasing strength:
+--   ACCESS SHARE            SELECT. Conflicts only with ACCESS EXCLUSIVE
+--   ROW EXCLUSIVE           INSERT, UPDATE, DELETE
+--   SHARE                   CREATE INDEX (blocks writes)
+--   SHARE ROW EXCLUSIVE     ADD FOREIGN KEY
+--   EXCLUSIVE               REFRESH MATERIALIZED VIEW
+--   ACCESS EXCLUSIVE        most ALTER TABLE, DROP, VACUUM FULL.
+--                           Blocks EVERYTHING including reads
+
+-- Resolve, least violent first:
+SELECT pg_cancel_backend(12345);      -- cancel the query, keep the connection
+SELECT pg_terminate_backend(12345);   -- kill the connection entirely
+-- Cancel first. Terminate only if cancel does not work, and never blindly —
+-- read the query before killing it.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">The lock queue is why one slow query stops everything</span>
+  <p>Lock requests are ordered. A migration requests <code>ACCESS EXCLUSIVE</code>, waits behind one long-running <code>SELECT</code>, and <b>every query that arrives afterwards queues behind the migration</b> — including ordinary reads that would not have conflicted with the <code>SELECT</code> at all. One slow report plus one <code>ALTER TABLE</code> equals a total outage on that table. This is the single most common "the database froze for no reason" cause, and <code>lock_timeout</code> on every DDL statement prevents it entirely (SQL chapter 16).</p>
+</div>
+
+<h2><span class="h-rule"></span>Recovering from a full disk</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the awkward one, because you cannot write</span><button class="copy">Copy</button></div>
+<pre><code># Postgres has stopped accepting writes. Do NOT delete anything in pg_wal by
+# hand — removing unarchived segments breaks recovery and replication both.
+
+# 1. Buy space from outside the data directory.
+rm /var/log/postgresql/*.gz            # old logs
+#    Or extend the volume, which is usually fastest in cloud.
+
+# 2. Find why WAL is being retained (chapters 4, 12, 13).
+psql -c "SELECT slot_name, active, wal_status,
+         pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn))
+         FROM pg_replication_slots ORDER BY 4 DESC;"
+psql -c "SELECT failed_count, last_failed_time FROM pg_stat_archiver;"
+
+# 3. Fix the cause, then WAL is recycled at the next checkpoint.
+psql -c "SELECT pg_drop_replication_slot('dead_standby');"
+#    or repair archive_command, then:
+psql -c "CHECKPOINT;"
+
+# If it will not start at all, Postgres reserves a small emergency file
+# precisely for this. If even that is exhausted, create space and start it in
+# single-user mode:
+postgres --single -D $PGDATA postgres
+
+# Afterwards, prevent the recurrence:
+#   max_slot_wal_keep_size = '100GB'
+#   alerts on pg_wal size and pg_stat_archiver.failed_count</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>When a query must be stopped</h2>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Read it first</b><span>Is it a report someone is waiting on, or a runaway? Thirty seconds of reading avoids a worse problem</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Check what it is blocking</b><span>If nothing, you may have time to let it finish</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b><code>pg_cancel_backend</code></b><span>Cancels the statement, keeps the connection. Almost always sufficient</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b><code>pg_terminate_backend</code></b><span>Kills the connection. Uncommitted work rolls back</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Never <code>kill -9</code> a backend</b><span>The postmaster restarts the whole cluster to protect shared memory</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Then prevent it</b><span>A per-role <code>statement_timeout</code> is the fix, not vigilance</span></div>
+</div>
+
+<div class="note trap">
+  <span class="note-t">A rollback can take as long as the work did</span>
+  <p>Terminating a backend halfway through a large <code>UPDATE</code> does not free things instantly. The transaction must roll back, and on a statement that has modified millions of rows that takes real time — during which the locks are still held and the situation looks unchanged. People terminate again, then start killing processes, and make things considerably worse. <b>Watch <code>pg_stat_activity</code> after terminating</b>; if the backend is still there in state <code>idle</code> with no query, it is rolling back and the correct action is to wait.</p>
+</div>
+
+<h2><span class="h-rule"></span>Corruption</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">stop, take a copy, then investigate</span><button class="copy">Copy</button></div>
+<pre><code>-- ERROR: invalid page in block 8213 of relation base/16384/16401
+-- WARNING: page verification failed, calculated checksum 21023 but expected 15118
+
+-- 1. STOP. Take a filesystem-level copy of the data directory before doing
+--    anything else. Every subsequent action can make recovery harder.
+
+-- 2. Identify what is affected.
+SELECT relname FROM pg_class WHERE relfilenode = 16401;
+
+-- 3. Check the extent, with amcheck.
+CREATE EXTENSION amcheck;
+SELECT bt_index_check(index => c.oid, heapallindexed => true)
+FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+WHERE c.relam = (SELECT oid FROM pg_am WHERE amname = 'btree')
+  AND c.relpersistence = 'p';
+
+-- 4. If it is only an INDEX, that is recoverable: REINDEX rebuilds it from
+--    the heap. If the HEAP is corrupt, restore from backup.
+
+-- Do NOT reach for ignore_checksum_failure or zero_damaged_pages to make the
+-- error go away. They let you read past the damage, silently discarding data,
+-- and they turn a contained problem into an unknown one.
+
+-- Causes, in rough order: failing storage, a kernel or filesystem bug, a
+-- volatile write cache that lied about fsync, and operator error such as
+-- copying a data directory from a running server.
+--
+-- And note the point from chapter 5: WITHOUT checksums enabled, none of these
+-- errors appear at all. The corruption is read back as plausible data and
+-- propagates into every replica and every backup before anyone notices.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Things that look like Postgres problems and are not</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Symptom</th><th>Actual cause</th></tr></thead>
+<tbody>
+<tr><td>Total unavailability, low database CPU</td><td>Connection pool exhausted (chapter 9)</td></tr>
+<tr><td>Long transactions, blocked vacuum</td><td>The application holding a transaction across an HTTP call</td></tr>
+<tr><td>Intermittent timeouts, no slow queries</td><td>Network, or DNS resolution on connect</td></tr>
+<tr><td>Slow every hour on the hour</td><td>A cron job competing for I/O</td></tr>
+<tr><td>Slow for one customer only</td><td>Data skew — that tenant has 40× the rows</td></tr>
+<tr><td>Latency spikes with no query cause</td><td>Transparent huge pages, or a noisy neighbour (chapter 8)</td></tr>
+<tr><td>Everything slow after a deploy, queries unchanged</td><td>A new index, a plan change, or a config change</td></tr>
+<tr><td>Reads stale or wrong</td><td>Reading from a replica (chapter 13)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>Working an incident</h2>
+
+<ul class="check">
+  <li><b>Write down what you run and what it returned.</b> In the incident channel, as you go — reconstructing it afterwards is guesswork and the post-mortem needs it.</li>
+  <li><b>Change one thing at a time.</b> Two simultaneous changes and you will not know which helped, or which caused the next problem.</li>
+  <li><b>Prefer reversible actions.</b> Cancelling a query is reversible; a config change needing a restart is not, mid-incident.</li>
+  <li><b>Do not restart to "clear things up".</b> It discards the evidence and starts crash recovery, which can take longer than the incident.</li>
+  <li><b>Take a copy before destructive steps</b> — a snapshot of the volume, or a copy of the data directory.</li>
+  <li><b>Know when to fail over</b> and when not to. A slow primary usually stays slow after promotion (chapter 14).</li>
+  <li><b>Capture the state before fixing it.</b> <code>pg_stat_activity</code>, <code>pg_locks</code>, the plan — once resolved, they are gone.</li>
+</ul>
+
+<div class="note key">
+  <span class="note-t">The queries in this chapter belong in a file</span>
+  <p>Not in your memory, and not in a wiki page nobody can find. A <code>~/pg-incident.sql</code> checked into the ops repository, with the four opening queries and the twelve diagnostic ones, is worth more during an incident than any amount of remembered detail. Add to it every time you work something out the hard way. That file, and the history from chapter 17, are the two things that turn a two-hour investigation into a ten-minute one.</p>
+</div>
+
+<h2><span class="h-rule"></span>Where this unit ends</h2>
+
+<p>Eighteen chapters from five design decisions. A process per connection, so pooling is mandatory. MVCC by tuple versioning, so readers never block writers and dead rows accumulate. Vacuum as a separate process, so bloat and wraparound are things you operate rather than things that happen. Write-ahead logging, which turns out to provide durability, replication and point-in-time recovery from one mechanism. And extensibility deep enough to add index types, which is why "just use Postgres" is a serious architectural position rather than a slogan.</p>
+
+<p>Almost everything operational in this unit traces back to one of those. The bloat is MVCC. The wraparound alarm is MVCC. The idle-in-transaction timeout matters because one snapshot holds the cleanup horizon for the whole cluster. The disk fills because a replication slot is retaining WAL, and WAL exists because of the write path. The connection pooler exists because a connection is a process. Once the five are internalised, the rest is consequence — which is why the first four chapters are the ones worth rereading.</p>
+
+<p>Three things are worth doing this week, whatever else you take from this. Set <b><code>idle_in_transaction_session_timeout</code></b>. Check <b><code>SHOW data_checksums</code></b>. And <b>run a restore</b>, end to end, and time it. Each takes under an hour and each addresses a failure that is otherwise silent until it is not.</p>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Four queries first: <b>what is running, who blocks whom, connections by state, disk</b>. Keep them in a file.</li>
+    <li><b>Ask whether it is the database at all.</b> Pool exhaustion and application-held transactions both look exactly like this.</li>
+    <li><b>The lock queue</b> is why one slow query plus one <code>ALTER TABLE</code> freezes a table entirely.</li>
+    <li><b>Cancel before terminate</b>, never <code>kill -9</code>, and expect a rollback to take as long as the work did.</li>
+    <li>On a full disk, <b>never delete WAL by hand</b> — find the slot or the failing archive command.</li>
+    <li>On corruption: <b>copy the data directory first</b>, and do not silence the error to make it go away.</li>
+    <li><b>Capture state before fixing it.</b> Once resolved, the evidence is gone.</li>
+    <li>Set <code>idle_in_transaction_session_timeout</code>, check <code>data_checksums</code>, and <b>time a real restore</b>.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("18-troubleshooting.html");
+
+(function(){
+  const root = document.getElementById("tb");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const S = {
+    slow: {
+      causes:[["Lock contention","chapter 10 of the SQL unit"],["Connection pool exhausted","chapter 9"],
+              ["A runaway query saturating I/O","chapter 17"],["Checkpoint I/O spike","chapter 4"],
+              ["Anti-wraparound vacuum running","chapter 3"]],
+      q:"-- Aggregate wait events: what is everything waiting FOR?\nSELECT wait_event_type, wait_event, count(*)\nFROM pg_stat_activity\nWHERE state <> 'idle' AND backend_type = 'client backend'\nGROUP BY 1,2 ORDER BY count(*) DESC;",
+      note:"The wait-event breakdown distinguishes the causes immediately, which is why it comes before anything else.\n\nMostly 'Lock' means one transaction is blocking many — run the blocking-pid query and you have your answer in seconds. Mostly 'IO' means something is saturating the disk: a runaway query, a checkpoint, or an anti-wraparound vacuum. Mostly null means everything is genuinely on CPU, which points at query volume or plan changes rather than contention. Mostly 'ClientRead' with state 'idle in transaction' means the application is holding transactions open and the database is waiting on IT.\n\nThat last case is the one people misdiagnose most: the database looks busy, is doing nothing, and the fix is entirely in application code."
+    },
+    oneslow: {
+      causes:[["A plan flipped after statistics changed","chapter 7"],["A prepared statement switched to a generic plan","chapter 1"],
+              ["The table grew past a crossover point","chapter 7"],["An index became bloated","chapter 3"],
+              ["Data skew for one parameter value","chapter 7"]],
+      q:"-- Compare against the baseline you snapshotted (chapter 17)\nSELECT calls, mean_exec_time, stddev_exec_time, rows/calls AS rows_per_call\nFROM pg_stat_statements WHERE queryid = :id;\n\nEXPLAIN (ANALYZE, BUFFERS) <the query>;",
+      note:"High stddev relative to the mean is the tell for a plan that flips between executions — usually parameter sniffing, where a prepared statement built a generic plan that suits one parameter value and not another. SET plan_cache_mode = 'force_custom_plan' confirms it in one line.\n\nIf the mean has moved steadily rather than becoming erratic, the table probably crossed a cost crossover: the planner switched from an index scan to a sequential scan because selectivity changed. Chapter 7's demo shows exactly where that boundary sits.\n\nAnd check Heap Fetches if the plan is an index-only scan. A high figure means the table needs vacuuming, not a different index — the visibility map is stale (chapter 3)."
+    },
+    conn: {
+      causes:[["No pooler, or the pool is too small","chapter 9"],["Backends stuck in idle in transaction","chapter 8"],
+              ["Queries got slower, so more run concurrently","chapter 17"],["A client leaking connections",""]],
+      q:"SELECT state, count(*), max(now() - state_change) AS longest,\n       max(now() - xact_start) AS oldest_txn\nFROM pg_stat_activity\nWHERE backend_type = 'client backend'\nGROUP BY state;",
+      note:"Read the state breakdown before doing anything. A large 'idle in transaction' count means backends are checked out and doing nothing — the fix is in the application, and idle_in_transaction_session_timeout stops it recurring.\n\nA large 'active' count means queries genuinely got slower, so the same traffic now needs more concurrent backends. Raising max_connections here makes it worse: past the knee, more concurrency reduces throughput (chapter 9). Find what got slow instead.\n\nA large 'idle' count with no pooler means clients are holding connections they are not using, which is exactly what a pooler exists to solve.\n\nsuperuser_reserved_connections is what lets you run this query at all when the limit is reached — if you cannot connect, that setting was never configured."
+    },
+    disk: {
+      causes:[["An inactive replication slot retaining WAL","chapters 4, 13"],["archive_command failing","chapter 12"],
+              ["Table or index bloat","chapter 3"],["Temp files from spilling sorts","chapter 8"],
+              ["Old WAL from a very large max_wal_size","chapter 4"]],
+      q:"SELECT pg_size_pretty(sum(size)) AS wal FROM pg_ls_waldir();\n\nSELECT slot_name, active, wal_status,\n  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS held\nFROM pg_replication_slots ORDER BY 4 DESC;\n\nSELECT failed_count, last_failed_time FROM pg_stat_archiver;",
+      note:"Check pg_wal first. If it is large, the cause is one of two things and both are visible in the queries above: a replication slot holding WAL for a consumer that will never return, or an archive_command that has been failing silently.\n\nNever delete files from pg_wal by hand. Removing unarchived segments breaks both recovery and replication, and it is the one action that turns a disk-space incident into a data-loss incident.\n\nIf pg_wal is normal, look at table and TOAST sizes — remember pg_relation_size excludes TOAST, so use pg_total_relation_size (chapter 5).\n\nPrevention: max_slot_wal_keep_size so Postgres invalidates a runaway slot rather than sacrificing the primary, plus alerts on pg_wal size and failed_count."
+    },
+    bloat: {
+      causes:[["A long transaction holding the cleanup horizon","chapter 2"],["A replication slot holding xmin","chapter 13"],
+              ["autovacuum scale_factor too high for the table size","chapter 3"],["A prepared transaction left in doubt",""],
+              ["Updates disqualified from HOT","chapter 5"]],
+      q:"SELECT max(age(backend_xmin)) FROM pg_stat_activity;\nSELECT slot_name, age(xmin) FROM pg_replication_slots;\nSELECT * FROM pg_prepared_xacts;   -- should be empty\n\nSELECT relname, n_dead_tup, last_autovacuum, autovacuum_count\nFROM pg_stat_user_tables ORDER BY n_dead_tup DESC LIMIT 10;",
+      note:"The diagnostic that matters is whether vacuum is RUNNING but not reclaiming, or not running at all — and last_autovacuum distinguishes them.\n\nRunning but reclaiming nothing means something is holding the cleanup horizon: the oldest backend_xmin, a logical replication slot, or a prepared transaction. All three block vacuum cluster-wide, and vacuum will complete successfully while freeing nothing, which is what makes this confusing.\n\nNot running means autovacuum is not reaching the table — usually the default scale_factor of 0.2, which is a percentage and therefore waits for 20 million dead tuples on a 100-million-row table.\n\nIf neither applies, check the HOT ratio: n_tup_hot_upd / n_tup_upd. An index on a constantly-updated column disqualifies every update from HOT and multiplies the cleanup work by the index count (chapter 5)."
+    },
+    wraparound: {
+      causes:[["Autovacuum too slow for the write rate","chapter 3"],["A long transaction blocking freezing","chapter 2"],
+              ["An abandoned replication slot","chapter 13"],["autovacuum disabled at some point",""]],
+      q:"SELECT datname, age(datfrozenxid) FROM pg_database ORDER BY 2 DESC;\n\nSELECT c.relname, age(c.relfrozenxid)\nFROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace\nWHERE c.relkind IN ('r','m','t') AND n.nspname NOT LIKE 'pg\\_%'\nORDER BY 2 DESC LIMIT 20;",
+      note:"Act on this. The endpoint is the database refusing all writes and requiring a single-user-mode recovery, which on a large cluster is a multi-hour outage.\n\nFind the specific tables with the highest relfrozenxid age and vacuum them manually with a raised cost limit — do not wait for autovacuum, which is throttled by design. And remove whatever is holding the horizon first, or the manual vacuum will be as ineffective as the automatic one.\n\nOne thing to expect: at autovacuum_freeze_max_age an ANTI-WRAPAROUND vacuum starts, and unlike a normal one it does not yield to conflicting lock requests. It will block your migration on your largest table for hours and there is nothing to do but wait. That is frequently how teams first discover the problem — as a deploy that mysteriously hangs."
+    },
+    lock: {
+      causes:[["Waiting behind a long-running query","SQL chapter 16"],["A conflicting DDL statement",""],
+              ["An anti-wraparound vacuum that will not yield","chapter 3"],["An idle-in-transaction session holding a lock","chapter 2"]],
+      q:"SELECT blocked.pid, left(blocked.query, 50) AS blocked_query,\n       blocking.pid AS blocker, blocking.state,\n       now() - blocking.xact_start AS blocking_for,\n       left(blocking.query, 50) AS blocking_query\nFROM pg_stat_activity blocked\nJOIN pg_stat_activity blocking\n  ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))\nWHERE cardinality(pg_blocking_pids(blocked.pid)) > 0;",
+      note:"This is the query to have memorised or, better, in a file. It identifies the culprit in one step where reading pg_locks directly takes several.\n\nThe crucial thing to understand: lock requests are ORDERED. A migration waiting for ACCESS EXCLUSIVE behind one long SELECT causes every subsequent query — including ordinary reads that would not have conflicted with the SELECT — to queue behind the migration. One slow report plus one ALTER TABLE equals a total outage on that table.\n\nSo cancelling the blocked DDL often resolves the whole pile-up immediately, and it is usually the right first action.\n\nPrevention is lock_timeout on every DDL statement, with retry. It converts this failure into a migration that fails fast and tries again."
+    },
+    deadlock: {
+      causes:[["Inconsistent lock ordering across code paths","SQL chapter 10"],["Long transactions holding many locks",""],
+              ["Foreign keys locking parent rows","SQL chapter 11"],["Check-then-insert instead of an upsert","SQL chapter 9"]],
+      q:"SELECT datname, deadlocks FROM pg_stat_database\nWHERE datname = current_database();\n\n-- log_lock_waits = on gives you the full detail in the log:\n--   ERROR: deadlock detected\n--   DETAIL: Process 123 waits for ShareLock on transaction 456...\n--   the log entry names BOTH statements",
+      note:"Deadlocks are normal in small numbers — the database detected a circular wait and resolved it by killing the cheaper victim, which is correct behaviour rather than a bug. Every write path should retry them, using the same logic as serialisation failures since the error codes and correct response are identical.\n\nWhat matters is the RATE. A step change means a new lock-ordering bug shipped, and the log entry names both statements involved, which usually identifies it immediately.\n\nThe fix is almost always consistent lock ordering: sort by primary key before updating multiple rows, so two transactions touching the same set acquire them in the same sequence and one simply waits."
+    },
+    replag: {
+      causes:[["Standby storage slower than the primary","chapter 13"],["A conflicting query on the standby",""],
+              ["Network saturation",""],["Single-threaded replay cannot keep up",""],["A large write burst on the primary",""]],
+      q:"-- On the primary\nSELECT application_name, state, sent_lsn, replay_lsn,\n       write_lag, flush_lag, replay_lag\nFROM pg_stat_replication;\n\n-- On the standby\nSELECT wait_event_type, wait_event FROM pg_stat_activity\nWHERE backend_type = 'startup';",
+      note:"Compare sent_lsn against replay_lsn. If they are close, the WAL is arriving and replay is keeping up — the lag is network. If sent is far ahead of replay, the standby is receiving fine and cannot apply fast enough.\n\nReplay is single-threaded, so a standby on slower storage than the primary will fall behind under sustained write load and never recover. That is a hardware mismatch rather than a tuning problem.\n\nThe startup process's wait event tells you what replay is blocked on. A recovery conflict means a long query on the standby is holding rows that replay needs to remove — max_standby_streaming_delay and hot_standby_feedback are the two knobs, and they trade the problem for bloat on the primary (chapter 13).\n\nAnd remember the false alarm: time-based lag grows on an idle primary because there is nothing new to replay. Check byte lag too."
+    },
+    afterupgrade: {
+      causes:[["Statistics were not carried across","chapter 16"],["A planner behaviour change",""],
+              ["An extension not upgraded","chapter 10"],["A default setting changed between versions","chapter 16"],
+              ["Collation change invalidating text indexes","chapter 16"]],
+      q:"-- Almost always this, and it is a two-minute fix:\nvacuumdb --all --analyze-in-stages --jobs=8\n\n-- Then compare against the baseline you captured\nSELECT queryid, mean_exec_time FROM pg_stat_statements\nORDER BY total_exec_time DESC LIMIT 20;\n\n-- And diff the settings\nSELECT name, setting, boot_val FROM pg_settings\nWHERE setting <> boot_val ORDER BY name;",
+      note:"Nine times out of ten it is statistics. pg_upgrade does not carry them across, so the planner starts blind and builds every plan for a table it believes is empty. vacuumdb --analyze-in-stages runs three passes of increasing accuracy and gives usable estimates within seconds.\n\nRun it as the very next command after starting the new cluster, not as a follow-up task.\n\nIf statistics are fresh and something is still slow, compare against the pre-upgrade pg_stat_statements snapshot to identify which specific query regressed — then look at its plan on both versions. This is why capturing that baseline is part of the upgrade procedure.\n\nAnd if TEXT queries are returning wrong or missing rows rather than being slow, check collation versions immediately. That is index corruption, not a performance problem."
+    },
+    oom: {
+      causes:[["The OOM killer chose the postmaster","chapter 8"],["work_mem × connections × nodes exceeded RAM","chapter 8"],
+              ["A backend crashed and the postmaster restarted everything",""],["Storage or filesystem failure",""]],
+      q:"-- In the Postgres log:\n--   LOG: server process (PID 1234) was terminated by signal 9: Killed\n--   LOG: terminating any other active server processes\n\n-- In the kernel log:\n--   dmesg | grep -i 'out of memory'\n--   journalctl -k | grep -i oom",
+      note:"When any backend dies uncleanly, the postmaster restarts the entire cluster — it cannot know whether shared memory was corrupted, so it will not take the risk. One killed backend is a full restart and crash recovery.\n\nIf it is the OOM killer, the arithmetic to check is chapter 8's: work_mem is per sort or hash NODE, multiplied again by parallel workers. A hundred connections each running a query with two hash joins and four workers can allocate a thousand times work_mem.\n\nTwo preventions. Set vm.overcommit_memory = 2 so an allocation fails rather than the kernel choosing a victim — a failed query is much better than a cluster restart. And lower the global work_mem, raising it per role for the reporting workloads that need it.\n\nAlso check for transparent huge pages, which cause latency spikes and memory pressure both, and should be off."
+    },
+    corrupt: {
+      causes:[["Failing storage",""],["A volatile write cache that lied about fsync","chapter 5"],
+              ["A kernel or filesystem bug",""],["A data directory copied from a running server",""],
+              ["Collation change reordering a text index","chapter 16"]],
+      q:"-- FIRST: take a filesystem copy of the data directory.\n\nSELECT relname FROM pg_class WHERE relfilenode = 16401;\n\nCREATE EXTENSION amcheck;\nSELECT bt_index_check(index => c.oid, heapallindexed => true)\nFROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid\nWHERE c.relam = (SELECT oid FROM pg_am WHERE amname='btree');",
+      note:"Stop and take a copy before anything else. Every subsequent action can make recovery harder, and a copy costs minutes.\n\nThen establish the extent. If only an INDEX is corrupt you are fine — REINDEX rebuilds it from the heap and nothing is lost. If the HEAP is corrupt, restore from backup, and use PITR to a point before the corruption if you can identify when it started.\n\nDo not use ignore_checksum_failure or zero_damaged_pages to make the error stop. They let you read past the damage while silently discarding data, turning a contained and diagnosable problem into an unknown one.\n\nAnd the point that decides whether you found this early or late: WITHOUT checksums enabled, none of these errors appear at all. The corruption is read back as plausible data and flows into every replica and every backup. Check SHOW data_checksums on every cluster you own."
+    }
+  };
+
+  function render(){
+    const s = S[$("d-sym").value];
+
+    $("d-causes").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:16px 0 8px">' +
+      'Likely causes, most common first</div>' +
+      '<div style="display:flex;flex-direction:column;gap:5px">' +
+      s.causes.map((c, i) =>
+        '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid ' +
+        (i === 0 ? "#E2574C" : i === 1 ? "#F2A03D" : "#CFD8E0") +
+        ';border-radius:4px;padding:8px 12px;display:flex;gap:10px;align-items:baseline">' +
+        '<span style="font-family:var(--mono);font-size:11px;color:#8FA0AF">' + (i+1) + '</span>' +
+        '<span style="flex:1;font-size:13.5px">' + c[0] + '</span>' +
+        (c[1] ? '<span style="font-size:11.5px;color:#8FA0AF">' + c[1] + '</span>' : '') +
+        '</div>').join("") + '</div>';
+
+    $("d-query").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      'The query that tells you which</div>' +
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid #25B7C4;border-radius:5px;' +
+      'padding:11px 13px;margin:0 0 12px;font-family:var(--mono);font-size:12px;line-height:1.6;overflow-x:auto">' +
+      s.q.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>';
+
+    $("d-note").textContent = s.note;
+  }
+
+  $("d-sym").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

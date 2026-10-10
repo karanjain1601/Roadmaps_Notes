@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Lists, hashes and sets — Redis</title>
+<meta name="description" content="Three structures that cover most of what people actually build — queues, objects and membership — with the operations that make each one worth choosing.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 04 · The structures</div>
+    <h1>Lists, hashes and sets</h1>
+    <p class="standfirst">Three structures covering queues, objects and membership. Most Redis code is made of these plus strings, and choosing between them is mostly a question of which operations you need to be cheap.</p>
+    <div class="chap-meta">
+      <span class="tagpill">lists</span>
+      <span class="tagpill">hashes</span>
+      <span class="tagpill">sets</span>
+      <span class="tagpill">encodings</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Lists</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">a doubly-linked structure — fast at the ends, slow in the middle</span><button class="copy">Copy</button></div>
+<pre><code>LPUSH  jobs "a" "b"        # push left. O(1)
+RPUSH  jobs "c"            # push right. O(1)
+LPOP   jobs                # pop left. O(1)
+RPOP   jobs [count]        # pop right, optionally several
+LLEN   jobs                # O(1)
+LRANGE jobs 0 9            # O(N) in what you ASK FOR — bound it
+LINDEX jobs 5              # O(N) — walks from the nearest end
+LSET   jobs 5 "x"          # O(N)
+LREM   jobs 1 "x"          # remove occurrences. O(N)
+LTRIM  jobs 0 999          # keep the first 1000, discard the rest. O(N)
+LPOS   jobs "x"            # find the index of a value (6.0.6+)
+LMPOP  2 q1 q2 LEFT        # pop from the first non-empty of several (7.0+)
+
+# BLOCKING pops — the reason lists are used as queues at all:
+BLPOP  jobs 0              # block until an element arrives. 0 = forever
+BRPOP  jobs 5              # or time out after 5 seconds
+BLMPOP 5 2 q1 q2 LEFT      # blocking multi-key (7.0+)
+
+# The client waits on the server rather than polling, so there is no
+# busy-loop and no latency between the push and the pop. A worker doing
+# BLPOP in a loop is an efficient consumer with no polling interval to tune.
+
+# A CAPPED LIST — a recent-events log that cannot grow without bound:
+LPUSH  recent:u41 "event"
+LTRIM  recent:u41 0 99     # keep the newest 100
+# Two commands. Do them in a pipeline or a MULTI so the trim always follows
+# (chapter 8), or the list grows if the second one fails.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">A list is a queue, and it is not a message queue</span>
+  <p><code>LPUSH</code> plus <code>BRPOP</code> gives you a working job queue in two commands, and it is genuinely good for that. What it does not give you is <b>acknowledgement</b>: once a worker pops an item, the item is gone from Redis, so a worker that crashes mid-job loses the work with no record. <code>LMOVE</code> (or the deprecated <code>RPOPLPUSH</code>) into a processing list is the classic mitigation — the item moves atomically to a second list, and the worker removes it there on success — but you then have to detect and recover abandoned items yourself. <b>If the work must not be lost, you want a stream with consumer groups</b> (chapter 6), which does all of this properly.</p>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the reliable-queue pattern, and its limits</span><button class="copy">Copy</button></div>
+<pre><code># Atomically move an item from the queue to a per-worker processing list:
+LMOVE jobs processing:worker-3 RIGHT LEFT
+BLMOVE jobs processing:worker-3 RIGHT LEFT 0     # blocking version
+
+# ... do the work ...
+LREM processing:worker-3 1 "the-job"             # acknowledge
+
+# If the worker dies, the job sits in processing:worker-3 forever. You need
+# a reaper: something that looks for processing lists belonging to workers
+# that have stopped heartbeating and moves their items back.
+#
+# That reaper is the part people skip, and it is why this pattern quietly
+# loses jobs. Chapter 6's consumer groups have the equivalent built in —
+# XAUTOCLAIM does exactly this and knows how long each message has been
+# pending.
+
+# WHERE A LIST QUEUE IS STILL THE RIGHT CHOICE:
+#   * the work is idempotent and cheap to redo, so loss is tolerable
+#   * you want the simplest possible thing and one consumer
+#   * throughput matters more than delivery guarantees
+#   * you are pushing to a fan-out of workers with BRPOP and no state</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Hashes</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">an object, with field-level access</span><button class="copy">Copy</button></div>
+<pre><code>HSET    user:41 name "Amara" tier "gold" visits 412
+HGET    user:41 tier                  # one field. O(1)
+HMGET   user:41 name tier             # several. O(N) in fields requested
+HGETALL user:41                       # ALL of them. O(N) — see the warning
+HDEL    user:41 tier
+HEXISTS user:41 tier
+HLEN    user:41
+HKEYS / HVALS user:41                 # also O(N)
+HINCRBY user:41 visits 1              # ATOMIC, no read needed
+HINCRBYFLOAT user:41 score 1.5
+HSETNX  user:41 created "..."         # only if the field is absent
+HRANDFIELD user:41 2 WITHVALUES       # random fields (6.2+)
+HSCAN   user:41 0 COUNT 100           # iterate a large hash safely
+
+# Field-level TTLs, new in 7.4 — the exception to "TTLs are per key":
+HEXPIRE user:41 3600 FIELDS 1 tier
+HTTL    user:41 FIELDS 1 tier
+HPERSIST user:41 FIELDS 1 tier
+
+# WHY A HASH RATHER THAN A JSON STRING (chapter 3):
+#   HINCRBY user:41 visits 1
+# is one atomic command with no read. The string version is GET, parse,
+# increment, serialise, SET — five steps and a lost-update race.
+
+# WHY A HASH RATHER THAN MANY STRING KEYS:
+#   user:41:name, user:41:tier, user:41:visits
+# is three keys, each carrying 50-80 bytes of overhead. One small hash holds
+# all three fields with almost none, because it is stored as a flat list
+# rather than a hash table (see encodings below). At ten million objects
+# that difference is measured in gigabytes.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">HGETALL is the O(N) command people forget is O(N)</span>
+  <p>It reads perfectly innocently, it is what every ORM-style wrapper reaches for, and it returns every field over the wire. On a hash with twenty fields that is nothing. On one that has accumulated a field per day for three years, it is a 1,000-field response blocking the thread and crossing the network on every request — and it got there gradually, with no point at which anything broke. Use <code>HMGET</code> for the fields you need, <code>HSCAN</code> to iterate, and treat a hash that grows a field per event as the modelling error it is. The same warning applies to <code>LRANGE 0 -1</code>, <code>SMEMBERS</code> and <code>ZRANGE 0 -1</code>.</p>
+</div>
+
+<h2><span class="h-rule"></span>Sets</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">unordered, unique, with set algebra on the server</span><button class="copy">Copy</button></div>
+<pre><code>SADD      online "u41" "u9"          # O(1) per member
+SREM      online "u9"
+SISMEMBER online "u41"               # O(1) — the membership test
+SMISMEMBER online "u41" "u9"         # several at once (6.2+)
+SCARD     online                     # O(1) count
+SMEMBERS  online                     # O(N) — everything. Careful
+SRANDMEMBER online 5                 # random sample, without removing
+SPOP      online 5                   # random, removing
+SMOVE     online offline "u41"       # atomic move between sets
+SSCAN     online 0                   # safe iteration
+
+# SET ALGEBRA, computed server-side:
+SINTER      tag:redis tag:database   # members in both
+SUNION      tag:redis tag:valkey
+SDIFF       tag:redis tag:database   # in the first, not the others
+SINTERCARD 2 tag:redis tag:database LIMIT 100   # just the count (7.0+)
+SINTERSTORE result tag:redis tag:database       # store the result
+
+# SINTERCARD is worth knowing: "how many users have both tags" without
+# materialising the intersection. The LIMIT stops early once it has counted
+# that many, which turns an expensive question into a cheap one when you only
+# need to know whether it exceeds a threshold.
+
+# The natural uses:
+#   * membership:      is this user online, is this token revoked
+#   * deduplication:   have I already processed this id
+#   * tagging:         which items have all of these tags
+#   * relationships:   followers, group members, permissions
+
+# Deduplication in one command — SADD returns how many were NEW:
+SADD processed:batch-7 "msg-8842"
+# 1 -> new, process it.  0 -> already seen, skip.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Choosing</h2>
+
+<div class="demo" id="pick">
+  <div class="demo-head">
+    <b>Which structure</b>
+    <span>Describe what you need. The answer includes what the other options would cost.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="k-need">I need to store</label>
+        <select id="k-need">
+          <option value="queue" selected>A queue of work items</option>
+          <option value="object">An object with fields</option>
+          <option value="membership">Whether X is in a group</option>
+          <option value="recent">The most recent N items</option>
+          <option value="dedupe">Whether I have seen this id before</option>
+          <option value="tags">Items matching several tags</option>
+          <option value="counters">Many counters that belong together</option>
+          <option value="ordered">Items in a specific order I control</option>
+        </select>
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="k-use">—</b><span>use</span></div>
+      <div><b id="k-why">—</b><span>because</span></div>
+      <div><b id="k-cost">—</b><span>key operations</span></div>
+    </div>
+    <div id="k-code"></div>
+    <div class="out" id="k-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Encodings</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">small collections are stored completely differently</span><button class="copy">Copy</button></div>
+<pre><code>HSET small a 1 b 2
+OBJECT ENCODING small        # "listpack" — a flat, contiguous byte array
+
+# ... add 200 fields ...
+OBJECT ENCODING small        # "hashtable" — a real hash table
+
+# Redis switches representation once a collection exceeds a threshold. Below
+# it, the structure is a compact flat array with almost no per-element
+# overhead; above it, a proper data structure with pointers and metadata.
+
+CONFIG GET hash-max-listpack-entries    # 128
+CONFIG GET hash-max-listpack-value      # 64  (bytes per value)
+CONFIG GET list-max-listpack-size       # 128
+CONFIG GET set-max-intset-entries       # 512  (all-integer sets)
+CONFIG GET set-max-listpack-entries     # 128  (7.2+, non-integer sets)
+CONFIG GET zset-max-listpack-entries    # 128
+
+# THE DIFFERENCE IS LARGE. A 100-field hash as a listpack can be ~10x smaller
+# than the same hash as a hashtable, because the hashtable pays a pointer, a
+# length and allocator overhead per field.
+#
+# The trade is time complexity: listpack operations are O(N) over a small N,
+# which is fast because it is contiguous and cache-friendly. That is why the
+# thresholds are small — the encoding is a memory optimisation that stops
+# being a good deal once N grows.
+
+# THE CONVERSION IS ONE-WAY. A hash that briefly exceeded 128 fields and then
+# shrank back to 10 stays a hashtable until the key is rewritten. So a
+# transient spike permanently costs you memory:
+DEBUG OBJECT key             # or just recreate the key
+
+# THE PATTERN THIS ENABLES — sharded hashes. Instead of ten million string
+# keys, bucket them into hashes of ~100 fields each:
+#   user:meta:{id % 100000}  ->  field "41" = "..."
+# Ten million values in a hundred thousand listpack hashes uses a fraction of
+# the memory of ten million keys. Chapter 12 works through the arithmetic.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>The three, side by side</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th>List</th><th>Hash</th><th>Set</th></tr></thead>
+<tbody>
+<tr><td>Ordered</td><td><b>Yes</b>, by insertion</td><td>No</td><td>No</td></tr>
+<tr><td>Duplicates</td><td>Allowed</td><td>Fields unique</td><td><b>Never</b></td></tr>
+<tr><td>Add</td><td>O(1) at the ends</td><td>O(1)</td><td>O(1)</td></tr>
+<tr><td>Membership test</td><td>O(N)</td><td>O(1) by field</td><td><b>O(1)</b></td></tr>
+<tr><td>Random access</td><td>O(N)</td><td>O(1) by field</td><td>n/a</td></tr>
+<tr><td>Count</td><td>O(1)</td><td>O(1)</td><td>O(1)</td></tr>
+<tr><td>Atomic increment</td><td>No</td><td><b>Yes</b>, <code>HINCRBY</code></td><td>No</td></tr>
+<tr><td>Blocking pop</td><td><b>Yes</b></td><td>No</td><td>No</td></tr>
+<tr><td>Set algebra</td><td>No</td><td>No</td><td><b>Yes</b>, server-side</td></tr>
+<tr><td>Cap it</td><td><code>LTRIM</code></td><td>Manual</td><td>Manual</td></tr>
+<tr><td>Iterate safely</td><td><code>LRANGE</code> in pages</td><td><code>HSCAN</code></td><td><code>SSCAN</code></td></tr>
+</tbody>
+</table>
+<caption>Missing from all three: ordering by a value you control, and range queries over that order. That is a sorted set, and it is the next chapter.</caption>
+</div>
+
+<div class="note tip">
+  <span class="note-t">The question is which operation you need to be O(1)</span>
+  <p>All three add in constant time and count in constant time, so those never decide it. What decides it is the read: if you ask "is X in here" constantly, that is a set. If you ask "what is X's tier", that is a hash. If you ask "give me the next one", that is a list. Picking by what the data <em>is</em> — "it's a collection of users, so a set" — produces code that then does <code>SMEMBERS</code> and filters in the application, which is the whole thing the server-side structure was supposed to avoid. <b>Pick by the access pattern, and if two access patterns disagree, maintain two structures.</b> Duplication is cheap here.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Lists are fast at the ends and slow in the middle.</b> <code>LINDEX</code> and <code>LSET</code> are O(N).</li>
+    <li><b><code>BLPOP</code> makes a list a queue</b> with no polling — and no acknowledgement. Use a stream if loss matters.</li>
+    <li><b><code>LTRIM</code> after <code>LPUSH</code></b> is how a list stays bounded. Do both in one pipeline.</li>
+    <li><b>A hash beats a JSON string</b> for anything with field-level updates, because <code>HINCRBY</code> is atomic and needs no read.</li>
+    <li><b>A hash beats many keys</b> — 50–80 bytes of overhead per key, almost none per listpack field.</li>
+    <li><b><code>HGETALL</code>, <code>SMEMBERS</code> and <code>LRANGE 0 -1</code> are O(N)</b> and get there gradually.</li>
+    <li><b><code>SADD</code> returning 1 or 0 is a deduplication check</b> in one command.</li>
+    <li><b>Small collections use a compact encoding</b> and the conversion is one-way — a transient spike costs memory permanently.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("04-lists-hashes-sets.html");
+
+(function(){
+  const root = document.getElementById("pick");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const N = {
+    queue: {use:"a list", why:"blocking pop", cost:"LPUSH O(1) · BRPOP O(1)",
+      code:'# Producer\nLPUSH jobs:pending "job-8842"\n\n# Worker — blocks until something arrives\nBRPOP jobs:pending 0\n\n# Reliable variant: move to a processing list atomically\nBLMOVE jobs:pending processing:w3 RIGHT LEFT 0\n# ... work ...\nLREM processing:w3 1 "job-8842"',
+      note:"A list is the simplest working queue in Redis, and BRPOP is why: the worker blocks on the server rather than polling, so there is no interval to tune and no latency between push and pop.\n\nWhat you do not get is acknowledgement. Once the item is popped it is gone, so a worker that crashes mid-job loses the work with no record. BLMOVE into a per-worker processing list is the standard mitigation, and it only works if something reaps abandoned processing lists — which is the part that gets skipped.\n\nIf the work must not be lost, chapter 6's streams have consumer groups with pending-entry tracking and XAUTOCLAIM built in. A list queue is right when the work is idempotent, cheap to redo, or genuinely disposable."},
+    object: {use:"a hash", why:"field-level access", cost:"HGET O(1) · HINCRBY O(1)",
+      code:'HSET user:41 name "Amara" tier "gold" visits 412\n\nHGET    user:41 tier          # one field, no parsing\nHMGET   user:41 name tier     # several\nHINCRBY user:41 visits 1      # atomic, no read',
+      note:"The alternative is a serialised JSON string, and the deciding factor is whether you ever update part of it.\n\nHINCRBY on a hash is one atomic command. The string equivalent is GET, parse, increment, serialise, SET — five steps with a lost-update race in the middle that you would then need a WATCH loop or a Lua script to close.\n\nA hash is also cheaper than one key per field: each key carries 50-80 bytes of overhead, while a small hash stores every field in one flat listpack with almost none.\n\nUse a string instead when the value is genuinely read and written whole — a rendered fragment, an API response — or when the shape is nested, since hashes are flat."},
+    membership: {use:"a set", why:"O(1) SISMEMBER", cost:"SADD O(1) · SISMEMBER O(1)",
+      code:'SADD      online:now "u41" "u9"\nSISMEMBER online:now "u41"       # 1\nSCARD     online:now             # how many\n\n# Several at once\nSMISMEMBER online:now "u41" "u9" "u12"',
+      note:"The canonical set use. SISMEMBER is O(1) regardless of how many members there are, so the check on the request path costs the same at ten members or ten million.\n\nThe temptation to avoid is SMEMBERS followed by a check in application code. It is O(N), transfers the whole set, and gets slower as the set grows — and it works fine in development where the set has twelve members.\n\nIf the membership is per user id and the ids are dense integers, chapter 3's bitmap is even cheaper: one bit each, with BITOP across days. Sets win when ids are sparse, non-numeric, or when you need to enumerate members."},
+    recent: {use:"a capped list", why:"O(1) push, bounded", cost:"LPUSH O(1) · LTRIM O(N)",
+      code:'LPUSH  recent:u41 "viewed product 8842"\nLTRIM  recent:u41 0 99            # keep newest 100\nLRANGE recent:u41 0 19            # show the last 20\n\n# Together, so the trim always happens:\nMULTI\nLPUSH recent:u41 "..."\nLTRIM recent:u41 0 99\nEXEC',
+      note:"LPUSH plus LTRIM is the bounded-log pattern, and it is the answer to \"store the last N of something\" whenever N is fixed and the order is insertion order.\n\nThe trim is O(N) in what it REMOVES, so trimming one element off a capped list each time is effectively free. What you must not do is let the list grow to a million and then trim — pair every push with a trim.\n\nRun them together in a MULTI or a pipeline. If the push succeeds and the trim does not, the list grows, and a list that grows by one per event and is never trimmed is unbounded memory.\n\nIf you need \"the most recent N by a timestamp you control\" rather than by insertion, that is a sorted set — chapter 5."},
+    dedupe: {use:"a set, with a TTL", why:"SADD returns new-or-not", cost:"SADD O(1)",
+      code:'# 1 = new, 0 = already seen\nSADD processed:2026-03-14 "msg-8842"\n\n# Bound it — a dedupe set with no TTL grows forever\nEXPIRE processed:2026-03-14 86400 NX\n\n# Very large volumes, approximate is acceptable:\nPFADD   seen:today "msg-8842"\nPFCOUNT seen:today',
+      note:"SADD returns the number of members that were actually new, so the add and the check are one atomic command. That is the whole pattern: if it returns 1, this is the first time; if 0, skip.\n\nThe part that needs deliberate thought is the bound. A deduplication set with no TTL grows forever, and it is exactly the kind of key nobody notices until memory fills (chapter 2). Key it by day or by batch and expire it, sized to how long duplicates could plausibly arrive.\n\nAt very high volume where exactness is not required, HyperLogLog gives you approximate cardinality in a fixed 12 KB regardless of how many items you add — though note it can only count, not tell you whether a specific item was seen. Chapter 10 covers the difference."},
+    tags: {use:"a set per tag", why:"server-side intersection", cost:"SINTER O(N×M)",
+      code:'SADD tag:redis    "post:1" "post:5"\nSADD tag:database "post:5" "post:9"\n\nSINTER tag:redis tag:database        # post:5\nSUNION tag:redis tag:database\nSDIFF  tag:redis tag:database\n\n# Just the count, stopping early\nSINTERCARD 2 tag:redis tag:database LIMIT 100',
+      note:"One set per tag, containing the ids of items with that tag. Intersection answers \"items with all of these tags\", union answers \"any of these\", difference answers \"this but not that\" — all computed on the server with nothing transferred but the result.\n\nSINTER is O(N×M) in the worst case and Redis optimises by starting from the smallest set, so intersecting a rare tag with a common one is cheap. Intersecting two very large sets is not — use SINTERSTORE and cache the result if the query repeats.\n\nSINTERCARD with LIMIT is the underrated one: \"are there more than 100 items with both tags\" stops counting at 100 rather than materialising the whole intersection.\n\nIf you also need the results ranked — by relevance, recency or score — that is a sorted set, and ZINTERSTORE does the same algebra with scores."},
+    counters: {use:"one hash", why:"avoids per-key overhead", cost:"HINCRBY O(1)",
+      code:'# Not this — 24 keys, each with overhead\nINCR stats:41:hour:0\nINCR stats:41:hour:1\n\n# This — one key, 24 listpack fields\nHINCRBY stats:41 hour:0 1\nHGETALL stats:41\nEXPIRE  stats:41 604800',
+      note:"Many related counters belong in one hash rather than many keys, and the reason is per-key overhead: 50-80 bytes each for the key string, the dict entry and the object header.\n\nTwenty-four hourly counters as separate keys cost roughly 1.5 KB of overhead to hold 24 small integers. As one hash under the listpack threshold, the whole thing is a few hundred bytes.\n\nHINCRBY is atomic exactly like INCR, so nothing is lost. And one EXPIRE bounds the whole group, where separate keys need one each.\n\nWatch the listpack thresholds — 128 fields by default. A hash that grows past that converts to a hashtable and the memory advantage largely disappears, permanently, since the conversion is one-way."},
+    ordered: {use:"a sorted set", why:"you control the order", cost:"ZADD O(log N)",
+      code:'# Order by a score you choose\nZADD queue 1741946400 "job-a"     # by due time\nZADD queue 5          "job-b"     # or by priority\n\nZRANGEBYSCORE queue -inf 1741946400 LIMIT 0 10\nZPOPMIN queue                     # lowest score\n\n# Chapter 5 is entirely this type.',
+      note:"When the order is not insertion order — when you control it with a score you assign — none of these three structures fits and a sorted set does.\n\nA list preserves insertion order and nothing else: you cannot insert in the middle cheaply, and you cannot reorder. A set has no order at all. A hash has no order.\n\nA sorted set keeps members ordered by a numeric score you set, supports range queries over that score, and gives you rank in either direction. Due times, priorities, points, timestamps, versions — anything where \"give me everything between X and Y\" or \"what position is this in\" is a question you ask.\n\nThat is the next chapter, and it is the type with no real equivalent in any other database."}
+  };
+
+  function render(){
+    const n = N[$("k-need").value];
+    $("k-use").textContent  = n.use;
+    $("k-why").textContent  = n.why;
+    $("k-cost").textContent = n.cost;
+
+    $("k-code").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid #25B7C4;border-radius:5px;' +
+      'padding:11px 13px;margin:16px 0 12px;font-family:var(--mono);font-size:12px;line-height:1.65;overflow-x:auto">' +
+      n.code.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>';
+
+    $("k-note").textContent = n.note +
+      "\n\nThe general rule: choose by which operation must be O(1) on the read path, not by what the data conceptually is. If two access patterns disagree, maintain two structures — duplication is cheap here, and it is far cheaper than SMEMBERS followed by filtering in application code.";
+  }
+
+  $("k-need").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

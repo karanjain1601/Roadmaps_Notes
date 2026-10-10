@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · How agents fail — AI Agents</title>
+<meta name="description" content="Looping, oscillation, context exhaustion, fabricated arguments, premature success and silent partial failure — with a detector and a recovery for each.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 12 · Making it work</div>
+    <h1>How agents fail</h1>
+    <p class="standfirst">Agents fail in a small number of recognisable ways, over and over, across every domain. Each has a cheap mechanical detector and a known recovery. Building those in from the start is the difference between a system you can operate and one that produces incident reports.</p>
+    <div class="chap-meta">
+      <span class="tagpill">looping</span>
+      <span class="tagpill">oscillation</span>
+      <span class="tagpill">fabrication</span>
+      <span class="tagpill">premature success</span>
+      <span class="tagpill">detectors</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The catalogue</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Failure</th><th>What it looks like</th><th>Usual cause</th></tr></thead>
+<tbody>
+<tr><td><b>Looping</b></td><td>The same call, same arguments, repeatedly</td><td>The observation does not read like an answer, so the model tries again identically</td></tr>
+<tr><td><b>Oscillation</b></td><td>A, B, A, B without progress</td><td>Two tools each look like they should have the answer; neither does</td></tr>
+<tr><td><b>Context exhaustion</b></td><td>Hard failure mid-run, or quality collapse before it</td><td>No truncation or compaction (chapter 7)</td></tr>
+<tr><td><b>Fabricated arguments</b></td><td>An order id or email that does not exist</td><td>The model needed a value, had none, and produced a plausible one</td></tr>
+<tr><td><b>Wrong tool, confidently</b></td><td>A reasonable-sounding call that cannot answer the question</td><td>A description problem, not a model problem (chapter 4)</td></tr>
+<tr><td><b>Premature success</b></td><td>Declares completion having done something adjacent</td><td>No objective completion criterion</td></tr>
+<tr><td><b>Goal drift</b></td><td>Ends up solving a related, easier problem</td><td>The objective is 40k tokens back and never restated</td></tr>
+<tr><td><b>Silent partial failure</b></td><td>Three of five sub-tasks failed; the summary says nothing</td><td>Statuses aggregated by the model instead of by code</td></tr>
+<tr><td><b>Observation misreading</b></td><td>Acts on a field that was not there, or on an error as if it were data</td><td>Poorly shaped tool returns; errors that look like results</td></tr>
+<tr><td><b>Runaway cost</b></td><td>A run that should cost a cent costs three pounds</td><td>No budget, or a budget on only one axis</td></tr>
+<tr><td><b>Sycophantic agreement</b></td><td>Abandons a correct finding because the user pushed back</td><td>No distinction between evidence and instruction</td></tr>
+<tr><td><b>Destructive overreach</b></td><td>Does more than asked — "while I was in there, I also…"</td><td>No consequence gating (chapter 5)</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">Detect in code, recover through the model</span>
+  <p>The pattern that works throughout this chapter: your code notices the failure deterministically, then injects an observation telling the model what happened and what to do differently. Detection must not be the model's job — it is inside the failure. Recovery usually should be the model's job, because it has the context to choose a different approach. Halting is the fallback when recovery does not take.</p>
+</div>
+
+<h2><span class="h-rule"></span>The guard function</h2>
+
+<p>One place, called before every tool execution, holding every cheap detector. This is <code>guard()</code> from chapters 2 and 5, written out.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">guards.py — mechanical detection, model-side recovery</span><button class="copy">Copy</button></div>
+<pre><code>import json, hashlib
+from collections import Counter
+
+def sig(name: str, args) -> str:
+    return name + ":" + hashlib.sha1(
+        json.dumps(args, sort_keys=True, default=str).encode()).hexdigest()[:12]
+
+def guard(call, args, ctx, steps: list[Step]) -> str | None:
+    """Return an observation to short-circuit with, or None to proceed."""
+    history = [(s.tool, s.arg_sig) for s in steps if s.tool]
+    this = (call.name, sig(call.name, args.model_dump()))
+
+    # 1. Exact repeat — the same call with the same arguments.
+    if history.count(this) >= 2:
+        return ("You have already called this twice with these exact arguments and "
+                "received the same result both times. It will not change. Either try "
+                "a different tool or different arguments, or stop and report what you "
+                "have established and what is blocking you.")
+
+    # 2. Oscillation — A, B, A, B with no new information.
+    recent = [t for t, _ in history[-4:]]
+    if len(recent) == 4 and recent[0] == recent[2] and recent[1] == recent[3] \
+       and recent[0] != recent[1]:
+        return (f"You are alternating between {recent[0]} and {recent[1]} without making "
+                f"progress. Neither is answering the question. Summarise what you know "
+                f"and state what information you are missing.")
+
+    # 3. Per-tool call cap within one run.
+    used = sum(1 for t, _ in history if t == call.name)
+    if used >= ctx.limits.per_tool.get(call.name, 8):
+        return (f"You have used {call.name} {used} times in this run, which is the limit. "
+                f"Work with what you already have.")
+
+    # 4. Fabricated references — the identifier was never seen.
+    for field, kind in TOOL_REFS.get(call.name, {}).items():
+        ref = getattr(args, field, None)
+        if ref and not seen_reference(steps, ctx, kind, ref):
+            return (f"The {kind} reference '{ref}' has not appeared in any tool result "
+                    f"in this conversation and was not provided by the user. Do not "
+                    f"guess identifiers — look it up first with {LOOKUP_TOOL[kind]}.")
+
+    # 5. Cost trajectory — projected overrun, caught early rather than at the wall.
+    if steps and ctx.budget.projected_cost(len(steps)) > ctx.budget.max_cost_usd:
+        return ("This run is on track to exceed its cost budget. Stop exploring and "
+                "produce the best answer you can from what you already have.")
+
+    return None</code></pre>
+</div>
+
+<p>Detector four is worth dwelling on. Checking that every identifier the model passes has actually appeared in a previous observation or in the user's message catches fabrication before it reaches a database — and it converts a whole class of confident-wrong-answer bugs into a single recoverable step.</p>
+
+<div class="demo" id="fail">
+  <div class="demo-head">
+    <b>Detector bench</b>
+    <span>A trace with a problem in it. Turn detectors on and off and see what each catches, and what it costs the run.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="v-case">Failure to reproduce</label>
+        <select id="v-case">
+          <option value="loop" selected>Looping — same call three times</option>
+          <option value="osc">Oscillation — alternating between two tools</option>
+          <option value="fab">Fabricated identifier</option>
+          <option value="prem">Premature success</option>
+          <option value="partial">Silent partial failure</option>
+        </select>
+      </div>
+      <div>
+        <label for="v-budget">Step budget — <span id="v-budgetv">12</span></label>
+        <input type="range" id="v-budget" min="4" max="20" step="1" value="12">
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:6px 16px;margin:12px 0">
+      <label><input type="checkbox" class="vg" value="repeat" checked> Repeat detector</label>
+      <label><input type="checkbox" class="vg" value="osc" checked> Oscillation detector</label>
+      <label><input type="checkbox" class="vg" value="ref"> Reference validation</label>
+      <label><input type="checkbox" class="vg" value="done"> Completion check</label>
+      <label><input type="checkbox" class="vg" value="agg"> Status aggregation in code</label>
+    </div>
+    <div class="stat">
+      <div><b id="v-caught">—</b><span>detected</span></div>
+      <div><b id="v-steps">—</b><span>steps used</span></div>
+      <div><b id="v-out2">—</b><span>outcome</span></div>
+    </div>
+    <div id="v-trace"></div>
+    <div class="out" id="v-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Premature success</h2>
+
+<p>The most damaging failure, because it looks like a completed run. The agent did something plausible, decided that was the task, and returned a fluent answer. Nothing in the trace is obviously wrong.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">completion.py — check the claim before returning it</span><button class="copy">Copy</button></div>
+<pre><code>class Completion(BaseModel):
+    criterion_met: bool
+    evidence: list[str] = Field(description="Specific tool results supporting this")
+    unmet: list[str] = Field(description="Parts of the request not addressed")
+
+CHECK = """The agent claims this task is complete. Decide whether it is, using only
+the tool results in the transcript.
+
+<task>{goal}</task>
+<completion_criterion>{criterion}</completion_criterion>
+<transcript>{steps}</transcript>
+<answer>{answer}</answer>
+
+For each part of the original request, was it actually addressed by a tool result —
+not merely asserted in the answer? List anything unaddressed."""
+
+def verify_completion(run: Run, goal: str, criterion: str) -> Run:
+    v = structured_call(Completion, CHECK.format(...), temperature=0)
+    if v.criterion_met:
+        return run
+
+    metrics.incr("agent.premature_completion")
+    if run.budget.remaining_steps() >= 2:
+        return continue_run(run, nudge=(
+            f"Before finishing: these parts of the request are not yet addressed by "
+            f"any tool result: {'; '.join(v.unmet)}. Handle them or explain why you "
+            f"cannot."))
+
+    return run.with_caveat(f"Incomplete: {'; '.join(v.unmet)}")
+
+# The cheaper version, where you can write it: a deterministic check.
+#   "a refund proposal exists for this order"  ->  db query, no model needed
+# Always prefer the deterministic check. Use the judge only where you cannot.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Silent partial failure</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">aggregate statuses in code, never in a prompt</span><button class="copy">Copy</button></div>
+<pre><code># WRONG: hoping the summary mentions it.
+system += "If any sub-task failed, say so in your answer."
+
+# RIGHT: the caller owns the truth about what happened.
+results = await asyncio.gather(*workers, return_exceptions=True)
+
+succeeded = [r for r in results if not isinstance(r, Exception) and r.status == "completed"]
+failed    = [(s, r) for s, r in zip(sources, results)
+             if isinstance(r, Exception) or r.status != "completed"]
+
+answer = compose(succeeded)
+if failed:
+    answer.caveat = (f"{len(failed)} of {len(results)} sources could not be checked: "
+                     + ", ".join(s for s, _ in failed) + ".")
+    answer.confidence = "partial"
+
+# The caveat is attached by your code to the response object. It appears in the
+# UI whether or not the model mentioned it, and it is queryable in your metrics.</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Never let the model be the only reporter of its own failures</span>
+  <p>A model summarising a run it partly failed will produce a fluent, complete-sounding answer far more often than it will volunteer the gap. This is not deception — the failed branches are just less salient than the successful ones in a long context. Any status that matters must be computed by your code from what actually happened and attached to the response independently.</p>
+</div>
+
+<h2><span class="h-rule"></span>Goal drift and sycophancy</h2>
+
+<div class="cols">
+  <div class="col">
+    <h4>Drift</h4>
+    <p>By step twelve the objective is buried under forty thousand tokens of observations, and the agent is answering a related, easier question.</p>
+    <p><b>Fix:</b> restate the goal and remaining budget in a late user turn every few steps (chapter 7). Cheap, and it works.</p>
+  </div>
+  <div class="col">
+    <h4>Sycophancy</h4>
+    <p>The agent established that two captures exist. The customer says "no, I was only charged once." The agent apologises and agrees.</p>
+    <p><b>Fix:</b> an explicit rule that tool results outrank assertions, and a re-check rather than a capitulation.</p>
+  </div>
+</div>
+
+<div class="code" data-lang="markdown">
+<div class="code-head"><span class="lang">the system-prompt clause that handles disagreement</span><button class="copy">Copy</button></div>
+<pre><code>When someone contradicts something a tool established:
+- Do not change your finding on assertion alone. Say what the tool returned and
+  when it was checked.
+- Re-run the relevant lookup once. If it now returns something different, say
+  that it changed and give both values.
+- If it returns the same thing, state that plainly and offer to escalate to a
+  human who can look further. Being wrong is possible; agreeing without evidence
+  is not helpful.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Instrumenting the failures</h2>
+
+<p>Each detector should emit a metric. The rates tell you where to spend effort, and the trends tell you when something upstream broke.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Metric</th><th>Healthy</th><th>What a rise means</th></tr></thead>
+<tbody>
+<tr><td><code>repeat_blocked_rate</code></td><td>&lt; 3% of runs</td><td>A tool returns results that do not read like answers — check its return shape</td></tr>
+<tr><td><code>oscillation_rate</code></td><td>&lt; 1%</td><td>Two tool descriptions are not distinguishable. Find the pair</td></tr>
+<tr><td><code>fabricated_ref_rate</code></td><td>&lt; 1%</td><td>A lookup path is missing, so the model invents rather than searches</td></tr>
+<tr><td><code>premature_completion_rate</code></td><td>&lt; 5%</td><td>The completion criterion is vague, or the task is under-specified</td></tr>
+<tr><td><code>budget_halt_rate</code></td><td>&lt; 10%</td><td>Tasks are harder than the budget assumes, or a tool got slower</td></tr>
+<tr><td><code>partial_result_rate</code></td><td>Track, no target</td><td>Upstream reliability. This is a dependency dashboard, not an agent problem</td></tr>
+<tr><td><code>steps_p95</code></td><td>Stable</td><td>A jump usually means a model version changed or a tool started failing quietly</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Read ten failed traces a week</span>
+  <p>Metrics tell you the rate; only the traces tell you the cause, and the cause is almost always something you would never have guessed — a tool returning an empty list rather than an error, a date format the model keeps misreading, a description whose second sentence contradicts its first. Half an hour a week of reading actual failures will produce more improvement than any amount of prompt tuning done from imagination.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Agents fail in <b>a dozen recognisable ways</b>, each with a cheap detector and a known recovery.</li>
+    <li><b>Detect in code, recover through the model.</b> Detection cannot be the model's job — it is inside the failure.</li>
+    <li>One <code>guard()</code> function before every execution holds repeats, oscillation, per-tool caps, reference validation and cost projection.</li>
+    <li><b>Validate identifiers against what has actually been seen.</b> It stops fabrication before it reaches a database.</li>
+    <li><b>Premature success is the most damaging</b> failure because the run looks complete. Check the criterion — deterministically where you can.</li>
+    <li>Aggregate sub-task statuses <b>in code</b>. A model is not a reliable reporter of its own partial failures.</li>
+    <li>Restate the goal periodically for drift; give the agent <b>an explicit rule for disagreement</b> so it re-checks rather than capitulates.</li>
+    <li>Emit a metric per detector, and <b>read ten failed traces a week</b>.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("12-failure-modes.html");
+
+(function(){
+  const root = document.getElementById("fail");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const CASES = {
+    loop: {
+      needs: "repeat",
+      script: [
+        {t:"find_orders", a:"email=j.okafor@example.com", ok:true,  note:"returns 1 order"},
+        {t:"list_payments", a:"order_id=NW-8842", ok:true, note:"returns [] — no payments recorded yet"},
+        {t:"list_payments", a:"order_id=NW-8842", ok:true, note:"returns [] again", flag:true},
+        {t:"list_payments", a:"order_id=NW-8842", ok:true, note:"returns [] a third time", flag:true},
+        {t:"list_payments", a:"order_id=NW-8842", ok:true, note:"and again…", flag:true}
+      ],
+      caught: "Repeat detector fires on the second identical call.",
+      uncaught: "The run burns its entire step budget re-reading an empty list, then halts with nothing.",
+      lesson: "The root cause is not the model. list_payments returns an empty array for 'no payments' — which does not read like an answer, so the model assumes it failed and tries again. Return {\"payments\": [], \"note\": \"No payments recorded against this order.\"} and the loop disappears without any detector."
+    },
+    osc: {
+      needs: "osc",
+      script: [
+        {t:"search_policy", a:"q=refund timing", ok:true, note:"general refund policy, no timing detail"},
+        {t:"search_faq",    a:"q=refund timing", ok:true, note:"FAQ, also no timing detail"},
+        {t:"search_policy", a:"q=how long refunds take", ok:true, note:"same document", flag:true},
+        {t:"search_faq",    a:"q=how long refunds take", ok:true, note:"same FAQ", flag:true},
+        {t:"search_policy", a:"q=refund processing time", ok:true, note:"same document again", flag:true}
+      ],
+      caught: "Oscillation detector fires after the A,B,A,B pattern.",
+      uncaught: "It alternates until the budget runs out, then answers from general knowledge — unsourced and possibly wrong.",
+      lesson: "Two tools that look equally likely to hold the answer, and neither does, because the information is not in the corpus at all. The fix is upstream: the agent needs a way to conclude 'this is not documented' — and search tools should say when they matched nothing relevant rather than returning the nearest document."
+    },
+    fab: {
+      needs: "ref",
+      script: [
+        {t:"search_policy", a:"q=duplicate charge", ok:true, note:"policy found"},
+        {t:"get_order",     a:"order_id=NW-8842", ok:true,  note:"order found", fabricated:true,
+         detail:"The user's message never contained an order reference. The model produced a plausible one."},
+        {t:"list_payments", a:"order_id=NW-8842", ok:true,  note:"two captures found"},
+        {t:"propose_refund",a:"payment_id=p_2, amount=48.00", ok:true, note:"queued"}
+      ],
+      caught: "Reference validation fires at step 2: NW-8842 never appeared in any observation or in the user's message.",
+      uncaught: "The run completes successfully and confidently — against an order belonging to a different customer. Nothing in the trace looks wrong.",
+      lesson: "This is the most dangerous entry in the catalogue because the run succeeds. Every identifier the model passes should have appeared in a prior tool result or in the user's input. The check is five lines and it converts a silent cross-customer error into a recoverable step."
+    },
+    prem: {
+      needs: "done",
+      script: [
+        {t:"get_order",   a:"order_id=NW-8842", ok:true, note:"order found"},
+        {t:"list_payments", a:"order_id=NW-8842", ok:true, note:"two captures confirmed"},
+        {t:null, a:null, ok:true, note:"Final answer: \"I've confirmed the duplicate charge and the customer will be refunded.\"", flag:true,
+         detail:"No refund was proposed. Nothing was queued. The task asked for a remedy."}
+      ],
+      caught: "Completion check fires: the criterion 'a refund proposal exists for this order' is not satisfied by any tool result.",
+      uncaught: "The run is recorded as completed. The customer is told a refund is coming. No refund exists.",
+      lesson: "The investigation was correct and the conclusion was asserted rather than acted on. Prefer a deterministic completion criterion — a database query — over a judge wherever you can write one."
+    },
+    partial: {
+      needs: "agg",
+      script: [
+        {t:"sub:billing",  a:"investigate charges", ok:true,  note:"completed — two captures found"},
+        {t:"sub:shipping", a:"check delivery", ok:false, note:"timed out after 90s", flag:true},
+        {t:"sub:account",  a:"check contact preferences", ok:false, note:"upstream unavailable", flag:true},
+        {t:null, a:null, ok:true, note:"Final answer summarises the billing finding as though the full picture is in.", flag:true}
+      ],
+      caught: "Status aggregation in code attaches: \"2 of 3 checks could not be completed: shipping, account.\"",
+      uncaught: "A fluent, complete-sounding answer built on one third of the evidence. Neither the user nor your metrics can tell.",
+      lesson: "The model is not a reliable reporter of its own gaps — failed branches are simply less salient than successful ones in a long context. Compute the status from what actually happened and attach it to the response object, independently of anything the model wrote."
+    }
+  };
+
+  function render(){
+    const key = $("v-case").value;
+    const c = CASES[key];
+    const budget = parseInt($("v-budget").value, 10);
+    $("v-budgetv").textContent = budget;
+    const on = new Set([].slice.call(document.querySelectorAll(".vg:checked")).map(x => x.value));
+    const caught = on.has(c.needs);
+
+    // How far the run gets
+    const firstFlag = c.script.findIndex(s => s.flag || s.fabricated);
+    const steps = caught && firstFlag >= 0 ? firstFlag + 1 : Math.min(budget, c.script.length + (key === "loop" || key === "osc" ? budget : 0));
+
+    $("v-caught").textContent = caught ? "yes" : "no";
+    $("v-steps").textContent  = caught ? (firstFlag + 1) + " / " + budget
+                                       : ((key === "loop" || key === "osc") ? budget + " / " + budget : c.script.length + " / " + budget);
+    $("v-out2").textContent   = caught ? "recovered"
+                              : (key === "loop" || key === "osc") ? "halted, no answer"
+                              : "completed — wrongly";
+
+    const shown = caught && firstFlag >= 0 ? c.script.slice(0, firstFlag + 1) : c.script;
+    $("v-trace").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">Trace</div>' +
+      shown.map((s, i) => {
+        const bad = s.flag || s.fabricated;
+        const col = bad ? (caught && i === firstFlag ? "#F2A03D" : "#E2574C") : "#3FB984";
+        return '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid ' + col +
+          ';border-radius:4px;padding:8px 11px;margin-bottom:5px">' +
+          '<div style="display:flex;gap:10px;align-items:baseline">' +
+          '<span style="font-family:var(--mono);font-size:11px;color:#8FA0AF;min-width:22px">' + (i+1) + '</span>' +
+          '<span style="flex:1;font-size:13.5px">' +
+          (s.t ? '<code style="font-family:var(--mono);font-size:12px;color:#153351">' + s.t + '(' + s.a + ')</code> — ' : '') +
+          s.note + '</span></div>' +
+          (s.detail ? '<div style="font-size:12.5px;color:#E2574C;margin:5px 0 0 32px">' + s.detail + '</div>' : '') +
+          '</div>';
+      }).join("") +
+      (caught && firstFlag >= 0
+        ? '<div style="background:#FFF8EC;border:1px solid #F0DCB8;border-left:3px solid #F2A03D;border-radius:4px;padding:9px 11px;margin-bottom:5px;font-size:13.5px">' +
+          '<b>Guard fired.</b> ' + c.caught + ' An observation is injected telling the model what happened and what to try instead; the run continues.</div>'
+        : (key === "loop" || key === "osc"
+            ? '<div style="color:#54677A;font-size:13px;padding:4px 0">…pattern continues to the step limit…</div>' : ''));
+
+    $("v-note").textContent =
+      (caught ? "" : "NOT DETECTED. " + c.uncaught + "\n\n") + c.lesson;
+  }
+
+  ["v-case","v-budget"].forEach(id => $(id).addEventListener("input", render));
+  [].slice.call(document.querySelectorAll(".vg")).forEach(x => x.addEventListener("change", render));
+  render();
+})();
+</script>
+</body>
+</html>

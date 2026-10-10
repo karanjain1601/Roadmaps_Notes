@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Indexing documents — Elasticsearch</title>
+<meta name="description" content="CRUD, and what happens underneath: the translog, the refresh interval, near-real-time search, and getting bulk indexing right.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 06 · Modelling</div>
+    <h1>Indexing documents</h1>
+    <p class="standfirst">A write returns success roughly a second before it is searchable, an update is really a delete and an insert, and a delete does not free any space. All three follow from one Lucene property: segments are immutable.</p>
+    <div class="chap-meta">
+      <span class="tagpill">bulk</span>
+      <span class="tagpill">refresh</span>
+      <span class="tagpill">translog</span>
+      <span class="tagpill">versioning</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The operations</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">CRUD, and the distinctions that matter</span><button class="copy">Copy</button></div>
+<pre><code># CREATE OR REPLACE at a known id
+PUT /articles/_doc/1
+{ "title": "Consensus", "views": 0 }
+
+# CREATE ONLY — fails with 409 if the id exists
+PUT /articles/_create/1
+{ "title": "Consensus" }
+
+# CREATE with a generated id
+POST /articles/_doc
+{ "title": "Consensus" }
+
+# GET BY ID. Real-time — bypasses search entirely and always sees the
+# latest version, even before a refresh
+GET /articles/_doc/1
+GET /articles/_source/1
+HEAD /articles/_doc/1
+
+# PARTIAL UPDATE
+POST /articles/_update/1
+{ "doc": { "views": 42 } }
+
+# SCRIPTED UPDATE — atomic read-modify-write on the shard
+POST /articles/_update/1
+{ "script": { "source": "ctx._source.views += params.n", "params": { "n": 1 } } }
+
+# UPSERT
+POST /articles/_update/1
+{ "script": { "source": "ctx._source.views += 1" },
+  "upsert": { "title": "Consensus", "views": 1 } }
+
+DELETE /articles/_doc/1
+
+# WHAT AN UPDATE ACTUALLY IS: Elasticsearch fetches _source, applies your
+# change in memory, and reindexes the WHOLE DOCUMENT. There is no partial
+# write to disk, because segments are immutable. A "partial update" is a
+# convenience in the API, not an optimisation in the engine — and it needs
+# _source enabled, which is one of several reasons not to disable it.
+#
+# A DELETE is a tombstone. The document is marked deleted in a bitset and
+# skipped in results; the terms and doc values stay on disk until a merge
+# rewrites that segment without it. Deleting a million documents frees
+# nothing immediately, and GET /_cat/indices shows docs.deleted alongside
+# docs.count so you can see how much dead weight a shard is carrying.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Where a write goes</h2>
+
+<div class="demo" id="wr">
+  <div class="demo-head">
+    <b>The write path</b>
+    <span>Step through what happens between your request and a searchable document.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="w-step">Step — <span id="w-stepv">1</span> of 6</label>
+        <input type="range" id="w-step" min="1" max="6" step="1" value="1">
+      </div>
+      <div>
+        <label for="w-refresh">Refresh setting</label>
+        <select id="w-refresh">
+          <option value="1s" selected>index.refresh_interval: 1s (default)</option>
+          <option value="30s">30s (bulk-load tuning)</option>
+          <option value="wait">?refresh=wait_for</option>
+          <option value="true">?refresh=true</option>
+        </select>
+      </div>
+    </div>
+    <div id="w-stages"></div>
+    <div class="stat">
+      <div><b id="w-durable">—</b><span>survives a crash?</span></div>
+      <div><b id="w-getable">—</b><span>GET by id</span></div>
+      <div><b id="w-search">—</b><span>searchable</span></div>
+    </div>
+    <div class="out" id="w-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Durable and searchable are different moments</span>
+  <p>Elasticsearch acknowledges a write once it is in the in-memory buffer and the <b>translog</b>, and the translog is fsynced by default — so the write survives a crash immediately. It becomes <em>searchable</em> only at the next <b>refresh</b>, which turns the buffer into a new segment and by default happens once per second. That gap is why Elasticsearch is described as "near real time" rather than real time, and why a write-then-search in a test suite fails intermittently. <b>A <code>GET</code> by id has no such gap</b> — it reads the translog too and is always current, which is a genuinely useful asymmetry: if you need read-your-writes, read by id.</p>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">refresh, flush and merge — three different things</span><button class="copy">Copy</button></div>
+<pre><code># REFRESH — buffer becomes a searchable segment. Cheap-ish, frequent.
+PUT /logs/_settings { "index": { "refresh_interval": "30s" } }
+POST /articles/_refresh                     # force one, manually
+
+PUT /articles/_doc/1?refresh=true           # refresh NOW, then return.
+                                            # Creates a tiny segment. Fine in
+                                            # tests, terrible in a hot loop
+PUT /articles/_doc/1?refresh=wait_for       # wait for the NEXT scheduled
+                                            # refresh. No extra segments —
+                                            # the right choice in production
+PUT /articles/_doc/1?refresh=false          # default. Return immediately
+
+# FLUSH — commit segments to disk and clear the translog. Automatic.
+POST /articles/_flush
+# You should essentially never call this. Elasticsearch flushes when the
+# translog reaches index.translog.flush_threshold_size (512mb default).
+
+# MERGE — combine small segments into bigger ones, dropping deleted docs.
+# Continuous, in the background, and the main consumer of background I/O.
+POST /articles/_forcemerge?max_num_segments=1
+# ONLY on an index that will never be written to again. On a live index it
+# produces one enormous segment that the merge policy will never reconsider,
+# and deleted documents in it are then stuck there permanently.
+
+# THE TRANSLOG, which is what makes the acknowledgement safe:
+"index.translog.durability": "request"      # DEFAULT — fsync per request
+"index.translog.durability": "async"        # fsync every sync_interval (5s)
+"index.translog.sync_interval": "5s"
+# async is a real throughput gain for log ingestion where losing five
+# seconds of data on a hard crash is acceptable. It is the wrong choice for
+# anything you cannot re-send.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Bulk indexing</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the only sane way to load data</span><button class="copy">Copy</button></div>
+<pre><code>POST /_bulk
+{ "index":  { "_index": "articles", "_id": "1" } }
+{ "title": "Consensus", "views": 0 }
+{ "create": { "_index": "articles", "_id": "2" } }
+{ "title": "Raft" }
+{ "update": { "_index": "articles", "_id": "1" } }
+{ "doc": { "views": 5 } }
+{ "delete": { "_index": "articles", "_id": "3" } }
+
+# NDJSON: one action line, one source line, newline-delimited, and the file
+# MUST end with a newline. The format is deliberately dumb so that the
+# coordinating node can split it without parsing the whole body.
+
+# CHECK THE RESPONSE. This is the mistake that matters:
+#
+#   { "took": 30, "errors": true, "items": [ ... ] }
+#
+# The HTTP status is 200 even when individual documents failed. A bulk
+# request is not atomic — some documents succeed, some fail, and the only
+# place that is recorded is the per-item status inside the body. Client
+# libraries that ignore "errors" silently drop data, and this is the single
+# most common way an Elasticsearch load loses documents.
+
+# SIZING:
+#   * 5-15 MB per request is the usual sweet spot. Measure — the right
+#     number depends on document size and cluster shape
+#   * document COUNT is the wrong unit; bytes is the right one
+#   * too large and you hit http.max_content_length (100mb) or push the
+#     coordinating node into a circuit breaker
+
+# FOR A LARGE INITIAL LOAD:
+PUT /articles/_settings
+{ "index": { "refresh_interval": "-1",        # no refreshes at all
+             "number_of_replicas": 0 } }      # do not replicate per document
+# ... load everything ...
+PUT /articles/_settings
+{ "index": { "refresh_interval": "1s", "number_of_replicas": 1 } }
+POST /articles/_forcemerge?max_num_segments=1
+#
+# Replicas built afterwards are copied from finished shards rather than
+# constructed document by document, which is dramatically faster. This
+# combination routinely doubles or triples load throughput.
+
+# LET ELASTICSEARCH GENERATE IDS when you can. A supplied id forces a check
+# for an existing document with that id before writing; an auto-generated
+# one is known to be new, so the check is skipped.
+
+# HANDLE 429 PROPERLY. TOO_MANY_REQUESTS means the write queue is full, and
+# it is backpressure rather than an error. Retry with exponential backoff;
+# do not treat it as a failure and do not retry immediately in a tight loop.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">A bulk response of 200 does not mean the data arrived</span>
+  <p>It is worth repeating on its own because it costs people real data. <code>_bulk</code> returns HTTP 200 as long as the request itself was well-formed; individual documents can fail for mapping conflicts, version conflicts, circuit breakers or rejected queue slots, and each failure appears only as a status inside its own <code>items</code> entry. <b>Every bulk client must check <code>response["errors"]</code> and, when true, walk the items array</b>. The official language clients mostly do this for you if you use their bulk helpers — and mostly do not if you call the raw endpoint yourself, which is exactly what a hand-rolled ingestion script does.</p>
+</div>
+
+<h2><span class="h-rule"></span>Concurrency</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">optimistic concurrency control</span><button class="copy">Copy</button></div>
+<pre><code>GET /articles/_doc/1
+# { "_seq_no": 41, "_primary_term": 1, "_source": { "views": 42 } }
+
+PUT /articles/_doc/1?if_seq_no=41&if_primary_term=1
+{ "views": 43 }
+# 409 if anything changed the document since you read it
+
+# There are no transactions and no locks. This is the compare-and-swap
+# primitive, and it is the only concurrency control available.
+#
+# _seq_no    increments per operation on a shard
+# _primary_term increments when a shard's primary changes, so a write from a
+#               client that was talking to a stale primary is rejected
+#
+# The pair is what makes the check correct across a failover — the older
+# ?version= parameter was not.
+
+# FOR EXTERNAL SYSTEMS OF RECORD, use your own version number:
+PUT /articles/_doc/1?version=7&version_type=external
+{ "title": "Consensus" }
+# Rejected if the stored version is >= 7. This makes out-of-order delivery
+# safe: replaying an old change from a queue is a no-op rather than a
+# regression, which is exactly what you want when Elasticsearch holds a
+# derived copy of data owned elsewhere (chapter 1).
+
+# UPDATE BY QUERY AND DELETE BY QUERY — batch operations, and they take a
+# snapshot at the start, so documents changed underneath cause conflicts:
+POST /articles/_update_by_query?conflicts=proceed&wait_for_completion=false
+{ "query": { "term": { "status": "draft" } },
+  "script": { "source": "ctx._source.status = 'archived'" } }
+# -> { "task": "node-1:12345" }
+
+GET /_tasks/node-1:12345
+POST /_tasks/node-1:12345/_cancel
+
+# ALWAYS use wait_for_completion=false for anything touching more than a few
+# thousand documents. Otherwise the HTTP connection has to stay open for the
+# duration, and a client timeout does NOT cancel the work — it just leaves
+# you with no way to observe it.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Reindexing</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the operation you will need eventually</span><button class="copy">Copy</button></div>
+<pre><code># Changing a field type, changing an analyzer, changing the shard count —
+# all of these mean building a new index and copying into it.
+
+PUT /articles-v2 { "mappings": { ... }, "settings": { ... } }
+
+POST /_reindex?wait_for_completion=false&slices=auto
+{
+  "source": {
+    "index": "articles",
+    "size": 5000,
+    "query": { "range": { "published": { "gte": "2020-01-01" } } }
+  },
+  "dest": { "index": "articles-v2", "op_type": "create" },
+  "script": {
+    "source": "ctx._source.total = (ctx._source.remove('amount') ?: 0) / 100.0"
+  }
+}
+
+# slices=auto parallelises across the source shards. On a large index this
+# is the difference between hours and a coffee break.
+#
+# op_type: create makes the reindex idempotent — re-running it will not
+# overwrite documents already copied, so a failed run can be resumed.
+
+# THE ALIAS SWAP, which is why you always read through an alias:
+POST /_aliases
+{ "actions": [
+    { "remove": { "index": "articles",    "alias": "articles-live" } },
+    { "add":    { "index": "articles-v2", "alias": "articles-live" } } ]}
+# Atomic. No window where the alias points at nothing.
+
+# HANDLING WRITES DURING THE REINDEX is the hard part, and _reindex does not
+# solve it for you. Three approaches:
+#   1. accept the downtime — stop writes, reindex, swap
+#   2. dual-write to both indices during the migration, then swap
+#   3. reindex, then catch up with a second pass filtered on a timestamp,
+#      then swap. Requires an updated_at field you can trust
+#
+# Plan this before you need it. The reindex itself is the easy half.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Ingest pipelines do the transformation before the document lands</span>
+  <p>Rather than cleaning data in your application or standing up Logstash, a pipeline runs inside Elasticsearch on the ingest node: <code>PUT /_ingest/pipeline/logs</code> with processors like <code>grok</code>, <code>date</code>, <code>convert</code>, <code>rename</code>, <code>set</code>, <code>geoip</code> and <code>user_agent</code>. Attach it with <code>?pipeline=logs</code>, or set <code>index.default_pipeline</code> so every write to the index goes through it whether the client knows or not. <b>Test with <code>POST /_ingest/pipeline/logs/_simulate</code></b>, which runs your documents through and shows the output without indexing anything — the same debugging role <code>_analyze</code> plays for text. For a great many deployments this removes the need for a separate ingestion service entirely.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Segments are immutable.</b> An update reindexes the whole document; a delete is a tombstone that frees nothing until a merge.</li>
+    <li><b>Durable and searchable are different moments.</b> The translog makes it safe immediately; a refresh makes it findable, ~1s later.</li>
+    <li><b><code>GET</code> by id is always current.</b> If you need read-your-writes, read by id.</li>
+    <li><b><code>?refresh=wait_for</code>, not <code>?refresh=true</code></b> — the latter creates a tiny segment per call.</li>
+    <li><b>Bulk returns 200 with failures inside.</b> Check <code>errors</code> and walk the items, or you will silently lose documents.</li>
+    <li><b>For a big load: <code>refresh_interval: -1</code>, replicas 0</b>, then restore both and force-merge.</li>
+    <li><b><code>if_seq_no</code> and <code>if_primary_term</code> are the only concurrency control.</b> There are no transactions.</li>
+    <li><b>Use <code>wait_for_completion=false</code></b> for reindex and update-by-query, and read through an alias so the swap is atomic.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("06-indexing.html");
+
+(function(){
+  const root = document.getElementById("wr");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const STEPS = [
+    { t:"Request reaches a coordinating node",
+      stages:["arriving","","","",""],
+      durable:"no", get:"no", search:"no",
+      note:"Any node can receive the write. It hashes the document's routing value, works out which shard owns it, and forwards the request to that shard's primary — which may be itself.\n\nThis is why you can point a client at any node in the cluster and it works. There is no designated write endpoint." },
+    { t:"Primary shard validates and writes to the in-memory buffer",
+      stages:["done","buffer","","",""],
+      durable:"no", get:"no", search:"no",
+      note:"The primary checks the mapping, applies any dynamic mapping updates, runs the analysis chain (chapter 3), and puts the resulting document into an in-memory indexing buffer.\n\nNothing is on disk yet and nothing is searchable. A crash at this instant loses the write — which is why the next step exists and happens in the same breath." },
+    { t:"Written to the translog, and fsynced",
+      stages:["done","buffer","translog","",""],
+      durable:"YES", get:"yes", search:"no",
+      note:"The operation is appended to the transaction log and, with the default durability of \"request\", fsynced to disk before the response is sent.\n\nThe write now survives a crash. If the node dies, the translog is replayed on restart and the document reappears.\n\nNote what is true here and what is not: it is DURABLE, and it is not SEARCHABLE. A GET by id will find it, because a GET consults the translog. A search will not, because a search only sees segments." },
+    { t:"Replicated to in-sync replicas",
+      stages:["done","buffer","translog","replicas",""],
+      durable:"YES", get:"yes", search:"no",
+      note:"The primary forwards the operation to every in-sync replica and waits for them before acknowledging to the client.\n\nThis is synchronous replication, and it is a real difference from Redis and from MongoDB's default write concern — an Elasticsearch write is not acknowledged until the replicas have it. Losing the primary immediately after an acknowledgement does not lose the write.\n\nThe wait_for_active_shards parameter controls how many copies must be available before the write is even attempted. It defaults to 1, meaning just the primary." },
+    { t:"200 OK returned to the client",
+      stages:["done","buffer","translog","replicas","waiting"],
+      durable:"YES", get:"yes", search:"NOT YET",
+      note:"The client has its success response. The document is durable and replicated, and it is still invisible to search.\n\nThis is the gap that surprises everyone and breaks test suites: write a document, immediately search for it, get zero results, conclude something is broken. Nothing is broken — the refresh has not happened.\n\nThree ways to deal with it. Read by id if you can, since a GET is real-time. Use ?refresh=wait_for on the write when you genuinely need the next search to see it. Or accept the delay, which for almost every real workload is the right answer." },
+    { t:"Refresh — the buffer becomes a searchable segment",
+      stages:["done","flushed","translog","replicas","SEARCHABLE"],
+      durable:"YES", get:"yes", search:"yes",
+      note:"The refresh writes the in-memory buffer out as a new Lucene segment and opens it for searching. By default this happens once per second, per shard, if there is anything to write.\n\nThe segment goes to the filesystem cache rather than straight to disk — that is what makes a refresh cheap enough to run every second. The eventual fsync happens at flush time, and the translog is what covers the gap in between.\n\nEach refresh creates a segment, and segments are merged in the background. That is why refreshing too often is expensive: not the refresh itself, but the merge pressure from all the small segments it produces." }
+  ];
+
+  const LABELS = ["coordinating node","memory buffer","translog","replicas","search visibility"];
+
+  function render(){
+    const i = parseInt($("w-step").value, 10) - 1;
+    const s = STEPS[i];
+    const rf = $("w-refresh").value;
+    $("w-stepv").textContent = i + 1;
+
+    $("w-durable").textContent = s.durable;
+    $("w-getable").textContent = s.get;
+    $("w-search").textContent  = s.search;
+    $("w-durable").style.color = s.durable === "YES" ? "#3FB984" : "#E2574C";
+    $("w-search").style.color  = s.search === "yes" ? "#3FB984" : "#E2574C";
+
+    $("w-stages").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin:16px 0 8px">' + s.t + '</div>' +
+      '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:7px">' +
+      LABELS.map((lab, n) => {
+        const st = s.stages[n];
+        const on = st !== "";
+        const hot = st === "SEARCHABLE" || st === "translog" || st === "replicas";
+        return '<div style="background:' + (on ? "#fff" : "#F4F7F9") + ';border:2px solid ' +
+          (on ? (st === "SEARCHABLE" ? "#3FB984" : "#25B7C4") : "#E9EDF0") +
+          ';border-radius:6px;padding:10px 8px;text-align:center">' +
+          '<div style="font-size:10.5px;color:#8FA0AF;margin-bottom:5px">' + lab + '</div>' +
+          '<div style="font-family:var(--mono);font-size:11px;font-weight:700;color:' +
+          (on ? (st === "SEARCHABLE" ? "#1F7A52" : "#0F7A85") : "#C2CCD4") + '">' +
+          (on ? st : "—") + '</div></div>';
+      }).join("") + '</div>';
+
+    const notes = [s.note];
+
+    if(i >= 4){
+      if(rf === "30s")
+        notes.push("With refresh_interval at 30s the gap between acknowledgement and searchability is up to thirty seconds.\n\nThat is the standard tuning for log and metric ingestion, and it is a large throughput win: fewer refreshes means fewer tiny segments, which means far less merge pressure in the background. Nobody needs a log line to be searchable within one second.\n\nIt is the wrong setting for anything a user just submitted and expects to see in a list.");
+      else if(rf === "wait")
+        notes.push("With ?refresh=wait_for the write does not return until the next SCHEDULED refresh has made it visible — so your client blocks for up to a second, and no extra segment is created.\n\nThis is the right choice when you need read-your-writes through search. It costs latency on that one request and nothing else.\n\nContrast with ?refresh=true, which forces an immediate refresh and creates a new segment for your single document. In a loop that produces thousands of tiny segments and the merge pressure will hurt for hours.");
+      else if(rf === "true")
+        notes.push("With ?refresh=true the document is searchable the moment the call returns — because Elasticsearch performed a refresh right then, creating a segment containing essentially your one document.\n\nAcceptable in a test suite. Genuinely damaging in production code: every call makes a tiny segment, and the background merge process then has to spend I/O consolidating them all. A service that writes with refresh=true under load can generate more merge work than indexing work.\n\nUse wait_for instead. It gets you the same guarantee without the segment.");
+      else
+        notes.push("With the default 1s interval, the document becomes searchable within a second of this point. That is the near-real-time property, and it is a deliberate trade rather than a limitation — batching writes into periodic segments is a large part of why indexing throughput is what it is.\n\nTry the other refresh settings above to see the alternatives.");
+    }
+
+    if(i === 2)
+      notes.push("Worth noting the durability setting here. index.translog.durability defaults to \"request\", meaning an fsync per write, which is what makes the acknowledgement safe.\n\nSetting it to \"async\" fsyncs every 5 seconds instead and is a real throughput gain for log ingestion, where losing five seconds on a hard crash is acceptable because the shipper will resend. For anything you cannot re-send, leave it alone.");
+
+    $("w-note").textContent = notes.join("\n\n");
+  }
+
+  ["w-step","w-refresh"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

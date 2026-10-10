@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Constraints and integrity — SQL</title>
+<meta name="description" content="Primary and foreign keys, unique, check and exclusion constraints — pushing invariants into the database where they cannot be bypassed.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 11 · Changing data</div>
+    <h1>Constraints and integrity</h1>
+    <p class="standfirst">A rule enforced in application code holds until someone writes a second service, runs a migration by hand, or forgets. A rule in the database holds always. This chapter is about moving invariants to where they cannot be bypassed.</p>
+    <div class="chap-meta">
+      <span class="tagpill">keys</span>
+      <span class="tagpill">unique</span>
+      <span class="tagpill">check</span>
+      <span class="tagpill">cascade</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Why the database and not the application</h2>
+
+<div class="cols">
+  <div class="col bad">
+    <h4>Application-level validation</h4>
+    <ul>
+      <li>Bypassed by a second service, a background job, a console session, a migration</li>
+      <li>Racy — two requests both pass the check, both write (chapter 10)</li>
+      <li>Drifts between codebases and languages</li>
+      <li>Silent when it fails</li>
+    </ul>
+  </div>
+  <div class="col good">
+    <h4>Database-level constraints</h4>
+    <ul>
+      <li>Hold for every writer, including the ones that do not exist yet</li>
+      <li>Atomic — the check and the write happen under one lock</li>
+      <li>Document the rule where the data lives</li>
+      <li>Fail loudly, with an error naming the constraint</li>
+      <li>Let the planner optimise using the guarantee</li>
+    </ul>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Both, not either</span>
+  <p>Application validation gives good error messages and catches problems before a round trip. Database constraints guarantee the invariant actually holds. You want both: validate in the application for the user experience, constrain in the database for correctness. The failure mode to avoid is having only the first and believing it is sufficient — every table with duplicate rows that "cannot happen" is that belief being wrong.</p>
+</div>
+
+<h2><span class="h-rule"></span>The constraint types</h2>
+
+<div class="demo" id="con">
+  <div class="demo-head">
+    <b>What each constraint catches</b>
+    <span>Try to insert a row. Toggle constraints on and off and see which writes the database refuses.</span>
+  </div>
+  <div class="demo-body">
+    <label>Constraints on the table</label>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:6px 18px;margin:8px 0 14px">
+      <label><input type="checkbox" class="cn" value="pk" checked> PRIMARY KEY (id)</label>
+      <label><input type="checkbox" class="cn" value="nn"> NOT NULL (customer_id, amount)</label>
+      <label><input type="checkbox" class="cn" value="fk"> FOREIGN KEY (customer_id)</label>
+      <label><input type="checkbox" class="cn" value="uq"> UNIQUE (reference)</label>
+      <label><input type="checkbox" class="cn" value="ck"> CHECK (amount &gt; 0)</label>
+      <label><input type="checkbox" class="cn" value="enum"> CHECK (status IN (…))</label>
+    </div>
+    <label for="c-row">Row being inserted</label>
+    <select id="c-row">
+      <option value="ok" selected>Valid row — (9, 3, 210.00, 'NW-0009', 'paid')</option>
+      <option value="dupid">Duplicate id — (1, 3, 210.00, 'NW-0009', 'paid')</option>
+      <option value="nullcust">NULL customer_id — (9, NULL, 210.00, 'NW-0009', 'paid')</option>
+      <option value="badfk">Customer 99 does not exist — (9, 99, 210.00, 'NW-0009', 'paid')</option>
+      <option value="dupref">Reference already used — (9, 3, 210.00, 'NW-0001', 'paid')</option>
+      <option value="neg">Negative amount — (9, 3, -50.00, 'NW-0009', 'paid')</option>
+      <option value="badstatus">status = 'Paid ' — (9, 3, 210.00, 'NW-0009', 'Paid ')</option>
+      <option value="nullref">NULL reference — (9, 3, 210.00, NULL, 'paid')</option>
+    </select>
+    <div class="stat">
+      <div><b id="c-res">—</b><span>result</span></div>
+      <div><b id="c-by">—</b><span>caught by</span></div>
+    </div>
+    <div class="out" id="c-note"></div>
+  </div>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Constraint</th><th>Guarantees</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><td><b>NOT NULL</b></td><td>A value is present</td><td>Nothing. The cheapest correctness you can buy</td></tr>
+<tr><td><b>PRIMARY KEY</b></td><td>Unique and not null; one per table</td><td>An index, which you wanted anyway</td></tr>
+<tr><td><b>UNIQUE</b></td><td>No duplicate values</td><td>An index, and a check on every write</td></tr>
+<tr><td><b>FOREIGN KEY</b></td><td>The referenced row exists</td><td>A lookup per write, and a lock on the parent</td></tr>
+<tr><td><b>CHECK</b></td><td>An expression over the row is not false</td><td>Evaluated per write. Usually negligible</td></tr>
+<tr><td><b>EXCLUSION</b></td><td>No two rows conflict under an operator</td><td>A GiST index. Postgres only</td></tr>
+<tr><td><b>DEFAULT</b></td><td>Not a constraint, but pairs with NOT NULL</td><td>Nothing</td></tr>
+<tr><td><b>GENERATED</b></td><td>A column computed from others, always consistent</td><td>Computed on write (stored) or read (virtual)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>UNIQUE, and the NULL surprise</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">a "unique" column that permits a thousand duplicates</span><button class="copy">Copy</button></div>
+<pre><code>CREATE TABLE users (email text UNIQUE);
+INSERT INTO users VALUES (NULL), (NULL), (NULL);   -- all three succeed
+
+-- Standard SQL treats NULLs as distinct for uniqueness, because NULL = NULL is
+-- UNKNOWN rather than true (chapter 3). Every NULL is "possibly different".
+-- If the column must be unique AND present, that is two constraints:
+CREATE TABLE users (email text UNIQUE NOT NULL);
+
+-- Postgres 15+ can invert the behaviour when NULL genuinely means "one of these":
+CREATE UNIQUE INDEX ON users (email) NULLS NOT DISTINCT;
+
+-- SQL Server is the outlier: its unique index allows only ONE NULL, which is
+-- neither the standard behaviour nor usually what anyone wants.</code></pre>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">partial unique indexes — conditional uniqueness</span><button class="copy">Copy</button></div>
+<pre><code>-- "One active subscription per customer, but any number of cancelled ones."
+-- A plain UNIQUE on customer_id would forbid the history.
+CREATE UNIQUE INDEX one_active_sub
+    ON subscriptions (customer_id)
+    WHERE status = 'active';
+
+-- "Emails unique among live users, but soft-deleted rows may reuse them."
+CREATE UNIQUE INDEX unique_live_email
+    ON users (lower(email))
+    WHERE deleted_at IS NULL;
+
+-- Note lower(email): case-insensitive uniqueness needs the expression in the
+-- index, or 'A@x.com' and 'a@x.com' are both allowed. Postgres and SQLite
+-- support partial indexes; SQL Server calls them filtered indexes; MySQL has
+-- no equivalent and needs a generated column plus a trigger.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">The partial unique index is the most underused feature here</span>
+  <p>Nearly every "only one of these at a time" rule — one default address, one primary contact, one active subscription, one open shift per employee — is a partial unique index. Most codebases enforce these with application checks that race under concurrency, and the fix is one line of DDL that cannot be bypassed. When you next see a comment saying "there should only ever be one of these", that is what it is asking for.</p>
+</div>
+
+<h2><span class="h-rule"></span>Foreign keys</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the referential actions, and choosing between them</span><button class="copy">Copy</button></div>
+<pre><code>CREATE TABLE orders (
+    customer_id bigint NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+    address_id  bigint          REFERENCES addresses(id) ON DELETE SET NULL,
+    ...
+);
+
+-- ON DELETE:
+--   RESTRICT / NO ACTION  refuse the delete if children exist  <- safe default
+--   CASCADE               delete the children too
+--   SET NULL              null the reference (column must be nullable)
+--   SET DEFAULT           set it to the column default
+--
+-- ON UPDATE takes the same actions, and matters only if you allow the parent
+-- key to change — which is an argument for surrogate keys (chapter 4).</code></pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Use</th><th>When the child is</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td><b>RESTRICT</b></td><td>Independently meaningful</td><td>Orders for a customer. Deleting the customer should fail loudly</td></tr>
+<tr><td><b>CASCADE</b></td><td>Genuinely part of the parent</td><td>Line items of an order. Meaningless without it</td></tr>
+<tr><td><b>SET NULL</b></td><td>An optional reference</td><td>An order's delivery address, kept as a snapshot elsewhere</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Two things foreign keys will do that surprise people</span>
+  <p><b>They do not create an index on the child.</b> PostgreSQL, SQL Server and Oracle index the parent's key and not the referencing column, so every parent delete scans the child table to check the constraint, and every join across it is a scan. MySQL/InnoDB is the exception. This is the single most common missing index (chapter 5). <b>And cascades compound:</b> deleting one customer can remove orders, then their line items, then shipments — millions of rows and a long exclusive lock from a statement that looked trivial. Follow the graph and count before deleting from a parent table in production.</p>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">deferrable constraints — for the chicken-and-egg cases</span><button class="copy">Copy</button></div>
+<pre><code>-- Two tables that reference each other, or a bulk load that must insert
+-- children before parents.
+ALTER TABLE orders
+    ADD CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id)
+    REFERENCES customers(id) DEFERRABLE INITIALLY IMMEDIATE;
+
+BEGIN;
+SET CONSTRAINTS orders_customer_fk DEFERRED;   -- check at COMMIT, not per row
+INSERT INTO orders …;                          -- customer does not exist yet
+INSERT INTO customers …;                       -- now it does
+COMMIT;                                        -- constraint verified here
+
+-- Use sparingly. A deferred constraint means the database is inconsistent for
+-- the duration of the transaction, and the error arrives at COMMIT where it is
+-- harder to attribute to a particular statement.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>CHECK constraints</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the rules a type cannot express</span><button class="copy">Copy</button></div>
+<pre><code>ALTER TABLE orders
+  ADD CONSTRAINT amount_positive  CHECK (amount > 0),
+  ADD CONSTRAINT currency_iso     CHECK (currency ~ '^[A-Z]{3}$'),
+  ADD CONSTRAINT status_valid     CHECK (status IN ('pending','paid','shipped',
+                                                    'cancelled','refunded')),
+  -- cross-column rules
+  ADD CONSTRAINT ships_after_placed
+      CHECK (shipped_at IS NULL OR shipped_at >= placed_at),
+  ADD CONSTRAINT discount_within_total
+      CHECK (discount IS NULL OR discount <= amount),
+  -- keep a status column and its timestamps from drifting apart
+  ADD CONSTRAINT status_matches_timestamps
+      CHECK ((status = 'shipped')   = (shipped_at   IS NOT NULL)
+         AND (status = 'cancelled') = (cancelled_at IS NOT NULL));
+
+-- Remember chapter 3: CHECK rejects only FALSE, so UNKNOWN passes. Every one
+-- of these accepts a NULL in the tested column. If the value is mandatory,
+-- that is a separate NOT NULL — the CHECK will not do it for you.</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">A CHECK must be deterministic and row-local</span>
+  <p>It cannot reference other rows, other tables, or anything that changes — no subqueries, no <code>now()</code>, no user-defined function that reads a table. The reason is that constraints are re-verified when a table is rewritten or a dump is restored, and a rule depending on external state would fail then. <code>CHECK (placed_at &lt;= now())</code> looks reasonable and will reject your own backup during restore. For cross-row rules use an exclusion constraint, a trigger, or accept that it belongs in application code.</p>
+</div>
+
+<h2><span class="h-rule"></span>Exclusion constraints</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">preventing overlaps — the constraint UNIQUE cannot express</span><button class="copy">Copy</button></div>
+<pre><code>-- "No two bookings for the same room may overlap in time."
+-- UNIQUE cannot say this: the rule is about ranges intersecting, not values
+-- being equal. An exclusion constraint generalises UNIQUE to any operator.
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+
+CREATE TABLE bookings (
+    id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    room_id bigint NOT NULL,
+    during  tstzrange NOT NULL,
+    EXCLUDE USING gist (room_id WITH =, during WITH &&)
+    --                          equal        overlaps
+);
+
+INSERT INTO bookings (room_id, during)
+VALUES (1, '[2026-03-01 09:00, 2026-03-01 11:00)');   -- ok
+INSERT INTO bookings (room_id, during)
+VALUES (1, '[2026-03-01 10:00, 2026-03-01 12:00)');   -- ERROR: conflicts
+
+-- Without this, preventing double-booking needs a SELECT to check for overlaps
+-- followed by an INSERT — which is a race (chapter 10), and the failure mode
+-- is a customer arriving to find their room occupied.
+-- PostgreSQL only. Elsewhere: SERIALIZABLE plus retry, or an explicit lock.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Adding constraints to a table that already has data</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">without locking the table for an hour</span><button class="copy">Copy</button></div>
+<pre><code>-- The naive version scans the whole table under an ACCESS EXCLUSIVE lock:
+ALTER TABLE orders ADD CONSTRAINT amount_positive CHECK (amount > 0);
+
+-- Two-step. Step 1 takes a brief lock and does NOT scan; new and updated rows
+-- are checked from this moment on.
+ALTER TABLE orders ADD CONSTRAINT amount_positive CHECK (amount > 0) NOT VALID;
+
+-- Step 2 verifies the existing rows under a weaker lock that permits reads
+-- and writes. Slow, and it does not block anything.
+ALTER TABLE orders VALIDATE CONSTRAINT amount_positive;
+
+-- Same pattern for foreign keys. And for NOT NULL on a large table, add a
+-- CHECK (col IS NOT NULL) NOT VALID, validate it, then convert:
+--   Postgres 12+ recognises the validated CHECK and skips the scan when you
+--   SET NOT NULL.
+
+-- Fix the offending rows BEFORE validating. VALIDATE fails on the first bad
+-- row and you have to start again.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Find the violations before you add the constraint</span>
+  <p>Run the negation as a query first: <code>SELECT count(*) FROM orders WHERE NOT (amount &gt; 0)</code> — and remember to handle NULLs separately, since <code>NOT (NULL &gt; 0)</code> is UNKNOWN and will not appear in that count. Knowing the number changes the plan: zero means you can add the constraint immediately, a handful means fix them by hand, and thousands means you have a data-quality project rather than a migration, and probably a bug still producing them.</p>
+</div>
+
+<h2><span class="h-rule"></span>Triggers, and when to resist them</h2>
+
+<div class="cols">
+  <div class="col good">
+    <h4>Reasonable uses</h4>
+    <ul>
+      <li>Maintaining <code>updated_at</code></li>
+      <li>Append-only audit logging</li>
+      <li>Maintaining a denormalised counter or search vector</li>
+      <li>Enforcing a cross-row rule no constraint can express</li>
+    </ul>
+  </div>
+  <div class="col bad">
+    <h4>Why they are a last resort</h4>
+    <ul>
+      <li>Invisible — code runs that nobody reading the application can see</li>
+      <li>Hard to test, hard to debug, hard to version</li>
+      <li>Fire on bulk operations, turning one statement into millions of function calls</li>
+      <li>Can cascade into other triggers</li>
+      <li>Order between triggers on the same event is often undefined</li>
+    </ul>
+  </div>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the one nearly everyone should have</span><button class="copy">Copy</button></div>
+<pre><code>CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$
+BEGIN
+    NEW.updated_at := now();
+    RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+CREATE TRIGGER orders_updated_at
+    BEFORE UPDATE ON orders
+    FOR EACH ROW
+    WHEN (OLD.* IS DISTINCT FROM NEW.*)   -- skip no-op updates entirely
+    EXECUTE FUNCTION set_updated_at();
+
+-- The WHEN clause matters: without it, an UPDATE that changes nothing still
+-- bumps the timestamp, which breaks any consumer using updated_at to detect
+-- real changes — including incremental syncs and cache invalidation.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>A checklist for a new table</h2>
+
+<ul class="check">
+  <li><b>Primary key</b> — surrogate, <code>bigint</code> or UUID v7 (chapter 4).</li>
+  <li><b><code>NOT NULL</code> on every column</b> that has no meaningful absent state. Default to it and justify exceptions.</li>
+  <li><b>A unique constraint on the natural key</b>, even though the primary key is a surrogate.</li>
+  <li><b>Foreign keys with an explicit action</b>, and an index on each referencing column.</li>
+  <li><b>A <code>CHECK</code> for every enum-like column</b>, and for every numeric range that has one.</li>
+  <li><b>Cross-column checks</b> where two columns must agree — status and its timestamps especially.</li>
+  <li><b>Partial unique indexes</b> for every "only one of these at a time" rule.</li>
+  <li><b><code>created_at</code> and <code>updated_at</code></b>, both <code>timestamptz NOT NULL</code>.</li>
+  <li><b>Named constraints</b> — the auto-generated names appear in error messages and are useless.</li>
+</ul>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Application validation for the error message; <b>database constraints for the guarantee</b>. Both, not either.</li>
+    <li><b><code>UNIQUE</code> permits unlimited NULLs</b>, because NULL is never equal to NULL. Add <code>NOT NULL</code> if you meant both.</li>
+    <li><b>Partial unique indexes</b> are the answer to nearly every "only one at a time" rule, and they cannot be raced.</li>
+    <li>Foreign keys <b>do not create an index on the child</b> in most engines — the commonest missing index there is.</li>
+    <li><b>Cascades compound.</b> Follow the graph and count before deleting from a parent in production.</li>
+    <li><code>CHECK</code> must be <b>deterministic and row-local</b> — no <code>now()</code>, no subqueries, or restores will fail.</li>
+    <li><b>Exclusion constraints</b> generalise UNIQUE to overlap and other operators. No booking system should be without one.</li>
+    <li>On a live table, add constraints <b><code>NOT VALID</code> then <code>VALIDATE</code></b>, and find the violations first.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("11-constraints.html");
+
+(function(){
+  const root = document.getElementById("con");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const CASES = {
+    ok:        {needs:[], desc:"A clean row: unused id, existing customer, positive amount, unused reference, a valid status."},
+    dupid:     {needs:["pk"], desc:"id 1 already exists in the table."},
+    nullcust:  {needs:["nn"], desc:"customer_id is NULL. Note the foreign key does NOT catch this — a NULL reference is permitted by definition, because there is nothing to check against."},
+    badfk:     {needs:["fk"], desc:"customer_id 99 has no matching row in customers."},
+    dupref:    {needs:["uq"], desc:"reference NW-0001 is already used by another order."},
+    neg:       {needs:["ck"], desc:"amount is -50.00."},
+    badstatus: {needs:["enum"], desc:"status is 'Paid ' — wrong case and a trailing space. It is a perfectly valid string, so only an explicit CHECK or an enum type rejects it."},
+    nullref:   {needs:[], desc:"reference is NULL. UNIQUE allows this — any number of NULLs, because NULL is never equal to NULL."}
+  };
+
+  const NAMES = {
+    pk:"PRIMARY KEY (id)", nn:"NOT NULL (customer_id)", fk:"FOREIGN KEY (customer_id)",
+    uq:"UNIQUE (reference)", ck:"CHECK (amount > 0)", enum:"CHECK (status IN (…))"
+  };
+
+  function render(){
+    const on = new Set([].slice.call(document.querySelectorAll(".cn:checked")).map(c => c.value));
+    const key = $("c-row").value;
+    const cs = CASES[key];
+    const caught = cs.needs.filter(n => on.has(n));
+    const rejected = caught.length > 0;
+
+    $("c-res").textContent = rejected ? "rejected" : "accepted";
+    $("c-by").textContent  = rejected ? NAMES[caught[0]].split(" ")[0] : "—";
+
+    const notes = [cs.desc];
+
+    if(rejected){
+      notes.push("The database refuses the write with an error naming " + NAMES[caught[0]] +
+                 ". No application code was involved and no code path can bypass it — a migration script, a second service and a console session all hit the same wall.");
+    } else if(cs.needs.length){
+      notes.push("ACCEPTED, because " + cs.needs.map(n => NAMES[n]).join(" and ") +
+                 " is not enabled. The bad row is now in the table. Nothing errored, nothing logged, and it will be discovered by whichever report or join it breaks — " +
+                 "possibly months from now, when nobody remembers what wrote it.");
+    } else {
+      notes.push("Accepted, and correctly so — no constraint here is violated.");
+    }
+
+    if(key === "nullcust" && on.has("fk") && !on.has("nn"))
+      notes.push("Worth noticing specifically: the FOREIGN KEY is enabled and did not catch this. A NULL foreign key means \"references nothing\", which is legal by design. " +
+                 "If the reference is mandatory, that is a separate NOT NULL — the two constraints answer different questions.");
+
+    if(key === "nullref" && on.has("uq"))
+      notes.push("UNIQUE is enabled and the row was still accepted. Insert it again and it will be accepted again, and again — every NULL is treated as possibly distinct from every other. " +
+                 "A column that must be unique AND present needs UNIQUE NOT NULL.");
+
+    if(key === "badstatus" && !on.has("enum"))
+      notes.push("This is how a status column ends up with 'paid', 'Paid', 'PAID' and 'paid ' all meaning the same thing. Every downstream query then needs normalisation, " +
+                 "and any that forgets silently undercounts. A CHECK with an explicit value list costs one line and prevents the entire category.");
+
+    if(!on.has("nn"))
+      notes.push("NOT NULL is the cheapest constraint available — no index, no lookup, no measurable cost — and it prevents an entire class of three-valued-logic bug downstream (chapter 3). " +
+                 "It should be the default, with nullable columns as the justified exception.");
+
+    $("c-note").textContent = notes.join("\n\n");
+  }
+
+  [].slice.call(document.querySelectorAll(".cn")).forEach(c => c.addEventListener("change", render));
+  $("c-row").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

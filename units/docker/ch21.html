@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>21 · Podman, containerd and the OCI — Docker</title>
+<meta name="description" content="The OCI standards, the runtime stack from CLI to kernel, Podman's daemonless model, containerd and nerdctl, low-level runtimes including gVisor and Kata, build alternatives, and how to choose.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Crect x='6' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='19' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='10' width='5' height='5' fill='%23fff'/%3E%3Cpath d='M4 22h22a5 5 0 004-4' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch21">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Docker
+    </a>
+    <div class="chno"><b>Chapter 21</b><span>Beyond Docker</span></div>
+    <h1>Podman, containerd and the OCI</h1>
+    <p class="lede">Everything in the previous twenty chapters is portable, because almost none of it is really about Docker. <b>Images, the runtime contract and the registry API are all standards</b> — so the images you built will run under Podman, containerd or Kubernetes unchanged, and what actually differs between the tools is narrower and more interesting than the marketing suggests.</p>
+    <div class="meta"><span>28 min</span><span>2 demos</span><span>8 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="standards">
+      <h2 data-nav="The standards">The three OCI specifications</h2>
+      <p class="sub">Chapter 1 mentioned them. Here is what each one actually fixes in place.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Specification</th><th>Defines</th><th>Which is why</th></tr></thead>
+          <tbody>
+            <tr><td><strong>image-spec</strong></td><td>The manifest, the config blob, layer media types, and the index for multi-platform (chapter 3)</td><td>Any tool can read any image</td></tr>
+            <tr><td><strong>runtime-spec</strong></td><td>A filesystem bundle plus a <code>config.json</code>, and the lifecycle: create, start, kill, delete</td><td>Any runtime can run any bundle</td></tr>
+            <tr><td><strong>distribution-spec</strong></td><td>The <code>/v2/</code> HTTP API for manifests and blobs (chapter 15)</td><td>Any client can push to any registry</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">the runtime contract, in the raw</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># a "container" at the lowest level is a directory and a JSON file
+$ mkdir -p bundle/rootfs &amp;&amp; cd bundle
+$ docker export $(docker create alpine) | tar -C rootfs -xf -
+$ runc spec                                    # writes config.json
+$ sudo runc run demo                            # and that is a container
+/ # exit
+$ sudo runc list</pre>
+      </div>
+      <p>That is the whole runtime abstraction: a root filesystem and a specification of namespaces, cgroups, capabilities, seccomp and the process to run. Everything from chapters 2, 10 and 18 appears in that <code>config.json</code> — which is what Docker, Podman and Kubernetes are all ultimately generating.</p>
+    </section>
+
+    <section id="stack">
+      <h2 data-nav="The stack">The stack, layer by layer</h2>
+      <p class="sub">Where each tool slots in, and what follows from that.</p>
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Runtime stack explorer</h3>
+          <span class="hint">The layers a command traverses, and the consequences of that shape</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl" id="k-tool"></div>
+          <div id="k-diagram" style="margin:4px 0 10px"></div>
+          <div class="rgrid" id="k-out"></div>
+          <p class="readout" id="k-note"></p>
+        </div>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">seeing the layers on a Docker host</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run -d --name web nginx
+$ ps -ef --forest | grep -E 'dockerd|containerd|nginx' | head
+root      dockerd
+root       containerd
+root        containerd-shim-runc-v2 -namespace moby -id 3f9c2a…
+systemd+     nginx: master process        &lt;- a child of the SHIM, not of dockerd
+
+# containerd sees the same container, under the "moby" namespace
+$ sudo ctr -n moby containers list
+$ sudo ctr -n moby tasks list</pre>
+      </div>
+      <div class="key">
+        <span class="lbl">Why <code>live-restore</code> can work at all</span>
+        <p>Container processes are children of a <strong>shim</strong>, one per container, not of the daemon — so restarting <code>dockerd</code> does not orphan or kill them (chapter 20). The shim also holds the container's stdio and reports its exit status, which is how the exit code survives a daemon that was not running when the process died. That architecture is the reason a daemon is less of a single point of failure than it appears.</p>
+      </div>
+    </section>
+
+    <section id="podman">
+      <h2 data-nav="Podman">Podman</h2>
+      <p class="sub">The same commands, a different architecture.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th></th><th>Docker</th><th>Podman</th></tr></thead>
+          <tbody>
+            <tr><td>Daemon</td><td>Long-running <code>dockerd</code></td><td><b>None.</b> The CLI forks the runtime directly</td></tr>
+            <tr><td>Container parent</td><td>A shim under containerd</td><td>A <code>conmon</code> monitor per container</td></tr>
+            <tr><td>Rootless</td><td>Opt-in (chapter 18)</td><td><b>The default</b></td></tr>
+            <tr><td>Grouping</td><td>Compose projects</td><td><b>Pods</b> — a shared network and IPC namespace</td></tr>
+            <tr><td>Start on boot</td><td>Restart policies via the daemon</td><td>systemd units, generated by Quadlet</td></tr>
+            <tr><td>Building</td><td>BuildKit</td><td>Buildah, under the same <code>build</code> command</td></tr>
+            <tr><td>Networking</td><td>Bridge via the daemon</td><td>netavark rootful; pasta or slirp4netns rootless</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">the things Podman does that Docker does not</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># pods: a shared namespace group, as in Kubernetes
+$ podman pod create --name app -p 8080:8080
+$ podman run -d --pod app --name api ghcr.io/acme/api
+$ podman run -d --pod app --name cache redis:7-alpine    # api reaches it on localhost
+
+# and the bridge to Kubernetes, in both directions
+$ podman generate kube app &gt; app.yaml
+$ podman play kube app.yaml
+
+# systemd units instead of restart policies — /etc/containers/systemd/api.container
+$ systemctl --user enable --now api.service
+$ podman auto-update                        # pull and restart on a new digest</pre>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">a Docker-compatible API, so existing tooling works</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ systemctl --user enable --now podman.socket
+$ export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock
+$ docker compose up -d          # the real Compose CLI, talking to Podman
+$ ./run-testcontainers.sh        # and anything else that speaks the Docker API</pre>
+      </div>
+      <div class="trap">
+        <span class="lbl">The differences that actually bite</span>
+        <p>Rootless Podman <strong>cannot bind ports below 1024</strong> without a sysctl change, so <code>-p 80:80</code> fails where Docker succeeds. On SELinux systems, bind mounts need <code>:z</code> or <code>:Z</code> far more often (chapter 11). <code>--privileged</code> is privileged only <em>within your user namespace</em>, which is a feature and surprising the first time. And rootless networking runs in userspace, so throughput is lower and the source address a container sees may be rewritten. None of these is a defect — they are the visible cost of not having a root daemon.</p>
+      </div>
+    </section>
+
+    <section id="containerd">
+      <h2 data-nav="containerd, nerdctl">containerd and nerdctl</h2>
+      <p class="sub">The layer Docker already uses, driven directly.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">three clients, one containerd</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># ctr — containerd's own client. A debugging tool, not a user interface
+$ sudo ctr namespaces list                       # default, moby, k8s.io
+$ sudo ctr -n k8s.io images list | head
+$ sudo ctr -n moby tasks list                     # Docker's containers
+
+# nerdctl — a Docker-compatible CLI on containerd
+$ nerdctl run -d -p 8080:80 --name web nginx:alpine
+$ nerdctl compose -f compose.yaml up -d
+$ nerdctl build -t app .                          # via buildkitd
+
+# crictl — the CRI client, for debugging a kubelet's containers
+$ sudo crictl pods &amp;&amp; sudo crictl ps</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Concept</th><th>Detail</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Namespaces</strong></td><td>containerd partitions everything: Docker uses <code>moby</code>, Kubernetes uses <code>k8s.io</code>. Images are not shared across them</td></tr>
+            <tr><td><strong>Snapshotters</strong></td><td>The storage layer — <code>overlayfs</code> by default; <code>stargz</code> and SOCI enable <b>lazy pulling</b>, starting a container before the layers finish downloading</td></tr>
+            <tr><td><strong>Content store</strong></td><td>Content-addressed blobs, exactly as chapter 3 described</td></tr>
+            <tr><td><strong>CRI plugin</strong></td><td>What the kubelet talks to (chapter 22)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>The namespace detail explains a common confusion: an image pulled by Docker is invisible to Kubernetes on the same machine even though both use the same containerd, because they live in different namespaces. <code>ctr -n moby images list</code> and <code>ctr -n k8s.io images list</code> return different sets.</p>
+    </section>
+
+    <section id="runtimes">
+      <h2 data-nav="Low-level runtimes">Low-level runtimes</h2>
+      <p class="sub">Swappable, and one of them changes the security model entirely.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Runtime</th><th>Isolation</th><th>Cost</th><th>Use when</th></tr></thead>
+          <tbody>
+            <tr><td><code>runc</code></td><td>Namespaces and cgroups — the default</td><td>Essentially none</td><td>Almost always</td></tr>
+            <tr><td><code>crun</code></td><td>The same, implemented in C</td><td>Lower memory, faster start</td><td>Very high container density</td></tr>
+            <tr><td><code>youki</code></td><td>The same, in Rust</td><td>Comparable to crun</td><td>Curiosity, mostly</td></tr>
+            <tr><td><strong><code>runsc</code></strong> (gVisor)</td><td>A <b>userspace kernel</b> intercepting syscalls</td><td>Syscall overhead; some incompatibility</td><td>Running untrusted code</td></tr>
+            <tr><td><strong>Kata</strong></td><td>A <b>lightweight VM per container</b></td><td>Memory and boot overhead</td><td>Hardware-level isolation between tenants</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">registering and using one</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># /etc/docker/daemon.json
+{ "runtimes": { "runsc": { "path": "/usr/local/bin/runsc" } } }
+
+$ docker run --rm --runtime=runsc alpine dmesg | head -3
+[    0.000000] Starting gVisor…              # not the host kernel
+
+$ docker run --rm --runtime=runsc alpine uname -r
+4.4.0                                          # gVisor's reported version</pre>
+      </div>
+      <p>The distinction that matters: <code>runc</code>, <code>crun</code> and <code>youki</code> are interchangeable implementations of the same isolation model, so switching between them is a performance decision. <strong>gVisor and Kata change the model</strong> — the container no longer talks to the host kernel directly, which is the only thing on this page that meaningfully alters chapter 18's escalation analysis. Both cost real performance, and both are the right answer when you are running code you did not write.</p>
+    </section>
+
+    <section id="build">
+      <h2 data-nav="Build alternatives">Building without a daemon</h2>
+      <p class="sub">Mostly relevant inside Kubernetes, where there is no Docker socket.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Tool</th><th>Approach</th><th>Suits</th></tr></thead>
+          <tbody>
+            <tr><td><strong>BuildKit</strong></td><td>Dockerfiles, as a daemon or one-shot (chapter 8)</td><td>The default answer, including in CI</td></tr>
+            <tr><td><strong>Buildah</strong></td><td>Dockerfiles <em>or</em> a scriptable API; rootless, daemonless</td><td>Podman hosts; building inside a container</td></tr>
+            <tr><td><strong>Kaniko</strong></td><td>Executes a Dockerfile in userspace, in a container</td><td>Kubernetes CI with no privileged access</td></tr>
+            <tr><td><strong>ko</strong></td><td>Go source straight to an image, no Dockerfile</td><td>Go services — very fast, very opinionated</td></tr>
+            <tr><td><strong>Jib</strong></td><td>Java builds to an image from Maven or Gradle</td><td>JVM projects</td></tr>
+            <tr><td><strong>apko / melange</strong></td><td>Declarative package lists, no Dockerfile</td><td>Minimal, reproducible bases (chapter 8)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">Buildah's scriptable form, which has no Dockerfile equivalent</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ ctr=$(buildah from gcr.io/distroless/static:nonroot)
+$ buildah copy $ctr ./server /server
+$ buildah config --entrypoint '["/server"]' --user 65532 $ctr
+$ buildah commit $ctr ghcr.io/acme/api:2.4.1
+$ buildah push ghcr.io/acme/api:2.4.1</pre>
+      </div>
+      <p>That is the same image a multi-stage Dockerfile would produce, assembled by a shell script instead — occasionally useful when the build logic is genuinely dynamic, and worse than a Dockerfile whenever it is not, because you have traded a declarative artefact for imperative code.</p>
+    </section>
+
+    <section id="translate">
+      <h2 data-nav="Translating commands">Translating commands</h2>
+      <p class="sub">Most of them are identical. The interesting cases are not.</p>
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Command translator</h3>
+          <span class="hint">Docker to Podman and nerdctl, with the divergences flagged</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight" id="t-presets"></div>
+          <div class="ctrl">
+            <label for="t-in" style="min-width:52px">docker</label>
+            <input type="text" id="t-in" spellcheck="false" style="flex:1 1 300px;font-family:var(--mono);font-size:12.5px" value="docker run -d -p 80:80 -v /srv/data:/data nginx">
+          </div>
+          <div class="term" id="t-term"></div>
+          <div class="rgrid" id="t-out"></div>
+          <p class="readout" id="t-note"></p>
+        </div>
+      </div>
+    </section>
+
+    <section id="choosing">
+      <h2 data-nav="Choosing">Choosing, honestly</h2>
+      <p class="sub">What genuinely differs, once the marketing is removed.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Pick</th><th>When</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Docker</strong></td><td>Development on macOS or Windows; the Compose workflow; the largest ecosystem and the most documentation. Still the default for good reasons</td></tr>
+            <tr><td><strong>Podman</strong></td><td>Rootless matters and you want it by default; RHEL-family hosts; systemd-managed services; a pod model that matches Kubernetes</td></tr>
+            <tr><td><strong>containerd + nerdctl</strong></td><td>You are already running Kubernetes and want one runtime on the host; lazy pulling matters</td></tr>
+            <tr><td><strong>gVisor or Kata</strong></td><td>Multi-tenant workloads, or running code you did not write</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Migration cost</th><th>Reality</th></tr></thead>
+          <tbody>
+            <tr><td>Your images</td><td><b>Zero.</b> They are OCI images and already portable</td></tr>
+            <tr><td>Your Dockerfiles</td><td>Zero to small — Buildah and Kaniko accept them</td></tr>
+            <tr><td>Your Compose files</td><td>Small: <code>podman compose</code> or the Docker API socket</td></tr>
+            <tr><td>Your CI</td><td>Moderate: cache backends and socket assumptions differ (chapter 16)</td></tr>
+            <tr><td>Rootless assumptions</td><td><b>The real cost:</b> privileged ports, SELinux labels, mount ownership (chapter 11)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="key">
+        <span class="lbl">The standards are why this is a small decision</span>
+        <p>Because image-spec, runtime-spec and distribution-spec are settled, switching container tooling is closer to changing shell than changing database. Nothing you learned in chapters 3 to 20 becomes wrong — the layer model, the cache behaviour, the capability set, the digest discipline all transfer intact. <strong>What changes is which process holds your containers and whether it runs as root</strong>, and that is worth choosing deliberately rather than by default.</p>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 21 in eight lines</h2>
+        <ul>
+          <li>Three OCI specifications — <b>image, runtime, distribution</b> — make images, runtimes and registries interchangeable.</li>
+          <li>A container at the lowest level is a root filesystem plus a <code>config.json</code>, and <code>runc</code> will run one directly.</li>
+          <li>Container processes are children of a <b>per-container shim</b>, not of the daemon. That is why <code>live-restore</code> works.</li>
+          <li><b>Podman has no daemon</b> and is rootless by default; containers are held by a <code>conmon</code> per container.</li>
+          <li>Podman adds <b>pods</b> and Kubernetes YAML generation, and manages services with systemd rather than restart policies.</li>
+          <li>containerd partitions by <b>namespace</b>, so Docker's images (<code>moby</code>) are invisible to Kubernetes (<code>k8s.io</code>).</li>
+          <li><code>runc</code>, <code>crun</code> and <code>youki</code> are performance choices; <b>gVisor and Kata change the isolation model</b>.</li>
+          <li>Migration cost is near zero for images and Dockerfiles; the real cost is <b>rootless assumptions</b>.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary>You pull <code>nginx:alpine</code> with Docker on a Kubernetes node, and the kubelet still pulls it again. Both use containerd. Why?</summary>
+        <div class="ans"><p>containerd partitions its content and images by <b>namespace</b>. Docker operates in <code>moby</code>; the kubelet operates in <code>k8s.io</code>. They share the same containerd process and the same on-disk content store, but the image references live in separate namespaces, so a pull in one is not visible to the other. Confirm with <code>ctr -n moby images list</code> against <code>ctr -n k8s.io images list</code>. It is also why <code>docker images</code> on a Kubernetes node shows almost nothing of what the node is actually running.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A team moves to rootless Podman. <code>-p 80:80</code> now fails and a bind-mounted directory is unreadable. Explain both.</summary>
+        <div class="ans"><p>Both come from not being root. Binding a port below 1024 is a privileged operation, and a rootless process does not have it — the fixes are to publish a high port and let a proxy front it (chapter 20), or lower <code>net.ipv4.ip_unprivileged_port_start</code>. The unreadable mount is usually SELinux: Podman is common on RHEL-family systems where a bind mount needs a <code>:z</code> or <code>:Z</code> label, and separately the UID mapping means the container's user is not the directory's owner (chapter 11). Neither is a Podman defect; they are what chapter 18 called the visible cost of the structural fix.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Would switching from <code>runc</code> to <code>crun</code> change your answer to chapter 18's escalation analysis?</summary>
+        <div class="ans"><p>No. <code>crun</code> is a different implementation of the same runtime specification, so the isolation is identical — namespaces, cgroups, capabilities and seccomp behave the same way, and every path in that tracer stays exactly as open or closed as before. It is a performance and memory choice, worth making at high container density. The runtimes that <em>do</em> change the analysis are <b>gVisor</b>, which puts a userspace kernel between the container and the host so most syscalls never reach the real kernel, and <b>Kata</b>, which puts a VM boundary there. Both cost measurable performance in exchange.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Your CI runs in Kubernetes with no Docker socket, and you need to build images. What are the options?</summary>
+        <div class="ans"><p>A daemonless builder. <b>BuildKit</b> as a pod, addressed as a remote builder (chapter 8) — the closest to what you already do, and it keeps the cache backends. <b>Kaniko</b>, which executes a Dockerfile in userspace inside an ordinary container. <b>Buildah</b>, rootless, accepting the same Dockerfiles. For Go or Java specifically, <b>ko</b> and <b>Jib</b> skip the Dockerfile entirely. What you should <em>not</em> do is mount the node's socket or run privileged Docker-in-Docker to avoid the question, for the reasons in chapters 16 and 18.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Chapter 22 is Kubernetes from a Docker perspective: what a pod adds, how everything you know maps across, and when the complexity is worth it.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li><code>ps -ef --forest | grep -E 'dockerd|containerd-shim'</code>.</li>
+        <li><code>sudo ctr namespaces list</code> on a Docker host.</li>
+        <li><code>podman run --rm alpine id</code> — note the UID mapping.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>The OCI image, runtime and distribution specifications, the Podman and Buildah documentation, containerd's architecture notes, and the gVisor and Kata Containers project documentation.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — runtime stack explorer
+   ============================================================ */
+(function () {
+  var TOOLS = [
+    { id: "docker", label: "docker",
+      layers: ["docker CLI", "dockerd", "containerd", "containerd-shim-runc-v2", "runc", "kernel"],
+      daemon: "dockerd + containerd", parent: "the shim", rootless: "opt-in",
+      ns: "moby", api: "a root-owned socket at /var/run/docker.sock",
+      survives: true },
+    { id: "podman", label: "podman",
+      layers: ["podman CLI", "conmon", "crun / runc", "kernel"],
+      daemon: "none", parent: "conmon", rootless: "the default",
+      ns: "n/a", api: "optional, via podman.socket",
+      survives: true },
+    { id: "nerdctl", label: "nerdctl",
+      layers: ["nerdctl CLI", "containerd", "containerd-shim-runc-v2", "runc", "kernel"],
+      daemon: "containerd", parent: "the shim", rootless: "supported",
+      ns: "default", api: "containerd's gRPC socket",
+      survives: true },
+    { id: "ctr", label: "ctr",
+      layers: ["ctr CLI", "containerd", "containerd-shim-runc-v2", "runc", "kernel"],
+      daemon: "containerd", parent: "the shim", rootless: "no",
+      ns: "chosen with -n", api: "containerd's gRPC socket",
+      survives: true },
+    { id: "runc", label: "runc",
+      layers: ["runc CLI", "kernel"],
+      daemon: "none", parent: "your shell", rootless: "with a userns",
+      ns: "n/a", api: "none — a local bundle directory",
+      survives: false },
+    { id: "kubelet", label: "kubelet (CRI)",
+      layers: ["kubelet", "CRI plugin", "containerd", "containerd-shim-runc-v2", "runc", "kernel"],
+      daemon: "containerd", parent: "the shim", rootless: "no",
+      ns: "k8s.io", api: "the CRI socket",
+      survives: true }
+  ];
+  var tool = "docker";
+
+  var host = document.getElementById("k-tool");
+  var diagram = document.getElementById("k-diagram");
+  var out = document.getElementById("k-out");
+  var note = document.getElementById("k-note");
+
+  TOOLS.forEach(function (t) {
+    var b = document.createElement("button");
+    b.className = "btn mono" + (t.id === tool ? " on" : "");
+    b.textContent = t.label;
+    b.addEventListener("click", function () {
+      tool = t.id;
+      Array.prototype.forEach.call(host.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      render();
+    });
+    host.appendChild(b);
+  });
+
+  function render() {
+    var T = TOOLS.filter(function (x) { return x.id === tool; })[0];
+    var W = 470, rowH = 24, H = T.layers.length * rowH + 8;
+    var svg = ['<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;max-width:' + W + 'px;height:auto;font-family:var(--mono)">'];
+    T.layers.forEach(function (l, i) {
+      var y = 4 + i * rowH;
+      var isKernel = l === "kernel";
+      var isRuntime = /runc|crun/.test(l);
+      var col = isKernel ? "#0C1D30" : isRuntime ? "#3D4CC0" : i === 0 ? "#7C8CF8" : "#EEF0FE";
+      var txt = (isKernel || isRuntime || i === 0) ? "#fff" : "#20456A";
+      var indent = 18 + i * 16;
+      svg.push('<rect x="' + indent + '" y="' + y + '" width="' + (W - indent - 14) +
+        '" height="' + (rowH - 5) + '" rx="4" fill="' + col + '" stroke="#7C8CF8" stroke-width="1"/>');
+      svg.push('<text x="' + (indent + 9) + '" y="' + (y + 13) + '" font-size="10.5" fill="' + txt + '">' + l + "</text>");
+      if (i < T.layers.length - 1) {
+        svg.push('<path d="M' + (indent + 7) + " " + (y + rowH - 5) + "L" + (indent + 7) + " " + (y + rowH + 1) +
+          '" stroke="#A9B7C4" stroke-width="1.4"/>');
+      }
+    });
+    svg.push("</svg>");
+    diagram.innerHTML = svg.join("");
+
+    out.innerHTML = "";
+    tile("Layers", String(T.layers.length), "CLI to kernel");
+    tile("Daemon", T.daemon === "none" ? "none" : T.daemon.split(" ")[0], T.daemon === "none" ? "daemonless" : "", T.daemon === "none");
+    tile("Container parent", T.parent, "", T.parent !== "your shell");
+    tile("Rootless", T.rootless, "", T.rootless === "the default");
+
+    var msgs = [];
+    if (tool === "docker") {
+      msgs.push("<b>Six layers, and the important one is the shim.</b> Because each container's process is a child of its own <code>containerd-shim</code> rather than of <code>dockerd</code>, restarting the daemon does not kill anything — which is what makes <code>live-restore</code> possible (chapter 20). The shim also holds stdio and records the exit status, so an exit code survives a daemon that was not running when the process died.");
+    } else if (tool === "podman") {
+      msgs.push("<b>No daemon at all.</b> <code>podman run</code> forks a <code>conmon</code> monitor which execs the runtime, so the container's parent is a small per-container process and the CLI exits immediately afterwards. The consequence: there is no long-running root service to compromise or to restart, and equally <b>nothing to apply restart policies</b> — that job moves to systemd, which is why Quadlet exists.");
+    } else if (tool === "runc") {
+      msgs.push("<b>Two layers: the runtime and the kernel.</b> This is the OCI runtime specification with nothing on top — you supply a bundle directory and it runs. Note the container's parent is <em>your shell</em>, so it dies when your terminal does and nothing records its exit status. Everything above this line in the other tools exists to solve that.");
+    } else if (tool === "nerdctl" || tool === "ctr") {
+      msgs.push("<b>The same containerd Docker uses</b>, addressed directly — so the shim architecture and its consequences are identical. The difference is the client: <code>nerdctl</code> is a Docker-compatible interface, while <code>ctr</code> is containerd's own low-level tool and expects you to name the namespace explicitly.");
+    } else {
+      msgs.push("<b>Kubernetes reuses the same lower stack.</b> The kubelet speaks CRI to containerd, which uses the same shim and the same <code>runc</code> — so a pod's container is, at the bottom, exactly what <code>docker run</code> produces. What Kubernetes adds sits entirely above containerd (chapter 22).");
+    }
+    msgs.push("<b>containerd namespace:</b> " + T.ns + ". <b>API surface:</b> " + T.api + ".");
+    if (!T.survives) {
+      msgs.push("Containers started this way do <b>not</b> survive the tool exiting, which is the single practical reason the higher layers exist.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, val, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = val;
+    vv.style.fontSize = String(val).length > 9 ? "12px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — command translator
+   ============================================================ */
+(function () {
+  var input = document.getElementById("t-in");
+  var term = document.getElementById("t-term");
+  var out = document.getElementById("t-out");
+  var note = document.getElementById("t-note");
+
+  [
+    "docker run -d -p 80:80 -v /srv/data:/data nginx",
+    "docker run -d -p 8080:80 nginx",
+    "docker build -t app .",
+    "docker compose up -d",
+    "docker run --privileged alpine",
+    "docker ps -a",
+    "docker exec -it api sh",
+    "docker save app | gzip > app.tgz",
+    "docker system prune -af",
+    "docker stats --no-stream"
+  ].forEach(function (p) {
+    var b = document.createElement("button");
+    b.className = "btn mono";
+    b.textContent = p.length > 28 ? p.slice(0, 27) + "…" : p;
+    b.title = p;
+    b.addEventListener("click", function () { input.value = p; render(); });
+    document.getElementById("t-presets").appendChild(b);
+  });
+
+  /* subcommand-level rules, plus flag-level divergences */
+  var SUB = {
+    run: { podman: "run", nerdctl: "run" },
+    build: { podman: "build", nerdctl: "build",
+      pod: "Buildah is the backend rather than BuildKit — same Dockerfile, different cache semantics",
+      nerd: "needs a running buildkitd; nerdctl will not build without it" },
+    compose: { podman: "compose", nerdctl: "compose",
+      pod: "podman compose delegates to the Compose CLI or podman-compose; behaviour differs by which is installed",
+      nerd: "nerdctl compose is a native reimplementation — broadly compatible, not identical" },
+    ps: { podman: "ps", nerdctl: "ps",
+      nerd: "scoped to a containerd namespace; add -n to see another (Docker's are in moby)" },
+    exec: { podman: "exec", nerdctl: "exec" },
+    save: { podman: "save", nerdctl: "save" },
+    load: { podman: "load", nerdctl: "load" },
+    images: { podman: "images", nerdctl: "images",
+      nerd: "namespace-scoped, like ps" },
+    stats: { podman: "stats", nerdctl: "stats",
+      pod: "rootless stats needs cgroup v2 with delegation configured" },
+    system: { podman: "system", nerdctl: "system" },
+    network: { podman: "network", nerdctl: "network",
+      pod: "netavark rootful, pasta or slirp4netns rootless — different driver names" },
+    volume: { podman: "volume", nerdctl: "volume" },
+    logs: { podman: "logs", nerdctl: "logs" },
+    inspect: { podman: "inspect", nerdctl: "inspect" },
+    pull: { podman: "pull", nerdctl: "pull" },
+    push: { podman: "push", nerdctl: "push" }
+  };
+
+  function parse(cmd) {
+    var t = cmd.trim().replace(/^\$\s*/, "");
+    var m = /^docker\s+(\S+)([\s\S]*)$/.exec(t);
+    if (!m) return { err: "not a docker command" };
+    return { sub: m[1], rest: m[2] || "", full: t };
+  }
+
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+
+  function render() {
+    var p = parse(input.value);
+    if (p.err) {
+      term.innerHTML = '<span class="r">' + esc(p.err) + "</span>";
+      out.innerHTML = ""; note.innerHTML = "";
+      return;
+    }
+    var rule = SUB[p.sub];
+    var notes = [];
+
+    if (!rule) {
+      term.innerHTML = '<span class="y">docker ' + esc(p.sub) + "</span>\n\n" +
+        '<span class="d">no mapping recorded for this subcommand — most map one to one,</span>\n' +
+        '<span class="d">so try the same name and check the flags.</span>';
+      out.innerHTML = "";
+      note.innerHTML = "The translator covers the subcommands with known divergences. Anything not listed almost certainly has the same name in both tools, which is the point of the exercise.";
+      return;
+    }
+
+    /* flag-level divergences. The host port is the second-to-last component of a
+       publish spec, so ip:host:ctr and host:ctr both have to be handled. */
+    var lowPort = null;
+    var pubRe = /(?:^|\s)(?:-p|--publish)[\s=]+(\S+)/g, pm;
+    while ((pm = pubRe.exec(p.rest)) !== null) {
+      var parts = pm[1].replace(/\/(tcp|udp)$/, "").split(":");
+      if (parts.length < 2) continue;                 /* container port only */
+      var hostPort = parseInt(parts[parts.length - 2], 10);
+      if (!isNaN(hostPort) && hostPort > 0 && hostPort < 1024) { lowPort = hostPort; break; }
+    }
+    var privileged = /--privileged/.test(p.rest);
+    var bindMount = /(^|\s)-v\s+[.~/]/.test(p.rest);
+    if (lowPort !== null) {
+      notes.push({ who: "podman", sev: 2,
+        text: "publishing host port " + lowPort + " <b>fails under rootless Podman</b> — bind a high port and front it with a proxy, or lower <code>net.ipv4.ip_unprivileged_port_start</code>" });
+    }
+    if (privileged) {
+      notes.push({ who: "podman", sev: 1,
+        text: "<code>--privileged</code> is privileged only <b>within your user namespace</b> when rootless, so it grants far less than it does under Docker" });
+    }
+    if (bindMount) {
+      notes.push({ who: "podman", sev: 1,
+        text: "on SELinux systems a bind mount usually needs <code>:z</code> or <code>:Z</code>, and the UID mapping means the container user may not own the directory (chapter 11)" });
+    }
+    if (rule.pod) notes.push({ who: "podman", sev: 1, text: rule.pod });
+    if (rule.nerd) notes.push({ who: "nerdctl", sev: 1, text: rule.nerd });
+
+    term.innerHTML =
+      '<span class="d">docker  </span>' + esc(p.full) + "\n" +
+      '<span class="g">podman  </span>' + esc("podman " + rule.podman + p.rest) + "\n" +
+      '<span class="g">nerdctl </span>' + esc("nerdctl " + rule.nerdctl + p.rest) + "\n\n" +
+      (notes.length
+        ? notes.map(function (n) {
+            return (n.sev === 2 ? '<span class="r">' : '<span class="y">') + n.who.padEnd(8, "\u00a0") +
+              "</span>" + n.text.replace(/<\/?b>/g, "").replace(/<code>|<\/code>/g, "");
+          }).join("\n")
+        : '<span class="g">identical in all three — no divergence</span>');
+
+    var breaking = notes.filter(function (n) { return n.sev === 2; }).length;
+    out.innerHTML = "";
+    tile("Subcommand", p.sub, "maps directly", true);
+    tile("Divergences", String(notes.length), notes.length ? "see below" : "none", notes.length === 0);
+    tile("Would fail", breaking ? "yes" : "no", breaking ? "under rootless" : "", breaking === 0);
+    tile("Portable", notes.length === 0 ? "fully" : breaking ? "needs change" : "with caveats", "", notes.length === 0);
+
+    var msgs = [];
+    if (!notes.length) {
+      msgs.push("<b>Identical across all three.</b> This is the common case and the reason migration is cheap: the subcommands, the flags and the output shape all match, because they are all driving the same OCI runtime over the same image format.");
+    } else if (breaking) {
+      msgs.push("<b>This one genuinely breaks.</b> Everything about the command is portable except the privileged operation it requests — which is not a compatibility gap but the direct consequence of not running as root (chapter 18). The workaround is the same one chapter 20 recommends anyway: publish a high port and put a proxy in front.");
+    } else {
+      msgs.push("<b>The command translates, with behaviour worth checking.</b> These are the differences that produce a confusing afternoon rather than an error message — same syntax, same exit code, subtly different result.");
+    }
+    if (p.sub === "compose") {
+      msgs.push("Compose is the least uniform area: <code>podman compose</code> shells out to whatever Compose implementation is installed, and <code>nerdctl compose</code> is a separate reimplementation. If your Compose files are elaborate, the most reliable route on Podman is the Docker-compatible socket plus the real Compose CLI.");
+    }
+    if (p.sub === "ps" || p.sub === "images") {
+      msgs.push("The namespace point matters here: <code>nerdctl ps</code> shows the <code>default</code> namespace, so containers created by Docker (in <code>moby</code>) are invisible until you pass <code>-n moby</code>.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, val, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = val;
+    vv.style.fontSize = String(val).length > 9 ? "12px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  input.addEventListener("input", render);
+  render();
+})();
+</script>
+</body>
+</html>

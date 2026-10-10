@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Communication: protocols and API styles — System Design Notes</title>
+<meta name="description" content="TCP and UDP, TLS handshakes, HTTP/1.1 through /3, REST vs RPC vs gRPC vs GraphQL, real-time transports, idempotency and versioning.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/notes.css">
+<style>
+  .log2{max-height:230px;overflow-y:auto;border:1px solid var(--rule-2);border-radius:4px;background:var(--card);
+    font-family:var(--mono);font-size:12.4px;line-height:1.6;padding:9px 11px}
+  .log2 div{padding:1px 0;border-bottom:1px solid var(--rule-2)}
+  .log2 div:last-child{border-bottom:0}
+  .log2 .ok{color:var(--ok)} .log2 .err{color:var(--line)}
+  .log2 .warn{color:var(--warn)} .log2 .dim{color:var(--text-3)}
+</style>
+</head>
+<body>
+<div class="readbar"></div>
+
+<header class="top">
+  <div class="top-inner">
+    <a class="home" href="../../index.html"><span class="mark"></span>All roadmaps</a>
+    <span class="top-sep">/</span>
+    <a class="home" href="index.html" style="color:var(--band-text)">System Design</a>
+    <span class="top-spacer"></span>
+    <button class="rail-toggle" aria-expanded="false">Contents</button>
+    <nav class="top-nav" aria-label="Chapter navigation"></nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail" id="rail" aria-label="Chapter and section navigation"></aside>
+
+  <article>
+    <p class="crumb">Part 5 · Moving the data &nbsp;·&nbsp; <b>Chapter 16</b></p>
+    <h1>Communication: protocols and API styles</h1>
+    <p class="standfirst">Two services talking is where most of a distributed system's latency and most of its subtle bugs live. This chapter goes down to the handshakes that cost you round trips, up through the four API styles and what each is actually good at, and then spends real time on idempotency and versioning — the two things that decide whether your API survives contact with retries and time.</p>
+    <div class="meta">
+      <span>~45 min read</span>
+      <span>TCP/TLS/HTTP · REST · gRPC · GraphQL · idempotency</span>
+      <span>2 interactive panels</span>
+      <span>Prerequisite: chapter 3</span>
+    </div>
+
+    <div class="body">
+
+      <h2><span class="h2n">16.1</span>What a request costs before it starts</h2>
+
+      <p>Before any application byte moves, a client typically pays: a DNS lookup, a TCP handshake, and a TLS handshake. Each is at least one round trip, and a round trip is physics — 1 ms inside a datacenter, 70 ms across a continent, 150 ms across the world. Counting round trips is how you predict latency without measuring anything.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Round trips before the first byte of your response</caption>
+          <thead><tr><th>Stack</th><th>DNS</th><th>Transport</th><th>Crypto</th><th>Request</th><th>Total RTTs</th></tr></thead>
+          <tbody>
+            <tr><td>HTTP/1.1 + TLS 1.2, cold</td><td class="num">1</td><td class="num">1</td><td class="num">2</td><td class="num">1</td><td class="num"><b>5</b></td></tr>
+            <tr><td>HTTP/2 + TLS 1.3, cold</td><td class="num">1</td><td class="num">1</td><td class="num">1</td><td class="num">1</td><td class="num"><b>4</b></td></tr>
+            <tr><td>HTTP/3 (QUIC), cold</td><td class="num">1</td><td colspan="2" class="num">1 (combined)</td><td class="num">1</td><td class="num"><b>3</b></td></tr>
+            <tr><td>HTTP/3, resumed (0-RTT)</td><td class="num">0 (cached)</td><td colspan="2" class="num">0</td><td class="num">1</td><td class="num"><b>1</b></td></tr>
+            <tr><td>Any, existing keep-alive connection</td><td class="num">0</td><td class="num">0</td><td class="num">0</td><td class="num">1</td><td class="num"><b>1</b></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The last row is the point. Connection reuse eliminates every setup cost, which is why keep-alive, connection pooling and long-lived gRPC channels matter far more than protocol version for server-to-server traffic. Protocol version matters most for the <em>first</em> request from a cold client on a slow network.</p>
+
+      <h2><span class="h2n">16.2</span>TCP and UDP</h2>
+
+      <div class="tw">
+        <table>
+          <caption>The transport choice</caption>
+          <thead><tr><th></th><th>TCP</th><th>UDP</th></tr></thead>
+          <tbody>
+            <tr><td>Connection</td><td>Three-way handshake before any data</td><td>None — send and hope</td></tr>
+            <tr><td>Reliability</td><td>Retransmits lost segments</td><td>Nothing. Lost is lost</td></tr>
+            <tr><td>Ordering</td><td>Bytes delivered in order</td><td>Datagrams may arrive in any order, or twice</td></tr>
+            <tr><td>Flow / congestion control</td><td>Yes — adapts to the network</td><td>You implement it or you melt the network</td></tr>
+            <tr><td>Head-of-line blocking</td><td>Yes — one lost segment stalls everything behind it</td><td>No — each datagram is independent</td></tr>
+            <tr><td>Overhead</td><td>20+ byte header, state per connection</td><td>8-byte header, no state</td></tr>
+            <tr><td>Use for</td><td>Almost everything</td><td>DNS, real-time voice and video, game state, metrics, QUIC's foundation</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The reason to know this in a system design is <b>head-of-line blocking</b>, which drives the entire HTTP version story. TCP guarantees in-order delivery of a byte stream, so if segment 5 is lost, segments 6–20 sit in the kernel buffer, already received, and cannot be given to the application until 5 is retransmitted. On a lossy mobile link that is a stall of one round trip or more, applied to everything sharing that connection.</p>
+
+      <p>The reason to reach for UDP is when <b>late data is worthless</b>. In a voice call, a packet that arrives 400 ms late cannot be played — retransmitting it wastes bandwidth and delays everything behind it, so it is better to drop it and conceal the gap. Same for live game state: you want the newest position, not a complete history.</p>
+
+      <h2><span class="h2n">16.3</span>TLS</h2>
+
+      <p>TLS 1.3 cut the handshake from two round trips to one by removing the negotiation round trip: the client guesses the key-exchange parameters and sends its key share immediately. It also removed most of the legacy cipher suites, which is why "just use 1.3" is unusually good advice.</p>
+
+      <ul class="tight">
+        <li><b>Session resumption</b> lets a returning client skip the handshake with a ticket from the previous session — the single biggest TLS optimisation for repeat visitors.</li>
+        <li><b>0-RTT</b> sends application data in the very first packet. It is not replay-safe: an attacker can capture and resend that data, so it must be restricted to idempotent requests. Never allow 0-RTT for a request that charges a card.</li>
+        <li><b>mTLS</b> makes the client present a certificate too, which is how services authenticate each other without shared secrets in config. Its real cost is certificate lifecycle — issuance, rotation, revocation — which is exactly what a service mesh automates.</li>
+        <li><b>Terminating close to the user</b> converts multi-round-trip handshakes from intercontinental to local. This is a large part of what a CDN buys even for uncacheable traffic.</li>
+      </ul>
+
+      <h2><span class="h2n">16.4</span>The HTTP versions</h2>
+
+      <dl>
+        <dt>HTTP/1.1</dt>
+        <dd>One request at a time per connection. Browsers work around it by opening about six connections per host — which is why domain sharding used to help. Pipelining was specified and is unusable in practice because responses must return in order, so one slow response blocks the rest.</dd>
+        <dt>HTTP/2</dt>
+        <dd>One connection, many concurrent <b>streams</b>, binary framing, and header compression (HPACK) which matters more than it sounds when every request carries a kilobyte of cookies. Removes application-level head-of-line blocking — but not TCP's, so a single lost packet still stalls every stream on that connection. Server push was specified, barely used, and has been removed from browsers.</dd>
+        <dt>HTTP/3 / QUIC</dt>
+        <dd>The same multiplexing, but over UDP with its own reliability and ordering <em>per stream</em>. A lost packet stalls only the stream it belonged to. It also merges transport and crypto setup into one round trip, and supports <b>connection migration</b>: the connection is identified by a connection ID rather than by the four-tuple, so a phone moving from wifi to cellular keeps its connection instead of re-handshaking.</dd>
+      </dl>
+
+      <div class="note trap">
+        <span class="lab">HTTP/2 made one problem worse</span>
+        <p>One connection carrying everything is excellent for browsers and awkward for infrastructure. An L4 load balancer assigns whole connections, so all of a client's requests pin to one backend — the imbalance described in <a href="10-load-balancing.html">Chapter 10</a>. It is more acute for gRPC, where a service opens a single long-lived channel and then sends millions of requests down it. The fixes are the same: balance per request at L7, cap the connection's lifetime or maximum streams, or use client-side load balancing that knows the backend set.</p>
+      </div>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Page load cost by protocol</h4>
+          <p>A model, not a benchmark — but the round-trip arithmetic is real. Push loss up and watch HTTP/2 and HTTP/3 separate.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="p-rtt">Round trip time <b><span id="p-rttv">80</span> ms</b></label>
+              <input type="range" id="p-rtt" min="1" max="300" step="1" value="80">
+            </div>
+            <div class="ctrl">
+              <label for="p-n">Resources on the page <b><span id="p-nv">40</span></b></label>
+              <input type="range" id="p-n" min="1" max="200" step="1" value="40">
+            </div>
+            <div class="ctrl">
+              <label for="p-size">Average resource size <b><span id="p-sizev">30</span> KB</b></label>
+              <input type="range" id="p-size" min="1" max="500" step="1" value="30">
+            </div>
+            <div class="ctrl">
+              <label for="p-bw">Bandwidth <b><span id="p-bwv">10</span> Mbps</b></label>
+              <input type="range" id="p-bw" min="1" max="200" step="1" value="10">
+            </div>
+            <div class="ctrl">
+              <label for="p-loss">Packet loss <b><span id="p-lossv">0.5</span>%</b></label>
+              <input type="range" id="p-loss" min="0" max="5" step="0.1" value="0.5">
+            </div>
+            <div class="ctrl">
+              <label for="p-warm">Connection state</label>
+              <select id="p-warm">
+                <option value="cold" selected>Cold — nothing cached</option>
+                <option value="resume">Returning visitor (session resumption)</option>
+                <option value="open">Existing open connection</option>
+              </select>
+            </div>
+          </div>
+          <div class="bars" id="p-bars"></div>
+          <div class="out">
+            <div class="stats" id="p-stats"></div>
+            <p id="p-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">16.5</span>HTTP semantics worth having straight</h2>
+
+      <div class="tw">
+        <table>
+          <caption>Methods, and the two properties that matter</caption>
+          <thead><tr><th>Method</th><th>Safe?</th><th>Idempotent?</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td><code>GET</code></td><td class="yes">yes</td><td class="yes">yes</td><td>Cacheable. Never let a GET change state — crawlers and prefetchers will find it</td></tr>
+            <tr><td><code>HEAD</code></td><td class="yes">yes</td><td class="yes">yes</td><td>Headers only</td></tr>
+            <tr><td><code>PUT</code></td><td class="no">no</td><td class="yes">yes</td><td>Full replacement, so sending it twice lands in the same state</td></tr>
+            <tr><td><code>DELETE</code></td><td class="no">no</td><td class="yes">yes</td><td>Second call returns 404 or 204; the state is the same either way</td></tr>
+            <tr><td><code>POST</code></td><td class="no">no</td><td class="no">no</td><td>The one that needs an idempotency key</td></tr>
+            <tr><td><code>PATCH</code></td><td class="no">no</td><td class="no">not inherently</td><td>Can be made idempotent with a version precondition</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Status codes people get wrong: <code>400</code> means the request is malformed, <code>422</code> that it is well-formed but semantically invalid, <code>401</code> that you are not authenticated, <code>403</code> that you are but may not do this, <code>404</code> that it does not exist (or that you should not know it does), <code>409</code> that there is a state conflict, <code>412</code> that a precondition failed, <code>429</code> that you are rate limited — always with <code>Retry-After</code> — and <code>503</code> that the service is temporarily unavailable, also with <code>Retry-After</code>. The distinction that matters operationally is <b>retryable versus not</b>: 5xx and 429 are retryable, 4xx generally is not, and a client that retries 4xx is generating load that cannot possibly succeed.</p>
+
+      <h2><span class="h2n">16.6</span>The four API styles</h2>
+
+      <div class="tw">
+        <table>
+          <caption>What each is actually for</caption>
+          <thead><tr><th></th><th>REST</th><th>gRPC</th><th>GraphQL</th><th>Plain RPC / JSON-RPC</th></tr></thead>
+          <tbody>
+            <tr><td>Model</td><td>Resources and verbs</td><td>Typed methods</td><td>One endpoint, client-specified query</td><td>Methods over HTTP</td></tr>
+            <tr><td>Payload</td><td>JSON</td><td>Protobuf (binary)</td><td>JSON</td><td>JSON</td></tr>
+            <tr><td>Schema</td><td>OpenAPI, optional</td><td class="yes">Mandatory, code-generated</td><td class="yes">Mandatory, introspectable</td><td>Usually none</td></tr>
+            <tr><td>Streaming</td><td>SSE or chunked</td><td class="yes">Native, both directions</td><td>Subscriptions</td><td>No</td></tr>
+            <tr><td>Browser support</td><td class="yes">Native</td><td class="no">Needs grpc-web plus a proxy</td><td class="yes">Native</td><td class="yes">Native</td></tr>
+            <tr><td>HTTP caching</td><td class="yes">Works perfectly</td><td class="no">No</td><td class="no">Hard — POST to one URL</td><td class="no">Hard</td></tr>
+            <tr><td>Best at</td><td>Public APIs, anything cacheable</td><td>Service-to-service, low latency, high volume</td><td>Clients with varied and changing data needs</td><td>Internal simplicity</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>REST, done properly</h3>
+
+      <ul class="tight">
+        <li><b>Nouns in paths, verbs in methods.</b> <code>POST /orders</code>, not <code>POST /createOrder</code>. When an action genuinely is not CRUD, a sub-resource is cleaner than contorting the model: <code>POST /orders/{id}/cancellation</code>.</li>
+        <li><b>Cursor pagination.</b> Return an opaque <code>nextCursor</code>; never <code>?page=N&amp;size=M</code>, which is O(offset) at the database and produces duplicates and gaps when the underlying list changes.</li>
+        <li><b>Envelope your collections</b> — <code>{ "items": [...], "nextCursor": "..." }</code> — so you can add metadata later without breaking parsers. A bare top-level array is a versioning dead end.</li>
+        <li><b>Filtering, sorting and sparse fields as query parameters</b>, with a documented and <em>bounded</em> set. Unbounded filtering is how a public API becomes an unindexed query generator.</li>
+        <li><b>Consistent errors</b> — RFC 7807 problem details gives you <code>type</code>, <code>title</code>, <code>status</code>, <code>detail</code> and <code>instance</code>, plus room for your own fields. Include a machine-readable code and a correlation id; clients should never parse prose.</li>
+        <li><b>HATEOAS</b> — hypermedia links in responses — is in the original definition and is rarely implemented, because clients are written against documentation, not discovered at runtime. Know what it means; do not lose an argument over it.</li>
+      </ul>
+
+      <h3>gRPC</h3>
+
+      <p>Protobuf schemas compiled into client and server stubs, over HTTP/2. Four call shapes: unary, server streaming, client streaming and bidirectional. What you get is a binary wire format that is typically 3–10× smaller than the equivalent JSON and far cheaper to parse, a schema that cannot drift from the code, native streaming, and <b>deadlines that propagate</b> — a caller's remaining time budget travels with the call, so downstream services stop working on requests nobody is waiting for. That last feature is worth more than the performance for most systems.</p>
+
+      <p>The costs: browsers cannot speak it without a proxy; you cannot inspect traffic with curl; HTTP caching does not apply; and load balancing needs care because of the single long-lived connection.</p>
+
+      <h3>GraphQL</h3>
+
+      <p>The client sends a query describing exactly the shape it wants, and gets exactly that. It solves two real problems — over-fetching (a mobile client downloading a 40-field object to show two) and under-fetching (six round trips to assemble one screen) — and it does so without a new endpoint per client, which is why it appears wherever one backend serves web, iOS, Android and partners with divergent needs.</p>
+
+      <div class="note trap">
+        <span class="lab">What GraphQL moves rather than removes</span>
+        <ul class="tight">
+          <li><b>N+1 moves to the server.</b> A query for 50 posts each with an author becomes 51 database calls unless you batch. DataLoader-style per-request batching is not optional; it is part of the runtime.</li>
+          <li><b>Caching gets hard.</b> Everything is a POST to one URL, so HTTP caching is unavailable. You need persisted queries (send a hash instead of a query, which also lets you cache at the edge and reject unknown queries) or a client-side normalised cache.</li>
+          <li><b>Cost becomes unbounded.</b> A client can request a deeply nested query that fans out enormously. You need depth limits, complexity scoring, and query timeouts — for a public API, an allow-list.</li>
+          <li><b>Observability gets harder.</b> Every request is <code>POST /graphql</code>, so per-endpoint metrics are meaningless until you instrument per operation name and per resolver.</li>
+        </ul>
+      </div>
+
+      <h2><span class="h2n">16.7</span>Real-time transports</h2>
+
+      <div class="tw">
+        <table>
+          <caption>Getting data to a client that did not ask just now</caption>
+          <thead><tr><th>Technique</th><th>How</th><th>Cost</th><th>Use when</th></tr></thead>
+          <tbody>
+            <tr><td><b>Short polling</b></td><td>Client asks every N seconds</td><td>Wasteful — most responses are empty; latency averages N/2</td><td>Updates are rare and latency does not matter</td></tr>
+            <tr><td><b>Long polling</b></td><td>Server holds the request open until there is news</td><td>One held connection per client; works everywhere</td><td>You need push and cannot use WebSockets</td></tr>
+            <tr><td><b>Server-sent events</b></td><td>One long-lived HTTP response, server streams text events</td><td>One-directional; reconnects automatically with <code>Last-Event-ID</code></td><td>Feeds, notifications, progress, live dashboards. Underrated</td></tr>
+            <tr><td><b>WebSocket</b></td><td>HTTP upgrade to a full-duplex connection</td><td>Stateful; you own reconnection, heartbeats and backpressure</td><td>Chat, collaboration, trading, games</td></tr>
+            <tr><td><b>WebRTC / WebTransport</b></td><td>Peer-to-peer, or QUIC-based datagrams</td><td>Complex signalling and NAT traversal</td><td>Media, ultra-low-latency, unreliable-by-choice data</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>If the flow is server-to-client only, <b>prefer SSE over WebSockets</b>: it is plain HTTP, it works through proxies, browsers reconnect for you, and it costs a fraction of the implementation effort. Reach for WebSockets when the client genuinely needs to push.</p>
+
+      <p>Scaling persistent connections is a different discipline from scaling requests. Five million connections is not five million requests per second; it is five million file descriptors and their memory, spread across a dedicated stateless gateway tier. Because a connection lives on exactly one gateway, delivering a message to a user requires knowing <em>which</em> gateway — a presence registry mapping user to gateway, plus a pub/sub fabric between gateways. The business logic stays elsewhere. That split is the standard chat architecture and is worked through in <a href="22-worked-designs.html">Chapter 22</a>.</p>
+
+      <h2><span class="h2n">16.8</span>Idempotency</h2>
+
+      <p>A client sends a request and the response never arrives. It cannot tell whether the server never received it, processed it and the reply was lost, or is still working. Its only options are to retry — risking a duplicate — or to give up — risking a lost operation. Every network client eventually retries, so <b>your server must make duplicates harmless</b>. This is not an edge case; it is the normal condition of distributed systems.</p>
+
+      <div class="codewrap">
+        <span class="lang">The idempotency key protocol</span>
+        <pre><code>POST /v1/payments
+Idempotency-Key: 6f1e2c40-7b2a-4a1e-9a7f-2e2c0b9d1a55
+{ "amount": 4999, "currency": "GBP", "source": "card_9x" }
+
+Server:
+  1  Look up the key in a store, scoped to (account, endpoint).
+  2  Not found  → claim it atomically (INSERT … ON CONFLICT DO NOTHING).
+                  If the claim fails, another request has it: go to 4.
+  3  Process the request. Persist the response body and status
+     against the key, in the SAME transaction as the side effect.
+  4  Found, completed  → return the stored response verbatim, with a
+                         header marking it a replay. Do NOT re-execute.
+     Found, in flight  → return 409, so the client backs off and retries.
+  5  Expire keys after 24h–7d. Long enough for any sane retry,
+     short enough that the table does not grow forever.
+
+Also: if the same key arrives with a DIFFERENT body, that is a client
+bug — return 422 rather than silently serving the first response.</code></pre>
+      </div>
+
+      <p>The subtlety that trips people: <b>storing the response and performing the side effect must be atomic</b>. If you charge the card and then crash before recording the key, the retry charges again — you have implemented the illusion of idempotency without the property. If the side effect is in an external system, record the key and an "in progress" marker <em>first</em>, then reconcile: the external system almost certainly accepts an idempotency key of its own, and passing yours through is how the guarantee composes.</p>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Retries with and without an idempotency key</h4>
+          <p>Send a payment, lose the response, watch the client do the only thing it can.</p>
+        </div>
+        <div class="demo-body">
+          <div class="btnrow">
+            <button class="btn on" id="i-on">Idempotency key on</button>
+            <button class="btn" id="i-off">Off</button>
+          </div>
+          <div class="btnrow">
+            <button class="btn primary" id="i-send">Client sends payment</button>
+            <button class="btn" id="i-lose">Response is lost in the network</button>
+            <button class="btn" id="i-retry">Client retries</button>
+            <button class="btn" id="i-reset">Reset</button>
+          </div>
+          <div class="log2" id="i-log"></div>
+          <div class="out">
+            <div class="stats" id="i-stats"></div>
+            <p id="i-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">16.9</span>Versioning and compatibility</h2>
+
+      <p>Any API with more than one client is permanently in a state where old and new callers coexist. Two rules cover most of it.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Change classification</caption>
+          <thead><tr><th>Safe (additive)</th><th>Breaking</th></tr></thead>
+          <tbody>
+            <tr><td>Adding an optional request field</td><td>Adding a required request field</td></tr>
+            <tr><td>Adding a response field</td><td>Removing or renaming a response field</td></tr>
+            <tr><td>Adding a new endpoint or method</td><td>Changing a field's type or its units</td></tr>
+            <tr><td>Adding a new enum value <em>if clients tolerate unknowns</em></td><td>Adding an enum value if they do not — design for it from day one</td></tr>
+            <tr><td>Relaxing a validation rule</td><td>Tightening one</td></tr>
+            <tr><td>Making a response field nullable that was never guaranteed</td><td>Changing default behaviour, pagination size, or error codes</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <ul class="tight">
+        <li><b>Version in the URI</b> (<code>/v1/</code>) for public APIs: visible, cacheable, trivially routable, and easy to reason about in logs. Header-based versioning is theoretically cleaner and practically harder to debug.</li>
+        <li><b>Version rarely.</b> Every version is a codebase you maintain. Prefer additive evolution, and reserve a new major version for changes that cannot be made additively.</li>
+        <li><b>Protobuf's rules exist for this:</b> never reuse a field number, never change a field's type, mark removed fields <code>reserved</code>. Follow them and old and new binaries interoperate indefinitely.</li>
+        <li><b>Deprecate on a schedule</b> — announce, instrument who is still calling it, contact them, then remove. Without usage metrics per client you can never actually delete anything.</li>
+      </ul>
+
+      <h2><span class="h2n">16.10</span>Serialisation</h2>
+
+      <div class="tw">
+        <table>
+          <caption>Wire formats</caption>
+          <thead><tr><th>Format</th><th>Size</th><th>Schema</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td><b>JSON</b></td><td>Baseline</td><td>Optional (JSON Schema)</td><td>Universal, debuggable, verbose. Repeats every key name on every object</td></tr>
+            <tr><td><b>Protobuf</b></td><td class="yes">~3–10× smaller</td><td class="yes">Required, code-generated</td><td>Fast, strict, excellent evolution rules. Not human readable</td></tr>
+            <tr><td><b>Avro</b></td><td class="yes">Similar to protobuf</td><td class="yes">Required, travels with the data or via a registry</td><td>Dominant in data pipelines; strong schema evolution</td></tr>
+            <tr><td><b>MessagePack / CBOR</b></td><td class="mid">~20–40% smaller</td><td>Optional</td><td>Binary JSON. Easy win when you cannot adopt a schema</td></tr>
+            <tr><td><b>Parquet / ORC</b></td><td class="yes">Very small</td><td class="yes">Required</td><td>Columnar, for analytics at rest — not for messages</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The practical guidance: JSON at the public edge, because debuggability and universality genuinely matter there; a binary schema format internally, where volume is high and both ends are yours. And regardless of format, <b>enable compression</b> — gzip or brotli on JSON typically saves 60–80%, which is usually a larger win than switching formats and costs one configuration line.</p>
+
+      <details class="check">
+        <summary>A mobile client on a 200 ms link loads a screen needing six API calls. What are your options, ranked?</summary>
+        <div class="ans">
+          <p>Six sequential calls is 1.2 seconds of pure round trips. In order of value: <b>parallelise</b> them if there are no dependencies, which turns 6 × 200 into 200 ms plus the slowest response — often the entire fix. <b>Aggregate</b> them into one endpoint or a backend-for-frontend that fans out server-side over fast internal links, turning six client round trips into one. <b>Use GraphQL</b> if the client's needs vary enough that a fixed aggregate keeps changing. <b>Reuse the connection</b>, so at least the six calls do not each pay a handshake. And <b>render progressively</b> — show the screen with the two calls that returned and fill the rest in — because perceived latency is what the user experiences. Notice that only one of these is a protocol change; the rest are shape changes, and they matter more.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Why does a POST need an idempotency key when the client could just check whether the operation succeeded before retrying?</summary>
+        <div class="ans">
+          <p>Because "check then retry" is itself a race. Between the check and the retry, the original request — which the server may still be processing — can complete, and now you have two. It also requires a query endpoint that can answer "did my specific request happen?", which needs a client-supplied identifier — at which point you have reinvented the idempotency key, just with an extra round trip and a window of inconsistency. The key does the same job atomically at the moment of the write, with a claim that either succeeds or reveals the in-flight duplicate. And it is strictly cheaper: no extra call on the happy path.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>When is GraphQL the wrong choice?</summary>
+        <div class="ans">
+          <p>When there is one client with stable needs — a fixed set of REST endpoints is simpler, cacheable at the edge, and trivially observable. When the API is public and untrusted, because arbitrary query shapes are an unbounded cost surface that requires complexity limits, depth limits and probably an allow-list, at which point you have a REST API with extra steps. When responses are highly cacheable, since POST-to-one-URL forfeits HTTP caching, which is often the single biggest performance lever you have. And for service-to-service calls, where gRPC's typed contracts, binary encoding and deadline propagation matter more than client-specified response shapes. GraphQL earns its complexity when several clients with genuinely divergent and changing data needs are served by one backend team.</p>
+        </div>
+      </details>
+
+      <div class="recap">
+        <h2>Recap</h2>
+        <ol>
+          <li><b>Count round trips.</b> Cold HTTP/1.1 with TLS 1.2 is five before your first byte; an open connection is one.</li>
+          <li><b>TCP's in-order guarantee is head-of-line blocking</b> — the reason HTTP/3 moved to UDP and recovers loss per stream.</li>
+          <li><b>TLS 1.3 halves the handshake; resumption removes it; 0-RTT is not replay-safe.</b></li>
+          <li><b>HTTP/2's single connection helps browsers and hurts L4 balancing.</b> Balance per request or bound connection lifetime.</li>
+          <li><b>REST for public and cacheable, gRPC for internal and high-volume, GraphQL for many divergent clients, and never a state-changing GET.</b></li>
+          <li><b>GraphQL relocates N+1, caching and cost control</b> into your server; batching, persisted queries and complexity limits are mandatory, not optional.</li>
+          <li><b>Prefer SSE to WebSockets when the flow is one-directional.</b></li>
+          <li><b>Idempotency keys, with the response stored atomically alongside the side effect.</b> Retries are the normal case, not the exception.</li>
+          <li><b>Evolve additively; version rarely; never reuse a protobuf field number;</b> instrument usage before deprecating anything.</li>
+        </ol>
+      </div>
+
+      <nav class="pn" aria-label="Previous and next chapter"></nav>
+    </div>
+  </article>
+</div>
+
+<script src="assets/notes.js"></script>
+<script>
+function st16(k, v, tone) {
+  var d = document.createElement("div"); d.className = "stat";
+  var a = document.createElement("div"); a.className = "k"; a.textContent = k;
+  var b = document.createElement("div"); b.className = "v"; b.textContent = v;
+  if (tone) b.style.color = tone;
+  d.append(a, b); return d;
+}
+function bar16(label, pct, value, colour) {
+  var row = document.createElement("div"); row.className = "bar";
+  var k = document.createElement("span"); k.textContent = label;
+  var t = document.createElement("span"); t.className = "track";
+  var f = document.createElement("span"); f.className = "fill";
+  f.style.width = Math.max(0.5, Math.min(100, pct)) + "%";
+  if (colour) f.style.background = colour;
+  t.appendChild(f);
+  var v = document.createElement("span"); v.className = "val"; v.textContent = value;
+  row.append(k, t, v); return row;
+}
+
+/* ---------- protocol page load model ---------- */
+(function () {
+  var rtt = document.getElementById("p-rtt"), n = document.getElementById("p-n"),
+      size = document.getElementById("p-size"), bw = document.getElementById("p-bw"),
+      loss = document.getElementById("p-loss"), warm = document.getElementById("p-warm"),
+      bars = document.getElementById("p-bars"), stats = document.getElementById("p-stats"),
+      note = document.getElementById("p-note");
+
+  function model(proto, R, N, S, BW, L, state) {
+    var setup = 0;
+    if (state === "open") setup = 0;
+    else {
+      var dns = state === "cold" ? R : 0;
+      if (proto === "h1") setup = dns + R + 2 * R;        /* TCP + TLS 1.2 */
+      else if (proto === "h2") setup = dns + R + R;       /* TCP + TLS 1.3 */
+      else setup = dns + (state === "resume" ? 0 : R);    /* QUIC, 0-RTT on resume */
+    }
+    /* request rounds */
+    var rounds = proto === "h1" ? Math.ceil(N / 6) : 1;
+    var reqTime = rounds * R;
+    /* transfer, bandwidth bound */
+    var bytes = N * S * 1024;
+    var transfer = bytes * 8 / (BW * 1e6) * 1000;
+    /* loss: h1 and h2 stall the whole connection; h3 stalls one stream */
+    var packets = bytes / 1400;
+    var lossEvents = packets * (L / 100);
+    var stall;
+    if (proto === "h3") stall = lossEvents * R * 0.15 / Math.max(1, N) * N * 0.15;
+    else if (proto === "h2") stall = lossEvents * R * 0.25;
+    else stall = lossEvents * R * 0.25 / Math.max(1, Math.min(6, N)) * 2;
+    stall = Math.min(stall, R * 40);
+    return { setup: setup, req: reqTime, transfer: transfer, stall: stall,
+             total: setup + reqTime + transfer + stall };
+  }
+
+  function draw() {
+    var R = +rtt.value, N = +n.value, S = +size.value, BW = +bw.value, L = +loss.value, state = warm.value;
+    document.getElementById("p-rttv").textContent = R;
+    document.getElementById("p-nv").textContent = N;
+    document.getElementById("p-sizev").textContent = S;
+    document.getElementById("p-bwv").textContent = BW;
+    document.getElementById("p-lossv").textContent = L.toFixed(1);
+
+    var h1 = model("h1", R, N, S, BW, L, state),
+        h2 = model("h2", R, N, S, BW, L, state),
+        h3 = model("h3", R, N, S, BW, L, state);
+    var worst = Math.max(h1.total, h2.total, h3.total);
+
+    bars.innerHTML = "";
+    [["HTTP/1.1 + TLS 1.2", h1], ["HTTP/2 + TLS 1.3", h2], ["HTTP/3 (QUIC)", h3]].forEach(function (p) {
+      var v = p[1];
+      bars.appendChild(bar16(p[0], v.total / worst * 100, Math.round(v.total) + " ms",
+        v.total === Math.min(h1.total, h2.total, h3.total) ? "var(--ok)" : v.total > worst * 0.9 ? "var(--line)" : "#B87A17"));
+    });
+
+    stats.innerHTML = "";
+    stats.appendChild(st16("Setup (h2)", Math.round(h2.setup) + " ms"));
+    stats.appendChild(st16("Request rounds (h1)", Math.ceil(N / 6) + " × " + R + " ms",
+      Math.ceil(N / 6) > 3 ? "var(--line)" : ""));
+    stats.appendChild(st16("Transfer", Math.round(h2.transfer) + " ms"));
+    stats.appendChild(st16("Loss stall, h2 vs h3", Math.round(h2.stall) + " / " + Math.round(h3.stall) + " ms",
+      h2.stall > h3.stall * 2 ? "var(--line)" : ""));
+    stats.appendChild(st16("h3 vs h1", (h1.total / h3.total).toFixed(2) + "× faster", "var(--ok)"));
+    stats.appendChild(st16("Total bytes", (N * S / 1024).toFixed(1) + " MB"));
+
+    note.textContent = state === "open"
+      ? "With an open connection every handshake disappears and the difference is only multiplexing and loss recovery. This is why protocol choice matters far less for server-to-server traffic with pooled connections than for a cold browser."
+      : N > 30 && Math.ceil(N / 6) * R > 500
+      ? "HTTP/1.1 is spending " + Math.round(Math.ceil(N / 6) * R) + " ms just waiting its turn — six connections, one request at a time each. Multiplexing removes that entirely, which is why the win from HTTP/2 grows with the number of resources on the page."
+      : L > 1.5
+      ? "At " + L.toFixed(1) + "% loss, HTTP/2's single TCP connection means one lost packet stalls every stream on it. HTTP/3 recovers per stream, so the same loss affects one resource instead of all of them — this is the entire reason QUIC exists."
+      : "Low loss and few resources: the three protocols are close, and the difference is mostly handshake round trips. Reducing the number of hostnames and reusing connections beats any protocol choice here.";
+  }
+  [rtt, n, size, bw, loss, warm].forEach(function (x) { x.addEventListener("input", draw); x.addEventListener("change", draw); });
+  draw();
+})();
+
+/* ---------- idempotency ---------- */
+(function () {
+  var on = true, charges = 0, sent = 0, pending = false, stored = null, entries = [];
+  var logEl = document.getElementById("i-log"), stats = document.getElementById("i-stats"),
+      note = document.getElementById("i-note");
+  var KEY = "6f1e2c40-…-2e2c0b9d1a55";
+
+  function log(c, t) { entries.unshift({ c: c, t: t }); if (entries.length > 30) entries.pop(); render(); }
+  function render() {
+    logEl.innerHTML = "";
+    entries.forEach(function (e) {
+      var d = document.createElement("div"); d.className = e.c; d.textContent = e.t; logEl.appendChild(d);
+    });
+    stats.innerHTML = "";
+    stats.appendChild(st16("Requests sent", sent));
+    stats.appendChild(st16("Card charges", charges, charges > 1 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st16("Money taken", "£" + (charges * 49.99).toFixed(2), charges > 1 ? "var(--line)" : ""));
+    stats.appendChild(st16("Mode", on ? "key present" : "no key", on ? "var(--ok)" : "var(--line)"));
+    note.textContent = charges > 1
+      ? "The customer has been charged " + charges + " times for one purchase. Nothing in the network misbehaved — the client did the only sensible thing available to it, and the server had no way to recognise the duplicate."
+      : on && sent > 1
+      ? "The retry hit the stored key, so the server replayed the recorded response without touching the card. Note that it returned the ORIGINAL response, including the same payment id — the client cannot tell it retried, which is the point."
+      : "Send a payment, lose the response, then retry — and compare the two modes.";
+  }
+  function send(isRetry) {
+    sent++;
+    log("dim", (isRetry ? "RETRY   " : "REQUEST ") + "POST /v1/payments  " + (on ? "Idempotency-Key: " + KEY : "(no idempotency key)"));
+    if (on && stored) {
+      log("ok", "SERVER  key found, status=completed → replaying stored response, card NOT charged");
+      log("ok", "        200 OK  { paymentId: \"pay_7Kx\", status: \"succeeded\" }   [replayed]");
+      pending = true; render(); return;
+    }
+    if (on) log("dim", "SERVER  key not seen before → claimed atomically, processing");
+    charges++;
+    log(charges > 1 ? "err" : "ok", "SERVER  charging card £49.99   (charge #" + charges + ")");
+    if (on) { stored = true; log("dim", "SERVER  response persisted against the key, same transaction as the charge"); }
+    log("ok", "        200 OK  { paymentId: \"pay_7Kx\", status: \"succeeded\" }");
+    pending = true;
+    render();
+  }
+  document.getElementById("i-send").addEventListener("click", function () { send(false); });
+  document.getElementById("i-retry").addEventListener("click", function () {
+    if (!sent) { log("warn", "CLIENT  nothing to retry yet"); render(); return; }
+    log("warn", "CLIENT  no response after 10 s → retrying (this is what every HTTP client does)");
+    send(true);
+  });
+  document.getElementById("i-lose").addEventListener("click", function () {
+    if (!pending) { log("warn", "NETWORK nothing in flight"); render(); return; }
+    log("err", "NETWORK response lost. The client cannot tell whether the server processed it");
+    pending = false; render();
+  });
+  document.getElementById("i-reset").addEventListener("click", function () {
+    charges = 0; sent = 0; pending = false; stored = null; entries = [];
+    log("dim", "reset · fresh payment attempt");
+  });
+  ["i-on", "i-off"].forEach(function (id) {
+    document.getElementById(id).addEventListener("click", function () {
+      on = id === "i-on";
+      document.getElementById("i-on").classList.toggle("on", on);
+      document.getElementById("i-off").classList.toggle("on", !on);
+      charges = 0; sent = 0; pending = false; stored = null; entries = [];
+      log("dim", "reset · idempotency key " + (on ? "ON" : "OFF"));
+    });
+  });
+  log("dim", "ready · click through: send → lose → retry");
+})();
+</script>
+</body>
+</html>

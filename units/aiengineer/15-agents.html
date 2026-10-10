@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · AI agents — AI Engineer</title>
+<meta name="description" content="The agent loop in plain code, ReAct, tool design, memory, planning, the Model Context Protocol, multi-agent patterns and how agents fail.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 15 · Adaptation and autonomy</div>
+    <h1>AI agents</h1>
+    <p class="standfirst">An agent is a loop: the model chooses a tool, something runs it, the result goes back into the conversation, repeat until done. That is the whole idea, and it fits in forty lines. Everything difficult about agents is what happens when the loop does not terminate, or terminates having done the wrong thing to production.</p>
+    <div class="chap-meta">
+      <span class="tagpill">the loop</span>
+      <span class="tagpill">react</span>
+      <span class="tagpill">tools</span>
+      <span class="tagpill">memory</span>
+      <span class="tagpill">mcp</span>
+      <span class="tagpill">multi-agent</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>What makes something an agent</h2>
+
+<p>The distinction that matters in practice is <b>who decides what happens next</b>.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Pattern</th><th>Control flow</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><td><b>Single call</b></td><td>You call the model once</td><td>Classification, extraction, generation. Most production LLM work</td></tr>
+<tr><td><b>Chain</b></td><td>You call it several times in a fixed order</td><td>Summarise then translate; extract then validate. Predictable, testable, cheap</td></tr>
+<tr><td><b>Router</b></td><td>The model picks one of N fixed branches, you execute it</td><td>Intent classification into handlers. Bounded and safe</td></tr>
+<tr><td><b>Agent</b></td><td>The model decides what to do next, repeatedly, until it decides to stop</td><td>Open-ended tasks where the steps cannot be enumerated in advance</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">Prefer the least agentic thing that works</span>
+  <p>Agency buys flexibility and costs determinism, latency, money and debuggability. A chain that handles 90% of your cases in two predictable calls beats an agent that handles 95% in an unpredictable number of them. Reach for an agent when the sequence of steps genuinely depends on what earlier steps discover — research, triage across systems, multi-step repair — and not merely because the task has several steps.</p>
+</div>
+
+<h2><span class="h-rule"></span>The loop</h2>
+
+<div class="flow">
+  <div class="step"><b>Perceive</b><span>Goal, history, tool results so far</span></div>
+  <div class="arr">›</div>
+  <div class="step"><b>Reason</b><span>Model decides: answer, or call a tool</span></div>
+  <div class="arr">›</div>
+  <div class="step"><b>Act</b><span>Your code executes the tool</span></div>
+  <div class="arr">›</div>
+  <div class="step"><b>Observe</b><span>Result appended to messages</span></div>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">agent.py — the entire mechanism, with the guards that make it survivable</span><button class="copy">Copy</button></div>
+<pre><code>import json, time
+from dataclasses import dataclass, field
+
+@dataclass
+class Budget:
+    max_steps: int = 12
+    max_tokens: int = 120_000
+    max_seconds: float = 90.0
+    max_cost_usd: float = 0.50
+    started: float = field(default_factory=time.monotonic)
+    used_tokens: int = 0
+    used_cost: float = 0.0
+
+    def exceeded(self, step: int) -> str | None:
+        if step >= self.max_steps:                        return "step limit"
+        if self.used_tokens > self.max_tokens:            return "token limit"
+        if time.monotonic() - self.started > self.max_seconds: return "time limit"
+        if self.used_cost > self.max_cost_usd:            return "cost limit"
+        return None
+
+
+def run_agent(goal: str, ctx: RequestContext, budget: Budget | None = None) -> Result:
+    budget = budget or Budget()
+    messages = [{"role": "system", "content": SYSTEM},
+                {"role": "user",   "content": goal}]
+    trace = []
+
+    for step in range(budget.max_steps + 1):
+        if (reason := budget.exceeded(step)):
+            return Result(status="halted", reason=reason, trace=trace,
+                          text=summarise_progress(messages))
+
+        resp = call_model(messages, tools=TOOL_SCHEMAS, temperature=0)
+        budget.used_tokens += resp.usage.total_tokens
+        budget.used_cost   += resp.cost_usd
+        messages.append(resp.message)
+
+        if not resp.tool_calls:                             # the model is done
+            return Result(status="ok", text=resp.text, trace=trace, steps=step)
+
+        for call in resp.tool_calls:                        # may be several, in parallel
+            observation = execute(call, ctx, trace)
+            messages.append({"role": "tool", "tool_call_id": call.id,
+                             "content": observation})
+
+    return Result(status="halted", reason="loop fell through", trace=trace)
+
+
+def execute(call, ctx, trace) -> str:
+    """Every failure mode here is returned as text, never raised."""
+    tool = REGISTRY.get(call.name)
+    if tool is None:
+        return f"Error: no tool named {call.name}. Available: {', '.join(REGISTRY)}"
+
+    try:
+        args = tool.schema.model_validate_json(call.arguments)
+    except ValidationError as e:
+        return f"Error: invalid arguments. {e.errors()[0]['msg']}. Fix and retry."
+
+    if not authorised(tool, args, ctx):                     # never trust the model
+        return f"Error: not permitted for this user."
+
+    try:
+        result = tool.fn(args, ctx)
+    except Exception as e:                                  # tools fail; agents must cope
+        trace.append(("error", call.name, str(e)))
+        return f"Error running {call.name}: {e}. Consider a different approach."
+
+    trace.append(("ok", call.name, args.model_dump()))
+    return truncate(json.dumps(result), max_tokens=1500)    # protect the context</code></pre>
+</div>
+
+<p>Four things in that code are the difference between a demo and something you can run: <b>a budget with four independent limits</b>, <b>errors returned as observations rather than raised</b> (the model can recover from text; it cannot recover from a stack trace), <b>authorisation checked in your code</b> rather than requested in the prompt, and <b>truncation of tool results</b> so one verbose API response does not consume the context window.</p>
+
+<h2><span class="h-rule"></span>ReAct, and why the model narrates</h2>
+
+<p>ReAct — reason, act — is the observation that interleaving explicit reasoning with tool calls works better than tool calls alone. Modern models with native tool calling do this implicitly, but making the reasoning explicit still helps on hard tasks and helps enormously when debugging.</p>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">a real trace, lightly cleaned</span><button class="copy">Copy</button></div>
+<pre><code>Thought: The user says order NW-8842 was charged twice. I need the order first.
+Action: get_order({"order_id": "NW-8842"})
+Observation: {"id":"NW-8842","total":48.00,"status":"shipped","customer":"c_991"}
+
+Thought: One order at £48. Now check whether there are two payments against it.
+Action: list_payments({"order_id": "NW-8842"})
+Observation: [{"id":"p_1","amount":48.00,"status":"captured","at":"2026-03-02T10:14Z"},
+              {"id":"p_2","amount":48.00,"status":"captured","at":"2026-03-02T10:16Z"}]
+
+Thought: Confirmed - two captures two minutes apart, almost certainly a double
+submit. Refunding is destructive and above my auto-approval threshold, so I
+should propose it rather than do it.
+Action: propose_action({"type":"refund","payment_id":"p_2","amount":48.00,
+                        "reason":"duplicate capture 2 minutes apart"})
+Observation: {"status":"awaiting_human_approval","ticket":"AP-2210"}
+
+Thought: I have confirmed the problem and queued the fix. Time to answer.
+Answer: Order NW-8842 was charged twice — two £48 captures at 10:14 and 10:16 on
+2 March. I've queued a refund of the second payment for approval (AP-2210); it
+should reach the card within 5-10 working days once approved.</code></pre>
+</div>
+
+<p>Notice the third thought. The agent recognised a destructive action, checked it against a threshold, and proposed rather than executed. That behaviour comes from the system prompt and is enforced in <code>execute</code> — belt and braces, because the prompt alone is not a control.</p>
+
+<div class="demo" id="ag">
+  <div class="demo-head">
+    <b>Agent loop simulator</b>
+    <span>Run the same ticket under different constraints. Watch how budgets, tool reliability and tool count change what happens.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="g-steps">Max steps — <span id="g-stepsv">8</span></label>
+        <input type="range" id="g-steps" min="2" max="16" step="1" value="8">
+      </div>
+      <div>
+        <label for="g-fail">Tool failure rate — <span id="g-failv">10</span>%</label>
+        <input type="range" id="g-fail" min="0" max="60" step="5" value="10">
+      </div>
+      <div>
+        <label for="g-tools">Tools available — <span id="g-toolsv">6</span></label>
+        <input type="range" id="g-tools" min="3" max="40" step="1" value="6">
+      </div>
+    </div>
+    <label style="margin-top:12px"><input type="checkbox" id="g-guard" checked> Repeat-call guard and destructive-action confirmation</label>
+    <div style="margin-top:12px"><button class="btn" id="g-run">Run the agent</button></div>
+    <div class="stat">
+      <div><b id="g-out">—</b><span>outcome</span></div>
+      <div><b id="g-n">—</b><span>steps used</span></div>
+      <div><b id="g-tok">—</b><span>tokens</span></div>
+      <div><b id="g-cost">—</b><span>cost</span></div>
+    </div>
+    <div class="out" id="g-trace"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Designing the tools</h2>
+
+<p>Chapter 07 covered the mechanics of tool calling. Agents raise the stakes, because tool descriptions are now the model's entire map of what it can do, and errors compound across steps rather than surfacing immediately.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Principle</th><th>In practice</th></tr></thead>
+<tbody>
+<tr><td><b>Few tools, well described</b></td><td>Selection accuracy falls sharply past roughly 15–20 tools. If you have 40, group them behind a smaller set or route to a subset per request</td></tr>
+<tr><td><b>Task-shaped, not API-shaped</b></td><td><code>find_customer_orders(email)</code> beats exposing three CRUD endpoints and hoping the model composes them correctly</td></tr>
+<tr><td><b>Descriptions written for a stranger</b></td><td>Say when to use it <em>and when not to</em>. "Use for orders in the last 90 days; older orders are only in <code>search_archive</code>"</td></tr>
+<tr><td><b>Return what helps the next decision</b></td><td>Not the raw 40-field API response. Summarise, flatten, and include the identifiers the model will need to act next</td></tr>
+<tr><td><b>Errors that suggest a recovery</b></td><td>"No customer with that email. Try <code>search_customers</code> with a partial name." The model will follow that advice</td></tr>
+<tr><td><b>Idempotent where possible</b></td><td>Agents retry. A tool that double-charges on retry is a production incident waiting for a timeout</td></tr>
+<tr><td><b>Separate read from write</b></td><td>Reads run freely. Writes go through confirmation, an allowlist, or a proposal queue</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">guards.py — the checks that stop the common disasters</span><button class="copy">Copy</button></div>
+<pre><code>DESTRUCTIVE = {"refund", "cancel_order", "delete_record", "send_email", "update_address"}
+
+def guard(call, ctx, trace) -> str | None:
+    """Return an observation to short-circuit with, or None to proceed."""
+
+    # 1. The same call three times means the model is stuck in a groove.
+    signature = (call.name, call.arguments)
+    if [t for t in trace if t[:2] == signature[:2]].__len__() >= 2:
+        return ("You have already called this with these arguments and got the same "
+                "result. Try a different approach or explain what is blocking you.")
+
+    # 2. Destructive actions need explicit authority, never the model's own judgement.
+    if call.name in DESTRUCTIVE:
+        if ctx.mode == "read_only":
+            return f"Error: {call.name} is not available in read-only mode."
+        if not ctx.auto_approve_limit or amount_of(call) > ctx.auto_approve_limit:
+            queue_for_human(call, ctx)
+            return f"Queued for human approval (limit £{ctx.auto_approve_limit})."
+
+    # 3. Alternating between two tools without progress: a known oscillation.
+    recent = [t[1] for t in trace[-4:]]
+    if len(recent) == 4 and recent[0] == recent[2] and recent[1] == recent[3]:
+        return "You are alternating between two tools without progress. Stop and summarise."
+
+    return None</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Memory</h2>
+
+<p>"Agent memory" covers four genuinely different things that get conflated.</p>
+
+<div class="terms">
+  <div><dt>Working memory</dt><dd>The messages array in the current run. Bounded by the context window, gone when the run ends. Managed by truncation, summarisation and result compaction.</dd></div>
+  <div><dt>Session memory</dt><dd>The conversation across turns with one user. Usually the last N turns plus a rolling summary of what came before.</dd></div>
+  <div><dt>Long-term memory</dt><dd>Facts persisted across sessions — preferences, prior decisions, learned corrections. A database with an explicit write path, retrieved into the prompt when relevant. Not magic: it is RAG over things the agent chose to remember.</dd></div>
+  <div><dt>Episodic memory</dt><dd>Records of past runs — what was attempted, what worked. Useful for "you tried this last week and it failed for reason X".</dd></div>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">memory.py — long-term memory as an explicit tool, not an ambient mechanism</span><button class="copy">Copy</button></div>
+<pre><code>REMEMBER = {
+  "name": "remember",
+  "description": ("Store a durable fact about this user for future conversations. "
+                  "Use for stable preferences and decisions, e.g. 'prefers email over "
+                  "phone', 'account is on the legacy billing plan'. Do NOT store "
+                  "transient details, anything about the current task, or any payment "
+                  "card, password or identity document number."),
+  "parameters": {"type": "object", "required": ["fact", "category"],
+    "properties": {
+      "fact": {"type": "string", "maxLength": 200},
+      "category": {"enum": ["preference", "account", "history", "constraint"]}}}
+}
+
+def remember(args, ctx) -> dict:
+    if contains_pii(args.fact):                      # a hard gate, not a prompt rule
+        return {"stored": False, "reason": "contains sensitive data"}
+    vec = embed_passage(args.fact)
+    existing = memory_store.search(ctx.user_id, vec, limit=3)
+    if existing and existing[0].score > 0.93:        # deduplicate, or memory fills with restatements
+        memory_store.touch(existing[0].id)
+        return {"stored": False, "reason": "already known"}
+    memory_store.insert(ctx.user_id, args.fact, args.category, vec)
+    return {"stored": True}
+
+# At the start of a run, retrieve rather than dump:
+relevant = memory_store.search(ctx.user_id, embed_query(goal), limit=5)
+system += "\n\nWhat you know about this user:\n" + "\n".join(f"- {m.fact}" for m in relevant)</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Memory needs forgetting, or it poisons itself</span>
+  <p>An agent that stores everything accumulates contradictions, stale facts and near-duplicates, and eventually retrieves the wrong one confidently. Build in expiry by category, deduplication on write, an update path so a new fact supersedes an old one, and a way for the user to see and delete what is stored. The last one is a legal requirement in several jurisdictions and a trust requirement everywhere.</p>
+</div>
+
+<h2><span class="h-rule"></span>Planning</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Pattern</th><th>How it works</th><th>Trade-off</th></tr></thead>
+<tbody>
+<tr><td><b>Implicit (ReAct)</b></td><td>Decide the next step each iteration, no plan up front</td><td>Adaptive and simple; can wander on long tasks</td></tr>
+<tr><td><b>Plan then execute</b></td><td>Write the full plan first, then execute steps</td><td>Coherent and inspectable; brittle when reality diverges from the plan</td></tr>
+<tr><td><b>Plan, execute, replan</b></td><td>Plan, execute a step, revise the plan with what was learned</td><td>The practical middle. Costs an extra call per revision</td></tr>
+<tr><td><b>Task decomposition</b></td><td>Break into subtasks, run each in its own context, combine</td><td>Keeps contexts small and parallelises well; needs careful result merging</td></tr>
+<tr><td><b>Reflection</b></td><td>After producing output, critique it and revise once</td><td>Real quality gains on writing and code; roughly doubles cost. One round helps, three do not</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note tip">
+  <span class="note-t">A visible plan is a debugging tool</span>
+  <p>Even when the agent replans constantly, having it emit a plan first gives you something to show the user (progress is legible instead of a spinner), something to log, and something to diff when a run goes wrong. It also lets you insert a human approval point between planning and execution — often the difference between an agent you can deploy and one you cannot.</p>
+</div>
+
+<h2><span class="h-rule"></span>MCP: tools as infrastructure</h2>
+
+<p>The Model Context Protocol standardises how applications expose tools, resources and prompts to models. Instead of every application writing bespoke integrations for every system, a system publishes one MCP server and any MCP-capable client can use it.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Concept</th><th>What it is</th></tr></thead>
+<tbody>
+<tr><td><b>Host</b></td><td>The application the user interacts with — an editor, a chat client, your own agent</td></tr>
+<tr><td><b>Client</b></td><td>The connection the host maintains to one server</td></tr>
+<tr><td><b>Server</b></td><td>A process exposing capabilities over the protocol. Local (stdio) or remote (HTTP)</td></tr>
+<tr><td><b>Tools</b></td><td>Functions the model can invoke — the same shape as chapter 07</td></tr>
+<tr><td><b>Resources</b></td><td>Readable content the host can pull in: files, records, query results</td></tr>
+<tr><td><b>Prompts</b></td><td>Reusable templates the server offers the host, surfaced as slash commands or similar</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">An MCP server is arbitrary code with your credentials</span>
+  <p>Installing one is closer to installing a browser extension than adding a library. Review what it does, run it with the narrowest credentials that work, prefer read-only scopes, and treat everything it returns as untrusted input that may contain prompt injection (chapter 17). A tool description fetched from a remote server is text the model will read and may obey — this is a real attack surface, not a theoretical one.</p>
+</div>
+
+<h2><span class="h-rule"></span>Multi-agent, and when it is worth it</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Pattern</th><th>Shape</th><th>Honest assessment</th></tr></thead>
+<tbody>
+<tr><td><b>Supervisor</b></td><td>One coordinator delegates to specialists and assembles results</td><td>The most useful pattern. Each specialist gets a small tool set and a focused prompt, which is where the gain comes from</td></tr>
+<tr><td><b>Pipeline</b></td><td>Fixed sequence of specialists, each handing to the next</td><td>Not really multi-agent — it is a chain, and better for it: testable and predictable</td></tr>
+<tr><td><b>Parallel workers</b></td><td>Fan out independent subtasks, merge</td><td>Genuinely valuable for research and broad search. Contexts stay small, wall-clock time drops</td></tr>
+<tr><td><b>Debate / critic</b></td><td>One produces, another critiques, iterate</td><td>Works for writing and code review. Costs at least double; one round of critique captures most of the benefit</td></tr>
+<tr><td><b>Autonomous swarm</b></td><td>Peers negotiating freely</td><td>Impressive in demonstrations, extremely hard to make reliable or debug. Avoid in production</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The real reason multi-agent helps is not "collaboration" — it is <b>context isolation</b>. A specialist with six tools and a focused prompt makes better decisions than a generalist with forty. If you can get that isolation with a router and separate prompts, do that instead; it is cheaper and far easier to test.</p>
+
+<h2><span class="h-rule"></span>How agents fail</h2>
+
+<div class="terms">
+  <div><dt>Looping</dt><dd>The same call repeated with the same arguments. Fix with a repeat guard and a hard step limit.</dd></div>
+  <div><dt>Oscillating</dt><dd>Alternating between two tools without progress. Detect the pattern and force a summary.</dd></div>
+  <div><dt>Context exhaustion</dt><dd>Tool results accumulate until the window overflows mid-run. Truncate results, summarise old steps, keep only the last few observations in full.</dd></div>
+  <div><dt>Wrong tool, confidently</dt><dd>Usually a description problem, not a model problem. Rewrite the description to say when <em>not</em> to use it.</dd></div>
+  <div><dt>Fabricated arguments</dt><dd>Inventing an order id rather than looking one up. Validate arguments against reality — does that id exist? — before executing.</dd></div>
+  <div><dt>Premature success</dt><dd>Declaring the task done having achieved something adjacent. Add an explicit completion criterion and verify it in code.</dd></div>
+  <div><dt>Silent partial failure</dt><dd>Three of five subtasks failed; the summary mentions none of it. Aggregate statuses in code and report them, never leave it to the summary.</dd></div>
+  <div><dt>Runaway cost</dt><dd>A long loop over an expensive model. Four independent budget limits, and alerting on runs that approach them.</dd></div>
+</div>
+
+<h2><span class="h-rule"></span>What to build first</h2>
+
+<ul class="check">
+  <li><b>Write the loop yourself</b> before adopting a framework. Forty lines, and you will understand every abstraction you later choose. Frameworks are useful for the surrounding machinery — tracing, retries, streaming state — not for the loop.</li>
+  <li><b>Start read-only.</b> An agent that can look things up and propose actions is useful and safe. Add write access one tool at a time, each behind confirmation.</li>
+  <li><b>Log the full trace</b> — every message, tool call, argument, result, token count and timing. Agent debugging is impossible without it, and chapter 18 depends on it.</li>
+  <li><b>Set all four budgets</b> from day one. Steps, tokens, time, money.</li>
+  <li><b>Show progress to the user.</b> Streaming each step as it happens turns a 40-second silence into something legible, and lets them interrupt.</li>
+  <li><b>Evaluate on trajectories, not just outcomes.</b> A right answer reached by six wasteful steps is fragile; measure step count, tool-selection accuracy and cost per completed task.</li>
+</ul>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>An agent is a loop — <b>reason, act, observe, repeat</b> — and it fits in forty lines. Write those lines yourself.</li>
+    <li><b>Prefer the least agentic design that works.</b> Chains and routers are cheaper, faster and testable.</li>
+    <li>Return tool errors <b>as observations, never as exceptions</b>. The model can recover from text.</li>
+    <li>Enforce authorisation and destructive-action limits <b>in your code</b>. A prompt rule is not a control.</li>
+    <li>Tool descriptions are the model's map. <b>Few tools, task-shaped, with guidance on when not to use them.</b></li>
+    <li>Memory is four different things. Long-term memory needs <b>deduplication, expiry and a user-visible delete path</b>.</li>
+    <li>Multi-agent helps because of <b>context isolation</b>, not collaboration. Get the isolation the cheapest way you can.</li>
+    <li>Set <b>four budgets — steps, tokens, time, cost</b> — log the full trace, and evaluate trajectories as well as answers.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("15-agents.html");
+
+(function(){
+  const root = document.getElementById("ag");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const PLAN = [
+    {tool:"get_order",       note:"look up NW-8842",                  dest:false},
+    {tool:"list_payments",   note:"check for duplicate captures",     dest:false},
+    {tool:"get_customer",    note:"confirm contact preferences",      dest:false},
+    {tool:"search_policy",   note:"find the duplicate-charge policy", dest:false},
+    {tool:"refund_payment",  note:"refund the second £48 capture",    dest:true},
+    {tool:"send_email",      note:"notify the customer",              dest:true}
+  ];
+
+  function run(){
+    const maxSteps = parseInt($("g-steps").value, 10);
+    const failRate = parseInt($("g-fail").value, 10) / 100;
+    const nTools   = parseInt($("g-tools").value, 10);
+    const guards   = $("g-guard").checked;
+
+    // Tool-selection accuracy degrades as the tool count grows.
+    const pickAccuracy = Math.max(0.45, 1 - Math.max(0, nTools - 8) * 0.022);
+
+    const lines = [];
+    let step = 0, tokens = 900, cost = 0, planIdx = 0, repeats = 0, outcome = null;
+    let lastSig = "";
+
+    while(step < maxSteps){
+      step++;
+      const target = PLAN[Math.min(planIdx, PLAN.length - 1)];
+      const misfire = Math.random() > pickAccuracy;
+      const tool = misfire ? "search_docs" : target.tool;
+      const sig = tool + "|" + planIdx;
+
+      tokens += 700 + Math.round(Math.random() * 400);
+      cost += 0.004;
+
+      if(guards && sig === lastSig){
+        repeats++;
+        if(repeats >= 2){
+          lines.push(step + ". " + tool + " — BLOCKED by repeat guard, model redirected");
+          planIdx++; repeats = 0; lastSig = "";
+          continue;
+        }
+      } else { repeats = 0; }
+      lastSig = sig;
+
+      if(target.dest && guards){
+        lines.push(step + ". " + tool + " — destructive, queued for human approval");
+        planIdx++;
+        continue;
+      }
+      if(target.dest && !guards){
+        lines.push(step + ". " + tool + " — EXECUTED without confirmation ⚠");
+        planIdx++;
+        continue;
+      }
+
+      if(Math.random() < failRate){
+        lines.push(step + ". " + tool + " — failed (timeout), error returned as observation");
+        continue;                                  // retries next step, as a real agent would
+      }
+
+      if(misfire){
+        lines.push(step + ". " + tool + " — wrong tool for '" + target.note + "', no useful result");
+        continue;
+      }
+
+      lines.push(step + ". " + tool + " — ok, " + target.note);
+      planIdx++;
+      if(planIdx >= PLAN.length){ outcome = "completed"; break; }
+    }
+
+    if(!outcome) outcome = "halted: step limit";
+
+    $("g-out").textContent  = outcome === "completed" ? "completed" : "halted";
+    $("g-n").textContent    = step + " / " + maxSteps;
+    $("g-tok").textContent  = tokens.toLocaleString();
+    $("g-cost").textContent = "$" + cost.toFixed(3);
+
+    const notes = [];
+    if(outcome !== "completed")
+      notes.push("The run hit its step limit before finishing. In production this returns a partial summary rather than nothing — the user needs to know what was and was not done.");
+    if(nTools > 20)
+      notes.push("With " + nTools + " tools, selection accuracy is around " + Math.round(pickAccuracy*100) +
+                 "%. Wrong-tool steps are pure waste: tokens, latency and budget spent learning nothing. Group tools or route to a subset per request.");
+    if(failRate > 0.25)
+      notes.push("At a " + Math.round(failRate*100) + "% tool failure rate, most of the budget goes on retries. Agents amplify flaky dependencies — fix reliability below the agent, not above it.");
+    if(!guards)
+      notes.push("Guards are off: the refund and the email executed with no confirmation, and repeated calls are not blocked. This is the configuration behind most agent incidents.");
+    else
+      notes.push("Guards on: destructive actions were queued for approval rather than executed, and repeat calls were interrupted. The agent still did the useful investigative work.");
+
+    $("g-trace").textContent = lines.join("\n") + "\n\n" + notes.join("\n\n");
+  }
+
+  ["g-steps","g-fail","g-tools"].forEach(id =>
+    $(id).addEventListener("input", () => {
+      $("g-stepsv").textContent = $("g-steps").value;
+      $("g-failv").textContent  = $("g-fail").value;
+      $("g-toolsv").textContent = $("g-tools").value;
+    }));
+  $("g-run").addEventListener("click", run);
+  run();
+})();
+</script>
+</body>
+</html>

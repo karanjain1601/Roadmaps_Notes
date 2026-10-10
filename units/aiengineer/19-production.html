@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>19 · Shipping and running it — AI Engineer</title>
+<meta name="description" content="Reference architecture, streaming UX, caching layers, rate limits, fallbacks, latency budgets and controlling spend.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 19 · Taking it to production</div>
+    <h1>Shipping and running it</h1>
+    <p class="standfirst">Everything to this point was about making the model do the right thing. This chapter is about the system around it: the architecture, the caching, the fallbacks, and the operational habits that keep a feature working on a Tuesday afternoon when a provider is having a bad day.</p>
+    <div class="chap-meta">
+      <span class="tagpill">architecture</span>
+      <span class="tagpill">streaming</span>
+      <span class="tagpill">caching</span>
+      <span class="tagpill">fallbacks</span>
+      <span class="tagpill">latency</span>
+      <span class="tagpill">cost</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>A reference architecture</h2>
+
+<div class="flow stack">
+  <div class="step"><b>Client</b><span>Streams tokens, shows progress, allows interruption, degrades gracefully</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>API layer</b><span>Auth, rate limits, request validation, trace id issued here</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Orchestration</b><span>Prompt assembly, retrieval, tool loop, budgets, guards</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Model gateway</b><span>One seam over every provider: routing, retries, fallbacks, caching, cost accounting</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Providers and stores</b><span>Model APIs, self-hosted models, vector store, cache, queue</span></div>
+</div>
+
+<p>The gateway is the piece teams most often skip and most often regret. Every model call in your codebase going through one component means provider switching, fallbacks, cost tracking, caching and rate limiting are each implemented once. Without it they are implemented never, or eleven times inconsistently.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">gateway.py — the seam everything else depends on</span><button class="copy">Copy</button></div>
+<pre><code>@dataclass
+class Route:
+    primary: str                       # "anthropic:claude-x"
+    fallbacks: list[str]               # tried in order on failure
+    max_retries: int = 2
+    timeout_s: float = 30.0
+    cache: Literal["none", "exact", "semantic"] = "exact"
+
+ROUTES = {
+    "classify":  Route("openai:small",  ["anthropic:small"], cache="exact"),
+    "answer":    Route("anthropic:mid", ["openai:mid", "local:llama"], cache="semantic"),
+    "summarise": Route("openai:small",  ["local:llama"], cache="exact"),
+    "judge":     Route("anthropic:mid", [], cache="none"),      # never cache judging
+}
+
+async def complete(task: str, messages: list[dict], ctx: RequestContext, **kw):
+    route = ROUTES[task]
+    if route.cache != "none" and (hit := await cache_get(task, messages, route)):
+        metrics.incr("llm.cache_hit", task=task)
+        return hit
+
+    last_error = None
+    for model_id in [route.primary, *route.fallbacks]:
+        for attempt in range(route.max_retries + 1):
+            try:
+                with trace.span("llm", model=model_id, task=task) as span:
+                    result = await providers[model_id].complete(
+                        messages, timeout=route.timeout_s, **kw)
+                    span.record(result)
+                budget.charge(ctx, result.cost_usd)
+                await cache_put(task, messages, route, result)
+                return result
+            except RateLimited as e:
+                await asyncio.sleep(e.retry_after or backoff(attempt))
+                last_error = e
+            except (Timeout, ServerError) as e:
+                last_error = e
+                if attempt == route.max_retries:
+                    break                       # move to the next model
+            except BadRequest:
+                raise                           # our bug: do not retry, do not fail over
+    raise AllProvidersFailed(task) from last_error</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Fail over on the right errors only</span>
+  <p>Retry and fall back on rate limits, timeouts and 5xx responses. Do <em>not</em> retry a 400 — a malformed request will be malformed at the next provider too, and you will have burned the fallback budget hiding your own bug. Context-length errors are their own case: shorten the input rather than switching model, unless the fallback has a larger window, in which case switching is exactly right.</p>
+</div>
+
+<h2><span class="h-rule"></span>Caching, in four layers</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Layer</th><th>Mechanism</th><th>Typical effect</th></tr></thead>
+<tbody>
+<tr><td><b>Prompt prefix cache</b></td><td>Provider-side, on the stable start of your prompt (chapter 05)</td><td>Large cost and latency reduction on long system prompts. Nearly free to adopt</td></tr>
+<tr><td><b>Exact response cache</b></td><td>Hash of model + parameters + full message array → response</td><td>Excellent for classification and extraction, where inputs repeat. Useless for open chat</td></tr>
+<tr><td><b>Semantic cache</b></td><td>Embed the query; serve a stored answer if similarity exceeds a threshold</td><td>Real savings on FAQ-shaped traffic, and a real risk of serving a subtly wrong answer. Threshold high, scoped per tenant, never for personalised replies</td></tr>
+<tr><td><b>Derived-artefact cache</b></td><td>Store the <em>output</em> of expensive one-off work: document extraction, summaries, embeddings</td><td>The biggest saving of all, and the most often missed. Never recompute what has not changed</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">cache.py — exact caching, with the keys that matter</span><button class="copy">Copy</button></div>
+<pre><code>def cache_key(task: str, messages: list[dict], model: str, params: dict) -> str:
+    payload = json.dumps({
+        "task": task, "model": model, "messages": messages,
+        "temperature": params.get("temperature"),
+        "prompt_version": PROMPT_VERSIONS[task],   # invalidates on prompt change
+        "schema": params.get("schema_hash"),
+    }, sort_keys=True)
+    return "llm:" + hashlib.sha256(payload.encode()).hexdigest()
+
+# Cache only where it is safe:
+#   temperature > 0        -> caching removes variety users may expect
+#   personalised content   -> never cache across users
+#   time-sensitive answers -> short TTL, or do not cache
+#   tool-calling turns     -> do not cache; the world may have changed</code></pre>
+</div>
+
+<div class="demo" id="prod">
+  <div class="demo-head">
+    <b>Latency and cost budget</b>
+    <span>Build the request path stage by stage. The two numbers that decide whether a feature ships are at the bottom.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="p-arch">Shape</label>
+        <select id="p-arch">
+          <option value="single">Single model call</option>
+          <option value="rag" selected>RAG: rewrite → retrieve → rerank → generate</option>
+          <option value="agent">Agent: 5-step tool loop</option>
+        </select>
+      </div>
+      <div>
+        <label for="p-cache">Prompt cache hit rate — <span id="p-cachev">70</span>%</label>
+        <input type="range" id="p-cache" min="0" max="95" step="5" value="70">
+      </div>
+      <div>
+        <label for="p-resp">Response cache hit rate — <span id="p-respv">15</span>%</label>
+        <input type="range" id="p-resp" min="0" max="80" step="5" value="15">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="p-tier">Model tier</label>
+        <select id="p-tier">
+          <option value="small">Small — fast, $0.40/M blended</option>
+          <option value="mid" selected>Workhorse — $3/M blended</option>
+          <option value="large">Frontier — $15/M blended</option>
+        </select>
+      </div>
+      <div>
+        <label for="p-rps">Requests per day — <span id="p-rpsv">50,000</span></label>
+        <input type="range" id="p-rps" min="0" max="6" step="1" value="3">
+      </div>
+      <div>
+        <label><input type="checkbox" id="p-stream" checked> Stream the response</label>
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="p-ttft">—</b><span>time to first token</span></div>
+      <div><b id="p-total">—</b><span>full response</span></div>
+      <div><b id="p-per">—</b><span>cost / request</span></div>
+      <div><b id="p-month">—</b><span>cost / month</span></div>
+    </div>
+    <div id="p-bars"></div>
+    <div class="out" id="p-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Streaming, and the UX around it</h2>
+
+<p>Streaming does not make anything faster. It changes a four-second blank screen into visible progress starting at 700 milliseconds, which users experience as a different product.</p>
+
+<ul class="check">
+  <li><b>Stream by default</b> for anything conversational or long. Skip it for structured output the user never sees.</li>
+  <li><b>Show stage progress</b> in multi-step flows: "searching the documentation", "reading three sources". A spinner for eight seconds feels broken; labelled progress does not.</li>
+  <li><b>Make it interruptible.</b> A stop button that actually cancels the upstream request — and stops billing for the tokens you no longer want.</li>
+  <li><b>Handle mid-stream failure.</b> Errors can arrive after tokens have already rendered. Decide whether to keep partial output or replace it, and be consistent.</li>
+  <li><b>Watch the proxy layer.</b> Buffering proxies and some serverless platforms defeat streaming entirely; test the real deployed path, not localhost.</li>
+  <li><b>Render markdown incrementally</b> without flicker, and hold back partial links, code fences and tables until they close.</li>
+  <li><b>For long jobs, use a queue.</b> Anything beyond about thirty seconds should be a background job with a progress channel, not a held-open request.</li>
+</ul>
+
+<h2><span class="h-rule"></span>Failure modes and their responses</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Failure</th><th>Response</th></tr></thead>
+<tbody>
+<tr><td><b>Provider rate limit</b></td><td>Respect <code>retry-after</code>, back off with jitter, then fail over. Track headroom against your quota as a metric</td></tr>
+<tr><td><b>Provider outage</b></td><td>Fail over to a second provider. This is the main reason to keep the gateway abstraction honest — and to test the fallback path deliberately</td></tr>
+<tr><td><b>Elevated latency</b></td><td>Circuit-break after N slow responses and route elsewhere. A slow provider is worse than a failed one, because it ties up your capacity</td></tr>
+<tr><td><b>Context length exceeded</b></td><td>Truncate history, drop the lowest-ranked retrieved passages, or route to a larger-window model. Never just error</td></tr>
+<tr><td><b>Malformed structured output</b></td><td>Retry once with the validation error fed back; then fall back to a simpler schema or a default (chapter 07)</td></tr>
+<tr><td><b>Content filtered</b></td><td>A clear message, not a stack trace. Log the category; watch the rate</td></tr>
+<tr><td><b>Retrieval empty</b></td><td>Say so honestly rather than answering unsourced (chapter 12)</td></tr>
+<tr><td><b>Budget exhausted</b></td><td>Degrade to a cheaper model or a non-AI path. Decide in advance whether the feature fails closed or degrades</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Test the fallback path on purpose</span>
+  <p>A fallback that has never executed is not a fallback; it is untested code with a comforting name. Force it in staging — block the primary provider, exhaust a quota, inject timeouts — and confirm the second path produces acceptable output. Different providers have different tokenisers, different tool-calling formats and different behaviour on the same prompt. Discovering that during an outage is the wrong time.</p>
+</div>
+
+<h2><span class="h-rule"></span>Controlling spend</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Control</th><th>Detail</th></tr></thead>
+<tbody>
+<tr><td><b>Per-request cap</b></td><td>A hard token and cost ceiling on every request. Especially for agents, which can loop</td></tr>
+<tr><td><b>Per-user quotas</b></td><td>Daily or monthly limits by plan tier. Without these, one user can cost more than a hundred others combined</td></tr>
+<tr><td><b>Global circuit breaker</b></td><td>An automatic stop if daily spend exceeds a threshold. The protection against a deploy that accidentally loops</td></tr>
+<tr><td><b>Model routing by difficulty</b></td><td>Classify the request, send the easy majority to a small model, escalate the rest. Often halves cost with no measurable quality loss</td></tr>
+<tr><td><b>Batch what can wait</b></td><td>Overnight work at roughly half price through batch endpoints</td></tr>
+<tr><td><b>Attribute cost</b></td><td>Tag every call with feature, tenant and user. "We spend $9,000 a month on LLMs" is not actionable; "$6,200 of it is document summarisation for three enterprise accounts" is</td></tr>
+<tr><td><b>Alert on rate of change</b></td><td>Cost per request doubling matters more than absolute spend, and shows up sooner</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">router.py — difficulty routing, with a verification pass</span><button class="copy">Copy</button></div>
+<pre><code>async def answer(question: str, ctx: RequestContext) -> Answer:
+    difficulty = await classify_difficulty(question)        # small model, ~80ms
+
+    if difficulty == "simple":
+        result = await complete("answer", build(question), ctx, model_hint="small")
+        if await looks_uncertain(result):                   # hedging, refusal, low confidence
+            metrics.incr("router.escalated")
+            result = await complete("answer", build(question), ctx, model_hint="mid")
+        return result
+
+    return await complete("answer", build(question), ctx,
+                          model_hint="large" if difficulty == "hard" else "mid")
+
+# Track the escalation rate. If it climbs above ~15%, the classifier is
+# mis-routing and you are paying for two calls to do one job.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Deployment habits</h2>
+
+<ul class="check">
+  <li><b>Pin model versions.</b> Never point production at a floating alias. A silent model update will change your outputs, your latency and your costs on a schedule you do not control.</li>
+  <li><b>Version prompts and deploy them like code</b> — reviewed, versioned, rolled back. A prompt edit is a production change with no type checking, which makes review more important, not less.</li>
+  <li><b>Feature-flag every AI feature</b> for percentage rollout and instant disable. The kill switch is the most important operational control you have.</li>
+  <li><b>Run evals in CI</b> against a baseline, with zero tolerance on adversarial and regression cases (chapter 18).</li>
+  <li><b>Shadow-test model upgrades.</b> Run the new model on live traffic without serving its output, compare on your eval set and on real distributions, then switch.</li>
+  <li><b>Keep a non-AI path</b> where you can. Search that still works, a form that still submits, a human who can be reached.</li>
+  <li><b>Document the runbook</b>: how to disable the feature, how to switch providers, who to contact, what the budget alerts mean.</li>
+</ul>
+
+<h2><span class="h-rule"></span>The pre-launch list</h2>
+
+<div class="cols">
+  <div class="col">
+    <h4>Correctness</h4>
+    <ul>
+      <li>Eval suite passing against a baseline</li>
+      <li>Adversarial suite at 100%</li>
+      <li>Refusal behaviour verified</li>
+      <li>Citations verified where applicable</li>
+    </ul>
+  </div>
+  <div class="col">
+    <h4>Resilience</h4>
+    <ul>
+      <li>Fallback path exercised for real</li>
+      <li>Timeouts and retries on every call</li>
+      <li>Context-overflow path tested</li>
+      <li>Kill switch tested in production</li>
+    </ul>
+  </div>
+  <div class="col">
+    <h4>Safety</h4>
+    <ul>
+      <li>Tools scoped to the session user</li>
+      <li>Output sanitised before render</li>
+      <li>PII redacted from logs</li>
+      <li>Moderation both directions</li>
+    </ul>
+  </div>
+  <div class="col">
+    <h4>Operations</h4>
+    <ul>
+      <li>Tracing on, sampled, redacted</li>
+      <li>Cost attribution and alerts</li>
+      <li>Latency dashboards by stage</li>
+      <li>Runbook written and findable</li>
+    </ul>
+  </div>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Put <b>every model call behind one gateway</b>. Routing, retries, fallbacks, caching and cost accounting are then implemented once.</li>
+    <li>Fail over on <b>rate limits, timeouts and 5xx</b> — never on your own malformed requests.</li>
+    <li>Four caching layers. The most valuable and most forgotten is <b>caching derived artefacts</b>: never recompute what has not changed.</li>
+    <li>Streaming does not make it faster; it makes it <b>feel like a working product</b>. Show stage progress and allow interruption.</li>
+    <li>A fallback path that has never run <b>is not a fallback</b>. Force it in staging.</li>
+    <li>Cost control is <b>per-request caps, per-user quotas, a global breaker and difficulty routing</b> — plus attribution, so the number is actionable.</li>
+    <li><b>Pin model versions</b>, version prompts like code, and flag every feature for instant disable.</li>
+    <li>Keep a <b>non-AI path</b>. Some days the model is not available, and the product should still be.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("19-production.html");
+
+(function(){
+  const root = document.getElementById("prod");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const RPS = [1000, 5000, 20000, 50000, 200000, 1e6, 5e6];
+  const TIER = {small:{p:0.40, ttft:280, tps:180}, mid:{p:3, ttft:520, tps:90}, large:{p:15, ttft:900, tps:55}};
+
+  const SHAPES = {
+    single: [["Generate", "gen"]],
+    rag:    [["Query rewrite","small"],["Embed query","fixed:40"],["Hybrid search","fixed:60"],
+             ["Rerank","fixed:160"],["Generate","gen"]],
+    agent:  [["Plan","gen"],["Tool call 1","fixed:220"],["Reason","gen"],
+             ["Tool call 2","fixed:340"],["Reason","gen"],["Final answer","gen"]]
+  };
+
+  function render(){
+    const shape = $("p-arch").value;
+    const tier  = TIER[$("p-tier").value];
+    const pc    = parseInt($("p-cache").value, 10) / 100;
+    const rc    = parseInt($("p-resp").value, 10) / 100;
+    const ri    = parseInt($("p-rps").value, 10);
+    const reqs  = RPS[ri];
+    const stream = $("p-stream").checked;
+
+    $("p-cachev").textContent = Math.round(pc * 100);
+    $("p-respv").textContent  = Math.round(rc * 100);
+    $("p-rpsv").textContent   = reqs.toLocaleString();
+
+    const stages = SHAPES[shape];
+    let ttft = 0, total = 0, tokens = 0, firstGenSeen = false;
+    const bars = [];
+
+    stages.forEach(([name, kind]) => {
+      let ms;
+      if(kind === "small"){ ms = 190; tokens += 350; }
+      else if(kind.startsWith("fixed:")){ ms = parseInt(kind.split(":")[1], 10); }
+      else {
+        // Prompt caching mainly reduces prefill, i.e. time to first token.
+        ms = tier.ttft * (1 - pc * 0.55);
+        tokens += shape === "rag" ? 2600 : shape === "agent" ? 2200 : 1400;
+      }
+      if(!firstGenSeen) ttft += ms;
+      if(kind === "gen" && !firstGenSeen) firstGenSeen = true;
+      total += ms;
+      bars.push([name, ms]);
+    });
+
+    // Output generation time
+    const outTokens = shape === "agent" ? 260 : 200;
+    const genMs = outTokens / tier.tps * 1000;
+    total += genMs;
+    bars.push(["Token generation", genMs]);
+
+    const perReq = tokens / 1e6 * tier.p * (1 - pc * 0.55) + outTokens / 1e6 * tier.p * 3;
+    const effective = perReq * (1 - rc);
+    const month = effective * reqs * 30;
+
+    $("p-ttft").textContent  = stream ? Math.round(ttft) + "ms" : Math.round(total) + "ms";
+    $("p-total").textContent = (total / 1000).toFixed(1) + "s";
+    $("p-per").textContent   = "$" + effective.toFixed(4);
+    $("p-month").textContent = "$" + Math.round(month).toLocaleString();
+
+    const max = Math.max.apply(null, bars.map(b => b[1]));
+    $("p-bars").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">Where the time goes</div>' +
+      bars.map(b =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px">' +
+        '<span style="min-width:130px;font-size:13px">' + b[0] + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + Math.max(2, b[1]/max*100).toFixed(0) + '%"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:52px;text-align:right">' +
+        Math.round(b[1]) + 'ms</span></div>').join("");
+
+    const notes = [];
+    if(stream)
+      notes.push("Streaming: the user sees the first token at " + Math.round(ttft) + "ms rather than waiting " +
+                 (total/1000).toFixed(1) + "s. Identical work, entirely different experience.");
+    else
+      notes.push("Not streaming: a blank screen for " + (total/1000).toFixed(1) +
+                 "s. This is the single cheapest UX improvement available to you.");
+
+    if(pc < 0.4)
+      notes.push("Prompt cache hit rate is only " + Math.round(pc*100) + "%. Reorder the prompt so the stable parts come first — " +
+                 "system instructions, tool definitions, few-shot examples — and put retrieved context and the user turn last (chapter 05).");
+    if(rc > 0.4)
+      notes.push("A " + Math.round(rc*100) + "% response cache hit rate is high. Verify it is exact-match caching, or that your semantic threshold is strict and scoped per tenant — " +
+                 "a semantic cache serving a near-miss answer is an outage nobody notices.");
+    if(shape === "agent")
+      notes.push("Agent shape: cost scales with steps, and steps are not fixed. The number shown is one typical trajectory — " +
+                 "budget for the tail, not the median, and cap steps in code.");
+    if($("p-tier").value === "large" && shape !== "agent")
+      notes.push("Frontier tier for every request is rarely necessary. Difficulty routing typically sends 60-80% of traffic to a small model with no measurable quality loss — " +
+                 "roughly $" + Math.round(month * 0.45).toLocaleString() + "/month of the figure above.");
+    if(month > 20000)
+      notes.push("At $" + Math.round(month).toLocaleString() + "/month, self-hosting becomes worth modelling seriously (chapter 08), and so does per-user quota enforcement.");
+    $("p-note").textContent = notes.join("\n\n");
+  }
+
+  ["p-arch","p-cache","p-resp","p-tier","p-rps","p-stream"].forEach(id =>
+    $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

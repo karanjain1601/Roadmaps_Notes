@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Keys and expiry — Redis</title>
+<meta name="description" content="There is no schema, so the key namespace is your schema — naming, TTLs, how expiry actually works, and the commands that will take your server down.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 02 · The model</div>
+    <h1>Keys and expiry</h1>
+    <p class="standfirst">One flat namespace, no schema, no tables. The key name is the only structure you get, which makes naming a design decision rather than a style preference — and expiry is the feature that keeps the whole thing from filling up.</p>
+    <div class="chap-meta">
+      <span class="tagpill">naming</span>
+      <span class="tagpill">ttl</span>
+      <span class="tagpill">scan</span>
+      <span class="tagpill">keyspace</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The namespace is the schema</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">a convention, and why it matters</span><button class="copy">Copy</button></div>
+<pre><code># Redis has no tables and no collections. Every key lives in one flat
+# namespace, and the only organising tool is the name itself.
+
+user:41                       # a hash — the user object
+user:41:sessions              # a set  — their active sessions
+session:a3f9                  # a hash — one session
+leaderboard:global:2026-03    # a sorted set
+ratelimit:api:u41:1741946400  # a string counter, with a TTL
+lock:invoice:8842             # a string lock
+cache:product:2231:v3         # a cached render
+
+# The colon is convention, not syntax — Redis attaches no meaning to it. But
+# every tool, every dashboard and every human reading your keyspace expects
+# it, so use it.
+#
+# A workable pattern:
+#     <domain>:<entity>:<id>[:<attribute>]
+#
+# Rules worth adopting on day one:
+#   * PREFIX BY SERVICE if several share an instance:  orders:user:41
+#   * INCLUDE A VERSION where the value's shape may change:  cache:product:41:v3
+#     Bumping the version invalidates everything at once, with no deletion
+#   * KEEP THEM SHORT but not cryptic. Every key costs memory, and at ten
+#     million keys the difference between a 20-byte and a 60-byte name is
+#     hundreds of megabytes — but "u:41:s" that nobody can read is a false
+#     economy at any scale below that
+#   * NEVER put unbounded user input in a key without validating it. A key
+#     is up to 512 MB and nothing stops you creating millions of them</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">You cannot query, so the name is your only index</span>
+  <p>There is no <code>WHERE</code>. The only ways to find a key are to know its exact name, or to scan the entire keyspace — and scanning is what chapter 1's demo showed taking the server down. That inverts the usual design process: <b>you must be able to construct the key from what the caller already knows</b>. If answering "which sessions belong to user 41" requires finding keys by pattern, the design is wrong; you need a set at <code>user:41:sessions</code> holding the ids, maintained as sessions are created and destroyed. Every access path you need is a structure you maintain deliberately.</p>
+</div>
+
+<h2><span class="h-rule"></span>Never KEYS</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">SCAN, and the guarantees it gives you</span><button class="copy">Copy</button></div>
+<pre><code># KEYS blocks the server for the whole scan of every key (chapter 1).
+KEYS user:*                   # do not
+
+# SCAN walks the keyspace in bounded chunks, returning a cursor.
+SCAN 0 MATCH user:* COUNT 100
+1) "17408"                    # the cursor for the next call
+2) 1) "user:41"
+   2) "user:9"
+
+SCAN 17408 MATCH user:* COUNT 100
+# ... repeat until the returned cursor is "0"
+
+# WHAT SCAN GUARANTEES:
+#   * every key present for the WHOLE iteration is returned at least once
+#   * no key absent for the whole iteration is returned
+# WHAT IT DOES NOT:
+#   * keys added or removed during the iteration MAY or may not appear
+#   * a key may be returned MORE THAN ONCE — deduplicate if it matters
+#   * COUNT is a HINT about work per call, not a result count. A call can
+#     return zero keys and a non-zero cursor. That is normal, not the end
+
+# MATCH filters AFTER retrieval, so a pattern matching nothing still walks
+# the whole keyspace — just in bounded chunks that do not block.
+
+# The type-specific variants, which matter for the same reason (chapter 1):
+HSCAN user:41 0
+SSCAN online:now 0
+ZSCAN leaderboard 0
+
+# In cluster mode SCAN is per node, so iterate every master (chapter 16).
+redis-cli --scan --pattern 'user:*'      # handles the cursor loop for you</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Expiry</h2>
+
+<div class="demo" id="ttl">
+  <div class="demo-head">
+    <b>How a key actually disappears</b>
+    <span>Expiry is not a timer. Understanding the two mechanisms explains several surprising behaviours.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="e-what">Scenario</label>
+        <select id="e-what">
+          <option value="basic" selected>A key expires and nobody reads it</option>
+          <option value="read">A key expires and is then read</option>
+          <option value="many">A million keys expire at the same second</option>
+          <option value="replica">A key expires on a replica</option>
+          <option value="overwrite">SET on a key that has a TTL</option>
+          <option value="persist">Expire removed with PERSIST</option>
+          <option value="volatile">Memory fills with no TTLs set</option>
+        </select>
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="e-when">—</b><span>removed</span></div>
+      <div><b id="e-mem">—</b><span>memory freed</span></div>
+      <div><b id="e-visible">—</b><span>visible to clients</span></div>
+    </div>
+    <div id="e-cmd"></div>
+    <div class="out" id="e-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the commands</span><button class="copy">Copy</button></div>
+<pre><code>SET session:a3f9 "{...}" EX 3600      # set with a TTL, in one atomic command
+SET session:a3f9 "{...}" PX 500       # milliseconds
+SET session:a3f9 "{...}" EXAT 1741950000   # absolute unix time
+SET session:a3f9 "{...}" KEEPTTL      # replace the value, keep the existing TTL
+
+EXPIRE  session:a3f9 3600             # set or replace a TTL on an existing key
+EXPIRE  session:a3f9 3600 NX          # only if it has no TTL     (7.0+)
+EXPIRE  session:a3f9 3600 GT          # only if greater than the current (7.0+)
+TTL     session:a3f9                  # seconds remaining
+                                      #   -1 = exists, no TTL
+                                      #   -2 = does not exist
+PERSIST session:a3f9                  # remove the TTL
+
+# THE TRAP: most write commands CLEAR the TTL.
+SET  session:a3f9 "new"               # TTL is GONE. The key is now permanent
+SET  session:a3f9 "new" KEEPTTL       # TTL preserved
+GETSET / SETRANGE / GETDEL            # also clear it
+INCR / APPEND / HSET / LPUSH / ZADD   # do NOT clear it — they modify a value
+                                      # rather than replacing the key
+
+# That distinction — replacing a key clears the TTL, modifying it does not —
+# is the source of a classic leak: a session store that refreshes with plain
+# SET, so every active session becomes permanent and memory grows forever.
+
+# TTLs are per KEY, never per element. You cannot expire one field of a hash
+# or one member of a set. Hash field TTLs arrived in Redis 7.4 (HEXPIRE) and
+# are the exception; for everything else, if elements need individual
+# lifetimes they need to be separate keys, or a sorted set scored by
+# timestamp that you trim (chapter 5).</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Every key that can grow needs a TTL or a bound</span>
+  <p>Redis has no equivalent of dropping old rows. A key you create and never delete stays until the process restarts or eviction takes it — and if eviction takes it, that was not your decision (chapter 12). The failure is slow and quiet: memory climbs over months, nobody notices because there is plenty of headroom, and then the instance hits <code>maxmemory</code> during a traffic peak and starts evicting session keys. <b>For every key pattern you introduce, answer two questions: what deletes it, and what bounds its size.</b> A TTL answers the first. A capped list, a trimmed sorted set or a bounded stream answers the second.</p>
+</div>
+
+<h2><span class="h-rule"></span>Key management</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the rest of the keyspace API</span><button class="copy">Copy</button></div>
+<pre><code>EXISTS user:41                    # 0 or 1. Variadic: counts how many exist
+TYPE   user:41                    # string | list | set | zset | hash | stream
+DEL    user:41 user:9             # synchronous — blocks while freeing
+UNLINK user:41                    # frees on a background thread. Prefer this
+                                  # for anything large (chapter 1)
+RENAME old new                    # overwrites new if it exists
+RENAMENX old new                  # only if new does not exist
+COPY   src dst [DB n] [REPLACE]   # 6.2+
+RANDOMKEY                         # a random key. Useful for sampling
+DBSIZE                            # how many keys
+OBJECT ENCODING key               # the internal representation (chapter 12)
+OBJECT FREQ key                   # access frequency, under LFU eviction
+MEMORY USAGE key                  # bytes, including overhead
+
+# DEL versus UNLINK is worth internalising. DEL frees the object inline, so
+# deleting a set with ten million members blocks the thread for the whole
+# free. UNLINK removes the key from the namespace immediately and frees the
+# memory in the background. There is essentially no reason to prefer DEL.
+
+# NUMBERED DATABASES — SELECT 0..15 by default. Mostly a historical feature:
+SELECT 3
+# They share one process, one thread and one memory limit, so they provide
+# namespacing and nothing else. Cluster mode supports only database 0, and
+# most client libraries handle them poorly. Use key prefixes instead.
+
+# EXPIRY-RELATED SERVER SETTINGS worth knowing (chapter 12):
+CONFIG GET maxmemory-policy       # what happens when memory fills
+CONFIG GET hz                     # background task frequency, incl. expiry
+                                  # sampling. Default 10 times per second</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Keyspace notifications</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">events when keys change — with a large caveat</span><button class="copy">Copy</button></div>
+<pre><code>CONFIG SET notify-keyspace-events "Ex"     # E = keyevent, x = expired
+SUBSCRIBE __keyevent@0__:expired
+# 1) "message"
+# 2) "__keyevent@0__:expired"
+# 3) "session:a3f9"
+
+# The flags select what you hear:
+#   K  keyspace events, __keyspace@<db>__:<key> -> event name
+#   E  keyevent events, __keyevent@<db>__:<event> -> key name
+#   g  generic (DEL, EXPIRE, RENAME)    $ strings   l lists
+#   s  sets      h hashes    z sorted sets    x expired    e evicted
+#   A  everything except K and E
+
+# THE CAVEAT, and it is a big one: notifications are delivered over PUB/SUB,
+# which is fire-and-forget (chapter 11). If your subscriber is disconnected,
+# restarting, or simply slow, the message is gone. There is no queue, no
+# acknowledgement and no replay.
+#
+# So this is fine for a cache invalidation hint or a metric, and it is NOT a
+# reliable trigger. "Clean up the user's data when their session key expires"
+# will silently skip cleanups every time a consumer restarts.
+#
+# Two further points:
+#   * the `expired` event fires when the key is actually REMOVED, which may
+#     be well after it logically expired (see the demo above)
+#   * notifications add work to every matching command, so enabling A on a
+#     busy instance has a measurable cost
+
+# For anything that must not be missed, use a stream (chapter 6) or a sorted
+# set of pending work scored by due time (chapter 5), and poll it.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Inspecting a keyspace you inherited</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">what is in here, and what is eating the memory</span><button class="copy">Copy</button></div>
+<pre><code># A sampled summary of the whole keyspace — memory by pattern, biggest keys,
+# type distribution. Safe to run against production:
+redis-cli --memkeys
+redis-cli --bigkeys              # largest key of each type, by SCAN
+redis-cli --hotkeys              # most accessed. Needs maxmemory-policy
+                                 # allkeys-lfu
+
+# How many keys have no TTL — usually the most informative single number:
+redis-cli --scan | head -100000 | while read k; do
+  redis-cli TTL "$k"; done | grep -c '^-1$'
+
+# INFO keyspace gives the summary the server already tracks:
+INFO keyspace
+#   db0:keys=8412903,expires=6120441,avg_ttl=1840233
+#
+# The gap between `keys` and `expires` is the count of keys with no TTL. If
+# that number is large and growing on an instance used as a cache, you have
+# found a leak — and it is usually the SET-clears-the-TTL trap above.
+
+# Sample the key patterns actually in use:
+redis-cli --scan --pattern '*' | head -50000 |
+  sed 's/[0-9][0-9]*/N/g' | sort | uniq -c | sort -rn | head -20
+#   412031 cache:product:N:vN
+#    88201 session:N
+#      412 lock:invoice:N
+#        3 tmp:migration:N          <- residue from something in 2024</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Write the key patterns down</span>
+  <p>There is no schema to read, no <code>information_schema</code>, and no way to ask Redis what patterns exist without sampling. So the only durable record of your keyspace design is a document you maintain: <b>pattern, type, what writes it, what reads it, what expires it, and expected size</b>. It takes an hour and it is the difference between an instance somebody can reason about and one where nobody dares delete anything. The sampling command above tells you what is actually there; the document tells you what is supposed to be, and the gap between them is usually interesting.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>One flat namespace, no schema. <b>The key name is the only structure you get</b>, so naming is design.</li>
+    <li><b>You must be able to construct the key from what the caller knows.</b> Every other access path is a structure you maintain.</li>
+    <li><b>Never <code>KEYS</code>.</b> <code>SCAN</code> is incremental, may return duplicates, and <code>COUNT</code> is a hint.</li>
+    <li>Expiry is <b>lazy plus sampled</b>, so memory is freed after the key logically expires, not at the moment.</li>
+    <li><b><code>SET</code> clears the TTL.</b> <code>SET … KEEPTTL</code>, or use a command that modifies rather than replaces.</li>
+    <li><b>Every key pattern needs an answer to "what deletes it" and "what bounds it".</b></li>
+    <li><b><code>UNLINK</code>, not <code>DEL</code></b> — freeing happens in the background.</li>
+    <li>Keyspace notifications go over pub/sub, so they are <b>lossy</b>. Never use them as a reliable trigger.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("02-keys-and-expiry.html");
+
+(function(){
+  const root = document.getElementById("ttl");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const S = {
+    basic: {when:"when sampled", mem:"delayed", vis:"immediately gone",
+      cmd:'SET session:a3f9 "{...}" EX 60\n# ... 60 seconds pass, nobody touches it ...\n\n# The key is logically gone. The MEMORY is not yet freed.',
+      note:"Redis does not run a timer per key — with ten million keys that would be ten million timers. It uses two mechanisms together.\n\nLAZY EXPIRATION: when a key is accessed, Redis checks whether it has expired and removes it then. This is free, and it only helps for keys somebody touches.\n\nACTIVE EXPIRATION: ten times a second by default (the `hz` setting), a background cycle samples twenty random keys from the set that have TTLs, removes the expired ones, and if more than a quarter were expired it immediately repeats. That adaptive loop means a keyspace with many expired keys is cleaned aggressively and an idle one costs almost nothing.\n\nThe consequence: a key that expires and is never read is removed at some point after its TTL — usually within a second or so, occasionally longer. It is invisible to clients from the instant it expires, but the memory is still accounted for until the sampler reaches it."},
+    read: {when:"on the read", mem:"immediately", vis:"nil, correctly",
+      cmd:'SET session:a3f9 "{...}" EX 60\n# ... 60 seconds pass ...\nGET session:a3f9\n(nil)          # lazy expiration removed it right here',
+      note:"The lazy path. The read finds the key, sees the TTL has passed, deletes it, and returns nil — so the caller never observes a stale value.\n\nThis is why the delayed memory reclamation above is usually harmless: hot keys are read constantly and expire promptly. The keys that linger are the cold ones nobody is asking about, which are also the ones whose memory you are least likely to miss.\n\nWorth being precise about the guarantee: expiry is exact from the CLIENT's perspective. No command ever returns a value for an expired key. What is approximate is only when the memory comes back."},
+    many: {when:"spread over seconds", mem:"gradually", vis:"immediately gone",
+      cmd:'# A million keys all set with EX 3600 during a deploy,\n# so a million keys expire in the same second an hour later.\n\n# Active expiration samples 20 keys per cycle, 10 cycles/sec,\n# repeating while >25% of the sample is expired.',
+      note:"The adaptive loop handles this, and it takes time and CPU. While a large fraction of keys with TTLs are expired, the sampler keeps repeating within each cycle, so it spends noticeably more of the thread's time on expiry work — visible as a latency bump rather than a stall.\n\nRedis caps the effort per cycle specifically to avoid the single thread disappearing into expiry, so it will not block. But a million keys do not vanish instantly, and the memory comes back over seconds to minutes.\n\nThe practical advice is to JITTER your TTLs. Instead of EX 3600 everywhere, use EX 3600 plus a random 0-300 seconds. That spreads both the expiry work and — more importantly — the cache stampede when everything misses at once (chapter 7)."},
+    replica: {when:"when the master says so", mem:"on the DEL from master", vis:"master: gone",
+      cmd:'# On the MASTER: the key expires, and Redis replicates\n# an explicit DEL to every replica.\n\n# A replica does NOT expire keys on its own clock.\n# It waits to be told.',
+      note:"Replicas never expire keys independently. The master decides, and replicates an explicit DEL — which is what keeps every replica byte-identical rather than diverging based on clock skew.\n\nThe consequence used to be a real correctness issue: a read on a replica could return a logically-expired key, because the master had not yet noticed. Modern Redis handles this at the read path — a replica checks the logical expiry time and returns nil for an expired key even though the key is still physically present.\n\nSo reads are correct. What you can still observe is DBSIZE on a replica being higher than on the master, and memory not matching, because the physical keys linger until the DEL arrives. That is expected rather than a fault."},
+    overwrite: {when:"never — TTL cleared", mem:"never freed", vis:"key is now permanent",
+      cmd:'SET session:a3f9 "{...}" EX 3600\nTTL session:a3f9      # 3600\n\nSET session:a3f9 "{updated}"\nTTL session:a3f9      # -1   ← the TTL is GONE\n\n# The fix:\nSET session:a3f9 "{updated}" KEEPTTL\nSET session:a3f9 "{updated}" EX 3600   # or just re-set it',
+      note:"The single most common source of unbounded memory growth in Redis, and it is completely silent.\n\nA plain SET replaces the key entirely — new value, new key, no TTL. A session store that refreshes with SET on every request therefore converts every active session into a permanent key. Memory climbs slowly for months, nobody notices because there is headroom, and then the instance hits maxmemory during a peak and starts evicting.\n\nThe distinction is worth stating precisely: commands that REPLACE a key clear its TTL (SET, GETSET, SETRANGE). Commands that MODIFY a value keep it (INCR, APPEND, HSET, LPUSH, ZADD).\n\nDiagnose it with INFO keyspace: compare `keys` against `expires`. A growing gap on an instance you believe is entirely cache is this bug."},
+    persist: {when:"never", mem:"never freed", vis:"key is permanent",
+      cmd:'TTL     session:a3f9      # 3600\nPERSIST session:a3f9      # 1\nTTL     session:a3f9      # -1',
+      note:"Explicit and deliberate, which makes it the safe version of the previous case.\n\nUseful for promoting something from temporary to permanent — a draft that gets published, a trial that converts. The pattern is fine; just make sure something else now bounds the key, because nothing does once the TTL is gone.\n\nEXPIRE gained conditional flags in 7.0 that make careful TTL handling much easier: NX sets one only if there is none, XX only if there already is, GT only if the new TTL is longer, LT only if shorter. GT is particularly useful for extending a lease without ever accidentally shortening it (chapter 9)."},
+    volatile: {when:"eviction chooses", mem:"under pressure", vis:"keys vanish",
+      cmd:'CONFIG GET maxmemory-policy\n# "volatile-lru"      ← the default in many distributions\n\n# volatile-* policies only evict keys that HAVE a TTL.\n# If nothing has one:\nSET anything "x"\n(error) OOM command not allowed when used memory > \'maxmemory\'',
+      note:"The interaction that catches people. The volatile-* eviction policies only consider keys with a TTL set — so if memory fills and no key is a candidate, Redis cannot evict anything and starts refusing writes with an OOM error.\n\nThat is a total write outage on a server that is running perfectly and has, from its point of view, nothing it is permitted to discard.\n\nTwo ways out, and the choice depends on what the instance is for. If it is purely a cache where anything may be discarded, use allkeys-lru or allkeys-lfu, which consider every key. If it holds some data that must not be evicted, keep a volatile-* policy and make sure everything discardable actually has a TTL.\n\nWhat you should not do is leave the default unexamined. Chapter 12 covers the policies properly, and this is the interaction to remember until then."}
+  };
+
+  function render(){
+    const s = S[$("e-what").value];
+    $("e-when").textContent    = s.when;
+    $("e-mem").textContent     = s.mem;
+    $("e-visible").textContent = s.vis;
+
+    const bad = ["overwrite","persist","volatile"].includes($("e-what").value);
+    $("e-cmd").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid ' +
+      (bad ? "#E2574C" : "#25B7C4") +
+      ';border-radius:5px;padding:11px 13px;margin:16px 0 12px;font-family:var(--mono);' +
+      'font-size:12px;line-height:1.65;overflow-x:auto">' +
+      s.cmd.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>';
+
+    $("e-note").textContent = s.note;
+  }
+
+  $("e-what").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

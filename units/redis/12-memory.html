@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Memory and eviction — Redis</title>
+<meta name="description" content="Where the memory actually goes, the eviction policies and what each one means, fragmentation, and how to find the key that is eating your server.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 12 · Making it work</div>
+    <h1>Memory and eviction</h1>
+    <p class="standfirst">Memory is the hard limit (chapter 1), and Redis does not degrade gracefully when it runs out — it either discards data according to a policy you may not have chosen, or refuses writes. Both of those are configuration decisions, and the default is neither.</p>
+    <div class="chap-meta">
+      <span class="tagpill">maxmemory</span>
+      <span class="tagpill">policies</span>
+      <span class="tagpill">fragmentation</span>
+      <span class="tagpill">encodings</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Set maxmemory</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the first thing to configure</span><button class="copy">Copy</button></div>
+<pre><code>CONFIG GET maxmemory
+# "0"        <- unlimited. The default.
+
+# Unlimited means the real limit is the machine's RAM, and the failure is the
+# OOM killer terminating the process — an abrupt total outage with whatever
+# data loss your persistence configuration allows (chapter 13).
+
+CONFIG SET maxmemory 8gb
+CONFIG SET maxmemory-policy allkeys-lru
+CONFIG REWRITE                      # persist to the config file
+
+# HOW MUCH? Not all of the machine's RAM. Leave headroom for:
+#   * the COW fork during a background save, which can approach the dataset
+#     size under heavy writes (chapter 13)
+#   * client output buffers, especially pub/sub (chapter 11)
+#   * replication backlog and replica buffers
+#   * allocator fragmentation
+#
+# With persistence enabled, 50-60% of RAM is a common starting point. For a
+# pure cache with saving turned off, 75-80% is reasonable.
+#
+# maxmemory counts the DATASET, not the process. used_memory_rss — what the
+# operating system sees — is always larger.
+
+INFO memory
+#   used_memory              what Redis thinks it is using
+#   used_memory_rss          what the OS has allocated to the process
+#   used_memory_peak         the high-water mark
+#   used_memory_lua          scripting
+#   maxmemory / maxmemory_policy
+#   mem_fragmentation_ratio  rss / used_memory</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Eviction policies</h2>
+
+<div class="demo" id="ev">
+  <div class="demo-head">
+    <b>Which key gets discarded</b>
+    <span>The same keyspace, eight policies. Two of them will refuse writes instead of evicting.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="v-pol">maxmemory-policy</label>
+        <select id="v-pol">
+          <option value="noeviction">noeviction</option>
+          <option value="allkeys-lru" selected>allkeys-lru</option>
+          <option value="allkeys-lfu">allkeys-lfu</option>
+          <option value="allkeys-random">allkeys-random</option>
+          <option value="volatile-lru">volatile-lru</option>
+          <option value="volatile-lfu">volatile-lfu</option>
+          <option value="volatile-ttl">volatile-ttl</option>
+          <option value="volatile-random">volatile-random</option>
+        </select>
+      </div>
+    </div>
+    <div id="v-keys"></div>
+    <div class="stat">
+      <div><b id="v-victim">—</b><span>evicted</span></div>
+      <div><b id="v-writes">—</b><span>writes</span></div>
+      <div><b id="v-risk">—</b><span>risk</span></div>
+    </div>
+    <div class="out" id="v-note"></div>
+  </div>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Policy</th><th>Considers</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><td><code>noeviction</code></td><td>Nothing — writes fail</td><td>Redis holds data you cannot lose. <b>The default</b></td></tr>
+<tr><td><code>allkeys-lru</code></td><td>Every key, least recently used</td><td><b>A general cache</b></td></tr>
+<tr><td><code>allkeys-lfu</code></td><td>Every key, least frequently used</td><td>A cache with a stable hot set</td></tr>
+<tr><td><code>allkeys-random</code></td><td>Every key, at random</td><td>Uniform access, or when sampling costs too much</td></tr>
+<tr><td><code>volatile-lru</code></td><td>Only keys with a TTL</td><td>Mixed cache and persistent data on one instance</td></tr>
+<tr><td><code>volatile-lfu</code></td><td>Only keys with a TTL</td><td>Same, with frequency</td></tr>
+<tr><td><code>volatile-ttl</code></td><td>Shortest remaining TTL first</td><td>When expiry order approximates importance</td></tr>
+<tr><td><code>volatile-random</code></td><td>Only keys with a TTL, at random</td><td>Rarely the right choice</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-t">A volatile policy with no TTLs is a write outage</span>
+  <p>The <code>volatile-*</code> policies only consider keys that have a TTL. If memory fills and nothing qualifies, Redis cannot evict anything and starts returning <code>OOM command not allowed when used memory &gt; 'maxmemory'</code> — a total write outage on a server that is running perfectly and has, from its own point of view, nothing it is allowed to discard. This is the interaction from chapter 2, and it catches people because <code>volatile-lru</code> sounds like the cautious choice. It is cautious only if everything discardable genuinely has a TTL. <b>For a pure cache use <code>allkeys-*</code>; for mixed data use <code>volatile-*</code> and audit that your cache keys all have expiries.</b></p>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">LRU and LFU are approximate, on purpose</span><button class="copy">Copy</button></div>
+<pre><code># Exact LRU would require a linked list of every key updated on every access
+# — memory and time Redis will not spend. Instead it SAMPLES.
+
+CONFIG GET maxmemory-samples
+# "5"    <- pick 5 random candidates, evict the best one
+
+CONFIG SET maxmemory-samples 10     # closer to true LRU, more CPU per eviction
+# 5 is a good default; 10 is close to exact. Above that the returns are tiny.
+
+# LFU (4.0+) tracks access FREQUENCY with a probabilistic counter that decays
+# over time, so a key hammered once last week does not outrank one accessed
+# steadily today.
+CONFIG SET maxmemory-policy allkeys-lfu
+CONFIG SET lfu-log-factor 10        # how quickly the counter saturates
+CONFIG SET lfu-decay-time 1         # minutes before the counter halves
+
+OBJECT FREQ mykey                   # the LFU counter, under an LFU policy
+OBJECT IDLETIME mykey               # seconds since access, under LRU
+
+# LFU IS USUALLY BETTER FOR A CACHE. LRU is fooled by a scan: iterate a
+# million cold keys and every one becomes "recently used", evicting your
+# genuinely hot set. LFU is not — one access does not make a key frequent.
+#
+# The classic version of this is a nightly batch job reading everything,
+# which under LRU quietly destroys the cache hit rate every night at 2am and
+# it recovers by morning, so nobody connects the two.
+
+# Watch what is happening:
+INFO stats
+#   evicted_keys      cumulative. The RATE is what matters
+#   expired_keys      TTL expiry, which is different and normal
+#   keyspace_hits / keyspace_misses</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Where the memory goes</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">it is rarely the values</span><button class="copy">Copy</button></div>
+<pre><code>MEMORY USAGE user:41          # bytes for this key, including overhead
+MEMORY DOCTOR                 # a plain-English diagnosis
+MEMORY STATS                  # the full breakdown
+
+# PER-KEY OVERHEAD is 50-80 bytes before any data: the key string, the
+# dictionary entry, the robj header, and an entry in the expires table if it
+# has a TTL. Ten million keys holding one integer each is roughly 700 MB to
+# store 40 MB of data.
+#
+# This is why chapter 4's advice matters: many small related values belong in
+# one hash, not in many keys.
+
+# THE ENCODING THRESHOLDS decide the rest:
+CONFIG GET hash-max-listpack-entries    # 128
+CONFIG GET hash-max-listpack-value      # 64
+CONFIG GET list-max-listpack-size       # 128
+CONFIG GET set-max-intset-entries       # 512
+CONFIG GET set-max-listpack-entries     # 128
+CONFIG GET zset-max-listpack-entries    # 128
+
+OBJECT ENCODING mykey         # listpack | hashtable | intset | skiplist | ...
+
+# Below the threshold a collection is a flat contiguous array with almost no
+# per-element overhead. Above it, a real data structure with pointers and
+# metadata per element — commonly 5-10x more memory.
+#
+# THE CONVERSION IS ONE-WAY. A hash that briefly exceeded 128 fields and then
+# shrank back stays a hashtable until the key is rewritten. A transient spike
+# therefore costs memory permanently.
+
+# THE SHARDED HASH PATTERN, which follows directly:
+#   instead of  user:meta:41  ... ten million string keys
+#   use         user:meta:{41 % 100000}  ->  field "41"
+# Ten million values in a hundred thousand listpack hashes, at a fraction of
+# the memory. Instagram published this technique years ago and it still
+# routinely cuts memory by 5x or more for small-value workloads.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Finding the problem</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">what is actually in there</span><button class="copy">Copy</button></div>
+<pre><code># Safe against production — all of these use SCAN internally.
+redis-cli --bigkeys      # the largest key of each type
+redis-cli --memkeys      # memory by key, sampled
+redis-cli --hotkeys      # most accessed. Requires an LFU policy
+
+# Memory by key PATTERN, which is the number that usually explains things:
+redis-cli --scan | head -200000 |
+  sed 's/[0-9][0-9]*/N/g' | sort | uniq -c | sort -rn | head -20
+
+# How many keys have no TTL — the leak indicator from chapter 2:
+INFO keyspace
+#   db0:keys=8412903,expires=6120441,avg_ttl=1840233
+# The gap between keys and expires, growing over time on a cache, is the
+# SET-clears-the-TTL bug.
+
+# THE FOUR THINGS THAT ARE USUALLY EATING THE MEMORY, in order:
+#   1. keys with no TTL that should have one
+#   2. a collection that grew past its listpack threshold
+#   3. per-key overhead on millions of tiny values
+#   4. one enormous key nobody knew about — a list or set that grew for years
+
+# And the ones that are not your data at all:
+CLIENT LIST                # om= output buffer, per client
+INFO clients               # client_recent_max_output_buffer
+INFO replication           # the replication backlog
+#   A few hundred slow pub/sub subscribers can hold gigabytes in output
+#   buffers, charged to your instance (chapter 11).</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Fragmentation</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">when the OS holds more than Redis is using</span><button class="copy">Copy</button></div>
+<pre><code>INFO memory
+#   mem_fragmentation_ratio: 1.6
+
+# rss / used_memory.
+#   ~1.0-1.5   normal
+#   > 1.5      real fragmentation — memory the allocator holds but cannot reuse
+#   < 1.0      part of the process has been SWAPPED TO DISK. This is an
+#              emergency: swapping an in-memory database destroys its latency
+#              entirely. Set vm.swappiness=0 and size the instance properly
+
+# Fragmentation arises when many differently-sized objects are allocated and
+# freed — a workload with high churn and variable value sizes is the classic
+# case. jemalloc holds the freed space in size-class pools it cannot hand
+# back to the OS.
+
+# ACTIVE DEFRAGMENTATION moves objects to compact the heap, incrementally,
+# during idle cycles:
+CONFIG SET activedefrag yes
+CONFIG SET active-defrag-ignore-bytes 100mb
+CONFIG SET active-defrag-threshold-lower 10      # start at 10% fragmentation
+CONFIG SET active-defrag-threshold-upper 100
+CONFIG SET active-defrag-cycle-min 5             # % of CPU, minimum
+CONFIG SET active-defrag-cycle-max 25            # maximum
+
+# It costs CPU on the single thread, so it is throttled and enabled only when
+# fragmentation is genuinely high. Requires the bundled jemalloc.
+
+# THE OTHER FIX: restart the instance, or fail over to a replica and rebuild
+# the old primary. A freshly loaded dataset is compact. On a replicated setup
+# this is a rolling operation with no downtime, and it is often simpler than
+# tuning defrag parameters.
+
+# TRANSPARENT HUGE PAGES should be OFF. They make the copy-on-write fork
+# during a save copy 2 MB pages instead of 4 KB ones, which inflates memory
+# use and latency substantially (chapter 13):
+echo never > /sys/kernel/mm/transparent_hugepage/enabled</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Reducing memory</h2>
+
+<ul class="check">
+  <li><b>Give every key a TTL</b> that can have one. The single largest win, and usually available.</li>
+  <li><b>Shard many small values into hashes</b> under the listpack threshold — often a 5–10× reduction.</li>
+  <li><b>Shorten key names</b>, but only at very high key counts. <code>user:41:sessions</code> to <code>u:41:s</code> is a real saving at ten million keys and a false economy at ten thousand.</li>
+  <li><b>Compress large values</b> in the client. gzip on a JSON document is frequently 5–10×, at CPU cost on both sides.</li>
+  <li><b>Use a bitmap or HyperLogLog</b> where the question allows it (chapters 3 and 10).</li>
+  <li><b>Cap every collection</b> — <code>LTRIM</code>, <code>ZREMRANGEBYRANK</code>, <code>MAXLEN</code>.</li>
+  <li><b>Store integers as integers.</b> Redis encodes numeric strings as longs with no allocation.</li>
+  <li><b>Separate instances by purpose</b> — cache and durable data on one instance share one <code>maxmemory</code> and one policy.</li>
+</ul>
+
+<div class="note key">
+  <span class="note-t">One instance, one purpose</span>
+  <p>Putting the cache, the session store, the job queues and the rate limiters on one instance is the natural thing to do and it couples four workloads with different requirements. They share one <code>maxmemory</code>, so a cache surge evicts sessions and logs everybody out. They share one eviction policy, so you cannot say "evict cache freely, never evict sessions". They share one persistence configuration, so either you fsync data you were happy to lose or you risk losing data you were not. And they share one thread, so a slow command in one workload adds latency to all of them. <b>Separate instances cost a little memory overhead and remove an entire category of incident</b>, and on the same machine they also use more of your cores (chapter 1).</p>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Alert on evicted_keys, not on used_memory</span>
+  <p>Memory sitting at 95% of <code>maxmemory</code> is exactly what a correctly-sized cache looks like — it fills up and stays full, and an alert on that fires forever and gets muted. The signal that matters is <b>the eviction rate</b>: keys being discarded means the working set no longer fits and your hit rate is silently degrading. There is no error and nothing in the logs; requests simply start missing more often. Track <code>evicted_keys</code> as a rate alongside the hit ratio, and treat a sustained rise as the capacity signal it is.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b><code>maxmemory</code> defaults to unlimited</b>, and the failure is the OOM killer. Set it on day one.</li>
+    <li><b>Leave headroom</b> for the save fork, client buffers and fragmentation — 50–60% of RAM with persistence on.</li>
+    <li><b>A <code>volatile-*</code> policy with no TTLs refuses writes.</b> <code>allkeys-*</code> for a pure cache.</li>
+    <li><b>LFU beats LRU for caches</b>, because a scan does not destroy the hot set.</li>
+    <li><b>Per-key overhead is 50–80 bytes.</b> Many small values belong in sharded hashes.</li>
+    <li><b>Listpack encodings are 5–10× cheaper</b>, and the conversion above the threshold is one-way.</li>
+    <li><b>A fragmentation ratio below 1.0 means swapping</b> — an emergency for an in-memory database.</li>
+    <li><b>Alert on <code>evicted_keys</code>, not <code>used_memory</code></b>. Full is normal; evicting is the signal.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("12-memory.html");
+
+(function(){
+  const root = document.getElementById("ev");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  // key, ttl(s) or null, idle seconds, access freq
+  const KEYS = [
+    {k:"cache:product:8842", ttl:280,  idle:2,    freq:"high"},
+    {k:"cache:page:home",    ttl:45,   idle:1,    freq:"high"},
+    {k:"session:a3f9",       ttl:3400, idle:900,  freq:"low"},
+    {k:"config:features",    ttl:null, idle:30,   freq:"medium"},
+    {k:"queue:jobs",         ttl:null, idle:0,    freq:"high"},
+    {k:"cache:report:q1",    ttl:1200, idle:7200, freq:"low"}
+  ];
+
+  const P = {
+    noeviction: {victim:null, writes:"REFUSED", risk:"write outage",
+      note:"Nothing is evicted. Once memory is full, every write returns:\n\n    OOM command not allowed when used memory > 'maxmemory'\n\nReads keep working, so the instance looks half-alive: dashboards are green, the process is healthy, and every write fails.\n\nThis is the DEFAULT, and it is the correct choice for exactly one situation — when Redis holds data that must not silently vanish, and you would rather fail loudly than lose it. A job queue, a source-of-truth counter, anything not reconstructible.\n\nFor anything used as a cache it is the wrong default, and leaving it unexamined is how a cache instance turns into a write outage during a traffic peak."},
+    "allkeys-lru": {victim:"cache:report:q1", writes:"ok", risk:"low",
+      note:"Every key is a candidate; the least recently used is discarded. cache:report:q1 has been idle for two hours, so it goes first.\n\nThis is the right default for a general-purpose cache. Recency is a decent proxy for future usefulness and it needs no tuning.\n\nThe weakness is scan resistance. Iterate a million cold keys — a nightly batch job, an export, a --scan by an engineer investigating something — and every one of them becomes 'recently used', evicting your genuinely hot set. The hit rate collapses and recovers by morning, so nobody connects the incident to the cron job that caused it.\n\nNote also that LRU here is approximate: Redis samples five random keys and evicts the best of them, rather than maintaining an exact ordering. maxmemory-samples 10 gets closer to true LRU for a little more CPU."},
+    "allkeys-lfu": {victim:"cache:report:q1", writes:"ok", risk:"low",
+      note:"Least FREQUENTLY used, with a counter that decays over time. The same victim here, and for a better reason: it is not merely stale, it is rarely wanted.\n\nLFU is scan-resistant in a way LRU is not. A single access from a batch job does not make a key frequent, so a full iteration of cold keys leaves the hot set intact. That alone makes it the better choice for most caches.\n\nThe decay matters too — lfu-decay-time halves the counter periodically, so a key that was hammered last week does not permanently outrank one accessed steadily today.\n\nTwo settings to know: lfu-log-factor controls how quickly the counter saturates, and OBJECT FREQ key reads the current counter, which is genuinely useful for understanding what your cache considers hot."},
+    "allkeys-random": {victim:"any of the six", writes:"ok", risk:"unpredictable",
+      note:"A random key is discarded, with no consideration of recency or frequency. Anything can go, including queue:jobs and config:features.\n\nThere is a narrow case for it: when access is genuinely uniform, sampling costs more than it saves and random is as good as anything. That case is rarer than people assume — most real workloads have a hot set, and discarding from it at random measurably hurts the hit rate.\n\nIt is also the only policy where the evicted key is completely unrelated to its usefulness, which makes reasoning about cache behaviour impossible. Use allkeys-lru or allkeys-lfu unless you have measured that random is better for your workload."},
+    "volatile-lru": {victim:"cache:report:q1", writes:"ok, while candidates exist", risk:"OOM if TTLs run out",
+      note:"Only keys WITH A TTL are candidates. config:features and queue:jobs are permanently safe because they have no expiry — which is exactly the point when an instance mixes cache with data that must survive.\n\nThe hazard is what happens when no candidate exists. If every remaining key is TTL-less, Redis has nothing it is permitted to evict and starts refusing writes with an OOM error — the same total write outage as noeviction, on a server that appears entirely healthy.\n\nThis catches people because volatile-lru reads as the cautious option. It is cautious only if everything discardable genuinely has a TTL, which requires an audit rather than an assumption.\n\nCheck it: INFO keyspace shows keys and expires. If the gap is large and growing, you have TTL-less keys accumulating and this policy is heading for a write outage."},
+    "volatile-lfu": {victim:"cache:report:q1", writes:"ok, while candidates exist", risk:"OOM if TTLs run out",
+      note:"The same TTL-only restriction as volatile-lru, with frequency rather than recency choosing among the candidates.\n\nBetter than volatile-lru for the same reason allkeys-lfu is better than allkeys-lru — a scan does not promote cold keys — and it carries the identical hazard: no TTL'd candidates means no eviction means refused writes.\n\nIf you are running a mixed instance and want the best eviction behaviour, this is the policy. If you are running a pure cache, drop the volatile prefix entirely and remove the OOM risk."},
+    "volatile-ttl": {victim:"cache:page:home", writes:"ok, while candidates exist", risk:"evicts hot keys",
+      note:"The key with the SHORTEST remaining TTL is evicted first — here cache:page:home, with 45 seconds left.\n\nNote what just happened: a key being accessed constantly was discarded ahead of one that has been idle for two hours, purely because it was going to expire sooner anyway.\n\nThe reasoning behind the policy is that a short TTL signals the author considered it short-lived. In practice short TTLs often mark the most volatile and most frequently refreshed data, which is to say the hottest — so this policy has a habit of evicting exactly what you wanted to keep.\n\nIt has a legitimate use when TTL genuinely encodes importance and you set them deliberately with that in mind. Otherwise LRU or LFU makes better decisions."},
+    "volatile-random": {victim:"any with a TTL", writes:"ok, while candidates exist", risk:"unpredictable",
+      note:"Random selection among keys with a TTL. It combines the unpredictability of allkeys-random with the OOM risk of the volatile policies, and offers no advantage over either.\n\nThe only argument for it is that eviction itself becomes marginally cheaper because no sampling comparison is needed, and that saving is not worth the loss of any relationship between usefulness and survival.\n\nThere is essentially no workload for which this is the best available policy."}
+  };
+
+  function render(){
+    const k = $("v-pol").value, p = P[k];
+    const volatileOnly = k.startsWith("volatile");
+
+    $("v-keys").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:16px 0 8px">' +
+      'The keyspace, at maxmemory</div>' +
+      KEYS.map(x => {
+        const candidate = !volatileOnly || x.ttl !== null;
+        const victim = p.victim === x.k;
+        return '<div style="display:flex;align-items:center;gap:12px;background:' +
+          (victim ? "#FDECEA" : "#fff") + ';border:1px solid ' + (victim ? "#E2574C" : "#E1E7EC") +
+          ';border-left:3px solid ' + (victim ? "#E2574C" : candidate ? "#F2A03D" : "#CFD8E0") +
+          ';border-radius:4px;padding:7px 12px;margin-bottom:4px;font-family:var(--mono);font-size:11.5px">' +
+          '<span style="font-weight:700;color:' + (victim ? "#B0453B" : "#54677A") + ';min-width:158px">' + x.k + '</span>' +
+          '<span style="color:#8FA0AF;min-width:78px">' + (x.ttl === null ? "no ttl" : "ttl " + x.ttl + "s") + '</span>' +
+          '<span style="color:#8FA0AF;min-width:82px">idle ' + x.idle + 's</span>' +
+          '<span style="color:#8FA0AF">' + x.freq + ' freq</span>' +
+          (victim ? '<span style="margin-left:auto;color:#B0453B;font-weight:700">EVICTED</span>'
+                  : !candidate ? '<span style="margin-left:auto;color:#B4C0CA">safe</span>' : '') +
+          '</div>';
+      }).join("");
+
+    $("v-victim").textContent = p.victim || (k === "noeviction" ? "nothing" : p.victim === null ? "nothing" : "—");
+    if(k === "allkeys-random") $("v-victim").textContent = "any of the six";
+    if(k === "volatile-random") $("v-victim").textContent = "any with a TTL";
+    $("v-writes").textContent = p.writes;
+    $("v-risk").textContent   = p.risk;
+
+    let note = p.note;
+    if(volatileOnly)
+      note += "\n\nNotice which keys are marked safe: config:features and queue:jobs have no TTL, so this policy will never touch them. That is the reason to choose a volatile policy — and the reason it can run out of candidates and refuse writes.";
+    $("v-note").textContent = note;
+  }
+
+  $("v-pol").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · The planner and statistics — PostgreSQL</title>
+<meta name="description" content="How costs are estimated, where statistics come from, extended statistics, and the settings that change the planner's mind.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 07 · Storage and access</div>
+    <h1>The planner and statistics</h1>
+    <p class="standfirst">The SQL unit covered reading a plan. This one covers where the numbers in it come from — the cost constants, the statistics behind every row estimate, and the small number of settings that legitimately change the planner's mind rather than overriding it.</p>
+    <div class="chap-meta">
+      <span class="tagpill">cost model</span>
+      <span class="tagpill">statistics</span>
+      <span class="tagpill">extended statistics</span>
+      <span class="tagpill">settings</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Cost is a made-up unit</h2>
+
+<p>Every plan node gets a cost in arbitrary units, defined relative to one constant: <b>reading a page sequentially costs 1.0</b>. Everything else is calibrated against that, and the planner picks the cheapest total. The units mean nothing on their own; only the ratios matter.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Constant</th><th>Default</th><th>Meaning</th><th>Usually set to</th></tr></thead>
+<tbody>
+<tr><td><code>seq_page_cost</code></td><td>1.0</td><td>Read one page sequentially</td><td>Leave at 1.0 — it is the reference</td></tr>
+<tr><td><code>random_page_cost</code></td><td><b>4.0</b></td><td>Read one page randomly</td><td><b>1.1</b> on SSD or cloud storage</td></tr>
+<tr><td><code>cpu_tuple_cost</code></td><td>0.01</td><td>Process one row</td><td>Leave</td></tr>
+<tr><td><code>cpu_index_tuple_cost</code></td><td>0.005</td><td>Process one index entry</td><td>Leave</td></tr>
+<tr><td><code>cpu_operator_cost</code></td><td>0.0025</td><td>Evaluate one operator or function</td><td>Leave</td></tr>
+<tr><td><code>parallel_setup_cost</code></td><td>1000</td><td>Start a parallel query</td><td>Leave</td></tr>
+<tr><td><code>effective_cache_size</code></td><td>4GB</td><td>How much cache the planner may assume</td><td><b>50–75% of RAM</b></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">Two settings are wrong on most installations</span>
+  <p><code>random_page_cost = 4.0</code> encodes the seek time of a spinning disk: random reads were genuinely four times a sequential read. <b>On SSD or cloud block storage the real ratio is close to 1</b>, so leaving the default makes the planner systematically pessimistic about index scans and it chooses sequential scans it should not. Set it to 1.1. Meanwhile <code>effective_cache_size</code> defaults to 4 GB regardless of your machine, so on a 128 GB server the planner assumes almost nothing is cached and reaches the same wrong conclusion from a different direction. These two are the highest-value planner changes available and both are one line.</p>
+</div>
+
+<div class="demo" id="cost">
+  <div class="demo-head">
+    <b>The cost model, computed</b>
+    <span>Real PostgreSQL cost formulas. Watch where the planner switches from an index scan to a sequential scan, and how the constants move that point.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="p-rows">Table rows — <span id="p-rowsv">1 million</span></label>
+        <input type="range" id="p-rows" min="1" max="6" step="1" value="3">
+      </div>
+      <div>
+        <label for="p-sel">Rows matched — <span id="p-selv">0.5%</span></label>
+        <input type="range" id="p-sel" min="1" max="100" step="1" value="5">
+      </div>
+      <div>
+        <label for="p-rpc">random_page_cost — <span id="p-rpcv">4.0</span></label>
+        <input type="range" id="p-rpc" min="10" max="80" step="1" value="40">
+      </div>
+      <div>
+        <label for="p-corr">Index correlation — <span id="p-corrv">0.10</span></label>
+        <input type="range" id="p-corr" min="0" max="100" step="5" value="10">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="p-seq">—</b><span>seq scan cost</span></div>
+      <div><b id="p-idx">—</b><span>index scan cost</span></div>
+      <div><b id="p-bit">—</b><span>bitmap scan cost</span></div>
+      <div><b id="p-win">—</b><span>planner picks</span></div>
+    </div>
+    <div id="p-bars"></div>
+    <div class="out" id="p-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">the sequential scan formula, in full</span><button class="copy">Copy</button></div>
+<pre><code>Seq Scan cost = (pages × seq_page_cost)
+              + (rows  × cpu_tuple_cost)
+              + (rows  × cpu_operator_cost × number_of_filter_conditions)
+
+For a 1M-row table in 10,000 pages with one WHERE condition:
+    10,000 × 1.0     = 10,000     page reads
+ + 1,000,000 × 0.01  = 10,000     processing each row
+ + 1,000,000 × 0.0025 = 2,500     evaluating the filter
+                      ────────
+                        22,500
+
+Note that the CPU terms dominate here — more than half the cost is touching
+rows, not reading pages. That is why a filter that is expensive to evaluate
+(a function call, a regex) shifts the balance noticeably.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Where statistics come from</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">ANALYZE samples; it does not scan</span><button class="copy">Copy</button></div>
+<pre><code>-- ANALYZE reads a random sample of 300 × default_statistics_target rows —
+-- 30,000 by default — and derives four things per column, stored in pg_stats.
+
+SELECT attname, null_frac, n_distinct, correlation,
+       most_common_vals, most_common_freqs, histogram_bounds
+FROM pg_stats WHERE tablename = 'orders' AND attname = 'status';
+
+--   null_frac          fraction of NULLs
+--   n_distinct         distinct values. NEGATIVE means a ratio to row count:
+--                      -1 = every value unique, -0.5 = half as many distinct
+--   most_common_vals   the top N values and their frequencies (the MCV list)
+--   histogram_bounds   equal-frequency buckets covering everything else
+--   correlation        how well physical order matches value order (chapter 6)
+
+-- Selectivity for an equality predicate is then:
+--   value in the MCV list  ->  use its exact recorded frequency
+--   otherwise              ->  (1 - sum(mcv_freqs) - null_frac) / n_distinct_remaining
+--
+-- This is why estimates are excellent for common values and rougher for rare
+-- ones — and why a skewed column with more distinct values than the MCV list
+-- can hold produces poor estimates for everything outside it.</code></pre>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">raising the statistics target where it matters</span><button class="copy">Copy</button></div>
+<pre><code>-- Global default is 100 (so 100 MCVs, 100 histogram buckets, 30,000 sampled).
+SHOW default_statistics_target;
+
+-- Per column, which is nearly always the right scope:
+ALTER TABLE orders ALTER COLUMN status SET STATISTICS 1000;
+ANALYZE orders;                    -- required; the setting alone does nothing
+
+-- Raise it when a column is:
+--   * heavily skewed — one value is 40% of the table and others are rare
+--   * used in predicates whose estimates are visibly wrong in EXPLAIN ANALYZE
+--   * a join key on a large table
+--
+-- The cost is a slower ANALYZE and a larger pg_statistic. Raising the GLOBAL
+-- target to 1000 makes every ANALYZE ten times more expensive across every
+-- column of every table, which is rarely what you want. Target the columns.</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">n_distinct is sampled, and it is often badly wrong</span>
+  <p>Estimating the number of distinct values from a sample is a genuinely hard statistical problem, and Postgres frequently underestimates it on large tables — sometimes by orders of magnitude. The symptom is a group-by or a join that the planner thinks produces a hundred rows and actually produces a million. When you know the truth, tell it directly: <code>ALTER TABLE t ALTER COLUMN c SET (n_distinct = -0.8)</code> fixes the estimate permanently and survives <code>ANALYZE</code>. This is one of the few places where overriding a statistic rather than improving it is the right answer.</p>
+</div>
+
+<h2><span class="h-rule"></span>Extended statistics</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the fix for correlated columns</span><button class="copy">Copy</button></div>
+<pre><code>-- The planner assumes columns are INDEPENDENT, so for two predicates it
+-- multiplies their selectivities. When one column determines another, the
+-- true selectivity is the smaller of the two, not the product — and the
+-- estimate comes out orders of magnitude too low.
+--
+--   P(city = 'Manchester') = 0.02
+--   P(postcode LIKE 'M1%') = 0.01
+--   assumed together: 0.0002    actual: 0.01     50x too low
+--
+-- A 50x underestimate is exactly what produces the catastrophic nested loop
+-- from the SQL unit's chapter 13.
+
+CREATE STATISTICS addr_stats (dependencies, ndistinct, mcv)
+    ON city, postcode FROM addresses;
+ANALYZE addresses;
+
+--   dependencies  functional dependencies: postcode determines city
+--   ndistinct     the number of distinct COMBINATIONS, for GROUP BY estimates
+--   mcv           most common combinations — the most powerful, PG12+
+
+SELECT * FROM pg_stats_ext WHERE tablename = 'addresses';
+
+-- Pairs worth checking in almost any schema:
+--   (country, city)        (status, cancelled_at)
+--   (product, category)    (year, quarter)
+--   (tenant_id, anything)  in a multi-tenant schema, everything correlates
+--                          with the tenant</code></pre>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">statistics on an expression</span><button class="copy">Copy</button></div>
+<pre><code>-- No statistics exist for an expression, so the planner falls back to a
+-- fixed guess — usually 0.5% selectivity, which is wrong in both directions.
+SELECT * FROM orders WHERE date_trunc('month', placed_at) = '2026-03-01';
+
+-- Two ways to give it real numbers:
+CREATE INDEX ON orders (date_trunc('month', placed_at));   -- index + stats
+CREATE STATISTICS ON date_trunc('month', placed_at) FROM orders;  -- PG14+,
+                                                                  -- stats only
+ANALYZE orders;
+
+-- The second is useful when you want the estimate corrected but do not want
+-- to pay for an index on every write.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Join planning</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the combinatorial problem, and the escape hatch</span><button class="copy">Copy</button></div>
+<pre><code>-- The planner considers join orders exhaustively, which is factorial in the
+-- number of tables. Past a threshold it switches to a genetic algorithm.
+
+SHOW join_collapse_limit;      -- 8  — flatten explicit JOINs up to this many
+SHOW from_collapse_limit;      -- 8  — same, for subqueries in FROM
+SHOW geqo_threshold;           -- 12 — above this, use the genetic optimiser
+
+-- Symptoms of hitting these on a 15-table query:
+--   * planning time in the hundreds of milliseconds
+--   * the SAME query producing different plans between runs, because the
+--     genetic optimiser is non-deterministic
+--
+-- Options:
+--   raise geqo_threshold      exhaustive search, slower planning, stable plans
+--   set geqo = off            never use the genetic optimiser
+--   lower join_collapse_limit force the planner to respect your written order
+--   restructure the query     usually the real answer
+
+-- Check planning time separately from execution — EXPLAIN reports both, and
+-- on a short OLTP query 200ms of planning is the whole problem.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Parallel query</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Setting</th><th>Default</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><code>max_parallel_workers_per_gather</code></td><td>2</td><td>Per node. Raise to 4 for analytics; 0 disables parallelism</td></tr>
+<tr><td><code>max_parallel_workers</code></td><td>8</td><td>Cluster-wide pool</td></tr>
+<tr><td><code>max_worker_processes</code></td><td>8</td><td>The overall ceiling, shared with extensions and logical replication</td></tr>
+<tr><td><code>min_parallel_table_scan_size</code></td><td>8MB</td><td>Tables below this are never scanned in parallel</td></tr>
+<tr><td><code>parallel_setup_cost</code></td><td>1000</td><td>Lower it to make parallelism more attractive</td></tr>
+<tr><td><code>parallel_tuple_cost</code></td><td>0.1</td><td>Cost of passing a row from a worker to the leader</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Parallel workers multiply work_mem</span>
+  <p>Each worker gets its own <code>work_mem</code> for each sort or hash node it runs. A query with two hash joins running four workers can allocate <code>2 × 5 × work_mem</code> — counting the leader. This is chapter 1's warning in its sharpest form, and it is why raising both <code>work_mem</code> and <code>max_parallel_workers_per_gather</code> together on an OLTP system is a reliable way to meet the OOM killer. Also worth knowing: <code>Workers Planned: 4 / Workers Launched: 0</code> in a plan means the pool was exhausted by other queries, and the plan's cost estimate no longer bears any relation to what happened.</p>
+</div>
+
+<h2><span class="h-rule"></span>Settings that change the planner's mind</h2>
+
+<div class="cols">
+  <div class="col good">
+    <h4>Legitimate, permanent</h4>
+    <ul>
+      <li><code>random_page_cost = 1.1</code> on SSD</li>
+      <li><code>effective_cache_size</code> to 50–75% of RAM</li>
+      <li><code>default_statistics_target</code>, or per column</li>
+      <li><code>CREATE STATISTICS</code> for correlated columns</li>
+      <li><code>ALTER TABLE … SET (n_distinct = …)</code> when you know better</li>
+      <li><code>ALTER FUNCTION … STABLE</code> so calls can be cached</li>
+    </ul>
+  </div>
+  <div class="col bad">
+    <h4>Diagnostic only</h4>
+    <ul>
+      <li><code>SET enable_seqscan = off</code></li>
+      <li><code>SET enable_nestloop = off</code></li>
+      <li><code>SET enable_hashjoin = off</code></li>
+      <li><code>pg_hint_plan</code></li>
+    </ul>
+    <p style="margin-top:8px">These do not disable anything — they add a cost of 10 billion, so the plan is still chosen if nothing else is possible. Use them to confirm "would the other plan be faster", then fix the estimate that caused the wrong choice.</p>
+  </div>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the diagnostic loop</span><button class="copy">Copy</button></div>
+<pre><code>-- 1. Confirm the alternative would be better.
+SET enable_nestloop = off;
+EXPLAIN ANALYZE SELECT …;        -- 220ms instead of 18s: yes, it would
+RESET enable_nestloop;
+
+-- 2. Find why the planner did not choose it. Look for the node where
+--    estimated and actual rows diverge most (SQL chapter 13).
+--       Seq Scan on events  (rows=12) (actual rows=456213)
+
+-- 3. Fix the estimate, not the plan.
+CREATE STATISTICS ev_stats (mcv) ON source, region FROM events;
+ANALYZE events;
+
+-- 4. Re-check. The planner now chooses the hash join by itself, and it will
+--    keep choosing correctly as the data changes — which a forced plan
+--    would not.
+EXPLAIN ANALYZE SELECT …;</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">auto_explain gives you plans you did not think to capture</span>
+  <p>The hardest plans to debug are the ones from queries that were slow at 3am and are fast now. <code>auto_explain</code> logs the plan of any query exceeding a threshold, automatically, with actual row counts if you enable it. Set <code>auto_explain.log_min_duration = '1s'</code>, <code>log_analyze = on</code> and <code>log_nested_statements = on</code>. The <code>log_analyze</code> option adds measurable overhead to every query it triggers on, so start with a high threshold — but having the plan of the incident query, rather than a reconstruction, is worth a great deal.</p>
+</div>
+
+<h2><span class="h-rule"></span>Keeping statistics fresh</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the three cases where statistics are stale and it matters</span><button class="copy">Copy</button></div>
+<pre><code>-- 1. Immediately after a bulk load. Autoanalyze has not run yet, so the
+--    planner thinks the table is empty and picks plans for zero rows.
+COPY orders FROM …;
+ANALYZE orders;              -- always, explicitly, as part of the load
+
+-- 2. Immediately after a major upgrade. pg_upgrade does NOT carry statistics
+--    across, so the new cluster starts with none. This is the classic
+--    "the upgrade made everything slow" incident.
+--    (PostgreSQL 18 improves this; on earlier versions run it yourself.)
+vacuumdb --all --analyze-in-stages --jobs=4
+
+-- 3. On a table whose distribution shifts faster than autoanalyze notices.
+--    The scale factor is 0.1 by default — 10% of rows changed. On a large
+--    append-only table with a moving date range, that is far too slow.
+ALTER TABLE events SET (autovacuum_analyze_scale_factor = 0.005);
+
+-- What was analysed and when:
+SELECT relname, last_analyze, last_autoanalyze, n_mod_since_analyze
+FROM pg_stat_user_tables
+ORDER BY n_mod_since_analyze DESC
+LIMIT 20;</code></pre>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Cost is arbitrary units anchored to <b><code>seq_page_cost = 1.0</code></b>. Only ratios matter.</li>
+    <li><b><code>random_page_cost = 4.0</code> is a spinning-disk number.</b> Set 1.1 on SSD — the single highest-value planner change.</li>
+    <li><b><code>effective_cache_size</code> defaults to 4 GB regardless of your machine.</b> Set it to 50–75% of RAM. It allocates nothing.</li>
+    <li>Statistics come from a <b>sample</b>: MCV list, histogram, <code>n_distinct</code> and correlation.</li>
+    <li><b><code>n_distinct</code> is often badly underestimated</b>, and overriding it directly is legitimate.</li>
+    <li><b><code>CREATE STATISTICS</code> for correlated columns</b> — the planner multiplies selectivities and gets it wrong by orders of magnitude.</li>
+    <li><b>Parallel workers multiply <code>work_mem</code></b>, per worker per node.</li>
+    <li>Use <code>enable_*</code> settings to <b>confirm a diagnosis, then fix the estimate</b> — a forced plan stops adapting.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("07-planner.html");
+
+(function(){
+  const root = document.getElementById("cost");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const ROWS = [10000, 100000, 1000000, 10000000, 100000000, 1000000000];
+  const RLBL = ["10 thousand","100 thousand","1 million","10 million","100 million","1 billion"];
+
+  function fmt(n){
+    if(n < 1000) return n.toFixed(0);
+    if(n < 1e6) return (n/1e3).toFixed(1) + "k";
+    if(n < 1e9) return (n/1e6).toFixed(1) + "M";
+    return (n/1e9).toFixed(1) + "B";
+  }
+
+  function render(){
+    const ri = parseInt($("p-rows").value, 10) - 1;
+    const rows = ROWS[ri];
+    const sel = parseInt($("p-sel").value, 10) / 1000;      // 0.001 .. 0.1
+    const rpc = parseInt($("p-rpc").value, 10) / 10;
+    const corr = parseInt($("p-corr").value, 10) / 100;
+    $("p-rowsv").textContent = RLBL[ri];
+    $("p-selv").textContent  = (sel*100).toFixed(1) + "%";
+    $("p-rpcv").textContent  = rpc.toFixed(1);
+    $("p-corrv").textContent = corr.toFixed(2);
+
+    const ROWS_PER_PAGE = 100;
+    const pages = rows / ROWS_PER_PAGE;
+    const matched = rows * sel;
+
+    const SEQ = 1.0, CTUP = 0.01, CIDX = 0.005, COP = 0.0025;
+
+    // Sequential scan
+    const seqCost = pages * SEQ + rows * CTUP + rows * COP;
+
+    // Index scan: descend the tree, walk matching entries, fetch each row.
+    // Correlation interpolates the heap fetch cost between random and sequential.
+    const idxPages = Math.max(1, matched / 400);
+    const heapPages = Math.min(pages, matched);
+    const heapCost = corr * corr * (heapPages * SEQ) + (1 - corr * corr) * (heapPages * rpc);
+    const idxCost = idxPages * rpc + matched * CIDX + heapCost + matched * CTUP;
+
+    // Bitmap: collect tids, sort, fetch pages in physical order
+    const distinctPages = pages * (1 - Math.pow(1 - 1/pages, matched));
+    const bitCost = idxPages * rpc + matched * CIDX
+                  + distinctPages * (SEQ + (rpc - SEQ) * 0.25)
+                  + matched * CTUP + matched * COP;
+
+    $("p-seq").textContent = fmt(seqCost);
+    $("p-idx").textContent = fmt(idxCost);
+    $("p-bit").textContent = fmt(bitCost);
+
+    const best = Math.min(seqCost, idxCost, bitCost);
+    const winner = best === idxCost ? "Index Scan" : best === bitCost ? "Bitmap Heap Scan" : "Seq Scan";
+    $("p-win").textContent = winner;
+
+    const rowsB = [["Seq Scan", seqCost], ["Index Scan", idxCost], ["Bitmap Heap Scan", bitCost]];
+    const max = Math.max.apply(null, rowsB.map(r => r[1]));
+    $("p-bars").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      'Estimated cost · ' + fmt(matched) + ' of ' + fmt(rows) + ' rows match</div>' +
+      rowsB.map(([lab, v]) =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px">' +
+        '<span style="min-width:152px;font-size:13px' + (v === best ? ';font-weight:700' : '') + '">' + lab +
+        (v === best ? ' ★' : '') + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + Math.max(0.5, v/max*100).toFixed(1) +
+        '%' + (v === best ? ';background:#3FB984' : '') + '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:60px;text-align:right">' +
+        fmt(v) + '</span></div>').join("");
+
+    const notes = [];
+    notes.push("The planner picks " + winner + " here. These are the real PostgreSQL formulas — " +
+               "pages × seq_page_cost + rows × cpu_tuple_cost for the scan, plus index descent and heap fetches for the others.");
+
+    if(winner === "Seq Scan" && sel > 0.02)
+      notes.push("At " + (sel*100).toFixed(1) + "% selectivity the index would require " + fmt(matched) +
+                 " separate heap fetches, most of them random. Reading all " + fmt(pages) +
+                 " pages sequentially is genuinely cheaper. A sequential scan in a plan is not a failure — it is frequently the correct answer, and this is the arithmetic behind it.");
+    if(winner === "Bitmap Heap Scan")
+      notes.push("The bitmap scan is the middle ground: collect all the matching row locations from the index first, sort them into physical order, then read the heap pages once each in order. " +
+                 "That converts random reads into something closer to sequential, which is why it wins between the two extremes. A 'Recheck Cond' line in the plan is this node.");
+
+    if(rpc >= 3.5)
+      notes.push("random_page_cost is " + rpc.toFixed(1) + ", which is the default and encodes the seek time of a spinning disk. On SSD or cloud block storage the real ratio is close to 1 — " +
+                 "drag this to 1.1 and watch the index scan become viable at much higher selectivities. This one setting is wrong on a great many installations and it systematically biases the planner away from indexes.");
+    else if(rpc <= 1.5)
+      notes.push("With random_page_cost at " + rpc.toFixed(1) + " the planner correctly treats random and sequential reads as nearly equal, which is right for SSD. Note how much further the index scan stays competitive compared with the default of 4.0.");
+
+    if(corr >= 0.8)
+      notes.push("High correlation (" + corr.toFixed(2) + ") means the index order nearly matches physical row order, so following the index reads pages in something close to sequential order. " +
+                 "That is why an index on an append-only timestamp is so much cheaper to use than one on a random column — and it is the same property BRIN depends on entirely (chapter 6).");
+    else if(corr <= 0.2)
+      notes.push("Correlation is " + corr.toFixed(2) + ", so consecutive index entries point at scattered pages and every heap fetch is a random read. This is what makes an index scan expensive at higher selectivities, " +
+                 "and it is why CLUSTER — physically reordering a table by an index — can help a specific access pattern dramatically.");
+
+    notes.push("Model assumes 100 rows per 8 KB page and one filter condition. Real costs include join and sort nodes, and parallel plans divide the scan cost by the worker count — but the shape and the crossover behaviour are exactly this.");
+    $("p-note").textContent = notes.join("\n\n");
+  }
+
+  ["p-rows","p-sel","p-rpc","p-corr"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Packaging and serving — MLOps</title>
+<meta name="description" content="Batch, online and streaming inference, model servers, and what actually goes inside the container.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 11 · Serving</div>
+    <h1>Packaging and serving</h1>
+    <p class="standfirst">The decision that determines most of your serving complexity is made before you write any of it: whether the prediction can be computed in advance. Getting that wrong in the direction of "real time" is the most expensive default in applied ML.</p>
+    <div class="chap-meta">
+      <span class="tagpill">batch</span>
+      <span class="tagpill">online</span>
+      <span class="tagpill">triton</span>
+      <span class="tagpill">containers</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Which serving pattern</h2>
+
+<div class="demo" id="srv">
+  <div class="demo-head">
+    <b>Batch, online, or streaming</b>
+    <span>Three questions decide it. The answer is batch far more often than people build for.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="v-when">When is the prediction consumed?</label>
+        <select id="v-when">
+          <option value="later" selected>Whenever the user next opens the screen</option>
+          <option value="request">During the request that triggers it</option>
+        </select>
+      </div>
+      <div>
+        <label for="v-input">What does it depend on?</label>
+        <select id="v-input">
+          <option value="history" selected>History up to yesterday</option>
+          <option value="recent">Events from the last few minutes</option>
+          <option value="now">Something the user just submitted</option>
+        </select>
+      </div>
+      <div>
+        <label for="v-count">How many entities to score?</label>
+        <select id="v-count">
+          <option value="all" selected>All of them, regularly</option>
+          <option value="few">A small fraction, unpredictably</option>
+        </select>
+      </div>
+    </div>
+    <div id="v-arch"></div>
+    <div class="stat">
+      <div><b id="v-pattern">—</b><span>pattern</span></div>
+      <div><b id="v-infra">—</b><span>infrastructure</span></div>
+      <div><b id="v-cost">—</b><span>relative effort</span></div>
+    </div>
+    <div class="out" id="v-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Batch inference is a pipeline that ends in a write</span>
+  <p>It needs no service, no latency budget, no autoscaling, no online feature store, no request-path error handling and no capacity planning. It is chapter 4's pipeline with a model call in the middle, and it inherits every property you already built: idempotency, backfills, validation, caching. <b>A very large fraction of production ML is this and should be</b>, including most churn scoring, lead scoring, recommendation precomputation, forecast generation, risk scoring for review queues and content classification of a corpus. The tell that you need something else is narrow: the prediction depends on input that only exists at request time, or on state that changed in the last few minutes. Absent one of those, building a service is work you can decline.</p>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">batch inference, in full</span><button class="copy">Copy</button></div>
+<pre><code>@step
+def score_all(logical_date: date, model_alias: str = "champion") -> None:
+    model = mlflow.pyfunc.load_model(f"models:/churn@{model_alias}")
+    version = model.metadata.run_id                # for the prediction log
+
+    feats = read_features(logical_date)            # the same code training
+                                                   # used (chapter 5)
+    validate_schema(feats)                         # chapter 6
+
+    preds = model.predict(feats[FEATURE_ORDER])    # order matters — see below
+
+    out = feats[["entity_id"]].assign(
+        score        = preds,
+        model_version= version,
+        scored_at    = logical_date,
+        feature_hash = FEATURE_SET_HASH,
+    )
+    write_parquet_atomic(out, f"s3://scores/dt={logical_date}/")   # ch 4
+    upsert_to_serving_table(out)                   # what the app reads
+
+# THE APPLICATION then does a primary-key lookup. No model in the request
+# path, no Python in the request path, no cold starts, no GPU bill.
+#
+# AND THE PREDICTION LOG IS FREE. You just wrote every prediction with its
+# inputs and model version to a partitioned table, which is exactly what
+# chapters 1 and 15 asked for. Online serving has to build that separately.
+
+# FEATURE_ORDER deserves a note. Many model formats are positional — a
+# tree ensemble or a plain numpy-based model receives an array, not a
+# dataframe with names. If the column order at serving differs from
+# training, every feature is silently read as a different feature. No
+# error, and predictions that are confidently meaningless.
+#   * pin the order in one shared constant, used by both paths
+#   * better, log an MLflow SIGNATURE with the model so the server can
+#     validate names and dtypes and reject a mismatch (chapter 7)
+# This is one of the four shapes of skew in chapter 14 and it is the
+# easiest to prevent.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Online serving</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">and what goes in the container</span><button class="copy">Copy</button></div>
+<pre><code># THE THING PEOPLE SHIP: a FastAPI app that pickle-loads a model.
+# It works, and it is worth knowing what it is missing.
+
+from fastapi import FastAPI
+import mlflow.pyfunc
+
+app = FastAPI()
+MODEL = None
+
+@app.on_event("startup")
+def load():
+    global MODEL
+    MODEL = mlflow.pyfunc.load_model("models:/churn@champion")   # alias, ch 9
+
+@app.get("/healthz")                # liveness: is the process up
+def healthz(): return {"ok": True}
+
+@app.get("/readyz")                 # readiness: is the MODEL loaded
+def readyz():
+    if MODEL is None: raise HTTPException(503)
+    return {"ok": True, "version": MODEL.metadata.run_id}
+
+@app.post("/predict")
+def predict(req: PredictRequest):
+    feats = build_features(req)              # shared code (chapter 5)
+    p = float(MODEL.predict(feats[FEATURE_ORDER])[0])
+    log_prediction(req, feats, p, MODEL.metadata.run_id)   # ASYNCHRONOUSLY
+    return {"score": p}
+
+# THE FIVE THINGS THAT NAIVE VERSION USUALLY GETS WRONG:
+#
+#   1. NO SEPARATE READINESS PROBE. A liveness check that returns 200 while
+#      the model is still loading means Kubernetes routes traffic to a pod
+#      that cannot serve. Two endpoints, not one.
+#
+#   2. SYNCHRONOUS PREDICTION LOGGING. Writing to a database or Kafka on
+#      the request path adds its latency and its failure modes to yours.
+#      Buffer in memory and flush on a background task — and accept that
+#      you will lose a few records on a hard kill, which is fine for
+#      monitoring data.
+#
+#   3. NO INPUT VALIDATION. A request missing a field, or sending a string
+#      where a float is expected, should be a 422 rather than a NaN
+#      propagating into a confident prediction. Pydantic plus the model
+#      signature covers most of it.
+#
+#   4. THE MODEL LOADED AT IMPORT TIME, not in a startup hook, which makes
+#      the container slow to start and the failure mode a crash loop rather
+#      than an unready pod.
+#
+#   5. NO TIMEOUT OR FALLBACK. If feature lookup is slow, the request hangs.
+#      Decide in advance what happens when features are unavailable —
+#      usually a default score plus a metric increment, not a 500.
+
+# WHAT A DEDICATED MODEL SERVER ADDS: dynamic batching (chapter 13), multiple
+# models and versions per process, GPU sharing, and framework-native
+# runtimes. Triton, TorchServe, TF Serving, KServe, BentoML, Ray Serve.
+# Worth it when you are GPU-bound or serving many models; unnecessary
+# overhead for a scikit-learn model on CPU.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>What actually goes in the artefact</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Format</th><th>Holds</th><th>Watch for</th></tr></thead>
+<tbody>
+<tr><td><b>pickle / joblib</b></td><td>Arbitrary Python objects</td><td>Version-fragile, unsafe to load from untrusted sources, and silently omits custom class definitions</td></tr>
+<tr><td><b>ONNX</b></td><td>A framework-independent graph</td><td>Conversion can subtly change numerics — always verify parity after export</td></tr>
+<tr><td><b>MLflow pyfunc</b></td><td>Model plus environment plus signature</td><td>The best default. Wraps whatever is underneath</td></tr>
+<tr><td><b>SavedModel / TorchScript</b></td><td>Graph plus weights, framework-native</td><td>Ties you to that runtime, which is often fine</td></tr>
+<tr><td><b>Safetensors</b></td><td>Weights only, safely</td><td>No architecture — you supply the code</td></tr>
+<tr><td><b>PMML</b></td><td>Classical models as XML</td><td>Still alive in regulated industries; limited coverage</td></tr>
+<tr><td><b>A container image</b></td><td>Everything, including the runtime</td><td>The most reproducible and the largest</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note warn">
+  <span class="note-t">The model is not the whole artefact</span>
+  <p>What has to travel together is the model <em>and</em> the preprocessing that produced its inputs — the fitted scaler, the encoder's category mapping, the imputer's learned medians, the feature order. Saving the estimator alone and reimplementing the preprocessing in the service is the most common route to skew (chapter 14), because the reimplementation is written from memory and the fitted state is silently different. <b>Serialise the whole pipeline as one object</b>: a scikit-learn <code>Pipeline</code>, an MLflow pyfunc wrapper with a custom <code>predict</code>, or an ONNX graph including the preprocessing operators. Then the round-trip test from chapter 10 — save, reload in a fresh process, assert identical predictions on a fixed sample — actually proves something, because the thing you reloaded is the thing that runs.</p>
+</div>
+
+<h2><span class="h-rule"></span>Streaming inference</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">the middle case, and its one hard part</span><button class="copy">Copy</button></div>
+<pre><code># Events arrive, are scored, and the score is emitted or stored. Between
+# batch and online: no request waiting for you, but freshness in seconds.
+
+# Typical shape with Kafka:
+for msg in consumer:                          # or Flink / Spark Structured
+    event    = parse(msg.value)
+    state    = state_store.get(event.entity)  # rolling aggregates
+    features = build_features(event, state)   # shared code again
+    score    = model.predict(features)
+
+    producer.send("scores", key=event.entity, value=score)
+    state_store.update(event.entity, event)
+    consumer.commit()                         # AFTER the side effects
+
+# THE HARD PART IS THE STATE, not the model call. Features like "count of
+# transactions in the last hour" require a rolling window maintained across
+# events, and that state must survive restarts, be correct under
+# out-of-order arrival, and be reproducible for training.
+#
+#   * WATERMARKS decide how long to wait for late events before closing a
+#     window. Too short and you drop real data; too long and you add latency
+#   * CHECKPOINTS make state recoverable. Flink and Spark do this for you;
+#     hand-rolled consumers usually do not, and the failure surfaces as
+#     wrong aggregates after a restart rather than as an error
+#   * COMMIT AFTER SIDE EFFECTS, or a crash between the two loses the event.
+#     Commit before, and you get at-most-once; commit after, at-least-once
+#     with possible duplicates. Duplicates are usually the safer failure
+
+# AND THE POINT THAT CONNECTS TO CHAPTER 5: whatever computes these rolling
+# features must produce the SAME values that the offline training pipeline
+# produced for historical events. A streaming aggregate computed over
+# arrival order and an offline aggregate computed over event time will
+# disagree, and the model trained on one is served the other.
+#
+# This is the hardest instance of the parity problem in the whole unit, and
+# it is why streaming feature pipelines are where feature stores earn their
+# cost — they materialise both sides from one definition.
+
+# THE PRACTICAL ARCHITECTURE that avoids most of this: batch for the heavy
+# historical features, streaming for the handful that genuinely must be
+# fresh, joined at scoring time. A hybrid rather than a compromise.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Ship a serving container that is not built by the data scientist</span>
+  <p>The training environment and the serving environment want different things. Training wants pandas, matplotlib, notebook tooling, the whole scientific stack — often two gigabytes of image. Serving wants the minimum that can load the model and respond: no plotting, no notebook, no training-only libraries. <b>A serving image built from a separate, minimal lockfile is smaller, starts faster, has a much smaller vulnerability surface, and forces you to discover which dependencies the model actually needs.</b> That last point is the real benefit — a model whose preprocessing imports something from the training environment will fail to load in the slim image, loudly, in CI, instead of quietly working because everything happened to be present. Build both images from the same base and run chapter 10's round-trip test inside the serving one.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Ask whether the prediction can be precomputed.</b> If yes, batch — and skip nearly all serving complexity.</li>
+    <li><b>Batch inference is a pipeline that ends in a write</b>, and it gives you the prediction log for free.</li>
+    <li><b>Feature order matters</b> for positional formats, and getting it wrong is silent. Pin it, or ship a signature.</li>
+    <li><b>Liveness and readiness are different probes.</b> One endpoint means traffic to a pod that cannot serve.</li>
+    <li><b>Log predictions asynchronously.</b> A write on the request path adds its latency and its failures to yours.</li>
+    <li><b>Serialise the whole pipeline</b>, preprocessing included. Reimplementing it in the service is the classic skew.</li>
+    <li><b>Streaming's hard part is the state</b>, not the model call — and matching offline aggregates is harder still.</li>
+    <li><b>Build a separate, minimal serving image.</b> It exposes hidden dependencies loudly in CI.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("11-serving.html");
+
+(function(){
+  const root = document.getElementById("srv");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  function render(){
+    const when  = $("v-when").value;
+    const input = $("v-input").value;
+    const count = $("v-count").value;
+
+    let pattern, infra, cost, note;
+
+    if(input === "now"){
+      pattern = "online";
+      infra = "an endpoint, autoscaling, feature lookup";
+      cost = "high";
+      note = "The prediction depends on something the user just submitted — a form they filled in, a transaction they initiated, an image they uploaded. That value does not exist until the request arrives, so no amount of precomputation helps.\n\nThis is the case that genuinely requires online serving, and it is the smallest of the three in practice.\n\nWhat comes with it: an endpoint with a latency budget, capacity planning, autoscaling, a deployment strategy with rollback (chapter 12), online feature lookup for the historical part of the feature vector, and the parity problem between that lookup and the offline training path (chapter 14).\n\nNote you may still be able to precompute MOST of the feature vector. The historical features — the customer's transaction count, their tenure, their average basket — can come from a nightly batch job and a key-value lookup; only the request-time values need computing live. That hybrid is usually the right architecture and it removes most of the streaming complexity.";
+    }
+    else if(input === "recent" && when === "request"){
+      pattern = "online + streaming features";
+      infra = "an endpoint, plus a stream maintaining rolling state";
+      cost = "highest";
+      note = "The hardest combination: a request waiting for an answer, and features that must reflect the last few minutes.\n\nFraud detection is the canonical example — \"how many transactions has this card made in the past hour\" cannot come from a nightly batch, and the answer is needed in 50 ms.\n\nSo you need both halves. A stream processor maintaining rolling aggregates per entity, with watermarks for late events and checkpoints for recovery. And an endpoint that reads that state and scores.\n\nThe part that will cost you most is not either half — it is making the streaming aggregate agree with the offline aggregate the model was trained on. A count computed over arrival order and a count computed over event time will differ, and the model trained on one is being served the other (chapters 5 and 14).\n\nThis is where a feature store genuinely earns its cost, because materialising both sides from one definition is the whole problem.";
+    }
+    else if(input === "recent"){
+      pattern = "streaming to a table";
+      infra = "a stream processor, a serving table";
+      cost = "medium";
+      note = "Features must be fresh to within minutes, but nothing is waiting for the answer — the score is written somewhere and read later.\n\nSo you get the freshness without the request path. A stream processor consumes events, maintains state, scores, and writes to a serving table that the application reads by key. No latency budget on your side, no autoscaling for request spikes, no cold-start problem.\n\nThis is a genuinely good middle ground and it is underused, because \"streaming\" and \"real-time API\" get conflated. Freshness and request latency are separate requirements and only one of them needs an endpoint.\n\nThe state management is still the hard part: watermarks, checkpoints, commit ordering, and matching the offline aggregates.";
+    }
+    else if(when === "request" && count === "few"){
+      pattern = "online, or batch with a fallback";
+      infra = "an endpoint — or a table plus a cold-path model";
+      cost = "medium";
+      note = "The score is needed during the request and it depends only on history up to yesterday. That combination has two valid answers, and the second is usually cheaper.\n\nThe obvious answer is an endpoint. The cheaper one: precompute scores for every entity nightly into a key-value table, and have the request do a lookup. If the features are historical, yesterday's score IS the answer — computing it live gains nothing.\n\nThe reason people build the endpoint anyway is the cold path: a brand-new entity has no precomputed score. That is a real gap and it does not require a full serving stack — a default score, a simple heuristic, or a small model for new entities covers it, and only that fraction of traffic pays any complexity.\n\nWorth checking the numbers before deciding. If 98% of requests hit a precomputed score, an endpoint is serving 2% of traffic at 100% of the operational cost.";
+    }
+    else {
+      pattern = "batch";
+      infra = "a scheduled pipeline and a table";
+      cost = "lowest";
+      note = "Batch, and this is the case that covers most production ML.\n\nThe prediction is not needed until the user next looks, and it depends only on history up to yesterday — so scoring everything on a schedule and writing to a table is not a compromise, it is the correct architecture.\n\nWhat you avoid: an endpoint, a latency budget, autoscaling, capacity planning, request-path error handling, cold starts, an online feature store, and the parity problem between online and offline feature computation.\n\nWhat you inherit instead, for free, from chapter 4: idempotency, backfills, validation, caching, and a pipeline you can rerun. Plus the prediction log — you have just written every prediction with its inputs and model version to a partitioned table, which is exactly what chapters 1 and 15 need and which online serving has to build separately.\n\nChurn scoring, lead scoring, recommendation precomputation, forecasting, risk scoring for a review queue, content classification of a corpus — all of these are this case, and building services for them is work you can decline.";
+    }
+
+    $("v-pattern").textContent = pattern;
+    $("v-infra").textContent   = infra;
+    $("v-cost").textContent    = cost;
+    $("v-cost").style.color    = cost === "lowest" ? "#3FB984" :
+                                 cost === "medium" ? "#F2A03D" : "#E2574C";
+
+    const boxes = pattern === "batch"
+      ? ["features table", "scheduled job", "model", "scores table", "app reads by key"]
+      : pattern === "streaming to a table"
+      ? ["event stream", "state store", "model", "scores table", "app reads by key"]
+      : pattern === "online + streaming features"
+      ? ["request", "online features", "stream state", "model", "response"]
+      : ["request", "feature lookup", "model", "response"];
+
+    $("v-arch").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin:16px 0 8px">Path a prediction takes</div>' +
+      '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:5px">' +
+      boxes.map((b, i) =>
+        '<span style="font-family:var(--mono);font-size:11px;padding:6px 10px;border-radius:4px;' +
+        'background:' + (i === boxes.length - 1 ? "#E0699F" : "#F1F4F6") + ';color:' +
+        (i === boxes.length - 1 ? "#fff" : "#54677A") + ';border:1px solid ' +
+        (i === boxes.length - 1 ? "#E0699F" : "#E1E7EC") + '">' + b + '</span>' +
+        (i < boxes.length - 1 ? '<span style="color:#C2CCD4">→</span>' : "")).join("") + '</div>';
+
+    $("v-note").textContent = note;
+  }
+
+  ["v-when","v-input","v-count"].forEach(id => $(id).addEventListener("change", render));
+  render();
+})();
+</script>
+</body>
+</html>

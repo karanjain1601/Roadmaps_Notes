@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Backup and recovery — PostgreSQL</title>
+<meta name="description" content="Logical against physical, base backups and WAL archiving, point-in-time recovery, and testing the restore.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 12 · Running it</div>
+    <h1>Backup and recovery</h1>
+    <p class="standfirst">The only property of a backup that matters is whether you have restored from it. Everything else in this chapter — the tools, the schedules, the retention — is in service of making that restore fast enough and recent enough when you need it.</p>
+    <div class="chap-meta">
+      <span class="tagpill">logical vs physical</span>
+      <span class="tagpill">pitr</span>
+      <span class="tagpill">rpo and rto</span>
+      <span class="tagpill">testing</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Two kinds, for two different jobs</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th>Logical — <code>pg_dump</code></th><th>Physical — base backup + WAL</th></tr></thead>
+<tbody>
+<tr><td>What it is</td><td>SQL statements or a custom archive</td><td>A byte copy of the data directory</td></tr>
+<tr><td>Restore granularity</td><td>A single table, or one database</td><td>The whole cluster only</td></tr>
+<tr><td>Point in time</td><td>No — only the dump's instant</td><td><b>Yes, to the second</b></td></tr>
+<tr><td>Restore speed</td><td>Slow — replays every insert and rebuilds every index</td><td>Fast — copy files, replay WAL</td></tr>
+<tr><td>Cross-version</td><td>Yes — how major upgrades work</td><td>No — same major version and architecture</td></tr>
+<tr><td>Impact on the source</td><td>Holds a long transaction (chapters 2, 3)</td><td>Low; can run from a replica</td></tr>
+<tr><td>Good for</td><td>Migrations, per-table recovery, small databases, dev copies</td><td><b>Production disaster recovery</b></td></tr>
+</tbody>
+</table>
+<caption>Most production clusters want both: physical for recovery, and periodic logical dumps for the case where someone dropped one table and you would rather not roll the whole cluster back.</caption>
+</div>
+
+<div class="demo" id="rpo">
+  <div class="demo-head">
+    <b>What your strategy actually gives you</b>
+    <span>RPO is how much data you lose; RTO is how long you are down. Pick a strategy and see both.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="r-strat">Strategy</label>
+        <select id="r-strat">
+          <option value="dump">Nightly pg_dump only</option>
+          <option value="snap">Nightly volume snapshot</option>
+          <option value="pitr" selected>Base backup + WAL archiving</option>
+          <option value="pitrsync">Base backup + WAL streaming to archive</option>
+          <option value="replica">Streaming replica + WAL archiving</option>
+        </select>
+      </div>
+      <div>
+        <label for="r-size">Database size — <span id="r-sizev">500 GB</span></label>
+        <input type="range" id="r-size" min="1" max="7" step="1" value="4">
+      </div>
+      <div>
+        <label for="r-wal">WAL generated — <span id="r-walv">20 GB/day</span></label>
+        <input type="range" id="r-wal" min="1" max="7" step="1" value="3">
+      </div>
+      <div>
+        <label for="r-when">Failure happens</label>
+        <select id="r-when">
+          <option value="1">1 hour after the backup</option>
+          <option value="12" selected>12 hours after</option>
+          <option value="23">23 hours after — just before the next one</option>
+        </select>
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="r-rpo">—</b><span>RPO · data lost</span></div>
+      <div><b id="r-rto">—</b><span>RTO · time to restore</span></div>
+      <div><b id="r-gran">—</b><span>recover one table?</span></div>
+      <div><b id="r-cost">—</b><span>storage</span></div>
+    </div>
+    <div id="r-bars"></div>
+    <div class="out" id="r-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Logical backups</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">pg_dump, with the options that matter</span><button class="copy">Copy</button></div>
+<pre><code># Custom format. Compressed, and restorable selectively — always use -Fc or -Fd
+# rather than plain SQL, unless you specifically need a readable file.
+pg_dump -Fc -Z 6 -d orders -f orders.dump
+
+# Directory format allows PARALLEL dump and restore. On a large database this
+# is the difference between hours and minutes.
+pg_dump -Fd -j 8 -d orders -f /backup/orders/
+
+# Restore, also parallel, into a fresh database
+createdb orders_restored
+pg_restore -d orders_restored -j 8 /backup/orders/
+
+# Restore ONE table out of a full dump — the thing physical backups cannot do
+pg_restore -d orders -t line_items /backup/orders/
+
+# See what is in an archive without restoring it
+pg_restore -l /backup/orders/ | less
+
+# Roles and tablespaces are CLUSTER-wide and are NOT in pg_dump. Without this
+# your restore has no users and every GRANT fails:
+pg_dumpall --globals-only -f globals.sql</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">pg_dump holds a long transaction</span>
+  <p>It takes a snapshot at the start and holds it for the entire dump, so that the output is consistent. On a 500 GB database that is hours — during which vacuum cannot remove any tuple dead after the snapshot began, <em>anywhere in the cluster</em> (chapters 2 and 3). Overnight dumps of large databases are a common and completely unsuspected cause of daytime bloat. Run them from a replica if you can, or accept the cost knowingly and watch the dead-tuple counts afterwards.</p>
+</div>
+
+<h2><span class="h-rule"></span>Physical backups and PITR</h2>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Base backup</b><span>A byte copy of the data directory, taken while the server runs</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · WAL archiving</b><span>Every WAL segment copied off as it fills — this is what makes PITR possible</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Restore the base backup</b><span>Copy it into place on the target machine</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Replay WAL forward</b><span>From the backup's position to any moment you choose</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Stop at the target and promote</b><span>A timestamp, an LSN, a named restore point, or a transaction id</span></div>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the built-in tools</span><button class="copy">Copy</button></div>
+<pre><code># postgresql.conf
+#   wal_level = replica
+#   archive_mode = on
+#   archive_command = 'test ! -f /archive/%f && cp %p /archive/%f'
+#   archive_timeout = '300s'    # force a segment switch, so RPO is bounded
+#                               # even when write traffic is light
+
+# A base backup
+pg_basebackup -D /backup/base -Ft -z -Xs -P -c fast
+
+#   -Ft  tar format      -z  compress
+#   -Xs  stream WAL alongside, so the backup is self-consistent on its own
+#   -c fast  checkpoint immediately rather than waiting for the spread
+
+# Restore to a point in time:
+#   1. stop the server, move the old data directory aside
+#   2. unpack the base backup into $PGDATA
+#   3. postgresql.conf:
+#        restore_command = 'cp /archive/%f %p'
+#        recovery_target_time = '2026-03-14 09:15:00+00'
+#        recovery_target_action = 'promote'
+#   4. touch $PGDATA/recovery.signal        # PG12+; recovery.conf is gone
+#   5. start, and watch the log replay forward
+
+# Name a point before a risky operation, so you can target it exactly:
+SELECT pg_create_restore_point('before_the_big_migration');
+#   recovery_target_name = 'before_the_big_migration'</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Use a backup tool, not scripts</span>
+  <p><code>pg_basebackup</code> plus <code>cp</code> works and it gives you no incremental backups, no parallelism, no compression tuning, no retention policy, no verification, and an <code>archive_command</code> that fails silently the first time the disk fills. <b>pgBackRest</b> and <b>Barman</b> handle all of it: parallel backup and restore, incremental and differential, checksum verification, retention, and PITR to a timestamp with one command. The setup cost is an afternoon. Rolling your own is one of those decisions that looks fine until the first real restore.</p>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">pgBackRest, since it is the usual answer</span><button class="copy">Copy</button></div>
+<pre><code># /etc/pgbackrest/pgbackrest.conf
+[global]
+repo1-path=/var/lib/pgbackrest
+repo1-retention-full=2
+repo1-retention-diff=6
+repo1-cipher-type=aes-256-cbc          # encrypt the repository
+process-max=8
+compress-type=zst
+start-fast=y
+
+[orders]
+pg1-path=/var/lib/postgresql/16/main
+
+# postgresql.conf
+#   archive_command = 'pgbackrest --stanza=orders archive-push %p'
+
+pgbackrest --stanza=orders stanza-create
+pgbackrest --stanza=orders check              # verifies archiving works NOW
+pgbackrest --stanza=orders backup --type=full
+pgbackrest --stanza=orders backup --type=incr
+pgbackrest --stanza=orders info
+
+# Point-in-time restore, in one command
+pgbackrest --stanza=orders restore \
+    --type=time --target="2026-03-14 09:15:00+00" --target-action=promote
+
+# `check` is the important one. Run it on a schedule: it confirms the archive
+# command actually works and the repository is reachable, which is exactly
+# what silently stops being true.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Monitoring backups</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the things that fail quietly</span><button class="copy">Copy</button></div>
+<pre><code>-- Is WAL archiving working? A rising failed_count with a stale
+-- last_archived_time means WAL is accumulating on the primary and your
+-- recovery window stopped advancing (chapter 4).
+SELECT archived_count, last_archived_wal, last_archived_time,
+       failed_count, last_failed_wal, last_failed_time,
+       now() - last_archived_time AS since_last
+FROM pg_stat_archiver;
+
+-- How much WAL is waiting to be archived
+SELECT count(*) AS pending
+FROM pg_ls_dir('pg_wal/archive_status') f
+WHERE f LIKE '%.ready';
+
+-- Alert on all four of these:
+--   backup age            > 1 day
+--   last_archived_time    > 15 minutes ago
+--   failed_count          rising at all
+--   last successful RESTORE TEST  > 1 month ago
+--
+-- The fourth is the one nobody has a metric for, and it is the one that
+-- decides whether the other three mattered.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">A failing archive_command has two separate consequences</span>
+  <p>Your recovery point stops advancing — everything since the last successful archive is unrecoverable if the primary dies. <b>And</b> Postgres refuses to recycle unarchived WAL, so <code>pg_wal</code> grows until the filesystem fills and the database stops accepting writes. One failure, two outages, and the only symptom in between is a counter nobody is watching. Alert on <code>failed_count</code> and on <code>pg_wal</code> size as a percentage of the disk.</p>
+</div>
+
+<h2><span class="h-rule"></span>Testing the restore</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">automate it, or it will not happen</span><button class="copy">Copy</button></div>
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+# Weekly, in CI, against a scratch instance.
+
+START=$(date +%s)
+
+pgbackrest --stanza=orders --delta \
+    --pg1-path=/scratch/pgdata restore
+
+pg_ctl -D /scratch/pgdata -o "-p 5433" -w start
+
+# 1. It starts and accepts connections.
+psql -p 5433 -d orders -c 'SELECT 1' > /dev/null
+
+# 2. The data is actually there — compare against known figures.
+psql -p 5433 -d orders -tAc \
+  'SELECT count(*) FROM orders' | tee /tmp/count
+
+# 3. Structural integrity, not just "the server started".
+psql -p 5433 -d orders -c 'CREATE EXTENSION IF NOT EXISTS amcheck'
+psql -p 5433 -d orders -tAc "
+  SELECT bt_index_check(index => c.oid, heapallindexed => true)
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE c.relam = (SELECT oid FROM pg_am WHERE amname='btree')
+    AND c.relpersistence = 'p'" > /dev/null
+
+pg_ctl -D /scratch/pgdata stop
+
+echo "restore verified in $(( $(date +%s) - START ))s"
+# Record that duration as a metric. It IS your recovery time objective,
+# whatever the policy document claims — and it grows as the database does.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">The restore duration is your real RTO</span>
+  <p>Not the number in the runbook. Measure it every week and trend it, because it grows with the database and one day it crosses the threshold that the business agreed to without anyone noticing. Teams routinely discover during an incident that their four-hour restore is now eleven hours — and that is the moment they find out, because it is the first time anyone ran it end to end. <b>An untested backup is a hope, and an untimed restore is an unknown outage length.</b></p>
+</div>
+
+<h2><span class="h-rule"></span>What backups do not cover</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Risk</th><th>Why a backup does not help</th><th>What does</th></tr></thead>
+<tbody>
+<tr><td>Logical corruption from a bug</td><td>The bad data is faithfully backed up too</td><td>PITR to before the deploy; retention long enough to notice</td></tr>
+<tr><td>Silent page corruption</td><td>Propagates into backups and replicas</td><td><b>Checksums</b> (chapter 5), and <code>amcheck</code> on restores</td></tr>
+<tr><td>Ransomware or a malicious insider</td><td>Backups reachable from the compromised host get encrypted too</td><td>Immutable or write-once storage; separate credentials</td></tr>
+<tr><td>Losing the whole region</td><td>Backups in the same region are gone</td><td>Cross-region replication of the repository</td></tr>
+<tr><td>Losing the encryption key</td><td>The backup exists and is unreadable</td><td>Key escrow, and testing a restore <em>with</em> the recovery key</td></tr>
+<tr><td>Dropping one table</td><td>Physical restore rolls back the entire cluster</td><td>A logical dump alongside, or restore to a scratch instance and copy</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">A replica is not a backup</span>
+  <p>Streaming replication copies everything faithfully, including the <code>DELETE</code> that removed a million rows — usually within a second. It protects against hardware failure and nothing else. Delayed replicas (<code>recovery_min_apply_delay = '1h'</code>) give you a window to catch a destructive mistake before it propagates, which is genuinely useful, and they are still not a substitute for backups you can restore to an arbitrary point weeks ago. Keep both, and be clear which risk each one addresses.</p>
+</div>
+
+<h2><span class="h-rule"></span>Retention</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">a schedule that covers the realistic cases</span><button class="copy">Copy</button></div>
+<pre><code>Full backup           weekly
+Incremental           daily
+WAL archiving         continuous, with archive_timeout = 5min
+
+Retain:
+  7 days    of full PITR capability     — the common case: a bad deploy
+  4 weeks   of weekly fulls             — "this has been wrong for a while"
+  12 months of monthly fulls            — compliance, and audits
+  Off-site or cross-region copy of everything
+
+Why the middle tier exists: logical corruption is often discovered long after
+it started. A seven-day window is useless if the bug shipped three weeks ago,
+and the monthly archive is what lets you extract the correct values for the
+affected rows rather than guess them.
+
+Also worth writing down, once, and reviewing yearly:
+  * the agreed RPO and RTO, and who agreed them
+  * where the decryption key lives, and who can get it
+  * the runbook, tested by someone who did not write it</code></pre>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Logical for granularity and version moves; physical for disaster recovery.</b> Most clusters need both.</li>
+    <li><code>pg_dump</code> <b>holds a long transaction</b> and blocks vacuum cluster-wide. Run it from a replica.</li>
+    <li><b>Base backup plus WAL archiving is what gives point-in-time recovery</b> — the only thing that undoes a bad deploy.</li>
+    <li><b>Use pgBackRest or Barman.</b> Hand-rolled scripts lack verification, retention and incrementals, and fail silently.</li>
+    <li>A failing <code>archive_command</code> costs you <b>both</b> your recovery window and eventually your disk.</li>
+    <li><b>Test the restore weekly, automatically</b>, and check integrity with <code>amcheck</code> rather than just that it started.</li>
+    <li><b>The restore duration is your real RTO.</b> Trend it — it grows with the database.</li>
+    <li><b>A replica is not a backup.</b> It replicates your mistakes within a second.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("12-backup.html");
+
+(function(){
+  const root = document.getElementById("rpo");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const SIZE = [10, 50, 100, 500, 1000, 5000, 20000];        // GB
+  const WAL  = [1, 5, 20, 50, 200, 500, 2000];               // GB/day
+
+  function dur(h){
+    if(h < 1/60) return (h*3600).toFixed(0) + "s";
+    if(h < 1) return (h*60).toFixed(0) + " min";
+    if(h < 48) return h.toFixed(1) + " hr";
+    return (h/24).toFixed(1) + " days";
+  }
+
+  const S = {
+    dump: {rpoH:  h => h, gran:"yes — any table", mult:1.0, restoreRate:12, replay:false,
+      note:"A nightly logical dump. Everything since it ran is gone, and the restore replays every INSERT and rebuilds every index — which is why the restore rate here is so much lower than a physical one.\n\nWhat it is genuinely good for is granularity: pg_restore -t line_items recovers one table without touching anything else, which no physical backup can do. Keep one alongside a physical strategy rather than instead of it."},
+    snap: {rpoH: h => h, gran:"no — whole volume", mult:1.2, restoreRate:400, replay:false,
+      note:"A nightly volume snapshot. Fast to restore because it is a block-level copy, and it still loses everything since the snapshot.\n\nOne caveat worth knowing: a snapshot is crash-consistent, not backup-consistent. Postgres will run crash recovery on startup and that is fine — provided the snapshot is atomic across ALL volumes. If pg_wal is on a separate volume snapshotted a moment later, the result may be unrecoverable. Check that your platform snapshots them together, or keep them on one volume."},
+    pitr: {rpoH: () => 0.083, gran:"no — whole cluster", mult:1.6, restoreRate:400, replay:true,
+      note:"Base backup plus WAL archiving. RPO is bounded by archive_timeout rather than by the backup schedule — set it to 5 minutes and you lose at most 5 minutes even if the primary is destroyed.\n\nThis is what makes point-in-time recovery possible, and PITR is the only thing that undoes a bad deploy: restore to 09:14, one minute before the migration that corrupted the data.\n\nThe restore cost is the base backup copy plus replaying WAL forward from it, which is why the failure timing slider matters — the further from the backup, the more WAL to replay."},
+    pitrsync: {rpoH: () => 0.003, gran:"no — whole cluster", mult:1.7, restoreRate:400, replay:true,
+      note:"WAL streamed continuously to the archive rather than shipped a segment at a time. RPO drops to seconds because you are no longer waiting for a 16 MB segment to fill or for archive_timeout to fire.\n\npgBackRest and Barman both support this. It costs a persistent connection and a little more complexity, and it is the difference between losing five minutes and losing almost nothing."},
+    replica: {rpoH: () => 0.001, gran:"no — whole cluster", mult:2.6, restoreRate:99999, replay:false,
+      note:"A streaming replica alongside WAL archiving. For hardware failure the recovery is a promotion — seconds, not hours — and RPO is whatever the replication lag was.\n\nBut note the granularity column, and note this carefully: the replica faithfully copies the DELETE that removed a million rows, usually within a second. It protects against the machine dying and against nothing else. The WAL archive is what covers the other cases, and it is why this row still includes it.\n\nA delayed replica (recovery_min_apply_delay = '1h') gives you a window to catch a destructive mistake before it lands, which is a useful third thing to have."}
+  };
+
+  function render(){
+    const k = $("r-strat").value;
+    const s = S[k];
+    const size = SIZE[parseInt($("r-size").value,10)-1];
+    const wal  = WAL[parseInt($("r-wal").value,10)-1];
+    const when = parseInt($("r-when").value, 10);
+    $("r-sizev").textContent = size >= 1000 ? (size/1000) + " TB" : size + " GB";
+    $("r-walv").textContent  = wal >= 1000 ? (wal/1000) + " TB/day" : wal + " GB/day";
+
+    const rpo = s.rpoH(when);
+    const copyH = size / s.restoreRate;
+    const replayH = s.replay ? (wal * (when/24)) / 120 : 0;   // ~120 GB/hr replay
+    const rto = k === "replica" ? 0.008 : copyH + replayH + 0.25;
+
+    $("r-rpo").textContent  = rpo < 0.005 ? "seconds" : dur(rpo);
+    $("r-rto").textContent  = dur(rto);
+    $("r-gran").textContent = s.gran;
+    $("r-cost").textContent = Math.round(size * s.mult) >= 1000
+      ? (size * s.mult / 1000).toFixed(1) + " TB" : Math.round(size * s.mult) + " GB";
+
+    const bars = [
+      ["Data lost (RPO)", rpo],
+      ["Copy the backup", copyH],
+      ["Replay WAL", replayH]
+    ].filter(b => b[1] > 0);
+    const max = Math.max.apply(null, bars.map(b => b[1]));
+    $("r-bars").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      'Failure ' + when + ' hours after the last backup</div>' +
+      bars.map(([lab, v], i) =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px">' +
+        '<span style="min-width:150px;font-size:13px">' + lab + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + Math.max(1, v/max*100).toFixed(0) +
+        '%' + (i === 0 && rpo > 1 ? ';background:#E2574C' : i === 0 ? ';background:#3FB984' : '') + '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:64px;text-align:right">' +
+        dur(v) + '</span></div>').join("");
+
+    const notes = [s.note];
+
+    if(rpo > 1)
+      notes.push("Losing " + dur(rpo) + " of data. Whether that is acceptable is a business decision and it needs to be made explicitly — most organisations discover their real tolerance during the incident, which is the wrong time.");
+
+    if(rto > 4)
+      notes.push("A restore of " + dur(rto) + " on a " + (size >= 1000 ? (size/1000) + " TB" : size + " GB") +
+                 " database. Measure this for real rather than trusting the estimate: run the restore weekly, time it, and trend the number. It grows as the database does, and one day it silently crosses whatever the business agreed to.");
+
+    if(s.replay && replayH > copyH)
+      notes.push("Notice that replaying WAL takes longer than copying the base backup. That is the argument for more frequent base backups, or for incrementals: less WAL to replay means a shorter restore. Move the failure-timing slider and watch this term grow.");
+
+    if(k === "dump" || k === "snap")
+      notes.push("No point-in-time recovery. If a bad migration corrupted data at 14:30, your only option is the previous night's backup — losing every legitimate change since. PITR is what turns that from a full day's loss into one minute's.");
+
+    if(k !== "dump")
+      notes.push("Granularity is the gap here: a physical restore brings back the entire cluster, so recovering one accidentally-dropped table means restoring to a scratch instance and copying the table across. A periodic logical dump alongside makes that a one-command operation.");
+
+    notes.push("Model: ~400 GB/hr to copy a physical backup, ~12 GB/hr for logical restore including index rebuilds, ~120 GB/hr WAL replay. Yours will differ — which is exactly why the weekly automated restore test in this chapter exists.");
+    $("r-note").textContent = notes.join("\n\n");
+  }
+
+  ["r-strat","r-size","r-wal","r-when"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

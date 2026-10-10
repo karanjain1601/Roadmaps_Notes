@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Replica sets — MongoDB</title>
+<meta name="description" content="Elections, the oplog, primary and secondary roles, what happens during a failover, and rollback of unreplicated writes.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 10 · Correctness</div>
+    <h1>Replica sets</h1>
+    <p class="standfirst">A group of servers holding the same data, one of which accepts writes. The election protocol is built in and it works — which is the single largest operational difference from the PostgreSQL unit, where the same capability required Patroni, etcd and a chapter of your attention.</p>
+    <div class="chap-meta">
+      <span class="tagpill">elections</span>
+      <span class="tagpill">oplog</span>
+      <span class="tagpill">failover</span>
+      <span class="tagpill">rollback</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The shape</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">three members, one primary</span><button class="copy">Copy</button></div>
+<pre><code>rs.initiate({
+  _id: "rs0",
+  members: [
+    { _id: 0, host: "mongo-a:27017", priority: 2 },
+    { _id: 1, host: "mongo-b:27017", priority: 1 },
+    { _id: 2, host: "mongo-c:27017", priority: 1 }
+  ]
+});
+
+rs.status();      // state of every member, election metrics, lag
+rs.conf();        // the configuration
+rs.hello();       // what THIS member thinks it is
+
+// One PRIMARY accepts writes. SECONDARIES replicate from it and can serve
+// reads if the client asks for them.
+//
+// Elections are majority-based, which is why the count should be ODD.
+// Three members tolerate one failure; four also tolerate only one, and give
+// you an extra machine to maintain for nothing.
+//
+// An ARBITER votes without holding data. It makes an even set odd cheaply
+// and it is a trap — see below.
+
+// The driver discovers the topology itself. Give it every host and it finds
+// the primary, follows failovers, and reconnects:
+//   mongodb://mongo-a,mongo-b,mongo-c/orders?replicaSet=rs0
+// or a DNS seedlist, which is what Atlas provides:
+//   mongodb+srv://cluster.example.mongodb.net/orders</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">The client is part of the failover mechanism</span>
+  <p>MongoDB drivers are topology-aware: they maintain a view of the replica set, monitor each member, and route writes to whichever node is currently primary. When the primary changes, the driver notices within seconds and follows — and with <code>retryWrites</code> on, which is the default, a single-document write interrupted by a failover is retried automatically against the new primary. That is why MongoDB failover feels seamless where PostgreSQL's needs HAProxy or a multi-host connection string configured deliberately. <b>Give the driver every host and let it do this</b>; a connection string pointing at one node defeats the entire arrangement.</p>
+</div>
+
+<h2><span class="h-rule"></span>Elections</h2>
+
+<div class="demo" id="rs">
+  <div class="demo-head">
+    <b>What happens when something fails</b>
+    <span>A three-member set. Pick a failure and see whether writes continue, and what it costs.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="r-fail">Failure</label>
+        <select id="r-fail">
+          <option value="primary" selected>The primary dies</option>
+          <option value="secondary">One secondary dies</option>
+          <option value="two">Two members die</option>
+          <option value="partition">The primary is network-partitioned</option>
+          <option value="slow">The primary is alive but very slow</option>
+          <option value="lag">A secondary falls far behind</option>
+        </select>
+      </div>
+      <div>
+        <label for="r-w">Write concern in use</label>
+        <select id="r-w">
+          <option value="majority" selected>w: "majority" (the default)</option>
+          <option value="one">w: 1</option>
+        </select>
+      </div>
+    </div>
+    <div id="r-nodes"></div>
+    <div class="stat">
+      <div><b id="r-writes">—</b><span>writes</span></div>
+      <div><b id="r-time">—</b><span>unavailable for</span></div>
+      <div><b id="r-loss">—</b><span>data loss</span></div>
+    </div>
+    <div class="out" id="r-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">how an election is decided</span><button class="copy">Copy</button></div>
+<pre><code>// Members heartbeat every 2 seconds. If a secondary has not heard from the
+// primary within electionTimeoutMillis (default 10s), it calls an election.
+//
+// To win, a candidate needs:
+//   * a MAJORITY of votes from the configured members
+//   * an oplog at least as recent as every voter's
+//   * priority > 0
+//
+// The freshness requirement is the important one: a member that is behind
+// cannot win, so a failover never promotes a node missing writes that
+// another member has. That bounds data loss without any configuration.
+
+cfg = rs.conf();
+cfg.settings.electionTimeoutMillis = 10000;   // lower = faster failover,
+                                              // more false positives
+rs.reconfig(cfg);
+
+// Per-member settings worth knowing:
+{
+  priority: 0,        // never becomes primary — for an analytics node or
+                      // a member in a distant region
+  votes: 0,           // participates without voting (max 7 voters total)
+  hidden: true,       // invisible to clients; implies priority 0
+  slaveDelay: 3600,   // secondaryDelaySecs in 5.0+ — deliberately behind
+  buildIndexes: false // rarely a good idea
+}
+
+rs.stepDown(60);          // planned handover. Waits for a secondary to catch
+                          // up, then steps down for 60 seconds
+rs.freeze(120);           // this member will not seek election for 2 minutes</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Do not use an arbiter</span>
+  <p>An arbiter votes without holding data, so it looks like a cheap way to make a two-member set electable. It is a trap. With a primary, a secondary and an arbiter, losing the secondary leaves a majority — so the primary stays up and now has <b>no copy of your data anywhere else</b>, and <code>w: "majority"</code> writes can be acknowledged by a single node. You have a set that reports healthy while running with no redundancy at all, which is worse than a two-member set that visibly steps down. The extra machine for a real third data-bearing member is cheaper than that failure mode. MongoDB's own guidance has moved to discouraging arbiters, and the reasoning is this.</p>
+</div>
+
+<h2><span class="h-rule"></span>The oplog</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">a capped collection every secondary tails</span><button class="copy">Copy</button></div>
+<pre><code>// The primary records every change in local.oplog.rs. Secondaries read it
+// and apply the entries. It is the mechanism behind replication, change
+// streams (chapter 14), point-in-time restore and initial sync.
+
+use local;
+db.oplog.rs.find().sort({ $natural: -1 }).limit(3);
+//   { op: "u", ns: "shop.orders", ts: Timestamp(...),
+//     o: { $v: 2, diff: { u: { status: "paid" } } },
+//     o2: { _id: ObjectId("...") } }
+
+// Operations are IDEMPOTENT by construction. An $inc in your application
+// becomes an absolute $set in the oplog, so replaying an entry twice
+// produces the same result — which is what makes recovery and resumption
+// safe.
+
+rs.printReplicationInfo();
+//   "oplog first event time" and "last event time" — the difference is your
+//   OPLOG WINDOW, and it is the number that matters operationally.
+
+// THE WINDOW IS THE CONSTRAINT. A secondary offline longer than the window
+// can no longer catch up: the entries it needs have been overwritten, and it
+// requires a full resync — hours, and heavy load on the primary.
+//
+// The same window bounds how long a change stream can be disconnected before
+// its resume token expires (chapter 14).
+
+// Size it for the longest maintenance you might do, not for the average.
+// 24-72 hours is a common target. It is a capped collection, so it costs
+// disk and nothing else.
+db.adminCommand({ replSetResizeOplog: 1, size: 51200 });   // MB, no restart
+
+// Watch it, because write volume grows and the window shrinks silently:
+db.getSiblingDB("local").oplog.rs.stats().maxSize;</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Reading from secondaries</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>readPreference</th><th>Reads from</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>primary</code></td><td>The primary only</td><td><b>The default.</b> Errors if there is none</td></tr>
+<tr><td><code>primaryPreferred</code></td><td>Primary, else a secondary</td><td>Availability over freshness during a failover</td></tr>
+<tr><td><code>secondary</code></td><td>Secondaries only</td><td>Analytics that must not touch the primary</td></tr>
+<tr><td><code>secondaryPreferred</code></td><td>Secondaries, else the primary</td><td>Reads that tolerate staleness</td></tr>
+<tr><td><code>nearest</code></td><td>Lowest latency, either role</td><td>Geographically spread clients</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">and the reasons not to</span><button class="copy">Copy</button></div>
+<pre><code>db.orders.find({ … }).readPref("secondaryPreferred", [{ region: "eu" }]);
+//   tags let you target specific members
+
+// Constrain how stale you will accept:
+.readPref("secondary", null, { maxStalenessSeconds: 90 });
+//   the driver excludes members lagging more than this. Minimum 90s
+
+// WHAT YOU GIVE UP:
+//   * READ-YOUR-WRITES. A user saves, the redirect reads from a secondary,
+//     and their change is not there. This is the commonest bug introduced by
+//     enabling secondary reads, and it is intermittent
+//   * every write still happens on every member, so a write-heavy workload
+//     gains nothing — you are only offloading read CPU and cache
+//   * during a failover, secondaries are also busy
+
+// If you need read-your-writes AND secondary reads, causal consistency does
+// it properly (chapter 11):
+const session = client.startSession({ causalConsistency: true });
+await coll.insertOne(doc, { session });
+await coll.findOne({ _id }, { session });   // guaranteed to see the insert
+
+// The honest summary is the same as the PostgreSQL unit's: secondary reads
+// are for workloads that tolerate staleness and would otherwise evict your
+// hot data from the primary's cache. They are not spare capacity.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Rollback</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">when a former primary has writes nobody else does</span><button class="copy">Copy</button></div>
+<pre><code>1. The primary accepts writes and acknowledges them with w: 1.
+2. It fails before those writes reach any secondary.
+3. A secondary is elected. It does not have them.
+4. The old node returns and finds its oplog has diverged.
+
+Those writes cannot be applied — the new primary's history is authoritative.
+They are ROLLED BACK: written to a rollback file and removed.
+
+  <dbpath>/rollback/<db>.<collection>/removed.<timestamp>.bson
+
+The application was told those writes succeeded. They no longer exist.
+Nothing surfaces this to the application; the files sit on disk until
+somebody looks. Since 4.4 they may go to a rollback collection instead,
+which is more discoverable and no more automatic.
+
+THE PREVENTION IS ONE SETTING. With w: "majority", a write is not
+acknowledged until a majority has it — and any node that can win an election
+must have everything the majority had. So an acknowledged write can never be
+rolled back.
+
+  w: "majority" has been the DEFAULT since MongoDB 5.0.
+
+Which means: on a current version you are protected unless somebody
+explicitly set w: 1 to make writes faster. That trade — a millisecond of
+latency against silently losing acknowledged writes — is almost never worth
+taking, and it is the single most consequential setting in chapter 11.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Deployment shapes</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Need</th><th>Configuration</th></tr></thead>
+<tbody>
+<tr><td>Survive one machine</td><td>Three data-bearing members, one zone each</td></tr>
+<tr><td>Survive one region</td><td>Members in three regions. Note the latency cost on <code>w: "majority"</code></td></tr>
+<tr><td>Analytics without disturbing production</td><td>A <code>hidden</code>, <code>priority: 0</code> member with its own indexes</td></tr>
+<tr><td>Catch a destructive mistake</td><td>A delayed member: <code>secondaryDelaySecs: 3600</code></td></tr>
+<tr><td>Backups without touching the primary</td><td>A hidden member, snapshotted</td></tr>
+<tr><td>Reads near distant users</td><td>Members in those regions, <code>nearest</code>, accepting staleness</td></tr>
+<tr><td>Cheap third vote</td><td><b>A real member.</b> Not an arbiter</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note tip">
+  <span class="note-t">A delayed member is cheap insurance</span>
+  <p><code>secondaryDelaySecs: 3600</code> keeps one hidden member deliberately an hour behind. When someone runs a <code>deleteMany</code> with the wrong filter, or a migration corrupts a field, the correct data is on a running server you can query immediately — rather than at the end of a multi-hour restore. It costs one machine. It is not a backup and does not replace one; it is the fastest possible recovery from the specific, common failure of a human destroying data. Same argument as the PostgreSQL unit, and it is easier to set up here.</p>
+</div>
+
+<h2><span class="h-rule"></span>Monitoring</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">four things to watch</span><button class="copy">Copy</button></div>
+<pre><code>rs.printSecondaryReplicationInfo();     // per-member lag in seconds
+
+// 1. REPLICATION LAG. Alert above a few seconds sustained.
+db.adminCommand({ replSetGetStatus: 1 }).members.forEach(m =>
+  print(m.name, m.stateStr, m.optimeDate));
+
+// 2. OPLOG WINDOW. Alert below ~24 hours. It shrinks as write volume grows,
+//    silently, and it is what bounds both resync and change-stream resume.
+rs.printReplicationInfo();
+
+// 3. ELECTIONS. Frequent elections mean network instability or an
+//    overloaded primary, and each one is a brief write outage.
+db.serverStatus().electionMetrics;
+
+// 4. MEMBER STATE. Anything other than PRIMARY or SECONDARY needs attention:
+//      RECOVERING   catching up, or unable to
+//      STARTUP2     initial sync in progress
+//      ROLLBACK     rolling back diverged writes — check for rollback files
+//      DOWN         unreachable from this member's perspective
+
+// A member stuck in RECOVERING is usually one that fell outside the oplog
+// window and now needs a full resync. That is the failure the window
+// setting exists to prevent, and it is much easier to prevent than to fix.</code></pre>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Elections are <b>built in and majority-based</b>. Use an odd number of data-bearing members.</li>
+    <li><b>The driver is part of the mechanism</b> — give it every host and let it follow failovers.</li>
+    <li>A candidate must be <b>as fresh as every voter</b>, so a failover never promotes a node missing writes others have.</li>
+    <li><b>Do not use an arbiter.</b> It produces a set that reports healthy while running with no redundancy.</li>
+    <li><b>The oplog window is the operational constraint</b> — it bounds resync and change-stream resume, and it shrinks silently.</li>
+    <li><b>Secondary reads cost read-your-writes</b> and are not spare capacity. Use causal consistency if you need both.</li>
+    <li><b>Rollback discards acknowledged writes to a file nobody reads.</b> <code>w: "majority"</code> prevents it, and is the default since 5.0.</li>
+    <li>A <b>delayed hidden member</b> is one machine and the fastest recovery from a human deleting data.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("10-replica-sets.html");
+
+(function(){
+  const root = document.getElementById("rs");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const F = {
+    primary: {
+      nodes:[["mongo-a","PRIMARY","down"],["mongo-b","SECONDARY → PRIMARY","elected"],["mongo-c","SECONDARY","ok"]],
+      writes:"resume", time:"~10-12s", lossMaj:"none", lossOne:"possible",
+      note:"The straightforward case, and the one the protocol handles best. Two members remain, which is a majority of three, so an election can proceed.\n\nThe timeline is dominated by detection rather than by the election itself: electionTimeoutMillis is 10 seconds by default, then the vote takes well under a second. Lowering the timeout makes failover faster and false positives more likely — a brief network hiccup then triggers an unnecessary failover, which is itself a small outage.\n\nDrivers notice the change within a couple of seconds and route writes to the new primary. With retryWrites on, which is the default, a single-document write interrupted mid-failover is retried automatically and the application may see nothing at all."
+    },
+    secondary: {
+      nodes:[["mongo-a","PRIMARY","ok"],["mongo-b","SECONDARY","down"],["mongo-c","SECONDARY","ok"]],
+      writes:"continue", time:"none", lossMaj:"none", lossOne:"none",
+      note:"Nothing happens, which is correct. The primary is healthy and still has a majority with mongo-c, so no election is called and writes never pause.\n\nOne thing to watch: with w: \"majority\" on a three-member set, a majority is two — the primary plus one secondary. You are now at exactly that threshold, so losing another member stops writes entirely. This is a degraded state that looks fine on a dashboard.\n\nThe other clock now running is the oplog window. If mongo-b stays down longer than the window, it can no longer catch up from the oplog and needs a full resync — hours of work and significant load on the primary."
+    },
+    two: {
+      nodes:[["mongo-a","PRIMARY → SECONDARY","stepped down"],["mongo-b","SECONDARY","down"],["mongo-c","SECONDARY","down"]],
+      writes:"STOP", time:"until a member returns", lossMaj:"none", lossOne:"none",
+      note:"No majority is possible, so the surviving member steps down to secondary and the set becomes read-only. Writes stop entirely.\n\nThis is the correct behaviour and it is worth being explicit that it is a deliberate choice: MongoDB prefers consistency over availability here. A lone member cannot know whether the others are dead or merely unreachable, and continuing to accept writes risks divergence that cannot be reconciled.\n\nReads still work if the client uses secondaryPreferred. Writes resume the moment a second member returns.\n\nThe lesson for topology: three members tolerate one failure. If you need to tolerate two, you need five — and four gives you no more tolerance than three while adding a machine to maintain."
+    },
+    partition: {
+      nodes:[["mongo-a","PRIMARY → SECONDARY","isolated"],["mongo-b","SECONDARY → PRIMARY","elected"],["mongo-c","SECONDARY","ok"]],
+      writes:"resume on the majority side", time:"~10-12s", lossMaj:"none", lossOne:"writes taken while isolated",
+      note:"The case that would be dangerous without the majority rule. mongo-a is perfectly healthy and can still be reached by some clients — it simply cannot see the other two.\n\nWhat prevents split-brain is that mongo-a discovers it has lost the majority and STEPS DOWN on its own, before the other side elects a new primary. It does not need to be told, and no external fencing is required. That self-demotion is the same property Patroni provides in the PostgreSQL unit, except here it is intrinsic to the protocol rather than a component you install and configure.\n\nAny write mongo-a accepted after the partition and before stepping down is on the losing side of history. With w: \"majority\" those writes were never acknowledged, so nothing was promised. With w: 1 they were acknowledged and will be rolled back to a file on disk."
+    },
+    slow: {
+      nodes:[["mongo-a","PRIMARY","degraded"],["mongo-b","SECONDARY","ok"],["mongo-c","SECONDARY","ok"]],
+      writes:"slow", time:"n/a", lossMaj:"none", lossOne:"none",
+      note:"The ambiguous one. The primary is responding to heartbeats, so no election is triggered — it is alive by every liveness measure and slow by every performance measure.\n\nUsually correct that nothing happens automatically. If the cause is the workload rather than the machine, a new primary inherits the same load and is equally slow within minutes, having also cost you a promotion and every in-flight operation.\n\nIf you have diagnosed that the machine itself is the problem — failing disk, noisy neighbour — rs.stepDown() hands over cleanly: it waits for a secondary to catch up first, so there is no data loss and no election timeout to wait through.\n\nDiagnose before failing over. Chapter 9's currentOp and slow query log are where to start."
+    },
+    lag: {
+      nodes:[["mongo-a","PRIMARY","ok"],["mongo-b","SECONDARY","lagging"],["mongo-c","SECONDARY","ok"]],
+      writes:"continue", time:"none", lossMaj:"none", lossOne:"none",
+      note:"Writes continue normally — the primary and mongo-c form a majority, so w: \"majority\" is satisfied without mongo-b.\n\nThree consequences worth tracking. Reads routed to mongo-b are stale, which maxStalenessSeconds is designed to handle: set it and the driver excludes members lagging beyond the threshold. A lagging member cannot win an election, since candidates must be as fresh as every voter — so your failover options have quietly narrowed to one. And if the lag exceeds the oplog window, mongo-b can no longer catch up at all and needs a full resync.\n\nCommon causes: slower storage than the primary, a long-running query on the secondary competing with replay, or network saturation. Replay is largely parallel in modern versions, so persistent lag under normal load usually points at hardware."
+    }
+  };
+
+  function render(){
+    const k = $("r-fail").value, f = F[k];
+    const maj = $("r-w").value === "majority";
+
+    const COL = {ok:"#3FB984", elected:"#3FB984", down:"#E2574C",
+                 isolated:"#F2A03D", degraded:"#F2A03D", lagging:"#F2A03D",
+                 "stepped down":"#F2A03D"};
+
+    $("r-nodes").innerHTML =
+      '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:9px;margin:16px 0 4px">' +
+      f.nodes.map(([n, role, state]) =>
+        '<div style="background:#fff;border:2px solid ' + COL[state] + ';border-radius:6px;padding:11px 12px;text-align:center">' +
+        '<div style="font-family:var(--mono);font-size:13px;font-weight:700;color:#16232F">' + n + '</div>' +
+        '<div style="font-size:11.5px;color:#54677A;margin-top:2px">' + role + '</div>' +
+        '<div style="font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;font-weight:700;color:' +
+        COL[state] + ';margin-top:5px">' + state + '</div></div>').join("") + '</div>';
+
+    $("r-writes").textContent = f.writes;
+    $("r-time").textContent   = f.time;
+    $("r-loss").textContent   = maj ? f.lossMaj : f.lossOne;
+
+    const notes = [f.note];
+
+    if(!maj && f.lossOne !== "none"){
+      notes.push("With w: 1 those writes were ACKNOWLEDGED to the application and are not on the surviving members. When the old node rejoins it finds its oplog has diverged, and the writes are rolled back — moved to a file under <dbpath>/rollback/ and removed from the database.\n\nNothing tells the application. The files sit on disk until someone looks, and the user who was told their order was placed no longer has one.\n\nw: \"majority\" makes this impossible: a write is not acknowledged until a majority holds it, and any node that can win an election must have everything the majority had. It has been the default since MongoDB 5.0, so this failure mode only exists if somebody explicitly turned it off to save a millisecond.");
+    } else if(maj && (k === "primary" || k === "partition")){
+      notes.push("With w: \"majority\", no acknowledged write can be lost here. A write is only confirmed once a majority holds it, and an election winner must be at least as fresh as every voter — so anything the application was told succeeded is guaranteed to be on the new primary.\n\nThis is the whole argument for the setting, and it is why the default changed in 5.0.");
+    }
+
+    if(k === "secondary" || k === "lag")
+      notes.push("Also worth watching in this state: the oplog window. A member that stays behind longer than the window can no longer catch up from the oplog and requires a full resync — hours of work and heavy load on the primary. Size the oplog for the longest outage or maintenance you might realistically have, not for the average.");
+
+    $("r-note").textContent = notes.join("\n\n");
+  }
+
+  ["r-fail","r-w"].forEach(id => $(id).addEventListener("change", render));
+  render();
+})();
+</script>
+</body>
+</html>

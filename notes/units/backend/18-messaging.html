@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · Queues, logs and events — Backend Developer</title>
+<meta name="description" content="Queues against logs, delivery semantics and idempotent consumers, the dual-write problem and the outbox pattern, dead letters, sagas and webhooks.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%233FB984' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">Backend Developer</a><span class="sep">/</span><span>Chapter 18</span></p>
+    <p class="chno">Chapter 18 · Architecture</p>
+    <h1>Queues, logs and events</h1>
+    <p class="lede">Not everything has to happen while someone waits. Moving work off the request path is the standard way to absorb bursts, survive a failing dependency and fan one action out to five consumers — and it introduces a problem that has no clean solution, only a well-known workaround.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapters 10, 17</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="why">
+<h2>Queues against logs</h2><div class="h2rule"></div>
+
+<p class="lead">Two categories of thing that both look like "message broker" in a diagram and behave completely differently. Choosing the wrong one is a design error you feel a year later.</p>
+
+<div class="demo" id="d-broker">
+  <div class="demo-top"><div class="demo-title">Eight messages, two models</div><div class="demo-hint">Add a second consumer group and try to replay</div></div>
+  <div class="demo-body">
+    <canvas id="cBroker" aria-label="Messages consumed from a queue compared with offsets into a log"></canvas>
+    <div class="ctrls" style="justify-content:center;flex-wrap:wrap">
+      <div class="ctrl"><label>Model</label><select id="bkM">
+        <option value="queue" selected>queue — RabbitMQ, SQS</option>
+        <option value="log">log — Kafka, Kinesis</option></select></div>
+      <button class="btn primary" id="bkNext">Consume</button>
+      <button class="btn" id="bkAdd">Add analytics consumer</button>
+      <button class="btn" id="bkReplay">Replay from the start</button>
+      <button class="btn" id="bkRst">Reset</button>
+    </div>
+    <div class="rgrid" id="bkOut"></div>
+    <div class="readout" id="bkNote"></div>
+  </div>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th>Queue</th><th>Log</th></tr></thead>
+<tbody>
+<tr><td>After delivery</td><td class="no">The message is gone</td><td class="yes">Retained for the configured period</td></tr>
+<tr><td>Several consumers</td><td class="yes">Compete — each message goes to one</td><td class="yes">Each group reads everything, independently</td></tr>
+<tr><td>Replay</td><td class="no">Impossible</td><td class="yes">Reset the offset</td></tr>
+<tr><td>Ordering</td><td>Best effort; lost with competing consumers</td><td class="yes">Strict, per partition</td></tr>
+<tr><td>Adding a consumer later</td><td class="no">Sees only new messages</td><td class="yes">Can read the entire history</td></tr>
+<tr><td>Per-message operations</td><td class="yes">Ack, nack, delay, priority, dead-letter</td><td class="no">Only offsets. No individual acknowledgement</td></tr>
+<tr><td>Natural for</td><td class="yes">Task distribution — send the email, resize the image</td><td class="yes">Event streams — something happened, whoever cares may react</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box intu"><b class="tag">Commands and events</b>
+<p style="margin:0">The distinction that usually resolves the choice. A <strong>command</strong> is addressed: <em>send this email</em>. It has one intended handler, the sender expects it to be done, and a queue is the right shape. An <strong>event</strong> is an announcement: <em>an order was placed</em>. The publisher does not know or care who is listening, any number of services may react, and a log is the right shape. Naming matters here — a topic called <code>send-welcome-email</code> is a command wearing an event's clothes, and it will acquire a second consumer eventually and behave badly.</p>
+</div>
+</section>
+
+<section id="delivery">
+<h2>Delivery semantics</h2><div class="h2rule"></div>
+
+<div class="tw">
+<table class="tight">
+<thead><tr><th>Guarantee</th><th>Means</th><th>Reality</th></tr></thead>
+<tbody>
+<tr><td><strong>At most once</strong></td><td>Acknowledge before processing</td><td class="no">A crash loses the message. Only for data you can afford to drop, such as metrics</td></tr>
+<tr><td><strong>At least once</strong></td><td>Acknowledge after processing</td><td class="yes">A crash between processing and acking causes a redelivery. This is what you will use</td></tr>
+<tr><td><strong>Exactly once</strong></td><td>Delivered and processed precisely once</td><td class="no">Not achievable across a network in general. What brokers offer is at-least-once delivery plus deduplication within their own boundary</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn"><b class="tag">"Exactly once" is at-least-once plus an idempotent consumer</b>
+<p style="margin:0">The consumer acknowledges after doing the work; if it crashes in between, the broker redelivers, and it must. There is no protocol that avoids this, because the acknowledgement itself can be lost. <strong>So the property you actually need lives in the consumer, not the broker</strong>: record the message id you have processed and skip repeats, in the same transaction as the effect. That is chapter 5's idempotency key applied to a different transport, and it is the difference between a system that tolerates redelivery and one that sends the same customer four emails after a deploy.</p>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">python — an idempotent consumer, which is most of the work</span><button class="code-copy">Copy</button></div><pre><span class="k">def</span> <span class="f">handle</span>(msg):
+    <span class="k">with</span> db.transaction():
+        <span class="k">if</span> db.already_processed(msg.id):     <span class="c">← a unique index on message_id</span>
+            <span class="k">return</span>                           <span class="c">  does the enforcing; the check</span>
+        db.mark_processed(msg.id)            <span class="c">  is only an optimisation</span>
+        apply_effect(msg)                    <span class="c">← same transaction as the marker,</span>
+    ack(msg)                                 <span class="c">  or a crash between them undoes</span>
+                                             <span class="c">  the idempotence</span>
+<span class="c"># three further rules that are learned the hard way:</span>
+<span class="c">#  · handlers must tolerate OUT OF ORDER delivery too. A redelivered</span>
+<span class="c">#    old message must not overwrite a newer state — compare versions.</span>
+<span class="c">#  · never do slow external work inside the transaction. Chapter 10.</span>
+<span class="c">#  · expire the processed-ids table, or it grows forever.</span></pre></div>
+</section>
+
+<section id="outbox">
+<h2>The dual-write problem</h2><div class="h2rule"></div>
+
+<p class="lead">Save the order and publish "order placed". Two systems, two writes, no transaction spanning them — and the gap between them is where the data corruption lives.</p>
+
+<div class="demo" id="d-outbox">
+  <div class="demo-top"><div class="demo-title">A crash at the worst moment</div><div class="demo-hint">Same failure, two designs</div></div>
+  <div class="demo-body">
+    <canvas id="cOutbox" aria-label="A dual write compared with the transactional outbox pattern under a crash"></canvas>
+    <div class="ctrls" style="justify-content:center">
+      <div class="ctrl"><label>Design</label><select id="obD">
+        <option value="dual" selected>write the database, then publish</option>
+        <option value="outbox">transactional outbox</option></select></div>
+      <div class="ctrl"><label><input type="checkbox" id="obC" checked> crash after the commit</label></div>
+      <button class="btn primary" id="obNext">Step</button>
+      <button class="btn" id="obAuto">Play</button>
+      <button class="btn" id="obRst">Restart</button>
+    </div>
+    <div class="rgrid" id="obOut"></div>
+    <div class="readout" id="obNote"></div>
+  </div>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">sql + python — the outbox, in full</span><button class="code-copy">Copy</button></div><pre><span class="k">CREATE TABLE</span> outbox (
+  id           bigserial <span class="k">PRIMARY KEY</span>,     <span class="c">-- ordering comes free</span>
+  aggregate_id uuid <span class="k">NOT NULL</span>,
+  event_type   text <span class="k">NOT NULL</span>,
+  payload      jsonb <span class="k">NOT NULL</span>,
+  created_at   timestamptz <span class="k">NOT NULL DEFAULT</span> now(),
+  published_at timestamptz                  <span class="c">-- null until the relay sends it</span>
+);
+<span class="k">CREATE INDEX</span> ON outbox (id) <span class="k">WHERE</span> published_at <span class="k">IS NULL</span>;   <span class="c">-- partial: the</span>
+<span class="c">-- relay's query stays fast no matter how large the table grows. Ch 9.</span>
+
+<span class="c"># the write path — one transaction, so the two cannot disagree</span>
+<span class="k">with</span> db.transaction():
+    order = db.insert_order(...)
+    db.insert_outbox(aggregate_id=order.id, event_type=<span class="s">"order.placed"</span>,
+                     payload=serialise(order))
+<span class="c"># nothing is published here. The request returns; the effect is durable.</span>
+
+<span class="c"># the relay — a separate process, or change-data-capture from the WAL</span>
+<span class="k">while</span> <span class="k">True</span>:
+    <span class="k">for</span> row <span class="k">in</span> db.fetch_unpublished(limit=<span class="n">100</span>):    <span class="c"># FOR UPDATE SKIP LOCKED</span>
+        broker.publish(row.event_type, row.payload,
+                       key=str(row.aggregate_id),      <span class="c">← partition key: all</span>
+                       headers={<span class="s">"message-id"</span>: str(row.id)})  <span class="c">  events for one</span>
+        db.mark_published(row.id)                      <span class="c">  order stay ordered</span>
+    sleep(<span class="n">0.2</span>)
+
+<span class="c"># if the relay crashes between publish and mark_published, the event is</span>
+<span class="c"># sent twice. That is fine and expected — the consumer is idempotent,</span>
+<span class="c"># which is why the previous section came first.</span></pre></div>
+
+<div class="tw">
+<table class="tight">
+<thead><tr><th>Concern</th><th>Handling</th></tr></thead>
+<tbody>
+<tr><td><strong>Poison message</strong></td><td class="yes">A dead-letter queue after N attempts, with the failure recorded. Never retry forever — one bad message will otherwise block a partition indefinitely</td></tr>
+<tr><td><strong>Retries</strong></td><td>Exponential backoff with jitter, and a cap. Chapter 19</td></tr>
+<tr><td><strong>Ordering</strong></td><td>Guaranteed only within a partition, so use a key that groups what must stay ordered — the order id, the account id — and accept that unrelated things interleave</td></tr>
+<tr><td><strong>Consumer lag</strong></td><td class="yes">The metric to alert on. Rising lag means consumers are losing, and the queue will absorb it right up until it does not</td></tr>
+<tr><td><strong>Schema change</strong></td><td>Events outlive the code that wrote them. Version the payload, only add optional fields, and keep a schema registry</td></tr>
+<tr><td><strong>Backfilling a new consumer</strong></td><td>Trivial with a log, a data migration with a queue. Often the deciding factor</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="sagas">
+<h2>Sagas, and webhooks</h2><div class="h2rule"></div>
+
+<p>Chapter 17 ended on the observation that a transaction cannot span two services. A saga is what you use instead: a sequence of local transactions, each with a compensating action that undoes it.</p>
+
+<div class="code"><div class="code-top"><span class="code-lang">a saga, and the part people underestimate</span><button class="code-copy">Copy</button></div><pre>place order   →  reserve stock  →  take payment  →  arrange shipping
+                       ↓                 ↓                  ↓
+                 release stock    refund payment      cancel shipment
+                                  ← compensations run in reverse →
+
+<span class="c">choreography — each service reacts to events. No coordinator, minimal</span>
+<span class="c">  coupling, and no single place that describes the process. Fine for</span>
+<span class="c">  three steps; unfollowable at eight.</span>
+
+<span class="c">orchestration — one service drives the sequence and holds the state.</span>
+<span class="c">  Explicit, visible, testable; a component everything depends on.</span>
+<span class="c">  Prefer this the moment the flow has branches or timeouts.</span>
+
+<span class="c">the hard part is not the happy path. It is that compensation is not</span>
+<span class="c">rollback: the email has been sent, the warehouse has moved the item,</span>
+<span class="c">the customer saw a confirmation. You are not undoing the effect, you</span>
+<span class="c">are performing a NEW business action that addresses it — and someone</span>
+<span class="c">has to decide what that action is for every step. That decision is a</span>
+<span class="c">product question, not a technical one, and it is why sagas are much</span>
+<span class="c">more expensive than the diagram suggests.</span></pre></div>
+
+<div class="kv">
+<dt>Webhooks are events for other people</dt><dd>The same problem with none of your infrastructure. You are now a broker whose consumers you do not control, cannot restart, and who will be offline when you deliver.</dd>
+<dt>What a receiver needs from you</dt><dd class="yes">A signature over the raw body with a shared secret, and a timestamp inside the signed payload so old deliveries cannot be replayed. A stable event id so they can deduplicate. Retries with backoff over hours, not minutes. A way to see and replay failed deliveries.</dd>
+<dt>What you need from a receiver</dt><dd>A fast acknowledgement. They should persist and return 200 immediately, then process asynchronously — a receiver that does real work before responding will time out under load and cause redeliveries that make it worse.</dd>
+<dt>Sending them safely</dt><dd class="no">The URL is user-supplied and your server fetches it: this is SSRF by design. Chapter 15 — resolve, validate the address, refuse redirects, and send from an egress-restricted worker rather than from your application.</dd>
+</div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>When is a log the right choice over a queue?
+<button class="reveal">Show answer</button><div class="ans">When more than one thing may care about the message, when you may want to add a consumer later that needs the history, when replay is valuable, or when strict ordering matters. Those all describe events — announcements about something that happened. A queue suits commands: one addressed handler, work distributed among competing workers, and per-message operations like delay, priority and dead-lettering, which a log does not offer.</div></li>
+
+<li>Why is exactly-once delivery not achievable?
+<button class="reveal">Show answer</button><div class="ans">Because the acknowledgement can be lost. If the consumer processes a message and crashes before acking, the broker cannot distinguish that from a consumer that never received it, so it must redeliver or risk losing the message. Acking first gives at-most-once and loses messages on a crash. What brokers market as exactly-once is at-least-once delivery plus deduplication inside their own boundary, which does not extend to the side effects your handler performs.</div></li>
+
+<li>What is the dual-write problem?
+<button class="reveal">Show answer</button><div class="ans">Writing to two systems that cannot participate in one transaction — commit the order, then publish the event. A crash in between leaves the order saved and no event, so every downstream service is permanently unaware of it; reversing the order gives an event for an order that does not exist. Neither ordering is safe, and retries do not fix it because the process may not survive to retry. The window is small and it is hit constantly at scale.</div></li>
+
+<li>How does the outbox pattern solve it, and what does it not solve?
+<button class="reveal">Show answer</button><div class="ans">The event is written into a table in the same transaction as the business data, so the two are atomic — either both exist or neither does. A separate relay then reads unpublished rows and sends them, retrying until it succeeds. What it does not give you is exactly-once: if the relay crashes between publishing and marking the row sent, the event goes out twice. That is deliberate and acceptable, provided consumers are idempotent — which is why the two sections belong together.</div></li>
+
+<li>Why does one poison message require a dead-letter queue?
+<button class="reveal">Show answer</button><div class="ans">Because retrying forever blocks everything behind it. In an ordered partition the consumer cannot move past a message it will not successfully process, so a single malformed payload halts the whole stream indefinitely while lag climbs. Moving it aside after a bounded number of attempts keeps the stream flowing and turns an outage into an item on a list — provided somebody actually watches that list, which is the part usually missing.</div></li>
+
+<li>Why is compensation not the same as rollback?
+<button class="reveal">Show answer</button><div class="ans">Because the effect already happened in the world. A database rollback erases an uncommitted change as if it never existed; a compensating action cannot un-send an email, un-charge a card without a visible refund, or un-move an item in a warehouse. You are performing a new business action that addresses the earlier one, and what that action should be has to be decided per step — usually by someone outside engineering. That is the real cost of a saga, and it is not visible in the diagram.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin:0">Chapter 19 covers what happens when the traffic doubles, and how to stop one slow dependency taking everything with it.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 18</h2><p>Queues, logs and events. Part of the Backend Developer unit — <a href="index.html">all 22 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 19 (backpressure and retries), 20 (consumer lag as a signal).</p></div>
+    <div><h2>Going deeper</h2><p>Chapter 11 of Kleppmann; Chris Richardson's microservices.io catalogues the outbox and saga patterns precisely.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: queue vs log ============ */
+(function(){
+  const cv=document.getElementById("cBroker"); if(!cv) return;
+  const mEl=document.getElementById("bkM"), out=document.getElementById("bkOut"), note=document.getElementById("bkNote");
+  const N=8;
+  let consumed=[], offsets={orders:0}, groups=["orders"], msg="", analytics=false;
+  function reset(){ consumed=[]; offsets={orders:0}; groups=["orders"]; analytics=false;
+    msg="<b>Eight messages have been published.</b> The <em>orders</em> service is consuming them. Consume a few, then try adding a second, unrelated consumer — and then try to replay."; draw(); }
+  function consume(){
+    const log=mEl.value==="log";
+    if(log){
+      let moved=false;
+      groups.forEach(g=>{ if(offsets[g]<N){ offsets[g]++; moved=true; } });
+      msg= moved
+        ? "<b>Each group advanced its own offset.</b> The messages are still there — consuming a log does not remove anything, it only moves a pointer. Two groups therefore read the same stream without interfering, and neither can starve the other."
+        : "<b>Every group has reached the end of the log.</b> The messages remain retained for the configured period, so a new group could still start from the beginning today.";
+    } else {
+      const next=consumed.length;
+      if(next<N){ consumed.push(next); 
+        msg="<b>Message "+(next+1)+" was delivered and acknowledged, and is now gone.</b> A queue removes what it delivers — that is the model. If a second service also needed this message, it will never see it, because the first consumer took it.";
+      } else msg="<b>The queue is empty.</b> Everything delivered has been removed. There is nothing left to read, and no way to ask for it again.";
+    }
+    draw();
+  }
+  function addGroup(){
+    const log=mEl.value==="log";
+    analytics=true;
+    if(log){ groups=["orders","analytics"]; offsets.analytics=0;
+      msg="<b>An analytics consumer joins, starting at offset 0.</b> It will read all eight messages including those the orders service already processed, and its progress is completely independent. This is the property that makes a log valuable: a consumer you had not thought of when you designed the system can be added later and given the full history.";
+    } else {
+      msg="<b>An analytics consumer joins — and competes.</b> In a queue, additional consumers share the work rather than each receiving everything, so from now on each message goes to one of them. Worse, the "+consumed.length+" message"+(consumed.length===1?"":"s")+" already consumed "+(consumed.length===1?"is":"are")+" gone: analytics can never see them. Getting that history requires a separate backfill from the database.";
+    }
+    draw();
+  }
+  function replay(){
+    const log=mEl.value==="log";
+    if(log){ groups.forEach(g=>offsets[g]=0);
+      msg="<b>Offsets reset to zero, and every message is redelivered.</b> Nothing was recovered from anywhere — the data never left. This is how you reprocess a stream after fixing a bug in a consumer, or populate a new read model from history. It is also why consumers must be idempotent: replay is redelivery.";
+    } else {
+      msg="<b>Nothing to replay.</b> Delivered messages were removed from the queue, so there is no copy to send again. If you need to reprocess, the source of truth is your database and you are writing a migration script — which is exactly the moment people wish they had chosen a log.";
+    }
+    draw();
+  }
+  function draw(){
+    const log=mEl.value==="log";
+    const w=cv.clientWidth||660, h=log?178:150, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h);
+    ctx.textBaseline="middle";
+    const pad=20, mw=Math.min(58,(w-2*pad)/N-6);
+    const mx=i=>pad+i*(mw+6);
+    ctx.fillStyle="#54677A"; ctx.font="600 10px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText(log?"the log — messages retained, offsets advance":"the queue — delivered messages are removed", pad, 18);
+    for(let i=0;i<N;i++){
+      const gone=!log&&consumed.includes(i);
+      ctx.fillStyle= gone?"#F7F9FA":"#E7F7EF";
+      ctx.strokeStyle= gone?"#EDF1F4":"#3FB984"; ctx.lineWidth= gone?1:1.9;
+      if(gone) ctx.setLineDash([3,3]);
+      ctx.fillRect(mx(i),30,mw,32); ctx.strokeRect(mx(i)+.5,30.5,mw,32); ctx.setLineDash([]);
+      ctx.fillStyle= gone?"#D5DCE2":"#166B47"; ctx.font="600 12px ui-monospace, monospace"; ctx.textAlign="center";
+      ctx.fillText(gone?"·":"m"+(i+1),mx(i)+mw/2,46);
+      ctx.fillStyle="#B8C4CE"; ctx.font="8.5px ui-monospace, monospace";
+      ctx.fillText(i,mx(i)+mw/2,70);
+    }
+    if(log){
+      const COL={orders:"#3FB984",analytics:"#7C8CF8"};
+      groups.forEach((g,gi)=>{
+        const y=88+gi*38, o=offsets[g];
+        const x= o<N? mx(o)+mw/2 : mx(N-1)+mw+4;
+        ctx.strokeStyle=COL[g]; ctx.lineWidth=2;
+        ctx.beginPath(); ctx.moveTo(x,y-14); ctx.lineTo(x,y-2); ctx.stroke();
+        ctx.fillStyle=COL[g]; ctx.beginPath();
+        ctx.moveTo(x,y-16); ctx.lineTo(x-5,y-8); ctx.lineTo(x+5,y-8); ctx.fill();
+        ctx.fillStyle= g==="orders"?"#E7F7EF":"#EAF1F7"; ctx.strokeStyle=COL[g]; ctx.lineWidth=1.8;
+        const bw=Math.min(190,w*0.4);
+        ctx.fillRect(pad,y,bw,24); ctx.strokeRect(pad+.5,y+.5,bw,24);
+        ctx.fillStyle= g==="orders"?"#166B47":"#3B4BB8"; ctx.font="600 10.5px Archivo, Arial"; ctx.textAlign="left";
+        ctx.fillText(g+" group  ·  offset "+o+" of "+N, pad+9, y+12);
+      });
+    } else {
+      const y=88;
+      ctx.fillStyle="#E7F7EF"; ctx.strokeStyle="#3FB984"; ctx.lineWidth=1.8;
+      const bw=Math.min(190,w*0.4);
+      ctx.fillRect(pad,y,bw,24); ctx.strokeRect(pad+.5,y+.5,bw,24);
+      ctx.fillStyle="#166B47"; ctx.font="600 10.5px Archivo, Arial"; ctx.textAlign="left";
+      ctx.fillText("consumers  ·  "+consumed.length+" of "+N+" taken", pad+9, y+12);
+      if(analytics){
+        ctx.fillStyle="#FBEAE9"; ctx.strokeStyle="#D9534F"; ctx.lineWidth=1.8;
+        ctx.fillRect(pad+bw+10,y,Math.min(200,w-pad*2-bw-10),24);
+        ctx.strokeRect(pad+bw+10.5,y+.5,Math.min(200,w-pad*2-bw-10),24);
+        ctx.fillStyle="#B0403C"; ctx.font="600 10.5px Archivo, Arial";
+        ctx.fillText("analytics  ·  missed "+consumed.length, pad+bw+19, y+12);
+      }
+    }
+    const left= log? N-Math.min(...Object.values(offsets)) : N-consumed.length;
+    out.innerHTML=
+      '<div><span>model</span><b>'+(log?"log":"queue")+'</b></div>'+
+      '<div><span>messages retained</span><b style="color:'+(log?"#1F7A52":"#D98324")+'">'+(log?N:N-consumed.length)+' / '+N+'</b></div>'+
+      '<div><span>consumer groups</span><b>'+(log?groups.length:(analytics?2:1))+'</b></div>'+
+      '<div><span>replay possible</span><b style="color:'+(log?"#1F7A52":"#D9534F")+'">'+(log?"yes":"no")+'</b></div>'+
+      '<div><span>late consumer sees</span><b>'+(log?"everything":"only new")+'</b></div>';
+    note.innerHTML=msg;
+  }
+  document.getElementById("bkNext").addEventListener("click",consume);
+  document.getElementById("bkAdd").addEventListener("click",addGroup);
+  document.getElementById("bkReplay").addEventListener("click",replay);
+  document.getElementById("bkRst").addEventListener("click",reset);
+  mEl.addEventListener("change",reset);
+  reset(); debounceResize(draw);
+})();
+
+/* ============ demo 2: outbox ============ */
+(function(){
+  const cv=document.getElementById("cOutbox"); if(!cv) return;
+  const dEl=document.getElementById("obD"), cEl=document.getElementById("obC"),
+        out=document.getElementById("obOut"), note=document.getElementById("obNote");
+  let k=0, timer=null;
+  function build(){
+    const dual=dEl.value==="dual", crash=cEl.checked;
+    const S=[];
+    if(dual){
+      S.push({db:false,ob:null,pub:false,crash:false,
+        note:"<b>A request arrives to place an order.</b> Two things must happen: the order is saved, and an <code>order.placed</code> event is published so fulfilment, analytics and the customer email service can react."});
+      S.push({db:true,ob:null,pub:false,crash:false,
+        note:"<b>The order is written and the transaction commits.</b> It is now durable. The event has not been sent yet — and there is no transaction that can cover both the database and the broker, because they are separate systems with no shared commit protocol."});
+      if(crash){
+        S.push({db:true,ob:null,pub:false,crash:true,fin:true,
+          note:"<b>The process dies here — a deploy, an out-of-memory kill, a node eviction.</b> The order exists and the event was never published. Fulfilment will never pick it up, no confirmation email is sent, and analytics shows a gap. Nothing errored from the customer's point of view: they saw a confirmation page. <em>Retrying does not help, because the process that would have retried is gone.</em> Reversing the order — publish first, then commit — just trades this for an event announcing an order that does not exist."});
+      } else {
+        S.push({db:true,ob:null,pub:true,crash:false,fin:true,
+          note:"<b>The event publishes successfully and everything is consistent.</b> This is what happens almost every time, which is precisely why the bug is hard to take seriously — until you multiply a small window by a large request volume and it becomes a steady trickle of orders that silently never ship. Tick the crash box and run it again."});
+      }
+    } else {
+      S.push({db:false,ob:null,pub:false,crash:false,
+        note:"<b>The same request, with an outbox table in the same database.</b> The event will be written as a row rather than sent to the broker directly."});
+      S.push({db:true,ob:"pending",pub:false,crash:false,
+        note:"<b>One transaction inserts both the order and the outbox row, and commits.</b> Two writes to the same database, so they are atomic in the ordinary way — either both are there or neither is. There is no window between them, because there is no gap to fall into."});
+      if(crash){
+        S.push({db:true,ob:"pending",pub:false,crash:true,
+          note:"<b>The process dies at exactly the same moment.</b> This time the order and the pending event are both safely committed. Nothing has been published yet, and nothing has been lost — the intent to publish is recorded in the same durable place as the fact it describes."});
+        S.push({db:true,ob:"pending",pub:false,crash:false,relay:true,
+          note:"<b>A separate relay process, unaffected by the crash, polls for unpublished rows and finds it.</b> The relay is deliberately not part of the request path: it can be restarted, scaled or replaced, and its only job is to move rows to the broker."});
+      } else {
+        S.push({db:true,ob:"pending",pub:false,crash:false,relay:true,
+          note:"<b>The relay polls for unpublished rows and picks this one up.</b> Typically within a few hundred milliseconds — the trade for this design is that publishing becomes asynchronous rather than immediate."});
+      }
+      S.push({db:true,ob:"sent",pub:true,crash:false,fin:true,
+        note:"<b>The event is published and the row is marked sent.</b> Consistent, with no possibility of an order without its event. One honest caveat: if the relay crashes between publishing and marking, the event is sent twice on the next pass — so the outbox gives at-least-once delivery, and the consumer must be idempotent. That is the deal, and it is a far better one than losing events."});
+    }
+    return S;
+  }
+  function draw(){
+    const S=build(), s=S[Math.min(k,S.length-1)], dual=dEl.value==="dual";
+    const w=cv.clientWidth||660, h=196, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h);
+    ctx.textBaseline="middle";
+    const bw=Math.min(150,(w-64)/3), gap=(w-32-bw*3)/2;
+    const boxes=[
+      ["orders table", s.db?"order 7c3a":"empty", s.db],
+      [dual?"(no outbox)":"outbox table", dual?"—":(s.ob?"1 row · "+s.ob:"empty"), !dual&&!!s.ob],
+      ["broker", s.pub?"order.placed":"nothing", s.pub]
+    ];
+    boxes.forEach(([lbl,val,on],i)=>{
+      const x=16+i*(bw+gap);
+      const na = i===1&&dual;
+      ctx.fillStyle= na?"#F7F9FA": on?"#E7F7EF":"#F5F7F9";
+      ctx.strokeStyle= na?"#EDF1F4": on?"#3FB984":"#CFD8E0"; ctx.lineWidth= on?2.1:1.2;
+      if(na) ctx.setLineDash([3,3]);
+      ctx.fillRect(x,34,bw,46); ctx.strokeRect(x+.5,34.5,bw,46); ctx.setLineDash([]);
+      ctx.fillStyle= na?"#D5DCE2":"#54677A"; ctx.font="600 10px Archivo, Arial"; ctx.textAlign="center";
+      ctx.fillText(lbl,x+bw/2,48);
+      ctx.fillStyle= na?"#D5DCE2": on?"#166B47":"#B8C4CE"; ctx.font="600 11px ui-monospace, monospace";
+      ctx.fillText(val,x+bw/2,66);
+    });
+    if(!dual&&k>=2){
+      ctx.strokeStyle="#3FB984"; ctx.lineWidth=2.2;
+      ctx.beginPath(); ctx.moveTo(16,26); ctx.lineTo(16+bw*2+gap,26); ctx.stroke();
+      ctx.fillStyle="#1F7A52"; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="center";
+      ctx.fillText("one transaction",(32+bw*2+gap)/2,18);
+    }
+    if(s.relay){
+      const x1=16+bw+gap+bw/2, x2=16+2*(bw+gap)+bw/2;
+      ctx.strokeStyle="#D98324"; ctx.lineWidth=2.2;
+      ctx.beginPath(); ctx.moveTo(x1,96); ctx.lineTo(x2,96); ctx.stroke();
+      ctx.fillStyle="#D98324"; ctx.beginPath();
+      ctx.moveTo(x2,96); ctx.lineTo(x2-9,91); ctx.lineTo(x2-9,101); ctx.fill();
+      ctx.fillStyle="#B0651A"; ctx.font="600 10px Archivo, Arial"; ctx.textAlign="center";
+      ctx.fillText("relay polls and publishes",(x1+x2)/2,84);
+    }
+    if(s.crash){
+      ctx.fillStyle="#FBEAE9"; ctx.strokeStyle="#D9534F"; ctx.lineWidth=2;
+      ctx.fillRect(16,112,w-32,28); ctx.strokeRect(16.5,112.5,w-32,28);
+      ctx.fillStyle="#B0403C"; ctx.font="600 11.5px Archivo, Arial"; ctx.textAlign="center";
+      ctx.fillText("✕  the process dies here", w/2, 126);
+    }
+    if(s.fin){
+      const bad=dual&&cEl.checked;
+      ctx.fillStyle= bad?"#FBEAE9":"#E7F7EF"; ctx.strokeStyle= bad?"#D9534F":"#3FB984"; ctx.lineWidth=2;
+      ctx.fillRect(16,150,w-32,30); ctx.strokeRect(16.5,150.5,w-32,30);
+      ctx.fillStyle= bad?"#B0403C":"#166B47"; ctx.font="600 11.5px Archivo, Arial"; ctx.textAlign="center";
+      ctx.fillText(bad? "order saved · event lost forever · downstream never knows"
+                      : "order saved · event delivered · consistent", w/2, 165);
+    }
+    const lost=dual&&cEl.checked&&k>=S.length-1;
+    out.innerHTML=
+      '<div><span>step</span><b>'+Math.min(k+1,S.length)+' / '+S.length+'</b></div>'+
+      '<div><span>order saved</span><b style="color:'+(s.db?"#1F7A52":"#8195A6")+'">'+(s.db?"yes":"no")+'</b></div>'+
+      '<div><span>event published</span><b style="color:'+(s.pub?"#1F7A52":lost?"#D9534F":"#8195A6")+'">'+(s.pub?"yes":lost?"never":"not yet")+'</b></div>'+
+      '<div><span>atomic</span><b style="color:'+(dual?"#D9534F":"#1F7A52")+'">'+(dual?"no":"yes")+'</b></div>'+
+      '<div><span>outcome</span><b style="color:'+(lost?"#D9534F":"#1F7A52")+'">'+(k<S.length-1?"—":lost?"data lost":"consistent")+'</b></div>';
+    note.innerHTML=s.note;
+  }
+  function stop(){ if(timer){clearInterval(timer);timer=null;document.getElementById("obAuto").textContent="Play";} }
+  document.getElementById("obNext").addEventListener("click",()=>{ if(k<build().length-1){k++;draw();} });
+  document.getElementById("obRst").addEventListener("click",()=>{ stop(); k=0; draw(); });
+  document.getElementById("obAuto").addEventListener("click",function(){
+    if(timer){stop();return;} this.textContent="Pause";
+    timer=setInterval(()=>{ if(k<build().length-1){k++;draw();} else stop(); },1700);
+  });
+  [dEl,cEl].forEach(e=>e.addEventListener("change",()=>{ stop(); k=0; draw(); }));
+  draw(); debounceResize(draw);
+})();
+</script>
+</body>
+</html>

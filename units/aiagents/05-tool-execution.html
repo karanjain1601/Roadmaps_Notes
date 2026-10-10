@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Executing tools safely — AI Agents</title>
+<meta name="description" content="Validation, authorisation, idempotency, timeouts, sandboxing code execution, and returning failures the model can recover from.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 05 · Tools and actions</div>
+    <h1>Executing tools safely</h1>
+    <p class="standfirst">Between the model asking for a tool call and something happening in the world sits your dispatch code. It is the only place in an agent where you have complete control, which makes it the right place to put every guarantee the system needs.</p>
+    <div class="chap-meta">
+      <span class="tagpill">validation</span>
+      <span class="tagpill">authorisation</span>
+      <span class="tagpill">idempotency</span>
+      <span class="tagpill">sandboxing</span>
+      <span class="tagpill">approval</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The execution pipeline</h2>
+
+<p>Seven gates, in this order. Order matters: cheap rejections first, side effects last.</p>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Resolve</b><span>Does this tool exist and is it in this request's toolset?</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Validate</b><span>Arguments against the schema. Reject before anything is touched</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Guard</b><span>Repeats, oscillation, per-run call limits</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Authorise</b><span>May this session's user do this, to this object? Server-side, from the session</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Gate consequences</b><span>Destructive or costly? Approval, dry-run or a proposal record</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>6 · Execute</b><span>With a timeout, an idempotency key and a circuit breaker</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>7 · Shape and truncate</b><span>Render for the model, cap the tokens, log the full thing separately</span></div>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">execute.py — the pipeline, complete</span><button class="copy">Copy</button></div>
+<pre><code>from dataclasses import dataclass
+
+@dataclass
+class Outcome:
+    observation: str          # what the model sees
+    ok: bool
+    audit: dict               # what the log sees — never the same object
+
+def execute(call, ctx: RequestContext, tools: dict, steps: list) -> Outcome:
+    # 1. resolve
+    tool = tools.get(call.name)
+    if tool is None:
+        return Outcome(f"Error: no tool called '{call.name}'. "
+                       f"Available: {', '.join(sorted(tools))}.", False,
+                       {"event": "unknown_tool", "requested": call.name})
+
+    # 2. validate
+    try:
+        args = tool.model.model_validate_json(call.arguments)
+    except ValidationError as e:
+        err = e.errors()[0]
+        field = ".".join(str(p) for p in err["loc"])
+        return Outcome(f"Error: invalid arguments for {call.name}. "
+                       f"Field '{field}': {err['msg']}. Fix and call again.", False,
+                       {"event": "invalid_args", "tool": call.name, "field": field})
+
+    # 3. guard
+    if (blocked := guard(call, args, ctx, steps)):
+        return Outcome(blocked, False, {"event": "guarded", "tool": call.name})
+
+    # 4. authorise — from the session, never from args
+    decision = authorise(tool, args, ctx)
+    if not decision.allowed:
+        return Outcome(f"Error: not permitted. {decision.reason}", False,
+                       {"event": "denied", "tool": call.name, "reason": decision.reason})
+
+    # 5. gate consequences
+    if tool.consequence != "none":
+        gate = consequence_gate(tool, args, ctx)
+        if gate.hold:
+            return Outcome(gate.observation, True,
+                           {"event": "held", "tool": call.name, "ref": gate.ref})
+
+    # 6. execute
+    key = idempotency_key(ctx.run_id, call.id, tool.name, args)
+    try:
+        result = tool.fn(args, ctx, idempotency_key=key, timeout=tool.timeout_s)
+    except ToolTimeout:
+        return Outcome(f"Error: {call.name} timed out after {tool.timeout_s}s. "
+                       f"It may have partially completed — do not retry it. "
+                       f"Verify the current state before continuing.", False,
+                       {"event": "timeout", "tool": call.name, "key": key})
+    except UpstreamUnavailable:
+        breaker.record_failure(tool.name)
+        return Outcome(f"Error: the {tool.upstream} service is unavailable. "
+                       f"Continue without it, or tell the user what is blocked.", False,
+                       {"event": "upstream_down", "tool": call.name})
+    except Exception as e:
+        log.exception("tool_failed", tool=call.name, run=ctx.run_id)
+        return Outcome(f"Error running {call.name}: {type(e).__name__}. "
+                       f"Consider a different approach.", False,
+                       {"event": "error", "tool": call.name, "type": type(e).__name__})
+
+    # 7. shape
+    rendered = tool.render(result)
+    return Outcome(truncate(rendered, tool.max_observation_tokens), True,
+                   {"event": "ok", "tool": call.name, "args": redact(args),
+                    "result_bytes": len(rendered)})</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Authorisation</h2>
+
+<p>This is the gate that matters most and the one most often implemented wrongly. Two rules, both absolute.</p>
+
+<div class="cols">
+  <div class="col bad">
+    <h4>Never</h4>
+    <ul>
+      <li>Take identity from a tool argument</li>
+      <li>Run tools with a service account that can see everything</li>
+      <li>Instruct the model in the prompt to only access permitted records</li>
+      <li>Filter results after fetching them broadly</li>
+      <li>Trust an id the model produced without checking it belongs to this session</li>
+    </ul>
+  </div>
+  <div class="col good">
+    <h4>Always</h4>
+    <ul>
+      <li>Derive identity from the session, server-side</li>
+      <li>Scope every query by that identity in the <code>WHERE</code> clause</li>
+      <li>Check object-level ownership, not just tool-level permission</li>
+      <li>Return "not permitted" identically to "not found"</li>
+      <li>Log every denial — a pattern of them is a signal</li>
+    </ul>
+  </div>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">authorise.py — tool-level and object-level, both</span><button class="copy">Copy</button></div>
+<pre><code>def authorise(tool, args, ctx) -> Decision:
+    # Tool-level: is this capability available to this role, in this mode?
+    if tool.name not in ROLE_TOOLS[ctx.role]:
+        return Decision(False, "this capability is not available for your role")
+    if ctx.mode == "read_only" and tool.consequence != "none":
+        return Decision(False, "this session is read-only")
+
+    # Object-level: does the thing being acted on belong to this session?
+    # This is the check that stops a persuasive ticket reaching another
+    # customer's data, and it cannot be skipped for "internal" tools.
+    for field, kind in tool.object_refs.items():          # {"order_id": "order"}
+        ref = getattr(args, field, None)
+        if ref is None:
+            continue
+        if not owns(ctx, kind, ref):
+            log.warn("object_denied", run=ctx.run_id, kind=kind, ref=ref)
+            # Deliberately indistinguishable from not-found: never confirm
+            # that an id exists to someone not entitled to see it.
+            return Decision(False, f"no {kind} with that reference is available")
+
+    return Decision(True, None)</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">The model is not a security boundary</span>
+  <p>Anything you ask the model to enforce is a suggestion. "Only access records for the current customer" is a sentence that competes with every other sentence in a context window that includes text an attacker may have written. The only enforcement that holds is the one in <code>authorise()</code>, running in your process, using an identity the model never touches. Put the instruction in the prompt as well — it improves behaviour — but never rely on it.</p>
+</div>
+
+<h2><span class="h-rule"></span>Idempotency</h2>
+
+<p>Agents retry. They retry after timeouts, after ambiguous errors, and sometimes simply because the observation did not read like success. A tool that is not idempotent will eventually do its thing twice.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">idempotency, from the run identity rather than the clock</span><button class="copy">Copy</button></div>
+<pre><code>import hashlib, json
+
+def idempotency_key(run_id: str, call_id: str, tool: str, args) -> str:
+    """Stable across retries of the SAME logical action, distinct across different ones."""
+    payload = json.dumps({"run": run_id, "tool": tool,
+                          "args": args.model_dump()}, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+# Note the key uses run_id + args, NOT call_id. If the model retries the same
+# refund with identical arguments after a timeout, the provider sees the same
+# key and returns the original result rather than issuing a second refund.
+# Including call_id would defeat that, because the retry has a new call id.
+
+def issue_refund(args, ctx, idempotency_key: str, timeout: float):
+    return payments.refund(payment_id=args.payment_id, amount=args.amount,
+                           idempotency_key=idempotency_key, timeout=timeout)</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Timeouts are the dangerous case, not errors</span>
+  <p>A clean error means nothing happened. A timeout means you do not know. The agent will be tempted to retry, and if the first call actually succeeded you now have two refunds, two emails, two tickets. The observation text above is written deliberately: <em>it may have partially completed — do not retry it, verify the state first</em>. Pair that with an idempotency key so that if it retries anyway, nothing bad happens. Belt and braces, because the model will occasionally ignore the belt.</p>
+</div>
+
+<h2><span class="h-rule"></span>Gating consequences</h2>
+
+<p>Classify every tool by what it can do. This one field drives most of the safety machinery.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Class</th><th>Examples</th><th>Treatment</th></tr></thead>
+<tbody>
+<tr><td><b>none</b> — read-only</td><td>get_order, search_policy, list_payments</td><td>Run freely. Rate-limit only</td></tr>
+<tr><td><b>reversible</b></td><td>add_note, set_tag, create_draft</td><td>Run, but log and make undo easy</td></tr>
+<tr><td><b>external</b></td><td>send_email, post_message, call_webhook</td><td>Approval, or a strict recipient allowlist. Cannot be unsent</td></tr>
+<tr><td><b>financial</b></td><td>refund, charge, adjust_credit</td><td>Threshold-based approval, idempotency, full audit</td></tr>
+<tr><td><b>destructive</b></td><td>delete_record, cancel_order, revoke_access</td><td>Soft delete plus approval. Never a hard delete from an agent</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="demo" id="exec">
+  <div class="demo-head">
+    <b>Consequence gate</b>
+    <span>One proposed action, several policies. See what reaches the world and what the agent is told.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="e-tool">Requested action</label>
+        <select id="e-tool">
+          <option value="get">get_order — read a record</option>
+          <option value="note">add_note — reversible write</option>
+          <option value="email">send_email — external, irreversible</option>
+          <option value="refund" selected>issue_refund — £48.00</option>
+          <option value="refund_big">issue_refund — £940.00</option>
+          <option value="delete">delete_customer — destructive</option>
+        </select>
+      </div>
+      <div>
+        <label for="e-mode">Session mode</label>
+        <select id="e-mode">
+          <option value="read_only">Read-only</option>
+          <option value="assisted" selected>Assisted — agent proposes, human approves</option>
+          <option value="auto">Autonomous within limits</option>
+        </select>
+      </div>
+      <div>
+        <label for="e-limit">Auto-approval limit — £<span id="e-limitv">100</span></label>
+        <input type="range" id="e-limit" min="0" max="1000" step="25" value="100">
+      </div>
+    </div>
+    <label style="margin-top:12px"><input type="checkbox" id="e-idem" checked> Idempotency key on write tools</label>
+    <div id="e-out"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">consequence_gate — proposals are first-class objects</span><button class="copy">Copy</button></div>
+<pre><code>def consequence_gate(tool, args, ctx) -> Gate:
+    if ctx.mode == "auto" and tool.consequence in ("none", "reversible"):
+        return Gate(hold=False)
+
+    if tool.consequence == "financial":
+        amount = float(getattr(args, "amount", 0))
+        if ctx.mode == "auto" and amount <= ctx.auto_approve_limit:
+            return Gate(hold=False)
+
+    proposal = proposals.create(
+        run_id=ctx.run_id, tool=tool.name, args=args.model_dump(),
+        requested_by=ctx.user_id, rationale=recent_reasoning(ctx),
+        expires_at=now_utc() + timedelta(hours=24),
+    )
+    return Gate(hold=True, ref=proposal.ref, observation=(
+        f"Queued for human approval as {proposal.ref}. It has NOT been executed. "
+        f"Do not attempt this action again. Continue with anything else you can "
+        f"do, then report what is pending."))</code></pre>
+</div>
+
+<p>Three details in that observation carry weight. It says the action <em>has not</em> happened, so the agent does not report success. It says not to retry, which prevents a loop. And it tells the agent to continue with other work, so a single held action does not waste the remaining budget.</p>
+
+<h2><span class="h-rule"></span>Sandboxing code execution</h2>
+
+<p>A code-execution tool is the most powerful thing you can hand an agent and the one with no partial measures. If generated code runs anywhere your application code can reach, you have no security model.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Control</th><th>Setting</th><th>Stops</th></tr></thead>
+<tbody>
+<tr><td>Process isolation</td><td>Separate container per execution, destroyed after</td><td>State leaking between runs and users</td></tr>
+<tr><td>Network</td><td>Disabled by default; allowlist if genuinely needed</td><td>Exfiltration, SSRF, calling your internal services</td></tr>
+<tr><td>Filesystem</td><td>Read-only root, one small writable scratch mount</td><td>Persistence, tampering, filling the disk</td></tr>
+<tr><td>User</td><td>Non-root, no capabilities, no host mounts</td><td>Escape attempts</td></tr>
+<tr><td>Limits</td><td>Memory cap, CPU quota, process count, wall-clock timeout</td><td>Fork bombs, infinite loops, noisy-neighbour effects</td></tr>
+<tr><td>Secrets</td><td>None in the environment. Ever</td><td>The most common real-world leak from this tool</td></tr>
+<tr><td>Output</td><td>Truncate stdout and stderr before they become an observation</td><td>A print loop consuming the whole context window</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">run_code — the minimum acceptable shape</span><button class="copy">Copy</button></div>
+<pre><code>def run_code(args, ctx, idempotency_key=None, timeout=20) -> dict:
+    with sandbox.session(
+        image="python-sandbox:3.12-slim",
+        network="none",
+        readonly_root=True,
+        writable=["/work"],
+        user="nobody",
+        memory_mb=512, cpus=0.5, pids_max=64,
+        env={},                          # deliberately empty
+        timeout_s=timeout,
+    ) as box:
+        box.put("/work/main.py", args.code)
+        for f in ctx.attached_files:     # only files this session already owns
+            box.put(f"/work/{f.name}", f.bytes)
+        r = box.run(["python", "/work/main.py"], cwd="/work")
+
+    return {
+        "exit_code": r.exit_code,
+        "stdout": truncate_chars(r.stdout, 4000),
+        "stderr": truncate_chars(r.stderr, 2000),
+        "files_written": [f.name for f in r.new_files][:20],
+        "_note": "No network access. Output truncated at 4000 characters.",
+    }</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Code produced by an agent is untrusted input</span>
+  <p>It does not matter that the model is helpful and the user is legitimate. The code may have been shaped by text the model read from a document, a web page or a ticket — the injection path in chapter 15. Treat every execution as if it were written by an anonymous stranger on the internet, because in the adversarial case it effectively was.</p>
+</div>
+
+<h2><span class="h-rule"></span>Reliability details that bite later</h2>
+
+<ul class="check">
+  <li><b>Per-tool timeouts, not one global value.</b> A database lookup gets 3 seconds; a report build gets 60. A single global timeout is either too short for the slow tool or too long for a stuck one.</li>
+  <li><b>Circuit-break flaky upstreams.</b> After N failures, stop calling and return "unavailable" immediately. An agent burning eight steps retrying a dead service is worse than one told plainly it is down.</li>
+  <li><b>Cache read-only calls within a run.</b> Agents re-read the same record repeatedly. A per-run cache keyed on tool plus arguments removes those steps and costs nothing.</li>
+  <li><b>Rate-limit per run, not just per user.</b> A single run should not be able to make ninety search calls.</li>
+  <li><b>Truncate at the token level, with a marker.</b> <code>"…[truncated, 340 of 2,100 rows shown — narrow with since=]"</code> tells the model both that there is more and how to get it.</li>
+  <li><b>Keep the audit record separate from the observation.</b> The model sees a shaped summary; the log keeps the full call, arguments and result, redacted per chapter 15.</li>
+  <li><b>Make tools testable in isolation.</b> Every tool should have unit tests that never involve a model. Most tool bugs are ordinary bugs.</li>
+</ul>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Dispatch is the one place with full control. <b>Seven gates: resolve, validate, guard, authorise, gate consequences, execute, shape.</b></li>
+    <li><b>Authorisation is object-level, from the session</b>, in your code. The model is never a security boundary.</li>
+    <li>Return "not permitted" <b>indistinguishably from "not found"</b>.</li>
+    <li>Agents retry. <b>Idempotency keys derived from run and arguments</b> make that survivable.</li>
+    <li><b>Timeouts are more dangerous than errors</b> — tell the agent not to retry, and make retrying harmless anyway.</li>
+    <li>Classify every tool by consequence. <b>Proposals are first-class records</b>, and the observation must say the action did <em>not</em> happen.</li>
+    <li>Code execution: <b>container, no network, read-only root, non-root user, hard limits, no secrets</b>. No partial measures.</li>
+    <li>Per-tool timeouts, circuit breakers, per-run caching and truncation markers — <b>the unglamorous parts that decide reliability</b>.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("05-tool-execution.html");
+
+(function(){
+  const root = document.getElementById("exec");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const ACTIONS = {
+    get:        {label:"get_order",        cls:"none",        amount:0},
+    note:       {label:"add_note",         cls:"reversible",  amount:0},
+    email:      {label:"send_email",       cls:"external",    amount:0},
+    refund:     {label:"issue_refund",     cls:"financial",   amount:48},
+    refund_big: {label:"issue_refund",     cls:"financial",   amount:940},
+    delete:     {label:"delete_customer",  cls:"destructive", amount:0}
+  };
+
+  function render(){
+    const a = ACTIONS[$("e-tool").value];
+    const mode = $("e-mode").value;
+    const limit = parseInt($("e-limit").value, 10);
+    const idem = $("e-idem").checked;
+    $("e-limitv").textContent = limit;
+
+    let verdict, sev, obs, notes = [];
+
+    if(mode === "read_only" && a.cls !== "none"){
+      verdict = "Blocked at gate 4 — authorisation";
+      sev = "warn";
+      obs = "Error: not permitted. This session is read-only.";
+      notes.push("Read-only mode is the cheapest safety control you have, and it covers more use cases than teams expect. An agent that investigates and reports is useful on its own.");
+    }
+    else if(a.cls === "none"){
+      verdict = "Executed";
+      sev = "good";
+      obs = "{\"order_id\":\"NW-8842\",\"status\":\"shipped\",\"total\":\"GBP 48.00\", …}";
+      notes.push("Read-only calls run freely. The only controls that apply are object-level authorisation — is this order visible to this session — and a per-run rate limit.");
+    }
+    else if(a.cls === "reversible" && mode === "auto"){
+      verdict = "Executed";
+      sev = "good";
+      obs = "{\"note_id\":\"n_4412\",\"created\":true}";
+      notes.push("Reversible writes are safe to automate provided undo is genuinely easy and the change is logged against the run id.");
+    }
+    else if(a.cls === "financial" && mode === "auto" && a.amount <= limit){
+      verdict = "Executed — within the auto-approval limit";
+      sev = "warn";
+      obs = "{\"refund_id\":\"r_8821\",\"amount\":\"GBP " + a.amount.toFixed(2) + "\",\"status\":\"issued\"}";
+      notes.push("£" + a.amount.toFixed(2) + " is at or below the £" + limit + " limit, so it executed without a human. " +
+                 "Set this threshold from the cost of being wrong, not from convenience — and alert on the rate, because a sudden rise is the first sign of something going wrong upstream.");
+      if(!idem)
+        notes.push("No idempotency key. If this call times out and the agent retries, the customer is refunded twice and nothing in the trace looks unusual.");
+    }
+    else {
+      verdict = "Held for human approval";
+      sev = "good";
+      obs = "Queued for human approval as AP-2210. It has NOT been executed. Do not attempt this action again. Continue with anything else you can do, then report what is pending.";
+      if(a.cls === "financial" && a.amount > limit)
+        notes.push("£" + a.amount.toFixed(2) + " exceeds the £" + limit + " auto-approval limit, so it becomes a proposal record rather than an action.");
+      if(a.cls === "external")
+        notes.push("Outbound messages cannot be unsent, so they are held regardless of mode. The alternative — a strict recipient allowlist — works when the set of possible recipients is small and known.");
+      if(a.cls === "destructive")
+        notes.push("Destructive actions are held in every mode. In practice an agent should never have a hard-delete tool at all: expose a soft delete, and let a human make it permanent.");
+      notes.push("Note the wording of the observation. It states the action did not happen (so the agent does not report success), forbids retrying (so it does not loop), and tells it to continue with other work (so one held action does not waste the remaining budget).");
+    }
+
+    if(idem && a.cls !== "none" && !(mode === "read_only" && a.cls !== "none"))
+      notes.push("Idempotency key is derived from run id plus arguments, not from the call id — so a retry of the same logical action reuses it and the provider returns the original result instead of acting twice.");
+
+    const colour = sev === "good" ? "#3FB984" : sev === "warn" ? "#F2A03D" : "#E2574C";
+    $("e-out").innerHTML =
+      '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid ' + colour +
+      ';border-radius:4px;padding:11px 13px;margin:14px 0 8px">' +
+      '<div style="font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:#54677A;margin-bottom:5px">' +
+      a.label + ' · consequence: ' + a.cls + '</div>' +
+      '<div style="font-weight:600;font-size:14.5px;margin-bottom:7px">' + verdict + '</div>' +
+      '<div style="font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:#54677A;margin-bottom:4px">observation returned to the agent</div>' +
+      '<pre style="margin:0;font-family:var(--mono);font-size:12px;white-space:pre-wrap;color:#25323E">' +
+      obs.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre></div>' +
+      '<div class="out">' + notes.join("\n\n") + '</div>';
+  }
+
+  ["e-tool","e-mode","e-limit","e-idem"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

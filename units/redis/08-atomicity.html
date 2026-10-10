@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Transactions, Lua and functions — Redis</title>
+<meta name="description" content="Three ways to make several operations indivisible, what MULTI actually guarantees, and why a Lua script is usually the right answer.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 08 · Patterns</div>
+    <h1>Transactions, Lua and functions</h1>
+    <p class="standfirst">Single commands are atomic for free (chapter 1). Making <em>several</em> operations indivisible takes one of three mechanisms, and the one named "transaction" is the least useful of them — because it cannot make a decision based on what it read.</p>
+    <div class="chap-meta">
+      <span class="tagpill">multi</span>
+      <span class="tagpill">watch</span>
+      <span class="tagpill">lua</span>
+      <span class="tagpill">functions</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>MULTI is not a transaction</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">what it actually does</span><button class="copy">Copy</button></div>
+<pre><code>MULTI
+  INCR   counter        # QUEUED  — not executed yet
+  LPUSH  log "event"    # QUEUED
+  EXPIRE log 3600       # QUEUED
+EXEC                    # all three now run, with nothing interleaved
+
+# WHAT YOU GET:
+#   * the queued commands run consecutively — no other client's command runs
+#     between them
+#   * all of them run
+#
+# WHAT YOU DO NOT GET, and the names mislead here:
+#   * ROLLBACK. If the third command fails at runtime, the first two have
+#     already applied and stay applied. There is no undo
+#   * READS. Every command returns QUEUED, so you cannot use the result of
+#     one command to decide the next. That is the fundamental limitation
+#
+# Errors split into two kinds:
+MULTI
+  NOTACOMMAND foo       # syntax error — detected at queue time
+EXEC                    # EXECABORT: the whole thing is discarded
+
+MULTI
+  LPUSH mykey "x"       # queued fine
+  INCR  mykey           # queued fine — mykey is a list, but Redis does not
+EXEC                    # know that until it runs
+# 1) (integer) 1
+# 2) (error) WRONGTYPE ...      <- the LPUSH already happened
+
+DISCARD                 # abandon a queued transaction
+
+# Because there are no reads, MULTI is only useful for "do these unrelated
+# writes together" — the LPUSH-then-LTRIM pair from chapter 4, or several
+# counters that must move as one. Anything conditional needs WATCH or Lua.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">"Atomic" here means uninterrupted, not all-or-nothing</span>
+  <p>Redis documentation calls <code>MULTI</code>/<code>EXEC</code> a transaction and it does not have the property people expect from that word. It guarantees <b>isolation</b> — no other client's commands interleave — and it does not guarantee <b>atomicity in the failure sense</b>: a runtime error partway through leaves the earlier commands applied. The reasoning given by the project is that such errors are programming bugs rather than runtime conditions, and that rollback support would slow down the common path for no benefit. Whether or not you find that convincing, the practical consequence is the same: <b>do not use <code>MULTI</code> where partial application would be a correctness problem.</b></p>
+</div>
+
+<h2><span class="h-rule"></span>WATCH</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">optimistic concurrency, with a retry loop you write</span><button class="copy">Copy</button></div>
+<pre><code># WATCH makes EXEC fail if a watched key changed since the WATCH.
+WATCH stock:TSH-001
+current = GET stock:TSH-001              # a real read — outside MULTI
+if current < 3: UNWATCH; return "insufficient"
+
+MULTI
+  DECRBY stock:TSH-001 3
+EXEC
+# (nil)  -> someone modified stock:TSH-001 in between. RETRY the whole thing.
+# [ok]   -> it went through
+
+# This is check-and-set. The read happens before MULTI, the decision is made
+# in your application, and WATCH guarantees the value did not change
+# underneath you — if it did, EXEC returns nil and you start again.
+
+# The costs, and they are the reason for the next section:
+#   * a retry loop in every caller, which people get wrong or omit
+#   * under contention the retries themselves collide, and throughput
+#     degrades quadratically on a hot key
+#   * three round trips minimum: WATCH, GET, MULTI+EXEC
+#   * WATCH is cleared by EXEC, UNWATCH, or the connection closing — forget
+#     UNWATCH on the early-return path and the next transaction on that
+#     connection carries a stale watch
+#   * with connection pooling, all of the above must happen on ONE
+#     connection, which some client libraries make awkward
+
+# WATCH is correct and it is rarely the best available option. The same
+# logic as a Lua script is one round trip, needs no retry loop, and cannot
+# be interleaved at all.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Comparing the three</h2>
+
+<div class="demo" id="atom">
+  <div class="demo-head">
+    <b>The same problem, three ways</b>
+    <span>Decrement stock only if there is enough. Watch how the guarantees and the round trips differ.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="a-how">Mechanism</label>
+        <select id="a-how">
+          <option value="naive">Read, decide, write</option>
+          <option value="multi">MULTI / EXEC</option>
+          <option value="watch">WATCH + MULTI</option>
+          <option value="lua" selected>Lua script</option>
+          <option value="fn">A Redis function</option>
+        </select>
+      </div>
+      <div>
+        <label for="a-conc">Concurrent callers — <span id="a-concv">50</span></label>
+        <input type="range" id="a-conc" min="1" max="200" step="1" value="50">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="a-safe">—</b><span>correct?</span></div>
+      <div><b id="a-rtt">—</b><span>round trips</span></div>
+      <div><b id="a-retry">—</b><span>retries under load</span></div>
+      <div><b id="a-block">—</b><span>blocks the server</span></div>
+    </div>
+    <div id="a-code"></div>
+    <div class="out" id="a-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Lua</h2>
+
+<div class="code" data-lang="lua">
+<div class="code-head"><span class="lang">the usual answer</span><button class="copy">Copy</button></div>
+<pre><code>-- Runs on the server, atomically, in one round trip. Nothing interleaves.
+EVAL "
+  local stock = tonumber(redis.call('GET', KEYS[1]) or 0)
+  local want  = tonumber(ARGV[1])
+  if stock < want then return -1 end
+  redis.call('DECRBY', KEYS[1], want)
+  return stock - want
+" 1 stock:TSH-001 3
+
+-- KEYS and ARGV are separate on purpose. Every key the script touches must
+-- be declared in KEYS, because that is how Redis Cluster knows which node
+-- the script belongs on (chapter 16). Building a key name from ARGV works on
+-- a single instance and breaks the moment you shard.
+
+-- Load once, call by hash — the script body then crosses the network once
+-- rather than on every call:
+SCRIPT LOAD "return redis.call('GET', KEYS[1])"
+-- "a5260dd66ce02462c5b5231c727b3f7772c0bcc5"
+EVALSHA a5260dd66ce02462c5b5231c727b3f7772c0bcc5 1 mykey
+-- NOSCRIPT means the cache was cleared — fall back to EVAL. Every good
+-- client library does this automatically.
+
+SCRIPT EXISTS <sha>
+SCRIPT FLUSH                -- clears the cache. Invalidates every EVALSHA
+SCRIPT KILL                 -- stop a running script, if it has not written
+
+-- WHAT A SCRIPT CAN DO THAT NOTHING ELSE CAN:
+--   read a value and branch on it, atomically
+--   loop over a collection server-side
+--   return a computed result rather than raw values
+--   perform many operations in one round trip</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">A script blocks the entire server for its whole duration</span>
+  <p>That is <em>why</em> it is atomic — nothing else runs (chapter 1). A ten-millisecond script is ten milliseconds of total unavailability for every client, and unlike an accidentally slow command this one you deployed on purpose. Worse, <code>SCRIPT KILL</code> only works on a script that has not yet written; once it has, the only way out is <code>SHUTDOWN NOSAVE</code>, which loses everything not persisted. <b>Keep scripts short and bounded.</b> A loop over a collection whose size you do not control is the reliable way to produce latency spikes that no single slow command explains, and <code>busy-reply-threshold</code> (default 5 seconds) is how long the server will accept being stuck before it even starts refusing other clients.</p>
+</div>
+
+<div class="code" data-lang="lua">
+<div class="code-head"><span class="lang">writing scripts that behave</span><button class="copy">Copy</button></div>
+<pre><code>-- DETERMINISM. Scripts are replicated by effect since Redis 5, so the
+-- old ban on randomness and time is relaxed — but a script whose result
+-- depends on the server clock still behaves differently on a replay during
+-- recovery. Pass time in from the caller when it matters:
+EVAL "... ARGV[1] is the timestamp ..." 1 key 1741946400
+
+-- redis.call vs redis.pcall:
+redis.call('GET', k)     -- an error aborts the whole script
+redis.pcall('GET', k)    -- returns the error as a value; you handle it
+
+-- TYPE CONVERSION is the commonest source of bugs. Lua numbers are doubles
+-- and Redis integers are 64-bit, so returning a number TRUNCATES it:
+return 3.7               -- the client receives 3
+return tostring(3.7)     -- "3.7"
+return redis.error_reply("insufficient stock")
+return redis.status_reply("OK")
+-- Lua false becomes nil; Lua nil terminates an array reply early, so never
+-- put a nil in the middle of a table you are returning.
+
+-- A useful complete example — rate limit with a token bucket (chapter 10):
+local tokens = tonumber(redis.call('HGET', KEYS[1], 'tokens') or ARGV[1])
+local last   = tonumber(redis.call('HGET', KEYS[1], 'ts') or ARGV[3])
+local now, rate, cap = tonumber(ARGV[3]), tonumber(ARGV[2]), tonumber(ARGV[1])
+
+tokens = math.min(cap, tokens + (now - last) * rate)
+if tokens < 1 then return 0 end
+
+redis.call('HSET', KEYS[1], 'tokens', tokens - 1, 'ts', now)
+redis.call('EXPIRE', KEYS[1], math.ceil(cap / rate))
+return 1
+
+-- Read, compute, branch, write, expire — five operations, one round trip,
+-- atomic, and impossible to express in MULTI at all.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Functions</h2>
+
+<div class="code" data-lang="lua">
+<div class="code-head"><span class="lang">Redis 7's answer to "where does the script live"</span><button class="copy">Copy</button></div>
+<pre><code>#!lua name=inventory
+
+local function reserve(keys, args)
+  local stock = tonumber(redis.call('GET', keys[1]) or 0)
+  local want  = tonumber(args[1])
+  if stock < want then return redis.error_reply('insufficient') end
+  redis.call('DECRBY', keys[1], want)
+  return stock - want
+end
+
+redis.register_function('reserve', reserve)
+
+-- Load the library, then call functions by NAME:
+FUNCTION LOAD "#!lua name=inventory ..."
+FCALL reserve 1 stock:TSH-001 3
+FCALL_RO get_stock 1 stock:TSH-001        -- read-only, can run on a replica
+
+FUNCTION LIST
+FUNCTION STATS
+FUNCTION DUMP / RESTORE                   -- move libraries between servers
+
+-- WHY THIS EXISTS. Scripts are cached per server, evaporate on restart, are
+-- addressed by an opaque SHA, and are effectively invisible in the codebase
+-- because they live as strings inside application code. Functions are
+-- registered by name, PERSIST across restarts, replicate to replicas, and
+-- are managed as a first-class server object.
+--
+-- The practical difference: with EVALSHA the source of truth for your
+-- server-side logic is scattered through your application; with functions it
+-- is a library you deploy deliberately, which makes it reviewable and
+-- versionable like anything else.
+
+-- The trade is deployment. A function must be loaded before it can be
+-- called, so you need a step that installs libraries — and on a fresh
+-- replica or a restored instance, something must reload them. EVALSHA with
+-- an automatic EVAL fallback is self-healing, which is why plenty of
+-- production systems still use scripts.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Choosing</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Need</th><th>Use</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>One command</td><td>The command</td><td>Already atomic. Nothing to add</td></tr>
+<tr><td>Several unrelated writes together</td><td><code>MULTI</code></td><td>No reads needed; isolation is enough</td></tr>
+<tr><td>Just avoiding round trips</td><td><b>Pipelining</b></td><td>Not atomic, and much simpler (chapter 14)</td></tr>
+<tr><td>Read, decide, write</td><td><b>Lua</b></td><td>One round trip, no retry loop, cannot interleave</td></tr>
+<tr><td>Read, decide, write — no scripting allowed</td><td><code>WATCH</code></td><td>Correct, with a retry loop you must write</td></tr>
+<tr><td>Logic reused across services</td><td><b>Functions</b></td><td>Named, persistent, deployable</td></tr>
+<tr><td>Anything long-running</td><td><b>None of these</b></td><td>Every one of them blocks the server</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Pipelining is not atomicity, and it is what people usually want</span>
+  <p>These two get conflated constantly. <b>Pipelining</b> sends many commands without waiting for each reply — it is purely a round-trip optimisation, other clients' commands can interleave freely, and it turns a hundred sequential operations into one network exchange. <b><code>MULTI</code></b> additionally guarantees nothing interleaves. If your reason for reaching for <code>MULTI</code> is "this loop of a thousand commands is slow", the answer is a pipeline, and it is simpler, has no error semantics to reason about, and works identically in cluster mode. Reach for <code>MULTI</code> only when the interleaving would actually be wrong. Chapter 14 covers pipelining properly.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b><code>MULTI</code> guarantees no interleaving, not all-or-nothing.</b> A runtime error leaves earlier commands applied.</li>
+    <li><b>Every command in <code>MULTI</code> returns QUEUED</b>, so you cannot branch on what you read. That is its real limitation.</li>
+    <li><b><code>WATCH</code> is check-and-set</b> with a retry loop you write — correct, and rarely the best option.</li>
+    <li><b>Lua is usually the answer</b>: read, decide, write, in one round trip, atomically.</li>
+    <li><b>Declare every key in <code>KEYS</code></b>, or the script breaks the moment you use cluster mode.</li>
+    <li><b>A script blocks the whole server.</b> Keep it short and bounded — a runaway one may need <code>SHUTDOWN NOSAVE</code>.</li>
+    <li><b>Lua numbers are doubles</b>, so returning a float truncates. Return strings when precision matters.</li>
+    <li><b>Pipelining is not atomicity</b>, and it is what most people reaching for <code>MULTI</code> actually want.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("08-atomicity.html");
+
+(function(){
+  const root = document.getElementById("atom");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const M = {
+    naive: {safe:"NO", rtt:"2", block:"no",
+      retry: () => "n/a",
+      code:'stock = GET stock:TSH-001      # both clients read 5\nif stock >= 3:\n    DECRBY stock:TSH-001 3    # both decrement\n\n# Started with 5, two clients each take 3,\n# ends at -1. You oversold.',
+      note:"The baseline, and it is wrong. Between the read and the write, another client can read the same value and make the same decision.\n\nThis is the lost update from the SQL unit's chapter 10, and it is the reason every other option on this list exists. It is also the version that passes every test written with one client and fails silently in production under concurrency — the stock goes negative occasionally and nobody can reproduce it.\n\nNote that each individual command IS atomic. GET is atomic, DECRBY is atomic. What is not atomic is the decision made between them."},
+    multi: {safe:"NO", rtt:"2", block:"briefly",
+      retry: () => "n/a",
+      code:'MULTI\n  DECRBY stock:TSH-001 3\nEXEC\n\n# ... but where does the check go?\n# Every command in MULTI returns QUEUED, so\n# you cannot read the stock and branch on it.',
+      note:"MULTI does not help here, and seeing why is the point of this option.\n\nEvery queued command returns QUEUED rather than a value, so there is no way to read the stock inside the transaction and decide whether to proceed. You can queue the DECRBY, and you cannot condition it on anything.\n\nMULTI is for \"do these unrelated writes together\" — the LPUSH-then-LTRIM pair from chapter 4, or several counters that must move as one. The moment a decision is involved, it is the wrong mechanism.\n\nAnd remember it has no rollback: if a later command in the transaction fails at runtime, the earlier ones stay applied."},
+    watch: {safe:"yes", rtt:"3+", block:"briefly",
+      retry: (n) => n <= 5 ? "rare" : n <= 30 ? "some" : "heavy",
+      code:'while True:\n    WATCH stock:TSH-001\n    stock = GET stock:TSH-001\n    if stock < 3:\n        UNWATCH; return "insufficient"\n    MULTI\n      DECRBY stock:TSH-001 3\n    result = EXEC\n    if result is not None:\n        break            # success\n    # else: someone changed it — retry',
+      note:"Correct. WATCH makes EXEC return nil if the watched key changed between the WATCH and the EXEC, so the client detects the interference and retries.\n\nThree things to be careful about. The retry loop must exist and must be bounded — an unbounded retry under heavy contention is a livelock. All of these commands must run on the SAME connection, which with a connection pool means checking one out for the duration. And UNWATCH on every early-return path, or the next transaction on that pooled connection inherits a stale watch.\n\nThe deeper issue is contention behaviour: it is optimistic, so conflicting callers do not queue, they fail and retry. Move the concurrency slider up and watch the retry column."},
+    lua: {safe:"yes", rtt:"1", block:"microseconds",
+      retry: () => "none",
+      code:'EVAL "\n  local stock = tonumber(redis.call(\'GET\', KEYS[1]) or 0)\n  local want  = tonumber(ARGV[1])\n  if stock < want then return -1 end\n  redis.call(\'DECRBY\', KEYS[1], want)\n  return stock - want\n" 1 stock:TSH-001 3\n\n# -1 = insufficient, otherwise the new stock level',
+      note:"The read, the decision and the write happen inside one server-side execution with nothing interleaving. There is no window to race in and therefore nothing to retry.\n\nOne round trip instead of three, no connection affinity to manage, no retry loop to get wrong, and the contention behaviour is simply serialisation — callers queue behind each other for microseconds rather than colliding and retrying.\n\nThis is why Lua is the default answer for read-decide-write in Redis. Use SCRIPT LOAD and EVALSHA so the script body crosses the network once rather than on every call.\n\nThe discipline required: declare every key in KEYS rather than constructing key names from ARGV, or the script works on a single instance and breaks under cluster mode. And keep it short — it blocks the server for its whole duration."},
+    fn: {safe:"yes", rtt:"1", block:"microseconds",
+      retry: () => "none",
+      code:'#!lua name=inventory\nlocal function reserve(keys, args)\n  local stock = tonumber(redis.call(\'GET\', keys[1]) or 0)\n  if stock < tonumber(args[1]) then\n    return redis.error_reply(\'insufficient\')\n  end\n  redis.call(\'DECRBY\', keys[1], args[1])\n  return stock - tonumber(args[1])\nend\nredis.register_function(\'reserve\', reserve)\n\n# FCALL reserve 1 stock:TSH-001 3',
+      note:"Identical semantics to the Lua script — the difference is entirely in where the code lives and how it is managed.\n\nA function is registered by name in a library, persists across restarts, replicates to replicas, and appears in FUNCTION LIST as a first-class server object. A script is cached by an opaque SHA, evaporates on restart, and lives as a string literal somewhere in your application code where nobody reviews it.\n\nFor logic shared across several services, or logic complex enough to deserve review, functions are the better home. FCALL_RO also lets read-only functions run on a replica, which EVALSHA cannot do safely.\n\nThe trade is deployment: something must load the library before anything can call it, including on a fresh replica or a restored instance. EVALSHA with an automatic EVAL fallback is self-healing, which is why plenty of production systems stay with scripts."}
+  };
+
+  function render(){
+    const k = $("a-how").value, m = M[k];
+    const n = parseInt($("a-conc").value, 10);
+    $("a-concv").textContent = n;
+
+    $("a-safe").textContent  = m.safe;
+    $("a-rtt").textContent   = m.rtt;
+    $("a-retry").textContent = m.retry(n);
+    $("a-block").textContent = m.block;
+
+    const bad = m.safe === "NO";
+    $("a-code").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid ' +
+      (bad ? "#E2574C" : k === "watch" ? "#F2A03D" : "#3FB984") +
+      ';border-radius:5px;padding:11px 13px;margin:16px 0 12px;font-family:var(--mono);' +
+      'font-size:12px;line-height:1.65;overflow-x:auto">' +
+      m.code.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>';
+
+    const notes = [m.note];
+
+    if(k === "watch" && n > 30)
+      notes.push("At " + n + " concurrent callers on one key, WATCH degrades badly. Each conflicting caller fails its EXEC and retries the whole sequence — three round trips — and the retries collide with each other, so throughput falls as concurrency rises rather than flattening.\n\nThe Lua version has no such curve: callers serialise on the single thread for microseconds each and every attempt succeeds. That difference is the practical argument for scripting over optimistic concurrency in Redis.");
+    else if((k === "lua" || k === "fn") && n > 30)
+      notes.push("At " + n + " concurrent callers this still behaves linearly. Each call occupies the single thread for microseconds and every one succeeds on the first attempt — there is nothing to conflict with, because nothing can interleave.\n\nThe limit is throughput on one thread, not contention. A script taking 50 microseconds caps at roughly 20,000 calls per second on that key, which is a very different constraint from a retry storm.");
+
+    if(bad)
+      notes.push("Set the concurrency to 1 and this works perfectly, which is exactly why the bug reaches production: it is correct in every test written with a single client. Concurrency is the only thing that surfaces it, and when it does the symptom is occasional impossible data with no way to reproduce it.");
+
+    $("a-note").textContent = notes.join("\n\n");
+  }
+
+  ["a-how","a-conc"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

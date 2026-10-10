@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Evaluating and testing models — MLOps</title>
+<meta name="description" content="Aggregate metrics hide the failures that matter. Slice-based evaluation, behavioural tests, and testing the pipeline rather than the model.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 10 · Training</div>
+    <h1>Evaluating and testing models</h1>
+    <p class="standfirst">A single number cannot tell you whether a model is fit to deploy, because averaging is exactly the operation that hides a concentrated failure. The evaluation that catches real problems is broken down by segment, checked for specific behaviours, and applied to the pipeline as well as the model.</p>
+    <div class="chap-meta">
+      <span class="tagpill">slices</span>
+      <span class="tagpill">behavioural</span>
+      <span class="tagpill">baselines</span>
+      <span class="tagpill">ci</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>What the average hides</h2>
+
+<div class="demo" id="sl">
+  <div class="demo-head">
+    <b>Slice-based evaluation</b>
+    <span>Two candidate models, one aggregate metric each. The breakdown tells a different story.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="s-model">Model</label>
+        <select id="s-model">
+          <option value="a" selected>Candidate A</option>
+          <option value="b">Candidate B</option>
+          <option value="live">Currently live</option>
+        </select>
+      </div>
+      <div>
+        <label for="s-min">Flag slices below — <span id="s-minv">0.75</span></label>
+        <input type="range" id="s-min" min="600" max="850" step="5" value="750">
+      </div>
+    </div>
+    <div id="s-table"></div>
+    <div class="stat">
+      <div><b id="s-agg">—</b><span>aggregate AUC</span></div>
+      <div><b id="s-worst">—</b><span>worst slice</span></div>
+      <div><b id="s-flag">—</b><span>slices flagged</span></div>
+      <div><b id="s-verdict">—</b><span>ship it?</span></div>
+    </div>
+    <div class="out" id="s-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Define your slices before you need them, and log them from run one</span>
+  <p>The slices worth tracking are known in advance and are almost always the same categories: <b>protected attributes</b> where a disparity is a legal and ethical problem; <b>commercially important segments</b> — enterprise accounts, high-value customers — which are usually small and therefore invisible in an average; <b>data-quality cohorts</b>, such as rows with missing optional fields, where the model behaves differently for mechanical reasons; <b>new versus established entities</b>, where a cold-start segment can be arbitrarily bad; and <b>geography, language and platform</b>. Ten to twenty slices, defined once, logged with every run (chapter 7). The value is in the <em>history</em> — after an incident you want to know whether a segment has been degrading for three months, and that answer only exists if you were recording it then.</p>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">slices, with the statistics that keep you honest</span><button class="copy">Copy</button></div>
+<pre><code>SLICES = {
+    "enterprise":     lambda df: df.plan == "enterprise",
+    "new_customer":   lambda df: df.tenure_days < 30,
+    "missing_income": lambda df: df.income.isna(),
+    "mobile":         lambda df: df.platform == "mobile",
+    "region_apac":    lambda df: df.region == "APAC",
+    "high_value":     lambda df: df.ltv > df.ltv.quantile(0.95),
+}
+
+def evaluate_slices(y, p, df, min_n=200):
+    rows = []
+    for name, mask_fn in SLICES.items():
+        m = mask_fn(df).values
+        n = int(m.sum())
+        if n < min_n:
+            rows.append(dict(slice=name, n=n, auc=None,
+                             note="too small to measure"))
+            continue
+        auc = roc_auc_score(y[m], p[m])
+        # bootstrap a confidence interval — a point estimate on 300 rows
+        # invites conclusions it cannot support
+        boots = [roc_auc_score(*resample(y[m], p[m])) for _ in range(200)]
+        lo, hi = np.percentile(boots, [2.5, 97.5])
+        rows.append(dict(slice=name, n=n, auc=auc, ci_lo=lo, ci_hi=hi,
+                         positives=int(y[m].sum())))
+    return pd.DataFrame(rows)
+
+# THREE THINGS THAT MAKE SLICE METRICS MISLEADING, all avoidable:
+#
+#   1. NO SAMPLE SIZE SHOWN. An AUC of 0.61 on 40 rows and one of 0.61 on
+#      40,000 warrant completely different responses, and a bare table of
+#      numbers makes them look identical
+#
+#   2. NO CONFIDENCE INTERVAL. On a small slice the interval is enormous —
+#      [0.48, 0.79] is not a finding. Bootstrap it and show it
+#
+#   3. NO POSITIVE COUNT. AUC on a slice with three positive examples is
+#      essentially meaningless whatever the row count, and this is the
+#      commonest version of the mistake
+
+# AUTOMATED SLICE DISCOVERY finds the segments you did not think of, by
+# searching for feature-value combinations where the loss is unusually
+# high. SliceFinder and the "sliced-based learning" literature cover this;
+# Fairlearn and Evidently both provide practical implementations.
+# Worth running periodically — it surfaces things like "loss is 3x higher
+# for rows where currency is JPY and channel is affiliate", which no
+# predefined slice list contains.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Behavioural tests</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">assertions about behaviour, not about metrics</span><button class="copy">Copy</button></div>
+<pre><code># Metrics tell you the model is 87% right. Behavioural tests assert things
+# that must be true regardless of the metric, and they fail loudly.
+# The taxonomy is from Ribeiro et al.'s CheckList work.
+
+# 1. INVARIANCE — a change that should not affect the prediction, does not
+def test_irrelevant_field_invariance(model, row):
+    a = model.predict(row)
+    b = model.predict(row.assign(marketing_source="email"))
+    assert abs(a - b) < 0.01, "marketing_source should not move the score"
+
+def test_name_invariance(model, row):
+    # for a credit model, the applicant's name must not matter
+    for name in ["Smith", "Okafor", "Nguyen", "Kowalski"]:
+        assert abs(model.predict(row.assign(surname=name)) - baseline) < 0.01
+
+# 2. DIRECTIONAL — a change should move the prediction a known way
+def test_income_directional(model, row):
+    low  = model.predict(row.assign(income=20_000))
+    high = model.predict(row.assign(income=200_000))
+    assert high < low, "higher income should not increase default risk"
+
+# 3. MINIMUM FUNCTIONALITY — the easy cases must be right
+def test_obvious_fraud(model):
+    assert model.predict(KNOWN_FRAUD_PATTERN) > 0.9
+
+def test_obvious_legitimate(model):
+    assert model.predict(LONG_STANDING_GOOD_CUSTOMER) < 0.1
+
+# 4. ROBUSTNESS — small perturbations do not flip the answer
+def test_rounding_robustness(model, row):
+    a = model.predict(row.assign(amount=100.00))
+    b = model.predict(row.assign(amount=100.01))
+    assert abs(a - b) < 0.05
+
+# 5. EDGE CASES — the inputs that break serving rather than the model
+@pytest.mark.parametrize("row", [ALL_NULLS, ZERO_ROW, MAX_VALUES,
+                                 UNSEEN_CATEGORY, EMPTY_STRING])
+def test_no_crash(model, row):
+    p = model.predict(row)
+    assert 0.0 <= p <= 1.0 and not math.isnan(p)
+
+# WHY THESE ARE WORTH MORE THAN THEY LOOK: they encode knowledge that no
+# metric contains. "Higher income should not increase default risk" is a
+# fact about the world, and a model that violates it has learned something
+# spurious — which an AUC of 0.87 will not tell you.
+#
+# They also survive retraining. A metric threshold has to be re-tuned as
+# the data moves; "the surname must not matter" is true forever, so these
+# tests accumulate value rather than decaying.
+#
+# WRITE ONE EVERY TIME SOMETHING GOES WRONG. That is the discipline that
+# builds a real suite — the same habit as a regression test after a bug.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Compare against a trivial baseline, always</span>
+  <p>Before any of the above, establish what a model with no intelligence achieves: predict the majority class, predict the historical average, predict "same as last week", or use the single most predictive feature with a threshold. This is skipped constantly and it is embarrassing when it turns out to matter. <b>An 87% accurate classifier on a problem with 86% base rate has learned almost nothing</b>, and a churn model that barely beats "flag anyone who has not logged in for 30 days" is not worth the pipeline that produces it. Log the baseline as a metric in every run so the comparison is permanently visible rather than something someone did once at the start. It also gives you the honest denominator for the business case — the value of the model is the lift over the trivial rule, not its absolute performance.</p>
+</div>
+
+<h2><span class="h-rule"></span>Testing the pipeline, not the model</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Test</th><th>Asserts</th><th>Runs</th></tr></thead>
+<tbody>
+<tr><td>Transformation unit tests</td><td>Feature functions handle nulls, duplicates, timezone edges, empty input</td><td>Every commit, milliseconds</td></tr>
+<tr><td>Pipeline smoke test</td><td>The whole pipeline completes on a 1,000-row sample</td><td>Every commit, under a minute (chapter 8)</td></tr>
+<tr><td>Schema and distribution checks</td><td>Input data is what the code expects</td><td>Every pipeline run (chapter 6)</td></tr>
+<tr><td>Training convergence</td><td>Loss decreases; a model overfits a tiny sample deliberately</td><td>Every commit</td></tr>
+<tr><td>Serialisation round-trip</td><td>Save, reload, and predictions are identical</td><td>Every commit</td></tr>
+<tr><td>Behavioural tests</td><td>Invariance, direction, minimum functionality</td><td>Every candidate, before promotion</td></tr>
+<tr><td>Slice metrics against live</td><td>No protected segment regresses</td><td>Every candidate (chapter 9)</td></tr>
+<tr><td>Serving parity</td><td>The served model gives the same output as the trained one</td><td>Every deployment (chapter 14)</td></tr>
+<tr><td>Latency benchmark</td><td>p99 within budget, on serving hardware</td><td>Every candidate (chapter 13)</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">two tests that catch a surprising amount</span><button class="copy">Copy</button></div>
+<pre><code># 1. OVERFIT A TINY SAMPLE ON PURPOSE. If the model cannot memorise twenty
+#    rows, something is structurally broken — the labels are misaligned, the
+#    features are constant, the learning rate is zero, the loss is wired to
+#    the wrong output.
+def test_can_overfit_small_sample():
+    tiny = train_df.sample(20, random_state=0)
+    model = train(tiny, tiny, cfg | {"epochs": 200, "regularisation": 0})
+    assert accuracy(model, tiny) > 0.95, "cannot fit 20 rows — check wiring"
+#    Runs in seconds and catches the class of bug that otherwise presents as
+#    "the model just does not learn very well".
+
+# 2. SERIALISATION ROUND-TRIP. Save the model, load it in a fresh process,
+#    and assert identical predictions on a fixed sample.
+def test_roundtrip_identical(tmp_path):
+    p1 = model.predict(SAMPLE)
+    save(model, tmp_path / "m.pkl")
+    p2 = load(tmp_path / "m.pkl").predict(SAMPLE)
+    np.testing.assert_allclose(p1, p2, rtol=1e-6)
+#    Catches: custom transformers that do not pickle their fitted state,
+#    a preprocessing step applied in training and forgotten at load time,
+#    library version differences between environments, and lambdas in a
+#    pipeline that silently fail to serialise. All of these produce a model
+#    that scores well in training and behaves differently once deployed —
+#    which is chapter 14, caught cheaply here instead.
+
+# AND THE ONE THING NOT TO DO: assert an absolute metric threshold in a unit
+# test.
+#     assert auc > 0.85          # <- will break for the wrong reasons
+# The achievable score moves with the data, so this test fails when the
+# world changes rather than when the code breaks, and it gets muted. Assert
+# RELATIVE performance at promotion time instead (chapter 9), and keep unit
+# tests for things that are true regardless of the data.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Do error analysis by reading the predictions</span>
+  <p>The highest-value hour in any modelling project is usually spent pulling the two hundred worst-scored examples into a notebook and reading them. Not computing a metric on them — reading them. <b>The failures cluster, and the clusters are informative in a way no aggregate is</b>: half of them turn out to have a null in the same field, or to be from one country, or to be duplicates, or to be mislabelled in the training data, or to be a category the feature encoding handles badly. Each of those is a specific fixable cause, and each one becomes a new slice to track and a behavioural test to add. Teams that do this routinely find data problems; teams that only look at metrics find that the model "needs more tuning". It is the one activity in this unit that is genuinely better done in a notebook (chapter 8).</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Averaging is the operation that hides a concentrated failure.</b> Evaluate by slice or you cannot see it.</li>
+    <li><b>Define ten to twenty slices in advance</b> and log them from the first run. The value is in the history.</li>
+    <li><b>Show sample size, positive count and a confidence interval</b> alongside every slice metric.</li>
+    <li><b>Behavioural tests encode knowledge no metric contains</b>, and they survive retraining rather than needing re-tuning.</li>
+    <li><b>Write a behavioural test every time something goes wrong.</b> Same habit as a regression test.</li>
+    <li><b>Always compare against a trivial baseline</b>, and log it. The model's value is the lift, not the absolute number.</li>
+    <li><b>Test that the model can overfit twenty rows</b>, and that it survives a save-and-reload round trip.</li>
+    <li><b>Never assert an absolute metric in a unit test.</b> It fails when the world changes and gets muted.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("10-evaluation.html");
+
+(function(){
+  const root = document.getElementById("sl");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  // slice: name, n, positives, auc per model
+  const SLICES = [
+    {n:"consumer, established", rows:41200, pos:3100, a:0.881, b:0.869, live:0.874},
+    {n:"consumer, new (<30d)",  rows:6800,  pos:940,  a:0.812, b:0.826, live:0.809},
+    {n:"enterprise",            rows:1740,  pos:118,  a:0.694, b:0.841, live:0.771},
+    {n:"missing income field",  rows:3900,  pos:410,  a:0.845, b:0.838, live:0.840},
+    {n:"mobile",                rows:22400, pos:1980, a:0.872, b:0.861, live:0.866},
+    {n:"region APAC",           rows:2100,  pos:150,  a:0.858, b:0.849, live:0.852},
+    {n:"high value (top 5%)",   rows:2600,  pos:290,  a:0.731, b:0.833, live:0.788},
+    {n:"partner channel",       rows:180,   pos:9,    a:0.612, b:0.744, live:0.680}
+  ];
+
+  const MODEL_NAME = {a:"Candidate A", b:"Candidate B", live:"Currently live"};
+
+  function render(){
+    const mk = $("s-model").value;
+    const min = parseInt($("s-min").value, 10) / 1000;
+    $("s-minv").textContent = min.toFixed(3);
+
+    const totalRows = SLICES.reduce((a, s) => a + s.rows, 0);
+    const agg = SLICES.reduce((a, s) => a + s[mk] * s.rows, 0) / totalRows;
+
+    const measurable = SLICES.filter(s => s.rows >= 200 && s.pos >= 30);
+    const worst = measurable.reduce((w, s) => s[mk] < w[mk] ? s : w, measurable[0]);
+    const flagged = measurable.filter(s => s[mk] < min);
+
+    $("s-agg").textContent   = agg.toFixed(3);
+    $("s-worst").textContent = worst[mk].toFixed(3) + " — " + worst.n;
+    $("s-flag").textContent  = flagged.length;
+    const ok = flagged.length === 0;
+    $("s-verdict").textContent = ok ? "yes" : "not as is";
+    $("s-verdict").style.color = ok ? "#3FB984" : "#E2574C";
+
+    // rough bootstrap-ish CI half-width, scaled by positives
+    const ci = s => 0.5 / Math.sqrt(Math.max(1, s.pos));
+
+    $("s-table").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin:16px 0 8px">' + MODEL_NAME[mk] + ' · aggregate AUC ' + agg.toFixed(3) + '</div>' +
+      '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">' +
+      '<thead><tr style="text-align:left">' +
+      ["slice","rows","positives","AUC","95% interval","vs live",""].map(h =>
+        '<th style="padding:6px 9px;font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;' +
+        'color:#8FA0AF;border-bottom:1px solid #E1E7EC;font-weight:600">' + h + '</th>').join("") +
+      '</tr></thead><tbody>' +
+      SLICES.map(s => {
+        const tooSmall = s.rows < 200 || s.pos < 30;
+        const val = s[mk];
+        const flag = !tooSmall && val < min;
+        const delta = val - s.live;
+        const h = ci(s);
+        return '<tr style="background:' + (flag ? "#FBEDEC" : tooSmall ? "#FAFBFC" : "#fff") + '">' +
+          '<td style="padding:6px 9px;border-bottom:1px solid #F0F3F5;color:' +
+          (tooSmall ? "#8FA0AF" : "#25323E") + '">' + s.n + '</td>' +
+          '<td style="padding:6px 9px;font-family:var(--mono);color:#54677A;border-bottom:1px solid #F0F3F5">' +
+          s.rows.toLocaleString() + '</td>' +
+          '<td style="padding:6px 9px;font-family:var(--mono);border-bottom:1px solid #F0F3F5;color:' +
+          (s.pos < 30 ? "#A8382F" : "#54677A") + '">' + s.pos + '</td>' +
+          '<td style="padding:6px 9px;font-family:var(--mono);font-weight:700;border-bottom:1px solid #F0F3F5;color:' +
+          (tooSmall ? "#8FA0AF" : flag ? "#A8382F" : "#16232F") + '">' +
+          (tooSmall ? "—" : val.toFixed(3)) + '</td>' +
+          '<td style="padding:6px 9px;font-family:var(--mono);font-size:11px;border-bottom:1px solid #F0F3F5;color:#8FA0AF">' +
+          (tooSmall ? "insufficient" : "±" + h.toFixed(3)) + '</td>' +
+          '<td style="padding:6px 9px;font-family:var(--mono);font-size:11px;border-bottom:1px solid #F0F3F5;color:' +
+          (mk === "live" ? "#C2CCD4" : delta >= 0 ? "#1F7A52" : "#A8382F") + '">' +
+          (mk === "live" ? "—" : (delta >= 0 ? "+" : "−") + Math.abs(delta*100).toFixed(1) + "pp") + '</td>' +
+          '<td style="padding:6px 9px;border-bottom:1px solid #F0F3F5;font-size:10.5px;font-weight:700;' +
+          'letter-spacing:.04em;text-transform:uppercase;color:' +
+          (tooSmall ? "#8FA0AF" : flag ? "#E2574C" : "#3FB984") + '">' +
+          (tooSmall ? "unmeasurable" : flag ? "flagged" : "ok") + '</td></tr>';
+      }).join("") + '</tbody></table></div>';
+
+    const notes = [];
+
+    notes.push("The aggregate AUC is " + agg.toFixed(3) +
+      ", which is the number that appears in a dashboard, a status update and a promotion decision. The breakdown is what it is made of.");
+
+    if(mk === "a")
+      notes.push("Candidate A has the best aggregate of the three — and it is the worst model for enterprise customers (0.694) and for the top 5% by lifetime value (0.731), both well below the live model.\n\nThose two slices are 1,740 and 2,600 rows out of 81,000, so together they are about 5% of the data and cannot move the average. They are also, in most businesses, where the money is.\n\nThis is the failure mode that motivates the whole chapter. Averaging is precisely the operation that hides a concentrated failure, and a model can be the best on aggregate while being the worst choice commercially. No amount of care in the train/test split, cross-validation or statistical testing surfaces it, because all of those operate on the aggregate too.");
+    else if(mk === "b")
+      notes.push("Candidate B has a slightly WORSE aggregate than A and is markedly better on the slices that matter: enterprise moves from 0.694 to 0.841, and high-value from 0.731 to 0.833.\n\nIt is worse on the large consumer slice, which is why the aggregate falls — that slice is half the data, so a small regression there outweighs large gains on the small ones.\n\nIf the decision were made on aggregate AUC, A would be chosen. That is the trade the average makes for you, silently, and it is why chapter 9's promotion gates include per-slice comparisons rather than only a headline metric.\n\nWhich model is actually right depends on what the segments are worth, and that is a business conversation the slice table makes possible and the aggregate makes impossible.");
+    else
+      notes.push("The currently deployed model, shown for comparison. Note it is not the best on any single slice — it is reasonably balanced, which is often what a model that has survived in production looks like.\n\nThe useful discipline is to always evaluate the live model in the same run as the candidate, on the same held-out data. Otherwise you are comparing a fresh number against a remembered one, and the remembered one was computed on different data (chapter 9).");
+
+    const partner = SLICES.find(s => s.n === "partner channel");
+    notes.push("Two rows deserve separate attention because of their SIZE rather than their score.\n\nThe partner channel slice has 180 rows and 9 positives. Its AUC is reported here as " +
+      partner[mk].toFixed(3) + " and that number means essentially nothing — with 9 positive examples the confidence interval is roughly ±" +
+      ci(partner).toFixed(2) + ", so the true value could plausibly be anywhere from poor to excellent.\n\nShowing it as a bare number invites a conclusion it cannot support. Showing it as unmeasurable, with the counts visible, is honest. That is why the table has a minimum sample threshold and why the POSITIVE count matters more than the row count — AUC on a slice with a handful of positives is meaningless whatever the total.");
+
+    if(flagged.length > 0)
+      notes.push(flagged.length + " slice" + (flagged.length === 1 ? "" : "s") +
+        " below the " + min.toFixed(2) + " floor: " + flagged.map(f => f.n).join(", ") +
+        ".\n\nWhat to do about a flagged slice is a separate question from noticing it, and the options are not only \"retrain\". Add features that help that segment specifically. Train a separate model for it, if it is large enough and different enough. Apply a different threshold for it. Or route it to a human, which is frequently the right answer for a small high-value segment.\n\nWhat is not acceptable is shipping without knowing.");
+    else
+      notes.push("No slice falls below the floor at this threshold. Worth moving the slider up to see where the model starts to break — the useful question is not whether it passes an arbitrary bar but where its weakest segments are and whether those are the ones you care about.");
+
+    notes.push("One habit that finds more than any of this: pull the two hundred worst-scored examples into a notebook and READ them.\n\nThe failures cluster, and the clusters are informative in a way no aggregate is — half of them turn out to share a null field, or a country, or to be duplicates, or to be mislabelled, or to be a category the encoding handles badly. Each is a specific fixable cause, and each becomes a new slice to track and a behavioural test to add.\n\nTeams that do this find data problems. Teams that only look at metrics conclude the model needs more tuning.");
+
+    $("s-note").textContent = notes.join("\n\n");
+  }
+
+  ["s-model","s-min"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

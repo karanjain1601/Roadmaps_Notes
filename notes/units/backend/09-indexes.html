@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Indexes and query performance — Backend Developer</title>
+<meta name="description" content="B-tree indexes, the leftmost prefix rule, covering indexes, reading EXPLAIN, and the several reasons a perfectly good index is ignored.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%233FB984' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">Backend Developer</a><span class="sep">/</span><span>Chapter 09</span></p>
+    <p class="chno">Chapter 09 · Data</p>
+    <h1>Indexes and query performance</h1>
+    <p class="lede">The single highest-leverage topic in the unit. An index turns a query that reads two million rows into one that reads forty, and most production slowdowns are one missing or unusable index. The second half of the chapter is the more useful half: why the index you created is being ignored.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapter 08</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="what">
+<h2>What an index is</h2><div class="h2rule"></div>
+
+<p class="lead">A separate, sorted structure holding the indexed columns plus a pointer to the row. Because it is sorted, the database can find a value by descending a tree instead of reading everything — the same B-tree from chapter 12 of the algorithms unit, sized so each node is one disk page.</p>
+
+<div class="kv">
+<dt>What it buys</dt><dd>Lookups by the indexed columns, range scans, sorted output without a sort, and uniqueness enforcement — all in logarithmic rather than linear time.</dd>
+<dt>What it costs</dt><dd class="no">Every insert, update and delete must maintain it. A table with eight indexes does roughly nine writes per row written. Indexes also occupy space, often more than the table, and compete for cache.</dd>
+<dt>The consequence</dt><dd>Indexes are not free and more is not better. The right number is the smallest set that serves your actual query patterns, which means you need to know what those are — <code>pg_stat_statements</code> rather than intuition.</dd>
+</div>
+
+<div class="demo" id="d-scan">
+  <div class="demo-top"><div class="demo-title">Seek, scan, and the crossover</div><div class="demo-hint">Raise the match percentage and watch the planner change its mind</div></div>
+  <div class="demo-body">
+    <canvas id="cScan" aria-label="Cost of an index scan against a sequential scan by selectivity"></canvas>
+    <div class="ctrls" style="justify-content:center">
+      <div class="ctrl"><label>Rows in table</label><input type="range" id="scN" min="3" max="7" step="0.1" value="6.3"><output id="scNo">2,000,000</output></div>
+      <div class="ctrl"><label>Rows matching</label><input type="range" id="scS" min="0.001" max="60" step="0.001" value="0.05"><output id="scSo">0.05%</output></div>
+    </div>
+    <div class="rgrid" id="scOut"></div>
+    <div class="readout" id="scNote"></div>
+  </div>
+</div>
+</section>
+
+<section id="composite">
+<h2>Composite indexes and column order</h2><div class="h2rule"></div>
+
+<p class="lead">An index on three columns is not three indexes. It is one index sorted by the first column, then the second within that, then the third — like a phone book ordered by surname, then forename. That ordering is the whole rule.</p>
+
+<div class="demo" id="d-comp">
+  <div class="demo-top"><div class="demo-title">How much of the index can this query use?</div><div class="demo-hint">Set what the query does with each column</div></div>
+  <div class="demo-body">
+    <canvas id="cComp" aria-label="Which prefix of a composite index a query can use"></canvas>
+    <div class="ctrls" style="justify-content:center;flex-wrap:wrap">
+      <div class="ctrl"><label>status</label><select id="cp0">
+        <option value="none">not in the query</option><option value="eq" selected>= 'pending'</option>
+        <option value="range">IN (…) / range</option><option value="order">ORDER BY</option></select></div>
+      <div class="ctrl"><label>created_at</label><select id="cp1">
+        <option value="none">not in the query</option><option value="eq">= a value</option>
+        <option value="range" selected>&gt; a date</option><option value="order">ORDER BY</option></select></div>
+      <div class="ctrl"><label>user_id</label><select id="cp2">
+        <option value="none" selected>not in the query</option><option value="eq">= a value</option>
+        <option value="range">IN (…)</option><option value="order">ORDER BY</option></select></div>
+    </div>
+    <div class="rgrid" id="cpOut"></div>
+    <div class="readout" id="cpNote"></div>
+  </div>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">sql — the ordering rule, and the rules of thumb that follow from it</span><button class="code-copy">Copy</button></div><pre><span class="k">CREATE INDEX</span> ON orders (status, created_at, user_id);
+
+<span class="c">-- ① equality columns first, range columns last. A range "opens up" the</span>
+<span class="c">--    index: everything after it can no longer be used for filtering,</span>
+<span class="c">--    because the rows are no longer contiguous by the next column.</span>
+
+<span class="c">-- ② ORDER BY can be served by the index only if the preceding columns</span>
+<span class="c">--    are all equalities — and the direction must match, or be exactly</span>
+<span class="c">--    reversed for every column.</span>
+
+<span class="c">-- ③ if you have (a, b), you do NOT also need (a). The composite index</span>
+<span class="c">--    already serves any query on a alone. You DO need (b) separately.</span>
+
+<span class="c">-- ④ a partial index is often better than a wider one:</span>
+<span class="k">CREATE INDEX</span> ON orders (created_at) <span class="k">WHERE</span> status = <span class="s">'pending'</span>;
+<span class="c">--    if 2% of orders are pending, this index is 2% of the size, stays in</span>
+<span class="c">--    cache, and is only maintained when a pending row changes.</span>
+
+<span class="c">-- ⑤ an expression index, for when the query wraps the column:</span>
+<span class="k">CREATE INDEX</span> ON users (lower(email));   <span class="c">-- makes WHERE lower(email) = …</span>
+<span class="c">--                                          usable. Chapter section below.</span></pre></div>
+
+<div class="box intu"><b class="tag">Covering indexes and index-only scans</b>
+<p style="margin:0">An index scan normally does two things: find the matching entries in the index, then fetch each row from the table to read the columns the query wants. That second step is a random read per row, and it is most of the cost. If <em>every</em> column the query touches is already in the index, the table is never visited — an index-only scan, and often an order of magnitude faster. Postgres supports <code>INCLUDE</code> for exactly this: <code>CREATE INDEX ON orders (user_id) INCLUDE (total_cents, status)</code> keeps the extra columns in the leaf pages without making them part of the sort key. It is the cheapest large win available on a hot read path, and the cost is a wider index.</p>
+</div>
+</section>
+
+<section id="ignored">
+<h2>Why your index is not being used</h2><div class="h2rule"></div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Cause</th><th>Looks like</th><th>Fix</th></tr></thead>
+<tbody>
+<tr><td><strong>The query wraps the column</strong></td><td><code>WHERE lower(email) = …</code>, <code>WHERE date(created_at) = …</code>, <code>WHERE id::text = …</code></td><td class="yes">An expression index, or rewrite as a range: <code>created_at &gt;= d AND &lt; d+1</code></td></tr>
+<tr><td><strong>Leading wildcard</strong></td><td><code>LIKE '%smith'</code></td><td>A trigram index, or full-text search. A B-tree cannot help — the prefix is unknown</td></tr>
+<tr><td><strong>Low selectivity</strong></td><td>The value matches 40% of rows</td><td class="yes">Nothing to fix. A scan genuinely is faster, and the planner is right</td></tr>
+<tr><td><strong>Type mismatch</strong></td><td>A <code>bigint</code> column compared to a string parameter</td><td>Fix the parameter type. The implicit cast is applied to the column, which disables the index</td></tr>
+<tr><td><strong>Wrong column order</strong></td><td>Index on (a, b); query filters on b only</td><td>The demo above. Add an index leading with b</td></tr>
+<tr><td><strong>Stale statistics</strong></td><td>The plan changed after a bulk load</td><td><code>ANALYZE</code>. Estimates are based on samples that can be badly out of date</td></tr>
+<tr><td><strong>The table is small</strong></td><td>A few thousand rows</td><td class="yes">Also nothing to fix. The whole table is one or two pages already in memory</td></tr>
+<tr><td><strong><code>OR</code> across columns</strong></td><td><code>WHERE a = 1 OR b = 2</code></td><td>Sometimes a bitmap of two indexes; often faster rewritten as a <code>UNION</code></td></tr>
+<tr><td><strong>Nullable and searching for NULL</strong></td><td><code>WHERE deleted_at IS NULL</code> on a mostly-null column</td><td>A partial index on exactly that predicate</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">sql — reading a plan</span><button class="code-copy">Copy</button></div><pre><span class="k">EXPLAIN</span> (<span class="k">ANALYZE</span>, BUFFERS) <span class="k">SELECT</span> …;
+<span class="c">-- ANALYZE actually runs it, so you get real timings and real row counts.</span>
+<span class="c">-- on an UPDATE or DELETE, wrap it in a transaction and roll back.</span>
+
+Seq Scan on orders  (cost=0.00..48210.00 <span class="k">rows</span>=<span class="n">1000</span> width=<span class="n">64</span>)
+                    (<span class="k">actual</span> time=<span class="n">0.02</span>..<span class="n">412.55</span> <span class="k">rows</span>=<span class="n">184320</span> loops=<span class="n">1</span>)
+                            ↑ estimated 1,000, got 184,320
+
+<span class="c">-- read it inside out, and look for three things:</span>
+<span class="c">--</span>
+<span class="c">-- ① estimated vs actual rows. An order of magnitude apart means the</span>
+<span class="c">--    planner is working from bad information, so every decision above</span>
+<span class="c">--    this node is suspect. Usually stale statistics or a correlation</span>
+<span class="c">--    the planner cannot see.</span>
+<span class="c">--</span>
+<span class="c">-- ② the node type. Seq Scan on a large table with a selective filter is</span>
+<span class="c">--    the classic missing index. Nested Loop with a high loop count is</span>
+<span class="c">--    the N+1 problem inside a single query.</span>
+<span class="c">--</span>
+<span class="c">-- ③ Rows Removed by Filter. A large number means the database read</span>
+<span class="c">--    those rows and threw them away — work an index would have avoided.</span>
+
+<span class="c">-- and the query to run first, before any of this:</span>
+<span class="k">SELECT</span> calls, mean_exec_time, total_exec_time, query
+<span class="k">FROM</span> pg_stat_statements <span class="k">ORDER BY</span> total_exec_time <span class="k">DESC</span> <span class="k">LIMIT</span> <span class="n">20</span>;
+<span class="c">-- total time, not mean. A 4 ms query called 50,000 times a minute costs</span>
+<span class="c">-- far more than a 2-second report nobody runs. This is the list that</span>
+<span class="c">-- tells you where to spend an afternoon.</span></pre></div>
+
+<div class="tw">
+<table class="tight">
+<thead><tr><th>Index type</th><th>For</th></tr></thead>
+<tbody>
+<tr><td><strong>B-tree</strong></td><td class="yes">The default and the right answer almost always. Equality, ranges, sorting, uniqueness</td></tr>
+<tr><td><strong>Hash</strong></td><td>Equality only, no ranges, no sorting. Rarely worth choosing over B-tree</td></tr>
+<tr><td><strong>GIN</strong></td><td class="yes">Values containing many items — JSONB keys, arrays, full-text search, trigrams</td></tr>
+<tr><td><strong>GiST</strong></td><td>Geometric and range types, nearest-neighbour searches</td></tr>
+<tr><td><strong>BRIN</strong></td><td>Enormous tables where the column correlates with physical order, such as an append-only timestamp. Tiny index, approximate</td></tr>
+<tr><td><strong>Partial</strong></td><td class="yes">Any B-tree with a <code>WHERE</code>. Smaller, cheaper to maintain, more likely to stay cached</td></tr>
+<tr><td><strong>Expression</strong></td><td>When the query cannot stop wrapping the column</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn"><b class="tag">Indexes you should delete</b>
+<p style="margin:0">Unused indexes cost write throughput, space and cache on every single insert, and they accumulate because nobody feels able to remove one. <code>pg_stat_user_indexes</code> reports <code>idx_scan</code> — the number of times each index has been used since statistics were reset. Any index with a scan count of zero after a full business cycle, that is not enforcing a uniqueness constraint, is dead weight. Also look for <strong>redundant prefixes</strong>: if you have an index on <code>(a, b)</code> then a separate index on <code>(a)</code> is almost always pointless, because the composite serves those queries already.</p>
+</div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>Why is an index not always faster?
+<button class="reveal">Show answer</button><div class="ans">Because an index scan is a random access per matching row — descend the tree, then fetch that row from the table — while a sequential scan reads pages in order, which storage and prefetching handle far better. Once the query matches enough of the table, doing hundreds of thousands of scattered reads costs more than streaming everything in order. The crossover is typically somewhere between five and fifteen per cent, and when the planner picks a scan above it, it is usually right.</div></li>
+
+<li>You have an index on <code>(status, created_at)</code>. Which of these can use it: filtering on status, on created_at, on both?
+<button class="reveal">Show answer</button><div class="ans">Status alone, and both together. Created_at alone cannot use it, because the index is sorted by status first — rows for a given date are scattered across every status group rather than being contiguous, so there is no range to seek to. This is the leftmost prefix rule, and it is why column order in a composite index is a design decision rather than a formatting one.</div></li>
+
+<li>Why should equality columns come before range columns?
+<button class="reveal">Show answer</button><div class="ans">Because a range opens the index up. With <code>status = 'pending' AND created_at &gt; d</code>, an index on (status, created_at) seeks to the pending block and then reads a contiguous run of dates — both columns used. Reverse the order and the index seeks to a date range, within which statuses are mixed, so status can only be checked row by row afterwards. Everything after the first range column stops being useful for narrowing.</div></li>
+
+<li>What is an index-only scan and why is it so much faster?
+<button class="reveal">Show answer</button><div class="ans">A scan where every column the query needs is present in the index, so the table itself is never read. That removes one random access per matching row, which is normally the dominant cost — often an order of magnitude on a wide table. Postgres's <code>INCLUDE</code> clause adds payload columns to the leaf pages without making them part of the sort key, which is the cheap way to get one on a hot read path.</div></li>
+
+<li><code>WHERE date(created_at) = '2026-03-01'</code> does not use the index on <code>created_at</code>. Why, and what are the two fixes?
+<button class="reveal">Show answer</button><div class="ans">Because the index stores <code>created_at</code>, not <code>date(created_at)</code>. Applying a function means the database would have to compute it for every row to compare, which is precisely the scan an index avoids. Either index the expression — <code>CREATE INDEX ON t (date(created_at))</code> — or rewrite the predicate as a range on the raw column: <code>created_at &gt;= '2026-03-01' AND created_at &lt; '2026-03-02'</code>. The rewrite is usually better, since it keeps one index serving every date query rather than only whole-day ones.</div></li>
+
+<li>Which query should you optimise first: one averaging 2 seconds, or one averaging 4 ms?
+<button class="reveal">Show answer</button><div class="ans">Whichever has the higher <em>total</em> time. If the 4 ms query runs fifty thousand times a minute it consumes over three minutes of database time per minute, while the 2-second query run twice an hour consumes four seconds. Sort <code>pg_stat_statements</code> by <code>total_exec_time</code>, not by mean — the slowest query is rarely the most expensive one, and optimising by anecdote sends you to the wrong place.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin:0">Chapter 10 covers what happens when two of these queries run at the same time and touch the same rows.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 09</h2><p>Indexes and query performance. Part of the Backend Developer unit — <a href="index.html">all 22 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 12 (the N+1 problem), 13 (caching what you cannot make fast), 19 (read replicas).</p></div>
+    <div><h2>Going deeper</h2><p><em>Use The Index, Luke</em> is free, short and the best resource on this topic; Postgres's own EXPLAIN documentation is excellent.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: scan vs seek ============ */
+(function(){
+  const cv=document.getElementById("cScan"); if(!cv) return;
+  const nEl=document.getElementById("scN"), sEl=document.getElementById("scS"),
+        out=document.getElementById("scOut"), note=document.getElementById("scNote");
+  function draw(){
+    const N=Math.round(Math.pow(10,+nEl.value)), sel=+sEl.value/100;
+    const matched=Math.max(1,Math.round(N*sel));
+    document.getElementById("scNo").textContent=N.toLocaleString();
+    document.getElementById("scSo").textContent=(sel*100)<0.01?(sel*100).toFixed(3)+"%":(sel*100).toFixed(2)+"%";
+    const seqMs   = N/4_000_000*1000 + 0.05;
+    const idxMs   = 0.02*Math.log2(N) + matched*0.0022 + 0.05;
+    const onlyMs  = 0.02*Math.log2(N) + matched*0.00035 + 0.04;
+    const M=[
+      ["Sequential scan", seqMs, N, "Read every row, discard the ones that do not match. Pages come off storage in order, which is the fastest way to move bulk data."],
+      ["Index scan", idxMs, matched, "Descend the B-tree to the first match, walk the matching entries, and fetch each row from the table — one random access apiece."],
+      ["Index-only scan", onlyMs, matched, "Same descent, but every needed column is in the index, so the table is never touched. No random reads at all."]
+    ];
+    const max=Math.max(...M.map(m=>m[1]));
+    const w=cv.clientWidth||660, h=136, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h);
+    ctx.textBaseline="middle";
+    const lx=Math.min(140,w*0.27), rx=w-110, span=rx-lx;
+    const chosen = seqMs<idxMs ? 0 : 1;
+    M.forEach((m,i)=>{
+      const y=16+i*38, isChosen=i===chosen;
+      ctx.fillStyle= isChosen?"#16232F":"#54677A"; ctx.font=(isChosen?"600 ":"")+"11.5px Archivo, Arial"; ctx.textAlign="right";
+      ctx.fillText(m[0], lx-9, y+12);
+      const wd=Math.max(3,(m[1]/max)*span);
+      ctx.fillStyle= i===2?"#BFE7D3": isChosen?"#3FB984":"#E8908B";
+      ctx.fillRect(lx,y,wd,24);
+      if(isChosen){ ctx.strokeStyle="#1F7A52"; ctx.lineWidth=1.8; ctx.strokeRect(lx-.5,y-.5,wd+1,25); }
+      ctx.fillStyle= isChosen?"#1F7A52":"#54677A"; ctx.font=(isChosen?"600 ":"")+"11px ui-monospace, monospace"; ctx.textAlign="left";
+      const t = m[1]>=1000? (m[1]/1000).toFixed(2)+" s" : m[1]>=1? m[1].toFixed(1)+" ms" : m[1].toFixed(2)+" ms";
+      ctx.fillText(t, lx+wd+7, y+12);
+      ctx.fillStyle="#B8C4CE"; ctx.font="9.5px ui-monospace, monospace";
+      const px=lx+wd+7+58;
+      if(w-px>76) ctx.fillText(m[2].toLocaleString()+" rows", px, y+12);
+    });
+    // crossover selectivity
+    const cross = ((N/4_000_000*1000) - 0.02*Math.log2(N)) / 0.0022 / N;
+    out.innerHTML=
+      '<div><span>table</span><b>'+N.toLocaleString()+' rows</b></div>'+
+      '<div><span>matching</span><b>'+matched.toLocaleString()+'</b></div>'+
+      '<div><span>planner picks</span><b style="color:'+(chosen?"#1F7A52":"#D98324")+'">'+(chosen?"index scan":"sequential scan")+'</b></div>'+
+      '<div><span>index vs scan</span><b>'+(seqMs/idxMs>=1?(seqMs/idxMs).toFixed(1)+"× faster":(idxMs/seqMs).toFixed(1)+"× slower")+'</b></div>'+
+      '<div><span>crossover at</span><b>'+(cross*100).toFixed(1)+'%</b></div>';
+    let msg;
+    if(sel*100<0.5) msg="<b>"+matched.toLocaleString()+" rows out of "+N.toLocaleString()+" — the case indexes exist for.</b> The index reaches them in "+idxMs.toFixed(2)+" ms; scanning takes "+(seqMs>=1000?(seqMs/1000).toFixed(2)+" s":seqMs.toFixed(0)+" ms")+", or "+(seqMs/idxMs).toFixed(0)+" times longer, and that ratio grows linearly with the table. Note the third bar: an index-only scan is faster again, because it never touches the table at all.";
+    else if(sel*100<cross*100) msg="<b>Still worth it, but the margin is closing.</b> At "+(sel*100).toFixed(1)+"% the index wins by "+(seqMs/idxMs).toFixed(1)+"×, down from thousands at high selectivity. Each matching row costs a random read, so the index's advantage erodes in proportion to how much of the table matches — and the crossover for this table is around "+(cross*100).toFixed(1)+"%.";
+    else msg="<b>The planner has switched to a sequential scan, and it is correct.</b> At "+(sel*100).toFixed(1)+"% selectivity the index would do "+matched.toLocaleString()+" scattered random reads, which costs more than streaming all "+N.toLocaleString()+" rows in physical order. This is the answer to \"why is my index not being used\" in a large share of cases: it is being considered and rejected on the numbers. An index-only scan can still win here, because it avoids the random reads entirely — which is exactly when <code>INCLUDE</code> earns its keep.";
+    note.innerHTML=msg;
+  }
+  [nEl,sEl].forEach(e=>e.addEventListener("input",draw));
+  draw(); debounceResize(draw);
+})();
+
+/* ============ demo 2: composite index prefix ============ */
+(function(){
+  const cv=document.getElementById("cComp"); if(!cv) return;
+  const sels=[0,1,2].map(i=>document.getElementById("cp"+i));
+  const out=document.getElementById("cpOut"), note=document.getElementById("cpNote");
+  const COLS=["status","created_at","user_id"];
+  const DIST=[4,null,50000];
+  const TOTAL=2_000_000;
+  function draw(){
+    const use=sels.map(s=>s.value);
+    // walk the prefix
+    const state=[]; let stopped=false, reason="";
+    for(let i=0;i<3;i++){
+      if(stopped){ state.push("unused"); continue; }
+      const u=use[i];
+      if(u==="none"){ state.push("unused"); stopped=true; reason= i===0?"leading":"gap"; continue; }
+      if(u==="eq"){ state.push("seek"); continue; }
+      if(u==="range"){ state.push("range"); stopped=true; reason="range"; continue; }
+      if(u==="order"){ state.push("order"); stopped=true; reason="order"; continue; }
+    }
+    const used=state.filter(s=>s!=="unused").length;
+    // rows examined
+    let rows=TOTAL;
+    for(let i=0;i<3;i++){
+      if(state[i]==="seek") rows = i===0? rows/DIST[0] : i===2? rows/DIST[2] : rows/900;
+      else if(state[i]==="range") rows = rows/6;
+      else break;
+    }
+    rows=Math.max(1,Math.round(rows));
+    // extra filtering in the heap for predicates the index couldn't use
+    let heapFiltered=0;
+    for(let i=0;i<3;i++) if(state[i]==="unused"&&use[i]!=="none"&&use[i]!=="order") heapFiltered++;
+    const w=cv.clientWidth||660, h=170, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h);
+    ctx.textBaseline="middle";
+    ctx.fillStyle="#54677A"; ctx.font="600 10px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("CREATE INDEX ON orders (status, created_at, user_id)", 16, 18);
+    const pad=16, cw=(w-2*pad-16)/3;
+    const COLR={seek:["#E7F7EF","#3FB984","#166B47","seek"],
+                range:["#FFF6E8","#D98324","#B0651A","range scan"],
+                order:["#EAF1F7","#3E8FD0","#2C6FA5","ordering only"],
+                unused:["#F5F7F9","#DDE4EA","#B8C4CE","not used"]};
+    COLS.forEach((c,i)=>{
+      const x=pad+i*(cw+8), st=COLR[state[i]];
+      ctx.fillStyle=st[0]; ctx.strokeStyle=st[1]; ctx.lineWidth= state[i]==="unused"?1.2:2.2;
+      ctx.fillRect(x,32,cw,44); ctx.strokeRect(x+.5,32.5,cw,44);
+      ctx.fillStyle= state[i]==="unused"?"#B8C4CE":"#16232F"; ctx.font="600 12px ui-monospace, monospace"; ctx.textAlign="center";
+      ctx.fillText(c,x+cw/2,47);
+      ctx.fillStyle=st[2]; ctx.font="600 9.5px Archivo, Arial";
+      ctx.fillText(st[3],x+cw/2,63);
+      if(i<2){ ctx.fillStyle="#CFD8E0"; ctx.font="14px Archivo, Arial";
+        ctx.fillText("›",x+cw+4,54); }
+    });
+    ctx.textAlign="left"; ctx.fillStyle="#54677A"; ctx.font="600 10px Archivo, Arial";
+    ctx.fillText("rows the database examines", 16, 96);
+    const bw=w-32, frac=Math.min(1,Math.log10(rows)/Math.log10(TOTAL));
+    ctx.fillStyle="#F2F5F7"; ctx.fillRect(16,106,bw,22);
+    ctx.fillStyle= rows>200000?"#D9534F": rows>5000?"#F2A03D":"#3FB984";
+    ctx.fillRect(16,106,Math.max(4,frac*bw),22);
+    ctx.strokeStyle="#E1E7EC"; ctx.lineWidth=1; ctx.strokeRect(16.5,106.5,bw,22);
+    ctx.fillStyle= frac>0.35?"#fff":"#54677A"; ctx.font="600 11px ui-monospace, monospace"; ctx.textAlign="left";
+    ctx.fillText(rows.toLocaleString()+" of "+TOTAL.toLocaleString(), frac>0.35?24:Math.max(4,frac*bw)+24, 117);
+    ctx.fillStyle="#8195A6"; ctx.font="10px Archivo, Arial";
+    ctx.fillText("log scale", w-72, 117);
+    ctx.textAlign="left";
+    ctx.fillStyle= used===0?"#D9534F":"#1F7A52"; ctx.font="600 11px Archivo, Arial";
+    ctx.fillText(used===0?"the index cannot be used at all — sequential scan":used+" of 3 columns usable", 16, 150);
+    out.innerHTML=
+      '<div><span>columns usable</span><b style="color:'+(used===0?"#D9534F":used>=2?"#1F7A52":"#D98324")+'">'+used+' / 3</b></div>'+
+      '<div><span>rows examined</span><b style="color:'+(rows>200000?"#D9534F":"#1F7A52")+'">'+rows.toLocaleString()+'</b></div>'+
+      '<div><span>of the table</span><b>'+(100*rows/TOTAL).toFixed(3)+'%</b></div>'+
+      '<div><span>filtered after fetch</span><b style="color:'+(heapFiltered?"#D98324":"#1F7A52")+'">'+heapFiltered+' predicate'+(heapFiltered===1?"":"s")+'</b></div>';
+    let msg;
+    if(use.every(u=>u==="none")) msg="<b>The query mentions none of the indexed columns, so the index is irrelevant.</b> Set at least one.";
+    else if(used===0&&reason==="leading") msg="<b>The index is unusable, because the query does not constrain <code>status</code> — the leading column.</b> The index is sorted by status first, so rows for a given <code>created_at</code> or <code>user_id</code> are scattered across every status block rather than sitting together. There is no contiguous range to seek to, and the database falls back to a full scan of all "+TOTAL.toLocaleString()+" rows. This is the leftmost prefix rule, and it is the most common reason a seemingly relevant index does nothing.";
+    else if(reason==="range"&&used<3&&use[used]!=="none") msg="<b>"+used+" columns usable: the range on <code>"+COLS[used-1]+"</code> stops the index there.</b> Within a range the rows are ordered by that column, so the next column's values are interleaved rather than contiguous — nothing further can be narrowed by seeking. The remaining predicate is still applied, but only after each row has been fetched, which is what <em>Rows Removed by Filter</em> means in a plan. Putting equality columns before range columns is the whole rule.";
+    else if(reason==="order") msg="<b>"+used+" columns usable, with <code>"+COLS[used-1]+"</code> providing the sort order for free.</b> Because every column before it is an equality, the matching rows are already stored in <code>"+COLS[used-1]+"</code> order — so <code>ORDER BY</code> costs nothing and, crucially, a <code>LIMIT</code> can stop early instead of sorting the whole result. Reverse the direction on only some columns and this stops working.";
+    else if(used===3) msg="<b>All three columns usable — "+rows.toLocaleString()+" rows examined out of "+TOTAL.toLocaleString()+".</b> Three equality predicates seek straight to a single narrow range of the index. This is the ideal case, and it is worth noticing how much of the win came from column order rather than from having an index at all.";
+    else msg="<b>"+used+" of 3 columns usable, narrowing to "+rows.toLocaleString()+" rows.</b> "+(heapFiltered?"One predicate could not be served by the index and is applied after each row is fetched — visible in a plan as <em>Rows Removed by Filter</em>.":"Add another column to the query and watch the row count fall further.");
+    note.innerHTML=msg;
+  }
+  sels.forEach(s=>s.addEventListener("change",draw));
+  draw(); debounceResize(draw);
+})();
+</script>
+</body>
+</html>

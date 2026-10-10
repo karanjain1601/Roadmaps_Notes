@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Mappings and field types — Elasticsearch</title>
+<meta name="description" content="Dynamic mapping guesses, and it guesses badly at scale. Field types, multi-fields, and how a mapping explosion takes down a cluster.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 04 · Modelling</div>
+    <h1>Mappings and field types</h1>
+    <p class="standfirst">Elasticsearch will happily accept a document it has never seen and invent a schema for it. That is a wonderful feature for the first afternoon and the source of a specific set of production problems from the second week onwards.</p>
+    <div class="chap-meta">
+      <span class="tagpill">mappings</span>
+      <span class="tagpill">dynamic</span>
+      <span class="tagpill">types</span>
+      <span class="tagpill">multi-fields</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>What dynamic mapping does</h2>
+
+<div class="demo" id="map">
+  <div class="demo-head">
+    <b>What Elasticsearch infers</b>
+    <span>Send a document to an index that does not exist, and this is the mapping you get.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="m-doc">Document</label>
+        <select id="m-doc">
+          <option value="order" selected>An order</option>
+          <option value="log">A log line</option>
+          <option value="product">A product</option>
+          <option value="messy">Slightly inconsistent data</option>
+        </select>
+      </div>
+    </div>
+    <div id="m-view"></div>
+    <div class="stat">
+      <div><b id="m-fields">—</b><span>mapped fields</span></div>
+      <div><b id="m-issues">—</b><span>problems</span></div>
+      <div><b id="m-verdict">—</b><span>verdict</span></div>
+    </div>
+    <div class="out" id="m-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">the inference rules, in full</span><button class="copy">Copy</button></div>
+<pre><code>JSON value          becomes
+------------------  ------------------------------------------------------
+"hello"             text, with a .keyword sub-field (ignore_above: 256)
+"2026-03-14"        date        — if date_detection is on, which it is
+"192"               text        — numeric_detection is OFF by default
+42                  long        — ALWAYS long, even if every value fits a byte
+42.5                float
+true                boolean
+{ "a": 1 }          object      — NOT nested. This matters enormously (ch 5)
+[ 1, 2, 3 ]         long        — arrays are not a type; the ELEMENT type is
+[ {...}, {...} ]    object      — and the array is FLATTENED. See chapter 5
+null                nothing at all — no field is created
+
+THE SINGLE MOST CONSEQUENTIAL RULE: every string becomes text AND keyword.
+That doubles the index size for every string field and is why dynamic
+mapping is so expensive at scale — you are paying to make every log message
+aggregatable, including the ones nobody will ever group by.
+
+A MAPPING IS ALMOST IMMUTABLE. You can ADD a new field to an existing
+mapping. You cannot change an existing field's type, its analyzer, or
+whether it is indexed. The reason is physical: the terms are already on
+disk in the old form, and changing the definition would make the index
+disagree with itself.
+
+  PUT /orders/_mapping
+  { "properties": { "discount_code": { "type": "keyword" } } }   # fine
+
+  PUT /orders/_mapping
+  { "properties": { "total": { "type": "double" } } }            # rejected
+  # "mapper [total] cannot be changed from type [long] to [double]"
+
+Changing a field type means creating a new index and reindexing (chapter 6).
+On a large index that is a project, which is why the first document you send
+matters more than it looks like it should.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">The first document defines the index</span>
+  <p>Whichever document happens to arrive first sets the type of every field in it, permanently. If your test data had <code>"quantity": 1</code> the field is a <code>long</code>, and the production document with <code>"quantity": 1.5</code> will be rejected — or worse, silently truncated depending on your settings. If a field was empty in the first batch and a string in the second, its type is whatever the second batch happened to contain. <b>The fix is to define the mapping before any data arrives</b>, via an explicit index creation or an index template. This is not a nicety for later; it is the difference between a schema you chose and a schema that was chosen by whatever your ingest pipeline emitted on a Tuesday.</p>
+</div>
+
+<h2><span class="h-rule"></span>The types worth knowing</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Type</th><th>For</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>text</code></td><td>Prose a human searches within</td><td>Analysed. Not sortable or aggregatable (chapter 3)</td></tr>
+<tr><td><code>keyword</code></td><td>Ids, statuses, tags, codes, emails</td><td>Exact. Sortable, aggregatable, cheap</td></tr>
+<tr><td><code>long</code> / <code>integer</code> / <code>short</code> / <code>byte</code></td><td>Whole numbers</td><td>Pick the smallest that fits — it is real disk savings</td></tr>
+<tr><td><code>double</code> / <code>float</code> / <code>half_float</code></td><td>Decimals</td><td><code>half_float</code> is plenty for percentages and ratings</td></tr>
+<tr><td><code>scaled_float</code></td><td>Money</td><td>Stored as a long with a scaling factor. Better than <code>double</code> for currency</td></tr>
+<tr><td><code>boolean</code></td><td>True/false</td><td>Accepts <code>"true"</code> and <code>"false"</code> strings too</td></tr>
+<tr><td><code>date</code></td><td>Timestamps</td><td>Stored as epoch millis. Accepts several formats via <code>format</code></td></tr>
+<tr><td><code>object</code></td><td>Nested JSON</td><td>Flattened internally. <b>Read chapter 5 before using with arrays</b></td></tr>
+<tr><td><code>nested</code></td><td>Arrays of objects where the pairing matters</td><td>Separate hidden documents. Costly, and sometimes essential</td></tr>
+<tr><td><code>flattened</code></td><td>Objects with unpredictable keys</td><td>One field, all values as keywords. The mapping-explosion antidote</td></tr>
+<tr><td><code>ip</code></td><td>IPv4 and IPv6</td><td>Supports CIDR range queries</td></tr>
+<tr><td><code>geo_point</code> / <code>geo_shape</code></td><td>Coordinates, areas</td><td>Distance sort, bounding box, polygon containment</td></tr>
+<tr><td><code>dense_vector</code></td><td>Embeddings</td><td>kNN search (chapter 13)</td></tr>
+<tr><td><code>*_range</code></td><td>A span rather than a point</td><td><code>date_range</code>, <code>integer_range</code> — genuinely useful and little known</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">an explicit mapping, with the decisions visible</span><button class="copy">Copy</button></div>
+<pre><code>PUT /orders
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 1
+  },
+  "mappings": {
+    "dynamic": "strict",              # reject unknown fields — see below
+    "properties": {
+
+      "order_id":  { "type": "keyword" },
+      "status":    { "type": "keyword" },
+
+      "customer_note": {              # prose, searched AND faceted
+        "type": "text",
+        "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } }
+      },
+
+      "total": {                      # money: never a float
+        "type": "scaled_float",
+        "scaling_factor": 100
+      },
+
+      "quantity": { "type": "integer" },
+      "placed_at": {
+        "type": "date",
+        "format": "strict_date_optional_time||epoch_millis"
+      },
+
+      "internal_ref": {               # stored and returned, never searched
+        "type": "keyword",
+        "index": false
+      },
+
+      "tags": { "type": "keyword" },  # arrays need no special declaration
+
+      "customer": {                   # an object, single-valued: fine
+        "properties": {
+          "id":    { "type": "keyword" },
+          "email": { "type": "keyword" },
+          "name":  { "type": "text" }
+        }
+      }
+    }
+  }
+}
+
+# FOUR SETTINGS THAT SAVE REAL SPACE, per field:
+#   "index": false          not searchable. Still in _source and returned
+#   "doc_values": false     not sortable/aggregatable. Saves the columnar copy
+#   "norms": false          drops length normalisation — fine for keyword-like
+#                           text you match but do not need scored well
+#   "ignore_above": 256     do not index keyword values longer than this
+#
+# On a large log index, turning off doc_values for fields you never aggregate
+# and norms for fields you never score can cut the index size substantially.
+# Check with GET /index/_disk_usage?run_expensive_tasks=true first.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Controlling dynamic behaviour</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">four settings, and dynamic templates</span><button class="copy">Copy</button></div>
+<pre><code>"dynamic": true        # DEFAULT. Add new fields to the mapping automatically
+"dynamic": "runtime"   # add them as RUNTIME fields — queryable, not indexed.
+                       # A very good middle ground: nothing is lost, nothing
+                       # is silently indexed, and you can promote a field to
+                       # a real one later if it earns it
+"dynamic": false       # ignore new fields. They stay in _source and are
+                       # returned, but are NOT searchable. Silent, and the
+                       # cause of "the data is there but I cannot find it"
+"dynamic": "strict"    # REJECT the document with an error
+
+# For anything with a known shape, "strict" is the right choice. A rejected
+# document is a bug report; a silently unindexed one is a mystery in three
+# months. For log-shaped data where fields genuinely vary, "runtime" is the
+# modern answer.
+
+# DYNAMIC TEMPLATES apply rules to fields you have not seen yet, matched by
+# name or by inferred type:
+
+PUT /logs
+{ "mappings": {
+    "dynamic_templates": [
+
+      { "ids_as_keyword": {
+          "match": "*_id",
+          "mapping": { "type": "keyword" } } },
+
+      { "strings_keyword_only": {
+          "match_mapping_type": "string",
+          "mapping": { "type": "keyword", "ignore_above": 1024 } } },
+
+      { "metrics_as_float": {
+          "path_match": "metrics.*",
+          "mapping": { "type": "float", "index": false } } }
+    ]
+}}
+
+# That second rule alone — every string becomes keyword-only instead of
+# text-plus-keyword — is the standard fix for log indices. Log messages are
+# filtered and aggregated far more often than they are searched as prose, and
+# you have just halved the string overhead across the whole index.
+
+# RUNTIME FIELDS deserve their own mention. They are computed at query time
+# from _source or other fields:
+PUT /logs/_mapping
+{ "runtime": {
+    "response_bucket": {
+      "type": "keyword",
+      "script": "emit(doc['status'].value < 400 ? 'ok' : 'error')"
+    }
+}}
+# No reindex, no disk cost, slower to query. Perfect for a field you need
+# occasionally, or for fixing a mapping mistake without rebuilding the index.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Mapping explosion</span>
+  <p>Every field in every index is held in the cluster state, which lives in memory on every node and is propagated to all of them on every change. A few hundred fields is nothing. <b>Tens of thousands of fields makes cluster-state updates slow, node joins slow, and the master unstable</b> — and the cluster degrades in ways that look like a performance problem rather than a modelling one. The classic cause is dynamic mapping over user-controlled keys: a document with <code>{"attributes": {"colour": "red"}}</code> creates <code>attributes.colour</code>, and if the key is whatever the customer typed, each new key is a permanent new field. The <code>index.mapping.total_fields.limit</code> setting defaults to 1000 and exists to stop this. Raising it because you hit it is almost always the wrong response; the right one is a <code>flattened</code> field.</p>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">flattened — one field for an entire unpredictable object</span><button class="copy">Copy</button></div>
+<pre><code>PUT /events
+{ "mappings": { "properties": {
+    "custom_attributes": { "type": "flattened" }
+}}}
+
+PUT /events/_doc/1
+{ "custom_attributes": {
+    "campaign": "spring-sale",
+    "variant":  "b",
+    "referrer": "newsletter",
+    "anything_at_all": "the customer decided this key name"
+}}
+
+# ONE field in the mapping, regardless of how many keys arrive. Every leaf
+# value is indexed as a keyword.
+
+GET /events/_search
+{ "query": { "term": { "custom_attributes.campaign": "spring-sale" } } }
+{ "query": { "term": { "custom_attributes": "spring-sale" } } }   # any key
+
+# WHAT YOU GIVE UP:
+#   * everything is a keyword. No numbers, no dates, no full-text
+#   * no per-field analysis, no per-field boosting
+#   * limited aggregation support compared with real fields
+#
+# WHAT YOU GET: an index whose field count is bounded by your schema rather
+# than by your users' imagination. For the "arbitrary tags" or "custom
+# properties" problem this is the correct answer, and it is under-used
+# because people do not know the type exists.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Inspecting and fixing</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">what have I actually got</span><button class="copy">Copy</button></div>
+<pre><code>GET /orders/_mapping
+GET /orders/_mapping/field/total
+GET /_mapping/field/*.keyword               # every keyword sub-field
+GET /orders/_field_caps?fields=*            # types across several indices —
+                                            # the way to find inconsistencies
+
+GET /orders/_disk_usage?run_expensive_tasks=true
+# per field, per structure: inverted index, doc values, stored fields, norms.
+# When an index is twice the size you expected, this says which field.
+
+GET /orders/_count
+GET /_cat/indices/orders?v&h=index,docs.count,store.size,pri,rep
+
+# TO CHANGE A TYPE, reindex into a correctly-mapped index and swap an alias:
+PUT /orders-v2  { "mappings": { ... } }
+
+POST /_reindex
+{ "source": { "index": "orders" },
+  "dest":   { "index": "orders-v2" } }
+
+POST /_aliases
+{ "actions": [
+    { "remove": { "index": "orders",    "alias": "orders-live" } },
+    { "add":    { "index": "orders-v2", "alias": "orders-live" } } ]}
+
+# ALWAYS READ AND WRITE THROUGH AN ALIAS, from day one. It costs nothing and
+# it turns "we need to change the mapping" from an outage into an atomic
+# swap. An application that names a concrete index cannot be reindexed
+# without a deployment; one that names an alias can be reindexed at 3pm on a
+# Tuesday. This is the single cheapest piece of Elasticsearch hygiene there
+# is, and the one most often skipped.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Index templates make the mapping arrive before the data</span>
+  <p>For anything created automatically — logs, metrics, events, any time-series index named by date — there is no moment at which you could apply a mapping by hand, because the index springs into existence the instant a document arrives. An <b>index template</b> binds settings, mappings and aliases to a name pattern in advance: <code>PUT /_index_template/logs</code> with <code>"index_patterns": ["logs-*"]</code>, and every index matching that pattern is born correct. <b>Component templates</b> let you compose them from reusable pieces, so a shared set of standard fields can be defined once and included everywhere. Without this, every new index gets full dynamic mapping and you find out a month later.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>The first document defines the index.</b> Field types are set by whatever arrived first and mostly cannot be changed.</li>
+    <li><b>Every string becomes <code>text</code> plus <code>keyword</code></b> under dynamic mapping, which doubles the cost of every string field.</li>
+    <li><b>Numbers are always <code>long</code> or <code>float</code></b>. Declaring smaller types is real disk savings.</li>
+    <li><b>Use <code>scaled_float</code> for money</b>, never <code>double</code>.</li>
+    <li><b><code>"dynamic": "strict"</code> for known shapes, <code>"runtime"</code> for varying ones.</b> <code>false</code> silently loses searchability.</li>
+    <li><b>Dynamic templates fix the string default</b> — keyword-only for log data is the standard win.</li>
+    <li><b><code>flattened</code> is the answer to user-controlled keys</b>, and mapping explosion is what happens without it.</li>
+    <li><b>Read and write through an alias from day one.</b> It turns a reindex from an outage into a swap.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("04-mappings.html");
+
+(function(){
+  const root = document.getElementById("map");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const DOCS = {
+    order: {
+      json: {
+        order_id: "A-8842",
+        status: "shipped",
+        total: 49,
+        placed_at: "2026-03-14",
+        tags: ["priority", "gift"],
+        customer: { id: "c-41", email: "sam@example.com" }
+      },
+      fields: [
+        ["order_id", "text + keyword", "warn", "An identifier analysed as prose. Should be keyword only."],
+        ["status", "text + keyword", "warn", "An enum with five possible values, indexed twice."],
+        ["total", "long", "bad", "49 is a whole number today. The first 49.99 is rejected or truncated."],
+        ["placed_at", "date", "ok", "Date detection got this right."],
+        ["tags", "text + keyword", "warn", "Arrays need no declaration, but these should be keyword only."],
+        ["customer.id", "text + keyword", "warn", "Same problem, nested."],
+        ["customer.email", "text + keyword", "bad", "The standard tokenizer splits this on @ and dots."]
+      ],
+      note: "Dynamic mapping produced something that works and is wrong in three ways that matter.\n\nThe serious one is total. It arrived as 49, so the field is a long — permanently. The first order for 49.99 either fails outright or is silently coerced to 49 depending on your coercion setting, and by the time anyone notices there is a month of truncated revenue data. Money should be scaled_float with a scaling factor of 100.\n\nThe email is the second: the standard tokenizer splits it into [sam, example.com], so a term query for the full address finds nothing and an aggregation groups by fragments.\n\nThe rest is waste rather than error. Every identifier and enum here is indexed twice — once analysed as prose that nobody will ever search within, once as a keyword. On a large index that is a meaningful fraction of your disk."
+    },
+    log: {
+      json: {
+        "@timestamp": "2026-03-14T09:12:44Z",
+        level: "ERROR",
+        message: "Connection refused to upstream 10.0.1.42:8080",
+        service: "checkout-api",
+        duration_ms: 1284,
+        trace_id: "4f9a2c8e1b"
+      },
+      fields: [
+        ["@timestamp", "date", "ok", "Correct."],
+        ["level", "text + keyword", "warn", "Five values, indexed twice, and you only ever filter on it."],
+        ["message", "text + keyword", "bad", "A keyword sub-field on a free-text log message: pure waste."],
+        ["service", "text + keyword", "warn", "Should be keyword only."],
+        ["duration_ms", "long", "ok", "Fine, though integer would be smaller."],
+        ["trace_id", "text + keyword", "warn", "An opaque id analysed as prose."]
+      ],
+      note: "This is the shape that motivates dynamic templates, because the waste compounds at log volumes.\n\nThe message field is the clearest problem. It gets a .keyword sub-field capped at 256 characters, which is useless — nobody aggregates on the exact text of a log line, and the values that would be interesting are longer than the cap anyway. You are paying to store a second copy of every log message for no purpose.\n\nMeanwhile level, service and trace_id all get analysed as text when they are only ever filtered and grouped.\n\nThe standard fix is one dynamic template: match_mapping_type string, map to keyword with ignore_above. Then add message back explicitly as text-only. That single change routinely cuts a log index's size by a third, and it has to be in an index template because these indices are created automatically as data arrives."
+    },
+    product: {
+      json: {
+        sku: "WH-1000XM5",
+        name: "Sony WH-1000XM5 Wireless Headphones",
+        description: "Industry-leading noise cancellation with...",
+        price: 349.99,
+        in_stock: true,
+        rating: 4.7,
+        categories: ["audio", "headphones"]
+      },
+      fields: [
+        ["sku", "text + keyword", "warn", "Analysed into [wh, 1000xm5]. Use keyword only."],
+        ["name", "text + keyword", "ok", "Genuinely wants both — searched as prose, sorted and faceted exactly."],
+        ["description", "text + keyword", "warn", "The keyword copy is waste on long prose."],
+        ["price", "float", "warn", "Works. scaled_float is better for money."],
+        ["in_stock", "boolean", "ok", "Correct."],
+        ["rating", "float", "warn", "half_float would halve the space with plenty of precision."],
+        ["categories", "text + keyword", "warn", "Facets use the keyword copy; the text copy is unused."]
+      ],
+      note: "The closest to acceptable of these, because a product catalogue is the use case dynamic mapping was designed around.\n\nname is the field that genuinely wants both types, and it is the reason multi-fields exist: users search within it as prose, and the sidebar facets and A-Z sort need the exact value. Dynamic mapping produces exactly the right shape here by accident.\n\nEverything else is a small improvement rather than a bug. sku analysed by the standard tokenizer becomes [wh, 1000xm5], so a term query for the full SKU fails — that one is a real error, just a quiet one.\n\nrating as half_float instead of float is the kind of change that looks trivial and is not: on a hundred million documents, halving a numeric field's doc values is real money. The same argument applies to choosing integer over long, and short over integer, wherever the range allows."
+    },
+    messy: {
+      json: {
+        user_id: 41,
+        signup: "2026-03-14",
+        score: "87",
+        active: "true",
+        meta: { source: "web", campaign_q1_2026_promo: "yes" }
+      },
+      fields: [
+        ["user_id", "long", "warn", "Numeric now. The first id like 'u-42' is rejected."],
+        ["signup", "date", "warn", "Date detection fired on a string. Convenient and fragile."],
+        ["score", "text + keyword", "bad", "A number sent as a string. No range queries, no aggregations."],
+        ["active", "text + keyword", "bad", "A boolean sent as a string. Filters will not behave."],
+        ["meta.source", "text + keyword", "warn", "Fine."],
+        ["meta.campaign_q1_2026_promo", "text + keyword", "bad", "A user-controlled key. Every new one is a permanent field."]
+      ],
+      note: "Four separate ways for this to go wrong, and all of them are silent.\n\nscore arrived as \"87\" — a string — so the field is text. Range queries on it will not work, aggregations will not work, and sorting will be lexicographic, meaning \"9\" sorts after \"87\". numeric_detection is off by default precisely because guessing here is dangerous, so Elasticsearch does the safe thing and you get a broken field.\n\nactive as \"true\" has the same problem. It is a string, so a boolean filter will not match it.\n\nsignup shows the opposite failure: date_detection IS on by default, so a string that looks like a date silently becomes one. Convenient until a value arrives in a different format and the document is rejected.\n\nThe worst is meta.campaign_q1_2026_promo. That key came from data rather than from a schema, so every campaign creates a permanent new field in the cluster state — held in memory on every node and propagated on every change. A few thousand campaigns later the master is struggling and it looks like a performance problem. The type for this is flattened."
+    }
+  };
+
+  function render(){
+    const k = $("m-doc").value, d = DOCS[k];
+    const bad  = d.fields.filter(f => f[2] === "bad").length;
+    const warn = d.fields.filter(f => f[2] === "warn").length;
+
+    const COL = {ok:"#3FB984", warn:"#F2A03D", bad:"#E2574C"};
+
+    $("m-fields").textContent  = d.fields.length;
+    $("m-issues").textContent  = bad + " serious, " + warn + " wasteful";
+    $("m-verdict").textContent = bad >= 3 ? "rebuild it" : bad > 0 ? "fix before scaling" : "acceptable";
+    $("m-verdict").style.color = bad >= 3 ? "#E2574C" : bad > 0 ? "#F2A03D" : "#3FB984";
+
+    $("m-view").innerHTML =
+      '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:18px;margin:16px 0 4px">' +
+      '<div><div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin-bottom:8px">The document you sent</div>' +
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-radius:5px;padding:11px 13px;' +
+      'margin:0;font-family:var(--mono);font-size:11.5px;line-height:1.6;overflow-x:auto">' +
+      JSON.stringify(d.json, null, 2) + '</pre></div>' +
+      '<div><div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin-bottom:8px">The mapping it created</div>' +
+      d.fields.map(([name, type, sev, why]) =>
+        '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid ' + COL[sev] +
+        ';border-radius:4px;padding:7px 11px;margin-bottom:4px">' +
+        '<div style="display:flex;gap:10px;align-items:baseline;font-family:var(--mono);font-size:11.5px">' +
+        '<span style="font-weight:700;color:#16232F">' + name + '</span>' +
+        '<span style="color:' + COL[sev] + '">' + type + '</span></div>' +
+        '<div style="font-size:11.5px;color:#54677A;margin-top:3px;line-height:1.45">' + why + '</div></div>').join("") +
+      '</div></div>';
+
+    $("m-note").textContent = d.note +
+      "\n\nEvery one of these is fixable in ten seconds before the index exists and expensive afterwards, because a field's type cannot be changed once documents are written — the terms are already on disk in the old form. The fix is always the same: create the index explicitly, or bind an index template to the name pattern so the mapping arrives before the data does.";
+  }
+
+  $("m-doc").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Pub/Sub and messaging — Redis</title>
+<meta name="description" content="Fire-and-forget delivery, keyspace notifications, sharded channels, and knowing when you actually wanted a stream.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 11 · Patterns</div>
+    <h1>Pub/Sub and messaging</h1>
+    <p class="standfirst">Publish a message, every current subscriber receives it, nothing is stored. That is the entire feature — and the word "current" is doing more work than most people notice when they build on it.</p>
+    <div class="chap-meta">
+      <span class="tagpill">publish</span>
+      <span class="tagpill">at-most-once</span>
+      <span class="tagpill">notifications</span>
+      <span class="tagpill">sharded</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The mechanism</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">four commands and no storage</span><button class="copy">Copy</button></div>
+<pre><code># Subscriber
+SUBSCRIBE room:general
+# 1) "subscribe"  2) "room:general"  3) (integer) 1
+# ... then, for each message:
+# 1) "message"    2) "room:general"  3) "hello"
+
+# Publisher
+PUBLISH room:general "hello"
+# (integer) 2      <- how many subscribers RECEIVED it, right now
+
+PSUBSCRIBE room:*              # glob patterns
+PUNSUBSCRIBE room:*
+PUBSUB CHANNELS                # active channels with subscribers
+PUBSUB NUMSUB room:general
+PUBSUB NUMPAT
+
+# The return value of PUBLISH is the only feedback there is, and it is worth
+# understanding precisely: it counts subscribers the message was DELIVERED
+# to, not subscribers who processed it. Zero means nobody was listening and
+# the message is gone — no queue, no retry, no record that it existed.
+
+# A subscribed connection is IN SUBSCRIBER MODE and can only run
+# SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PING and QUIT. To both
+# publish and subscribe you need two connections, which every client library
+# handles for you — and which is why a naive implementation that reuses one
+# pooled connection fails confusingly.
+#
+# RESP3 (Redis 6+) relaxes this: with HELLO 3 a client can subscribe and
+# still issue other commands on the same connection, because push messages
+# are distinguishable from replies at the protocol level.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>What gets lost</h2>
+
+<div class="demo" id="ps">
+  <div class="demo-head">
+    <b>Where the messages go</b>
+    <span>Pub/sub is at-most-once. Pick a situation and see what the subscriber receives.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="p-sit">Situation</label>
+        <select id="p-sit">
+          <option value="normal" selected>Everything is connected</option>
+          <option value="late">Subscriber connects after the publish</option>
+          <option value="restart">Subscriber restarts for 2 seconds</option>
+          <option value="slow">Subscriber is slower than the publisher</option>
+          <option value="crash">Subscriber crashes while processing</option>
+          <option value="failover">Redis fails over</option>
+          <option value="none">No subscriber at all</option>
+        </select>
+      </div>
+      <div>
+        <label for="p-mech">Mechanism</label>
+        <select id="p-mech">
+          <option value="pubsub" selected>Pub/Sub</option>
+          <option value="stream">A stream with a consumer group</option>
+        </select>
+      </div>
+    </div>
+    <div id="p-flow"></div>
+    <div class="stat">
+      <div><b id="p-got">—</b><span>received</span></div>
+      <div><b id="p-lost">—</b><span>lost</span></div>
+      <div><b id="p-recover">—</b><span>recoverable?</span></div>
+    </div>
+    <div class="out" id="p-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">At most once, and usually that is the wrong guarantee</span>
+  <p>A published message is delivered to whoever is connected at that instant and then discarded. A subscriber that is restarting, redeploying, briefly disconnected, or simply slow enough to be disconnected for buffer overrun misses everything that arrived meanwhile, permanently and silently. There is no acknowledgement, no replay, and no signal that anything was missed. <b>That is fine for data that is refreshed anyway</b> — a presence update, a live counter, a cache invalidation hint — because the next message repairs the gap. It is wrong for anything where a missed message means work not done, and "we restart during every deploy" means the gap is not hypothetical.</p>
+</div>
+
+<h2><span class="h-rule"></span>Slow subscribers get disconnected</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the failure mode nobody configures for</span><button class="copy">Copy</button></div>
+<pre><code>CONFIG GET client-output-buffer-limit
+# "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60"
+#                                          ^^^^^^ hard  soft  seconds
+
+# For pub/sub clients: disconnect immediately at 32 MB of pending output, or
+# after 60 continuous seconds above 8 MB.
+#
+# A subscriber that cannot keep up accumulates unsent messages in a buffer on
+# the SERVER. When that buffer hits the limit, Redis closes the connection.
+# The client reconnects, resubscribes, and has lost everything in between —
+# with nothing in its own logs to explain the gap beyond a reconnection.
+
+# Watch for it:
+CLIENT LIST TYPE pubsub
+#   omem=...   output buffer memory for this client
+INFO clients
+#   client_recent_max_output_buffer
+
+# THE SECOND HAZARD: those buffers are server memory, charged to your
+# instance. A few hundred slow subscribers on a busy channel can consume
+# gigabytes before the limits kick in, and that memory competes with your
+# data for maxmemory (chapter 12).
+
+# Mitigations, in order of usefulness:
+#   * do not do slow work in the message handler. Receive, enqueue locally,
+#     acknowledge nothing, and process on another thread
+#   * publish less — a notification that something changed, not the payload
+#   * fan out to fewer subscribers and distribute within your application
+#   * use a stream, where a slow consumer falls behind instead of being
+#     disconnected, and can catch up afterwards</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Keyspace notifications</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">events from the data itself</span><button class="copy">Copy</button></div>
+<pre><code>CONFIG SET notify-keyspace-events "KEA"      # everything. Usually too much
+CONFIG SET notify-keyspace-events "Ex"       # expired events only
+
+SUBSCRIBE __keyevent@0__:expired
+PSUBSCRIBE __keyspace@0__:session:*
+
+#   K  keyspace events: __keyspace@<db>__:<key>   -> the event name
+#   E  keyevent events: __keyevent@<db>__:<event> -> the key name
+#   g generic  $ string  l list  s set  h hash  z zset  x expired  e evicted
+#   t stream   d module  m key-miss   n new-key (7.0+)   A = everything but K/E
+
+# Uses that work:
+#   * invalidate a local in-process cache when a key changes
+#   * a metric on eviction rate
+#   * debugging what is touching a key
+
+# Uses that do NOT work, and this is the important part:
+#   * "clean up the user's data when their session expires" — a subscriber
+#     that is restarting misses the event and the cleanup never happens
+#   * anything where a missed event is a bug rather than a delay
+#
+# These notifications ride on pub/sub, so they inherit every property above.
+# They are hints, not triggers.
+
+# TWO FURTHER DETAILS:
+#   * the `expired` event fires when the key is actually REMOVED, which may
+#     be noticeably after it logically expired (chapter 2)
+#   * notifications add work to every matching command. "KEA" on a busy
+#     instance has a measurable cost, so enable only the classes you use
+
+# CLIENT-SIDE CACHING (Redis 6, RESP3) is the well-engineered version of
+# cache invalidation, and it is a separate mechanism:
+CLIENT TRACKING ON
+# The server remembers which keys each client has read and pushes an
+# invalidation when they change. Purpose-built for a local cache in front of
+# Redis, with none of the pattern-matching cost.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Sharded pub/sub</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the cluster problem, and the 7.0 fix</span><button class="copy">Copy</button></div>
+<pre><code># In cluster mode, ordinary PUBLISH is BROADCAST TO EVERY NODE, because any
+# node might have a subscriber for that channel. So publishing scales with
+# the number of nodes rather than being distributed by them — adding nodes
+# makes pub/sub slower, which is the opposite of what sharding is for.
+
+SPUBLISH   room:general "hello"        # 7.0+
+SSUBSCRIBE room:general
+SUNSUBSCRIBE room:general
+
+# A sharded channel is hashed to a slot exactly like a key, so the message
+# goes to one node and its subscribers only. Publishing now distributes.
+#
+# The cost: subscribers must connect to the node owning that channel's slot,
+# and a client must handle the MOVED redirection. Every cluster-aware client
+# library does, and it means a subscriber cannot listen to arbitrary channels
+# from one connection.
+#
+# Also note SPUBLISH does not support patterns. Sharding and glob matching
+# are fundamentally incompatible — you cannot route a pattern to one node.
+
+# If you use pub/sub at all in cluster mode, use the sharded form. The
+# broadcast behaviour of plain PUBLISH is a real scaling problem and it is
+# invisible until the cluster is large enough for it to hurt.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Choosing</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Need</th><th>Use</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Live presence, typing indicators</td><td><b>Pub/Sub</b></td><td>The next message repairs any gap</td></tr>
+<tr><td>Cache invalidation hint</td><td><b>Pub/Sub</b> or client tracking</td><td>A TTL is the backstop for missed ones (chapter 7)</td></tr>
+<tr><td>Broadcasting to websocket servers</td><td><b>Pub/Sub</b></td><td>Fan-out, and ephemeral by nature</td></tr>
+<tr><td>Work that must be done</td><td><b>Stream</b></td><td>Acknowledgement and reclaim (chapter 6)</td></tr>
+<tr><td>A late consumer needs history</td><td><b>Stream</b></td><td>Pub/Sub has no history at all</td></tr>
+<tr><td>Splitting work across a pool</td><td><b>Stream</b> or a list</td><td>Every pub/sub subscriber gets every message</td></tr>
+<tr><td>Reacting to data changes reliably</td><td><b>Poll a sorted set</b></td><td>Notifications are lossy</td></tr>
+<tr><td>Cross-datacentre messaging</td><td><b>Not Redis</b></td><td>Kafka, NATS, a real broker</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Publish the fact, not the payload</span>
+  <p>A message saying <code>{"type":"product.updated","id":8842}</code> is a few dozen bytes; one carrying the whole product document is kilobytes, multiplied by every subscriber, held in per-client output buffers on the server. It also goes stale the instant it is sent, so a subscriber processing it a second later may act on data that has already changed again. <b>Publish the identifier and let the subscriber fetch what it needs</b> — that keeps the channel cheap, keeps the read authoritative, and means a subscriber that missed three updates to the same entity does one fetch rather than three stale ones.</p>
+</div>
+
+<h2><span class="h-rule"></span>A pattern that works</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">pub/sub for latency, a durable store for correctness</span><button class="copy">Copy</button></div>
+<pre><code># The combination that gets both properties: fast notification from pub/sub,
+# and no missed work because the durable record is the source of truth.
+
+# Producer — write the work, THEN announce it.
+r.zadd("work:pending", {job_id: time.time()})
+r.publish("work:new", job_id)
+
+# Consumer
+def run():
+    catch_up()                       # 1. on start, drain anything pending
+
+    p = r.pubsub()
+    p.subscribe("work:new")
+    while True:
+        msg = p.get_message(timeout=5.0)
+        if msg and msg["type"] == "message":
+            claim_and_run(msg["data"])
+        else:
+            catch_up()               # 2. periodically, regardless
+
+def catch_up():
+    for job_id in r.zrangebyscore("work:pending", "-inf", time.time()):
+        claim_and_run(job_id)
+
+# The pub/sub message is a HINT that makes the common case fast — the
+# consumer reacts in microseconds rather than waiting for the next poll.
+# The sorted set is the truth, and the periodic catch-up means a missed
+# notification costs latency rather than correctness.
+#
+# This is the right shape whenever you want low latency and cannot tolerate
+# loss, and you do not want the operational weight of a stream. It is also
+# what most "we use pub/sub for jobs" systems should have been.</code></pre>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Fire and forget.</b> Delivered to whoever is connected at that instant, then discarded.</li>
+    <li><b><code>PUBLISH</code> returns the subscriber count</b> — that is the only feedback, and zero means the message is gone.</li>
+    <li><b>A slow subscriber is disconnected</b> at the output buffer limit, losing everything in between.</li>
+    <li>Those buffers are <b>server memory</b> competing with your data.</li>
+    <li><b>Keyspace notifications ride on pub/sub</b>, so they are hints and never reliable triggers.</li>
+    <li><b>Use <code>SPUBLISH</code> in cluster mode.</b> Plain <code>PUBLISH</code> broadcasts to every node.</li>
+    <li><b>Publish the identifier, not the payload</b> — cheaper, and the subscriber reads current data.</li>
+    <li><b>Pair pub/sub with a durable record</b> when loss matters: the message is a latency hint, the store is the truth.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("11-pubsub.html");
+
+(function(){
+  const root = document.getElementById("ps");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const SIT = {
+    normal: {
+      pubsub:{got:"all 5", lost:"none", rec:"n/a",
+        note:"The happy path, and pub/sub is excellent here. Delivery is immediate — the publisher's PUBLISH and the subscriber's receipt are microseconds apart, with no polling interval and no storage.\n\nFor live presence, typing indicators, or pushing updates to websocket servers, this is exactly the right tool and a stream would be needless overhead.\n\nThe question is only what happens when this path is not the one you get, which is what the other options show."},
+        stream:{got:"all 5", lost:"none", rec:"n/a",
+        note:"A stream also delivers all five, with slightly more latency because the consumer is doing a blocking XREADGROUP rather than being pushed to.\n\nIn the connected case a stream buys you nothing over pub/sub and costs memory for retained entries plus the consumer-group bookkeeping. If your only scenario is this one, pub/sub is the simpler choice.\n\nEverything a stream buys shows up in the other scenarios."}},
+    late: {
+      pubsub:{got:"nothing", lost:"all 5", rec:"NO",
+        note:"The subscriber connected after the messages were published, so it receives nothing. There is no history to catch up on — pub/sub stores nothing at all.\n\nWorth noting how ordinary this is. A service starting up, a new instance scaling in, a consumer added to an existing system: all of them see only what happens from their connection onward.\n\nIf a late subscriber needing history is part of your design, pub/sub cannot serve it under any configuration."},
+      stream:{got:"all 5", lost:"none", rec:"yes",
+        note:"The stream retained every entry, so a consumer group created with a starting position of 0 reads the whole history.\n\nThis is the difference that decides most choices between the two. A stream is a log that consumers read from a position; pub/sub is a broadcast that exists only at the instant of publication.\n\nCreating the group with $ instead of 0 gives you pub/sub-like behaviour — new messages only — so you get to choose, which pub/sub does not offer."}},
+    restart: {
+      pubsub:{got:"3 of 5", lost:"2, silently", rec:"NO",
+        note:"Two messages arrived while the subscriber was down. They were delivered to zero subscribers and discarded.\n\nThe subscriber has no idea. It reconnects, resubscribes, and carries on receiving messages — with a two-second hole in what it saw and nothing in its logs to indicate one exists.\n\nThis is the scenario that makes pub/sub unsuitable for work: every deploy is a restart, so the gap is not a rare failure but a routine occurrence. A system that loses a few messages on every deploy will appear to work fine and quietly accumulate missed work.\n\nIf what is being published is refreshed anyway — a presence update, a live count — the next message repairs the gap and none of this matters."},
+      stream:{got:"all 5", lost:"none", rec:"yes",
+        note:"The messages sat in the stream while the consumer was down. On reconnection XREADGROUP with > delivers everything not yet given to anyone in the group.\n\nNothing special is required — this is the default behaviour, because the group tracks a last-delivered position that survives the consumer's absence.\n\nThe consumer should also read its OWN pending entries with '0' on startup, in case it died holding messages it had been given but not acknowledged (chapter 6)."}},
+    slow: {
+      pubsub:{got:"some, then disconnected", lost:"everything after", rec:"NO",
+        note:"A subscriber that cannot keep up accumulates unsent messages in an output buffer ON THE SERVER. When that buffer exceeds client-output-buffer-limit — 32 MB hard, or 8 MB sustained for 60 seconds by default — Redis closes the connection.\n\nThe client sees a disconnection, reconnects, resubscribes, and has lost every message from the moment it fell behind. Its logs show a reconnection and nothing else.\n\nThere is a second cost: those buffers are server memory charged against your instance, competing with your data for maxmemory. A few hundred slow subscribers on a busy channel can consume gigabytes before the limits fire.\n\nThe mitigation is to do no slow work in the handler — receive, enqueue locally, process elsewhere."},
+      stream:{got:"all 5, eventually", lost:"none", rec:"yes",
+        note:"A slow stream consumer simply falls behind. It reads at whatever rate it can manage, the unread entries wait in the stream, and it catches up when it can.\n\nNo disconnection, no server-side buffering per consumer, no silent loss. Backpressure is handled by the consumer pulling rather than the server pushing, which is structurally the right way round.\n\nThe one thing to watch is trimming: if the stream is capped and the consumer falls further behind than the cap, entries fall off the end and are gone. Alert on the group's lag figure from XINFO GROUPS."}},
+    crash: {
+      pubsub:{got:"5, but one unprocessed", lost:"1's effect", rec:"NO",
+        note:"The message was delivered — as far as Redis is concerned, it succeeded. The subscriber crashed while processing it, and there is no record anywhere that the work was not completed.\n\nThis is the distinction between delivery and processing, and pub/sub only knows about the first. There is no acknowledgement step, so nothing can tell the difference between a message that was handled and one that was received a microsecond before the process died.\n\nAny recovery has to be built entirely outside Redis — a durable record of pending work that the consumer marks complete, which is the combined pattern at the end of this chapter."},
+      stream:{got:"5, one still pending", lost:"none", rec:"yes",
+        note:"The message was delivered but never acknowledged, so it remains in the consumer's pending entries list with a rising idle time.\n\nA reaper running XAUTOCLAIM reassigns it to a healthy worker after the idle threshold, and it gets processed. Nothing is lost and no external bookkeeping is required.\n\nThat PEL is the single largest reason to choose a stream over pub/sub for work: it is a server-side record of who was handed what, surviving their death (chapter 6)."}},
+    failover: {
+      pubsub:{got:"varies", lost:"in-flight", rec:"NO",
+        note:"Subscribers are connected to the primary. When it fails, those connections drop, clients reconnect to the new primary, and anything published during the gap is lost.\n\nPub/sub state is not replicated in any useful sense — subscriptions live on the connection, and the connection is to a specific node. There is nothing to fail over.\n\nIn cluster mode this interacts with the broadcast behaviour: plain PUBLISH is propagated to every node, so during a partition the picture is genuinely murky. Sharded pub/sub with SPUBLISH is better defined and still loses in-flight messages."},
+      stream:{got:"all 5, possibly a duplicate", lost:"unlikely", rec:"yes",
+        note:"The stream is data, so it replicates like any other key. After a failover the new primary has the entries — subject to replication lag, so entries written in the last few milliseconds before the failure may be missing (chapter 15).\n\nThe consumer group's state replicates too, so pending entries survive.\n\nThe realistic risk is duplication rather than loss: an acknowledgement that did not replicate before the failover means the message is still pending on the new primary and gets redelivered. At-least-once again, and the reason handlers must be idempotent."}},
+    none: {
+      pubsub:{got:"nothing", lost:"all 5", rec:"NO",
+        note:"PUBLISH returns 0 and the message is discarded immediately. There is no queue holding it for a future subscriber.\n\nThat return value is the only signal available, and it is worth using: a publisher that logs when PUBLISH returns 0 at least knows its messages are going nowhere. Most code ignores it entirely.\n\nThe common version of this in production: a consumer service that has been failing to start since a bad deploy, while the producer happily publishes into nothing and reports success."},
+      stream:{got:"nothing yet", lost:"none", rec:"yes",
+        note:"XADD stores the entries regardless of whether anyone is reading. A consumer group created later — or an existing one whose consumers are all down — picks them up whenever it starts.\n\nThis decoupling is the point of a log. The producer's job finishes when the entry is durable, not when someone consumes it.\n\nThe obligation it creates is trimming: a stream with no consumers grows until it hits the cap or exhausts memory. MAXLEN on every XADD (chapter 6)."}}
+  };
+
+  function render(){
+    const s = $("p-sit").value, m = $("p-mech").value;
+    const d = SIT[s][m];
+
+    const msgs = [1,2,3,4,5];
+    let received;
+    if(m === "stream") received = (s === "none") ? [] : msgs;
+    else if(s === "normal") received = msgs;
+    else if(s === "restart") received = [1,2,5];
+    else if(s === "slow") received = [1,2];
+    else if(s === "crash") received = msgs;
+    else if(s === "failover") received = [1,2,4,5];
+    else received = [];
+
+    $("p-flow").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:16px 0 8px">' +
+      'Five messages published</div>' +
+      '<div style="background:#fff;border:1px solid #E1E7EC;border-radius:5px;padding:12px">' +
+      '<div style="display:flex;gap:6px;margin-bottom:10px">' +
+      msgs.map(i => '<div style="flex:1;height:26px;border-radius:3px;background:#25B7C4;' +
+        'display:flex;align-items:center;justify-content:center;font-family:var(--mono);' +
+        'font-size:11px;color:#fff;font-weight:700">' + i + '</div>').join("") + '</div>' +
+      '<div style="font-family:var(--mono);font-size:10.5px;color:#8FA0AF;margin-bottom:5px">received by the subscriber</div>' +
+      '<div style="display:flex;gap:6px">' +
+      msgs.map(i => {
+        const ok = received.includes(i);
+        return '<div style="flex:1;height:26px;border-radius:3px;background:' +
+          (ok ? "#3FB984" : "#F4F7F9") + ';border:1px solid ' + (ok ? "#3FB984" : "#E1E7EC") +
+          ';display:flex;align-items:center;justify-content:center;font-family:var(--mono);' +
+          'font-size:11px;color:' + (ok ? "#fff" : "#B4C0CA") + ';font-weight:700">' +
+          (ok ? i : "×") + '</div>';
+      }).join("") + '</div></div>';
+
+    $("p-got").textContent     = d.got;
+    $("p-lost").textContent    = d.lost;
+    $("p-recover").textContent = d.rec;
+
+    let note = d.note;
+    if(m === "pubsub" && d.rec === "NO")
+      note += "\n\nThe combined pattern at the end of this chapter is the usual answer when you want pub/sub's latency and cannot accept this loss: write the work to a durable structure, publish the id as a hint, and have the consumer periodically drain the durable record regardless. A missed notification then costs latency rather than correctness.";
+    $("p-note").textContent = note;
+  }
+
+  ["p-sit","p-mech"].forEach(id => $(id).addEventListener("change", render));
+  render();
+})();
+</script>
+</body>
+</html>

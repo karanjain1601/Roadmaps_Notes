@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8 · BuildKit, multi-arch and provenance — Docker</title>
+<meta name="description" content="BuildKit and buildx, builders and drivers, building for arm64 by emulation or cross-compilation, build secrets that never reach a layer, provenance and SBOM attestations, and reproducible builds.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Crect x='6' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='19' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='10' width='5' height='5' fill='%23fff'/%3E%3Cpath d='M4 22h22a5 5 0 004-4' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch08">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Docker
+    </a>
+    <div class="chno"><b>Chapter 8</b><span>Building images</span></div>
+    <h1>BuildKit, multi-arch and provenance</h1>
+    <p class="lede">Chapters 5 to 7 were about what a Dockerfile says. This one is about the machine that reads it. <b>BuildKit is why stages run in parallel, why cache mounts and build secrets exist, and why one command can produce an arm64 image on an x86 laptop</b> — though how it does that is a decision worth making rather than accepting, because the wrong choice is ten times slower.</p>
+    <div class="meta"><span>28 min</span><span>2 demos</span><span>8 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="buildkit">
+      <h2 data-nav="BuildKit and buildx">BuildKit and buildx</h2>
+      <p class="sub">A different builder, and the CLI that exposes its features.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th></th><th>Legacy builder</th><th>BuildKit</th></tr></thead>
+          <tbody>
+            <tr><td>Execution</td><td>Instruction by instruction, top to bottom</td><td>A dependency graph, with parallelism (chapter 7)</td></tr>
+            <tr><td>Unused stages</td><td>Built anyway</td><td>Skipped</td></tr>
+            <tr><td>Cache mounts</td><td class="no">no</td><td class="yes">yes (chapter 6)</td></tr>
+            <tr><td>Build secrets</td><td class="no">no</td><td class="yes">yes</td></tr>
+            <tr><td>Multi-platform</td><td class="no">no</td><td class="yes">yes</td></tr>
+            <tr><td>Cache import/export</td><td>Inline only</td><td>registry, gha, local, s3</td></tr>
+            <tr><td>Attestations</td><td class="no">no</td><td class="yes">provenance and SBOM</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>BuildKit has been the default since Docker 23, so <code>docker build</code> already uses it. <code>docker buildx build</code> is the extended CLI: it accepts everything <code>docker build</code> does plus the multi-platform, cache-export and attestation flags, and it can drive builders that are not the local daemon.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">builders and drivers</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker buildx ls
+NAME/NODE       DRIVER/ENDPOINT   STATUS    PLATFORMS
+default *       docker            running   linux/amd64, linux/386
+multi           docker-container  running   linux/amd64, linux/arm64, linux/arm/v7
+
+$ docker buildx create --name multi --driver docker-container --use --bootstrap
+$ docker buildx use multi
+$ docker buildx inspect --bootstrap
+$ docker buildx prune --keep-storage 20GB      # this builder's cache</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Driver</th><th>Runs BuildKit</th><th>Use when</th></tr></thead>
+          <tbody>
+            <tr><td><code>docker</code> (default)</td><td>Inside the Docker daemon</td><td>Everyday local builds. <b>No multi-platform, no cache export</b></td></tr>
+            <tr><td><code>docker-container</code></td><td>In a container it starts for you</td><td>Multi-platform and cache export locally — the usual upgrade</td></tr>
+            <tr><td><code>kubernetes</code></td><td>As pods in a cluster</td><td>Shared build capacity for a team</td></tr>
+            <tr><td><code>remote</code></td><td>A BuildKit daemon you point at</td><td>Native builders per architecture, or a big shared machine</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="key">
+        <span class="lbl">The default driver is the one that surprises people</span>
+        <p><code>--platform linux/amd64,linux/arm64</code> fails on a fresh install with "multiple platforms feature is currently not supported for docker driver". Nothing is wrong with your command — the default driver cannot do it. Create a <code>docker-container</code> builder once and the same command works.</p>
+      </div>
+    </section>
+
+    <section id="platforms">
+      <h2 data-nav="Multi-arch">Building for another architecture</h2>
+      <p class="sub">Three approaches with very different costs.</p>
+      <p>Chapter 3 introduced the image <strong>index</strong>: one tag pointing at several per-platform manifests, so the same name works on an ARM laptop and an x86 server. Producing one means building the image once per platform, and there are three ways to do that:</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Approach</th><th>How</th><th>Cost</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Emulation</strong></td><td>QEMU runs the foreign binaries via binfmt_misc</td><td>Works for anything; <b>5–20× slower</b> for compilation</td></tr>
+            <tr><td><strong>Cross-compilation</strong></td><td>Build natively, targeting the other architecture</td><td>Fast, and only possible if the toolchain supports it</td></tr>
+            <tr><td><strong>Native builders</strong></td><td>One real machine per architecture</td><td>Fast and universal; you have to run the machines</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Multi-arch strategy model</h3>
+          <span class="hint">Which approach, what it costs, and whether it is even possible — assumptions underneath</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:82px">platforms</span>
+            <span id="m-plats" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:82px">workload</span>
+            <span id="m-lang" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl">
+            <label for="m-base" style="min-width:82px">native build <b id="m-basev">90</b>s</label>
+            <input type="range" id="m-base" min="10" max="600" step="10" value="90" style="width:130px">
+          </div>
+          <div id="m-table" style="overflow-x:auto"></div>
+          <div class="rgrid" id="m-out"></div>
+          <p class="readout" id="m-note"></p>
+        </div>
+      </div>
+
+      <div class="code">
+        <div class="code-top"><span class="tag">the setup and the build</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># register QEMU handlers for foreign architectures (once per machine)
+$ docker run --privileged --rm tonistiigi/binfmt --install all
+$ ls /proc/sys/fs/binfmt_misc/ | head        # qemu-aarch64, qemu-arm, …
+
+$ docker buildx create --name multi --driver docker-container --use --bootstrap
+$ docker buildx build --platform linux/amd64,linux/arm64 \
+    -t ghcr.io/acme/api:2.4.1 --push .
+
+$ docker buildx imagetools inspect ghcr.io/acme/api:2.4.1
+Name:      ghcr.io/acme/api:2.4.1
+MediaType: application/vnd.oci.image.index.v1+json
+Manifests:
+  Platform: linux/amd64
+  Platform: linux/arm64</pre>
+      </div>
+      <div class="trap">
+        <span class="lbl"><code>--load</code> and multi-platform do not mix</span>
+        <p>A multi-platform build produces an index, and the classic Docker image store cannot hold one — so <code>--load</code> fails and you must <code>--push</code>, or build a single platform locally. Two workarounds: build <code>--platform linux/arm64 --load</code> for the one you want to test, or enable the containerd image store in Docker Desktop, which can hold an index. Either way, "why can I not see my multi-arch image in <code>docker images</code>" has this answer.</p>
+      </div>
+    </section>
+
+    <section id="crosscompile">
+      <h2 data-nav="Cross-compiling">The cross-compilation pattern</h2>
+      <p class="sub">Two predefined build args, and a large speed-up.</p>
+      <p>BuildKit supplies the platform as build arguments. <code>BUILDPLATFORM</code> is the machine doing the building; <code>TARGETPLATFORM</code> is what you are building for. Pinning the build stage to <code>BUILDPLATFORM</code> makes it run <em>natively</em> while still producing a foreign binary:</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">Go — no emulation anywhere</span><button class="copy">Copy</button></div>
+<pre data-lang="dockerfile"># syntax=docker/dockerfile:1
+
+FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
+ARG TARGETOS TARGETARCH
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -ldflags="-s -w" -o /out/server ./cmd/server
+
+FROM gcr.io/distroless/static:nonroot
+COPY --from=build /out/server /server
+ENTRYPOINT ["/server"]</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Predefined ARG</th><th>Example value</th></tr></thead>
+          <tbody>
+            <tr><td><code>BUILDPLATFORM</code>, <code>BUILDOS</code>, <code>BUILDARCH</code></td><td><code>linux/amd64</code>, <code>linux</code>, <code>amd64</code></td></tr>
+            <tr><td><code>TARGETPLATFORM</code>, <code>TARGETOS</code>, <code>TARGETARCH</code></td><td><code>linux/arm64</code>, <code>linux</code>, <code>arm64</code></td></tr>
+            <tr><td><code>TARGETVARIANT</code></td><td><code>v7</code> for <code>linux/arm/v7</code>, empty otherwise</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>They must be declared with <code>ARG</code> inside the stage that uses them (chapter 5's scope rule), but need no default and no <code>--build-arg</code> — BuildKit supplies the values.</p>
+      <div class="note">
+        <span class="lbl">Which runtimes can do this</span>
+        <p><strong>Go and Rust cross-compile natively</strong>, so the pattern above is close to free. <strong>Interpreted languages have nothing to compile</strong>, so a Node or Python image is mostly a fast file copy under emulation — unless it has native modules or C extensions, which must be built for the target and therefore need emulation or a native builder. <strong>JVM languages</strong> produce architecture-independent bytecode, so only the base JRE differs. The demo above prices each case.</p>
+      </div>
+    </section>
+
+    <section id="secrets">
+      <h2 data-nav="Build secrets">Build secrets and other mounts</h2>
+      <p class="sub">Chapter 5 established that <code>ARG</code> is not safe. This is what is.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">the four mount types</span><button class="copy">Copy</button></div>
+<pre data-lang="dockerfile"># syntax=docker/dockerfile:1
+
+# a secret: a tmpfs file, present only during this instruction
+RUN --mount=type=secret,id=npmtoken,required=true \
+    NPM_TOKEN=$(cat /run/secrets/npmtoken) npm ci
+
+# an SSH agent socket, for private git dependencies
+RUN --mount=type=ssh git clone git@github.com:acme/private-lib.git /lib
+
+# files from another stage or image, without copying them into a layer
+RUN --mount=type=bind,from=schema,source=/schema,target=/schema \
+    ./generate --from /schema
+
+# scratch space that is never committed
+RUN --mount=type=tmpfs,target=/tmp/work ./big-extract.sh</pre>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">supplying them</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker build --secret id=npmtoken,env=NPM_TOKEN .
+$ docker build --secret id=npmtoken,src=./token.txt .
+$ docker build --ssh default .                      # forward your agent
+
+$ docker history --no-trunc my-app | grep -i token   # nothing
+$ docker save my-app | tar -xO --wildcards '*/layer.tar' | grep -a npmtoken   # nothing</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Mechanism</th><th>In a layer?</th><th>In <code>docker history</code>?</th><th>In provenance?</th></tr></thead>
+          <tbody>
+            <tr><td><code>ENV</code></td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td></tr>
+            <tr><td><code>ARG</code> + <code>--build-arg</code></td><td>Only if written</td><td class="yes">yes</td><td class="yes">yes — see below</td></tr>
+            <tr><td><code>COPY</code> of a secret file</td><td class="yes">yes, permanently</td><td>The instruction</td><td class="yes">yes</td></tr>
+            <tr><td><code>--mount=type=secret</code></td><td class="no">no</td><td class="no">no</td><td class="no">no</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="warn">
+        <span class="lbl">Provenance is another place build args show up</span>
+        <p>Attestations record how the image was built, and that record includes the build arguments. So a token passed with <code>--build-arg</code> is now recoverable from <em>two</em> places rather than one — <code>docker history</code> and the provenance attestation. This makes the chapter 5 advice stronger rather than weaker: use a secret mount, and treat any token that has been through a <code>--build-arg</code> as compromised.</p>
+      </div>
+    </section>
+
+    <section id="attestations">
+      <h2 data-nav="Provenance and SBOM">Provenance and SBOM</h2>
+      <p class="sub">Two machine-readable answers to "where did this image come from and what is in it".</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">producing and reading them</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker buildx build --provenance=mode=max --sbom=true \
+    -t ghcr.io/acme/api:2.4.1 --push .
+
+$ docker buildx imagetools inspect ghcr.io/acme/api:2.4.1 \
+    --format '{{json .Provenance.SLSA.invocation.configSource}}'
+$ docker buildx imagetools inspect ghcr.io/acme/api:2.4.1 \
+    --format '{{range .SBOM.SPDX.packages}}{{.name}} {{.versionInfo}}{{println}}{{end}}' | head</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Attestation</th><th>Records</th><th>Answers</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Provenance</strong></td><td>The Dockerfile, source repository and commit, base image digests, build arguments, builder identity, timestamps</td><td>Was this image built from the code we think, by the pipeline we think?</td></tr>
+            <tr><td><strong>SBOM</strong></td><td>Every package the scanner detected, with versions and licences</td><td>Are we affected by the CVE announced this morning?</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><code>mode=min</code> records the essentials; <code>mode=max</code> adds the full build definition and the source materials. The practical payoff arrives with the next emergency: when a widely used library has a critical CVE, an SBOM query across your registry answers "which of our 200 images contain it" in seconds rather than a week of rebuilding and grepping. Chapter 17 covers acting on that answer.</p>
+      <div class="tip">
+        <span class="lbl">Signing is the missing third piece</span>
+        <p>Provenance says how an image was built; it does not prove nobody replaced it afterwards. Signing does — <code>cosign sign</code> with a keyless OIDC identity, verified in an admission policy, so only images built by your pipeline can be deployed. Chapter 15 covers it alongside registries, and chapter 17 covers the policy side.</p>
+      </div>
+    </section>
+
+    <section id="reproducible">
+      <h2 data-nav="Reproducibility">Reproducible builds</h2>
+      <p class="sub">Building the same source twice and getting the same digest is harder than it sounds.</p>
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Digest reproducibility</h3>
+          <span class="hint">Real SHA-256: build the same source twice, an hour apart, and compare</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl" id="d-toggles"></div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(256px,1fr));gap:11px">
+            <div>
+              <div style="font-size:12px;color:var(--text-2);margin-bottom:5px">build A — 09:14</div>
+              <div class="term" id="d-a" style="min-height:auto;font-size:11.3px"></div>
+            </div>
+            <div>
+              <div style="font-size:12px;color:var(--text-2);margin-bottom:5px">build B — 10:22, same commit</div>
+              <div class="term" id="d-b" style="min-height:auto;font-size:11.3px"></div>
+            </div>
+          </div>
+          <div class="rgrid" id="d-out"></div>
+          <p class="readout" id="d-note"></p>
+        </div>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">the flags that help</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># pin every timestamp in the image to a fixed point, usually the commit date
+$ export SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
+$ docker buildx build --output type=image,name=app,rewrite-timestamp=true .
+
+# and pin the base by digest rather than by tag (chapter 3)
+FROM node:22-alpine@sha256:41523187cf…</pre>
+      </div>
+      <p>Full bit-for-bit reproducibility is achievable and demanding: every timestamp fixed, every dependency pinned by hash, every base pinned by digest, and no build step that embeds the clock or a random value. Most teams do not need it. <strong>What every team does need is the weaker property</strong> — that the image running in production corresponds to a known commit — and that is what pinning bases by digest plus recording provenance gives you, at almost no cost.</p>
+    </section>
+
+    <section id="bake">
+      <h2 data-nav="bake">Building several images at once</h2>
+      <p class="sub"><code>buildx bake</code>, for when one <code>docker build</code> is no longer the unit of work.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">docker-bake.hcl</span><button class="copy">Copy</button></div>
+<pre data-lang="text">variable "TAG" { default = "dev" }
+
+group "default" { targets = ["api", "worker"] }
+
+target "common" {
+  context    = "."
+  platforms  = ["linux/amd64", "linux/arm64"]
+  cache-from = ["type=registry,ref=ghcr.io/acme/cache"]
+  cache-to   = ["type=registry,ref=ghcr.io/acme/cache,mode=max"]
+}
+
+target "api" {
+  inherits   = ["common"]
+  dockerfile = "docker/api.Dockerfile"
+  tags       = ["ghcr.io/acme/api:${TAG}"]
+}
+
+target "worker" {
+  inherits   = ["common"]
+  dockerfile = "docker/worker.Dockerfile"
+  tags       = ["ghcr.io/acme/worker:${TAG}"]
+}</pre>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">using it</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker buildx bake --print                  # resolve and show the plan, build nothing
+$ docker buildx bake                           # the default group
+$ docker buildx bake api --set api.tags=…      # one target, with an override
+$ TAG=2.4.1 docker buildx bake --push</pre>
+      </div>
+      <p>The value is that build configuration stops living in a shell script full of repeated flags: platforms, cache settings and tags are declared once and inherited, and <code>--print</code> gives you a reviewable plan. It is also what CI should call, so local and CI builds cannot drift apart.</p>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 8 in eight lines</h2>
+        <ul>
+          <li>BuildKit is the default builder; <code>buildx</code> is the CLI exposing multi-platform, cache export and attestations.</li>
+          <li>The default <code>docker</code> driver <b>cannot build multi-platform</b> — create a <code>docker-container</code> builder once.</li>
+          <li>Three ways to build for another architecture: <b>emulation</b> (universal, 5–20× slower for compilation), <b>cross-compilation</b> (fast, toolchain permitting), <b>native builders</b> (fast, but you run the machines).</li>
+          <li><code>FROM --platform=$BUILDPLATFORM</code> plus <code>ARG TARGETOS TARGETARCH</code> is the cross-compile pattern, and it is close to free for Go and Rust.</li>
+          <li>Multi-platform builds produce an <b>index</b>, which the classic image store cannot hold — so <code>--push</code>, not <code>--load</code>.</li>
+          <li><code>--mount=type=secret</code> is the only mechanism here that leaves nothing in a layer, in history, or in provenance.</li>
+          <li>Provenance records <b>build arguments</b>, so a secret in <code>--build-arg</code> is now recoverable from two places.</li>
+          <li>Pinning the base by digest plus recording provenance gets you the property you actually need; bit-for-bit reproducibility is a further, much larger job.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary>Your CI arm64 build takes 24 minutes; the amd64 build takes 90 seconds. Same Dockerfile, a Go service. What is happening and what do you do?</summary>
+        <div class="ans"><p>The arm64 build is running under QEMU emulation, so the Go compiler is executing as translated instructions — a 10-to-20-fold slowdown on a CPU-bound workload. Because it is Go, you do not need emulation at all: pin the build stage with <code>FROM --platform=$BUILDPLATFORM</code>, declare <code>ARG TARGETOS TARGETARCH</code>, and pass them as <code>GOOS</code> and <code>GOARCH</code>. The compiler then runs natively and emits an arm64 binary, bringing the arm64 leg back to roughly the amd64 time. If the image needed cgo, cross-compilation gets harder and a native arm64 builder is the better answer.</p></div>
+      </details>
+      <details class="chk">
+        <summary><code>docker buildx build --platform linux/amd64,linux/arm64 --load .</code> fails. Two reasons it might.</summary>
+        <div class="ans"><p>First, the default <code>docker</code> driver does not support multi-platform builds at all — the fix is a <code>docker-container</code> builder. Second, even with the right driver, a multi-platform build produces an image <em>index</em> and the classic Docker image store cannot represent one, so <code>--load</code> has nowhere to put it; use <code>--push</code>, build a single platform with <code>--load</code>, or enable the containerd image store. The two failures look similar and the error messages differ, so read them rather than assuming.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Why is <code>--build-arg GITHUB_TOKEN=…</code> worse now than it was before attestations existed?</summary>
+        <div class="ans"><p>Because there is a second copy. It was already visible via <code>docker history</code>, which Docker documents. Provenance attestations additionally record the build invocation including its arguments, so an image built with <code>--provenance=mode=max</code> carries the token in its attestation as well — and attestations are designed to be published and queried, which is the opposite of what you want for a credential. Use <code>--mount=type=secret</code>, which appears in none of the three places, and rotate anything already exposed.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Two builds of the same commit produce different digests. Name three plausible causes, in order of likelihood.</summary>
+        <div class="ans"><p>First, <b>the base image was pinned by tag</b> and resolved to a different digest between the two builds — a moving tag makes every layer above it differ (chapter 3). Second, <b>file timestamps</b>: layer tarballs record modification times, so files created during the build carry the clock unless <code>SOURCE_DATE_EPOCH</code> and <code>rewrite-timestamp</code> are set. Third, <b>unpinned dependencies</b>: an install that resolves a floating version range fetches different bytes. Beyond those: a label containing the build date, a generated file embedding a UUID, or non-deterministic ordering in an archive. The demo above isolates each factor so you can see which one moves the digest.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Part 2 is complete. Chapter 9 opens Part 3 on running containers: the lifecycle in detail, restart policies, and the PID 1 signal problem from the runtime side.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li><code>docker buildx ls</code> — which drivers do you have?</li>
+        <li><code>docker buildx imagetools inspect nginx:alpine</code> — count the platforms.</li>
+        <li><code>docker buildx bake --print</code> if you have a bake file.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>The BuildKit and buildx documentation, Docker's multi-platform build guide, the build secrets and attestations references, and the SLSA provenance specification.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — multi-arch strategy model
+   ============================================================ */
+(function () {
+  var PLATFORMS = [
+    { id: "amd64", label: "linux/amd64", native: true, on: true },
+    { id: "arm64", label: "linux/arm64", native: false, on: true },
+    { id: "armv7", label: "linux/arm/v7", native: false, on: false }
+  ];
+  var WORKLOADS = [
+    { id: "go", label: "Go / Rust", emul: 12, crossable: true,
+      why: "compilation is CPU-bound, and the toolchain cross-compiles" },
+    { id: "node", label: "Node, pure JS", emul: 2.0, crossable: true,
+      why: "nothing is compiled, so emulation only slows the file copying" },
+    { id: "nodenative", label: "Node + native modules", emul: 10, crossable: false,
+      why: "node-gyp must compile for the target architecture" },
+    { id: "python", label: "Python + C extensions", emul: 13, crossable: false,
+      why: "wheels must be built for the target architecture" },
+    { id: "jvm", label: "JVM", emul: 1.6, crossable: true,
+      why: "bytecode is architecture-independent; only the base JRE differs" }
+  ];
+  var workload = "go";
+
+  var platHost = document.getElementById("m-plats");
+  var langHost = document.getElementById("m-lang");
+  var table = document.getElementById("m-table");
+  var out = document.getElementById("m-out");
+  var note = document.getElementById("m-note");
+
+  PLATFORMS.forEach(function (p) {
+    var b = document.createElement("button");
+    b.className = "btn mono" + (p.on ? " on" : "");
+    b.textContent = p.label;
+    b.addEventListener("click", function () { p.on = !p.on; b.classList.toggle("on", p.on); render(); });
+    platHost.appendChild(b);
+  });
+  WORKLOADS.forEach(function (w) {
+    var b = document.createElement("button");
+    b.className = "btn" + (w.id === workload ? " on" : "");
+    b.textContent = w.label;
+    b.addEventListener("click", function () {
+      workload = w.id;
+      Array.prototype.forEach.call(langHost.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      render();
+    });
+    langHost.appendChild(b);
+  });
+
+  function model() {
+    var T = parseInt(document.getElementById("m-base").value, 10);
+    var W = WORKLOADS.filter(function (x) { return x.id === workload; })[0];
+    var on = PLATFORMS.filter(function (p) { return p.on; });
+    var foreign = on.filter(function (p) { return !p.native; });
+
+    /* emulation: one builder, CPU-bound, so the legs effectively serialise */
+    var emulation = on.reduce(function (a, p) { return a + (p.native ? T : T * W.emul); }, 0);
+    /* cross-compile: every leg runs natively on the build host, serialised on one builder */
+    var cross = W.crossable ? on.length * T : null;
+    /* native builders: one machine per platform, genuinely parallel */
+    var nativeB = on.length ? T : 0;
+
+    return { T: T, W: W, on: on, foreign: foreign,
+             emulation: emulation, cross: cross, nativeB: nativeB };
+  }
+
+  function fmt(s) {
+    if (s === null) return "not possible";
+    return s >= 120 ? (s / 60).toFixed(1) + " min" : Math.round(s) + " s";
+  }
+
+  function render() {
+    document.getElementById("m-basev").textContent = document.getElementById("m-base").value;
+    var m = model();
+
+    if (!m.on.length) {
+      table.innerHTML = '<p style="font-size:13px;color:var(--text-3)">Select at least one platform.</p>';
+      out.innerHTML = ""; note.innerHTML = "";
+      return;
+    }
+
+    var rows = [
+      { name: "emulation (QEMU)", t: m.emulation, setup: "one binfmt install",
+        works: "always", cls: m.foreign.length ? "warn" : "ok" },
+      { name: "cross-compilation", t: m.cross, setup: "Dockerfile changes",
+        works: m.W.crossable ? "this workload" : "not this workload", cls: m.W.crossable ? "ok" : "bad" },
+      { name: "native builders", t: m.nativeB, setup: "a machine per architecture",
+        works: "always", cls: "ok" }
+    ];
+    var best = rows.filter(function (r) { return r.t !== null; })
+      .reduce(function (a, r) { return r.t < a.t ? r : a; });
+
+    table.innerHTML = '<table class="tbl"><thead><tr><th>approach</th><th>wall clock</th><th>vs best</th><th>setup</th><th>works for</th></tr></thead><tbody>' +
+      rows.map(function (r) {
+        return "<tr><td><b>" + r.name + "</b></td><td>" +
+          (r.t === null ? '<span style="color:var(--bad)">—</span>' : "<b>" + fmt(r.t) + "</b>") + "</td><td>" +
+          (r.t === null ? "" : r.t === best.t ? '<span style="color:var(--good);font-weight:600">best</span>'
+            : (r.t / best.t).toFixed(1) + "× slower") + "</td><td>" + r.setup +
+          "</td><td>" + (r.cls === "bad" ? '<span style="color:var(--bad)">' + r.works + "</span>" : r.works) + "</td></tr>";
+      }).join("") + "</tbody></table>";
+
+    out.innerHTML = "";
+    tile("Platforms", String(m.on.length), m.foreign.length + " foreign");
+    tile("Emulation", fmt(m.emulation), "QEMU", m.foreign.length === 0);
+    tile("Best option", fmt(best.t), best.name.split(" ")[0], true);
+    tile("Penalty avoided", m.emulation > best.t ? (m.emulation / best.t).toFixed(1) + "×" : "—",
+      "vs emulation", m.emulation / best.t > 1.5);
+
+    var msgs = [];
+    if (!m.foreign.length) {
+      msgs.push("With only the native platform selected there is nothing to emulate and all three approaches cost the same. Add <code>linux/arm64</code> to see the difference.");
+    } else if (m.W.crossable && m.W.emul > 3) {
+      msgs.push("<b>" + m.W.label + ": " + m.W.why + ".</b> Emulation costs " +
+        fmt(m.emulation) + " against " + fmt(m.cross) +
+        " for cross-compilation — a " + (m.emulation / m.cross).toFixed(1) +
+        "× penalty for not adding two lines to the Dockerfile. This is the case where the <code>FROM --platform=$BUILDPLATFORM</code> pattern above pays for itself immediately.");
+    } else if (m.W.crossable) {
+      msgs.push("<b>" + m.W.label + ": " + m.W.why + "</b>, so the emulation penalty is mild (" +
+        m.W.emul + "×) and QEMU is a perfectly reasonable choice. Cross-compilation still helps a little and costs Dockerfile complexity — worth it only if the build is on a hot path.");
+    } else {
+      msgs.push("<b>" + m.W.label + ": " + m.W.why + "</b> — so cross-compilation is not available and the choice is emulation (" +
+        fmt(m.emulation) + ") or native builders (" + fmt(m.nativeB) +
+        "). At this scale of difference, a single arm64 runner usually pays for itself in CI minutes alone.");
+    }
+    msgs.push("<b>Assumptions:</b> a " + m.T + "-second native build; emulation multipliers of " +
+      WORKLOADS.map(function (w) { return w.emul + "× (" + w.label + ")"; }).join(", ") +
+      "; one builder serialises its platform legs while native builders run in parallel on separate machines; no cache reuse between legs. Real multipliers vary widely with how CPU-bound the build is — measure before committing to infrastructure.");
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13.5px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  document.getElementById("m-base").addEventListener("input", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — digest reproducibility (real SHA-256 from unit.js)
+   ============================================================ */
+(function () {
+  var opts = { pinBase: false, epoch: false, pinDeps: false, dateLabel: true };
+  var togHost = document.getElementById("d-toggles");
+  var aEl = document.getElementById("d-a");
+  var bEl = document.getElementById("d-b");
+  var out = document.getElementById("d-out");
+  var note = document.getElementById("d-note");
+
+  [["pinBase", "pin the base by digest"],
+   ["epoch", "SOURCE_DATE_EPOCH + rewrite-timestamp"],
+   ["pinDeps", "lockfile pins every dependency"],
+   ["dateLabel", "LABEL build.date=$(date)"]].forEach(function (t) {
+    var b = document.createElement("button");
+    b.className = "btn mono" + (opts[t[0]] ? " on" : "");
+    b.textContent = t[1];
+    b.addEventListener("click", function () {
+      opts[t[0]] = !opts[t[0]];
+      b.classList.toggle("on", opts[t[0]]);
+      render();
+    });
+    togHost.appendChild(b);
+  });
+
+  /* each build gets a clock and a resolved-base; determinism decides whether
+     build B sees the same values as build A */
+  function inputs(which) {
+    var clock = which === "a" ? "2026-09-03T09:14:22Z" : "2026-09-03T10:22:47Z";
+    return {
+      base: opts.pinBase ? "sha256:41523187cf" : (which === "a" ? "node22alpine-build-4718" : "node22alpine-build-4731"),
+      mtime: opts.epoch ? "1756800000" : clock,
+      deps: opts.pinDeps ? "express@4.19.2+412-locked" : (which === "a" ? "express@4.19.2+412" : "express@4.19.4+413"),
+      label: opts.dateLabel ? clock : "(none)"
+    };
+  }
+
+  function build(which) {
+    var i = inputs(which);
+    var layers = [
+      { inst: "FROM node:22-alpine", content: i.base },
+      { inst: "COPY package*.json ./", content: "package.json+lock|mtime=" + i.mtime },
+      { inst: "RUN npm ci", content: "node_modules|" + i.deps + "|mtime=" + i.mtime },
+      { inst: "COPY src ./src", content: "src/index.js+src/auth.js|mtime=" + i.mtime }
+    ];
+    var diffIds = layers.map(function (l) { return sha256Text(l.content); });
+    var configJson = JSON.stringify({
+      config: { Labels: { "build.date": i.label }, Cmd: ["node", "src/index.js"] },
+      rootfs: { diff_ids: diffIds }
+    });
+    var configDigest = sha256Text(configJson);
+    var manifestDigest = sha256Text(JSON.stringify({
+      config: "sha256:" + configDigest,
+      layers: diffIds.map(function (d) { return "sha256:" + d; })
+    }));
+    return { layers: layers, diffIds: diffIds, configDigest: configDigest, manifestDigest: manifestDigest, i: i };
+  }
+
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+  function short(d) { return d.slice(0, 12) + "…"; }
+
+  function render() {
+    var A = build("a"), B = build("b");
+    var diverged = [];
+    A.diffIds.forEach(function (d, i) { if (d !== B.diffIds[i]) diverged.push(i); });
+    var same = A.manifestDigest === B.manifestDigest;
+
+    function paint(el, X, other) {
+      el.innerHTML = X.layers.map(function (l, i) {
+        var moved = X.diffIds[i] !== other.diffIds[i];
+        return (moved ? '<span class="r">' : '<span class="g">') + short(X.diffIds[i]) + "</span>  " + esc(l.inst);
+      }).join("\n") +
+        "\n" + (X.configDigest !== other.configDigest ? '<span class="r">' : '<span class="g">') +
+        short(X.configDigest) + "</span>  <b>config</b>" +
+        "\n" + (X.manifestDigest !== other.manifestDigest ? '<span class="r">' : '<span class="g">') +
+        short(X.manifestDigest) + "</span>  <b>manifest</b>" +
+        '\n\n<span class="d">base resolved: ' + esc(X.i.base) + "</span>" +
+        '\n<span class="d">timestamps:    ' + esc(X.i.mtime) + "</span>" +
+        '\n<span class="d">dependencies:  ' + esc(X.i.deps) + "</span>" +
+        '\n<span class="d">build.date:    ' + esc(X.i.label) + "</span>";
+    }
+    paint(aEl, A, B);
+    paint(bEl, B, A);
+
+    var deterministic = (opts.pinBase ? 1 : 0) + (opts.epoch ? 1 : 0) + (opts.pinDeps ? 1 : 0) + (opts.dateLabel ? 0 : 1);
+    out.innerHTML = "";
+    tile("Digests match", same ? "yes" : "no", same ? "reproducible" : "not reproducible", same);
+    tile("Layers differing", String(diverged.length) + "/4", diverged.length ? "layers " + diverged.map(function (i) { return i + 1; }).join(",") : "none", diverged.length === 0);
+    tile("Factors pinned", deterministic + "/4", "of the four");
+    tile("Config", A.configDigest === B.configDigest ? "same" : "differs", "", A.configDigest === B.configDigest);
+
+    var msgs = [];
+    if (same) {
+      msgs.push("<b>Identical manifest digests from two builds an hour apart.</b> All four sources of drift are pinned: the base by digest, timestamps by <code>SOURCE_DATE_EPOCH</code>, dependencies by lockfile, and no clock in a label. This is what reproducibility requires — and note how each one had to be handled separately.");
+    } else {
+      if (!opts.pinBase) msgs.push("<b>The base was pinned by tag</b>, and the registry published a rebuild between the two builds — so layer 1 differs and every layer above it inherits a different parent. This is the most common cause by a wide margin, and the cheapest to fix (chapter 3).");
+      if (!opts.epoch) msgs.push("<b>File timestamps</b> are recorded in the layer tarballs, so files written during the build carry the wall clock. <code>SOURCE_DATE_EPOCH</code> with <code>rewrite-timestamp=true</code> normalises them.");
+      if (!opts.pinDeps) msgs.push("<b>Dependency resolution</b> picked a newer patch release the second time, so the install layer contains different bytes. A committed lockfile fixes this, and it is worth doing for correctness rather than reproducibility.");
+      if (opts.dateLabel) msgs.push("<b>A label containing the build date</b> changes the config and therefore the image ID, while every <em>layer</em> stays identical — visible above as green layers and a red config. Record the commit rather than the clock, or put the timestamp in an attestation where it belongs.");
+    }
+    msgs.push("These are genuine SHA-256 digests computed here, chained the way chapter 3 described — so the cascade you see is the real mechanism rather than an illustration of it.");
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13.5px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,777 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Containers in CI — Docker</title>
+<meta name="description" content="Pipeline shape and critical path, building once and promoting by digest, cache backends on ephemeral runners, integration tests, multi-arch matrices, CI security and a complete worked pipeline.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Crect x='6' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='19' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='10' width='5' height='5' fill='%23fff'/%3E%3Cpath d='M4 22h22a5 5 0 004-4' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch16">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Docker
+    </a>
+    <div class="chno"><b>Chapter 16</b><span>Composition and workflow</span></div>
+    <h1>Containers in CI</h1>
+    <p class="lede">A container pipeline has one rule and everything else is optimisation. <b>Build the image once, and carry its digest through every later job</b> — because the moment a stage rebuilds, the thing you tested and the thing you deploy are different artefacts, and no amount of green ticks tells you so.</p>
+    <div class="meta"><span>28 min</span><span>2 demos</span><span>8 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="shape">
+      <h2 data-nav="Pipeline shape">The shape of a pipeline</h2>
+      <p class="sub">A build, a fan-out, a fan-in, a push.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">the job graph</span><button class="copy">Copy</button></div>
+<pre data-lang="text">                    ┌─ unit tests ─┐
+build ──(digest)──> ├─ lint ───────┤ ──> scan ──> push ──> promote
+                    └─ integration ┘
+        one image           several consumers        one artefact</pre>
+      </div>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Pipeline wall clock</h3>
+          <span class="hint">Where the time goes, and what rebuilding per job costs</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:88px">strategy</span>
+            <span id="p-strat" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl tight">
+            <label for="p-runners" style="min-width:132px">parallel runners <b id="p-runnersv">3</b></label>
+            <input type="range" id="p-runners" min="1" max="6" value="3" style="width:120px">
+          </div>
+          <div class="ctrl">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:88px">cache</span>
+            <span id="p-cache" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div id="p-chart" style="margin:6px 0 10px"></div>
+          <div class="rgrid" id="p-out"></div>
+          <p class="readout" id="p-note"></p>
+        </div>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Job</th><th>Runs on</th><th>Needs</th></tr></thead>
+          <tbody>
+            <tr><td><code>build</code></td><td>Once</td><td>The Dockerfile and a cache backend</td></tr>
+            <tr><td><code>unit</code>, <code>lint</code></td><td>The built image</td><td>Only the digest</td></tr>
+            <tr><td><code>integration</code></td><td>The built image plus real services</td><td>A database, a cache</td></tr>
+            <tr><td><code>scan</code></td><td>The built image</td><td>The digest, and a vulnerability database</td></tr>
+            <tr><td><code>push</code>/<code>promote</code></td><td>All of the above passing</td><td>Registry credentials</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="once">
+      <h2 data-nav="Build once">Build once, pass the digest</h2>
+      <p class="sub">The rule, and the three ways to implement it.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">the build job publishes a digest</span><button class="copy">Copy</button></div>
+<pre data-lang="yaml">jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write }
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: true
+          tags: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          docker run --rm \
+            ghcr.io/${{ github.repository }}@${{ needs.build.outputs.digest }} \
+            npm test</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>How to hand the image on</th><th>Cost</th><th>Suits</th></tr></thead>
+          <tbody>
+            <tr><td><b>Push, then pull by digest</b></td><td>A registry round trip per job</td><td>Almost everything — simple and exact</td></tr>
+            <tr><td>Save a tarball as a job artefact</td><td>Upload plus download of the whole image</td><td>When you cannot push before tests pass</td></tr>
+            <tr><td>One job does everything</td><td>No handoff at all, no parallelism</td><td>Small projects; it is a legitimate choice</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Artefact integrity tracer</h3>
+          <span class="hint">Real SHA-256 — is the digest you deploy the one you tested?</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:96px">handoff</span>
+            <span id="i-mode" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:96px">base republished</span>
+            <span id="i-when" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="term" id="i-term"></div>
+          <div class="rgrid" id="i-out"></div>
+          <p class="readout" id="i-note"></p>
+        </div>
+      </div>
+      <div class="key">
+        <span class="lbl">Pushing before the tests pass is fine</span>
+        <p>The instinct is to withhold the push until everything is green, which forces either a rebuild or a tarball. Push immediately under a per-commit tag instead (<code>sha-&lt;commit&gt;</code>, chapter 15) — an image in a registry is not deployed just because it exists, and a retention rule can expire unpromoted commit tags. <strong>Promotion, not pushing, is the gate.</strong> That inversion is what makes build-once practical.</p>
+      </div>
+    </section>
+
+    <section id="cache">
+      <h2 data-nav="Cache backends">Cache on ephemeral runners</h2>
+      <p class="sub">Chapter 6's cache, on a machine that is deleted after every job.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Backend</th><th>Where it lives</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td><code>type=gha</code></td><td>The Actions cache service</td><td>Easiest on GitHub. <b>Branch-scoped</b> and size-capped — see below</td></tr>
+            <tr><td><code>type=registry</code></td><td>A tag in your registry</td><td>Portable across CI systems and shareable between repositories</td></tr>
+            <tr><td><code>type=s3</code></td><td>A bucket you own</td><td>No size cap, and you control retention</td></tr>
+            <tr><td><code>type=local</code></td><td>A directory</td><td>Only useful with a persistent runner</td></tr>
+            <tr><td><code>type=inline</code></td><td>Embedded in the pushed image</td><td>Simple, but <code>mode=max</code> is unavailable</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">registry cache, which works anywhere</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker buildx build \
+    --cache-from type=registry,ref=ghcr.io/acme/api:buildcache \
+    --cache-to   type=registry,ref=ghcr.io/acme/api:buildcache,mode=max \
+    -t ghcr.io/acme/api:sha-$GIT_SHA --push .</pre>
+      </div>
+      <div class="trap">
+        <span class="lbl">Two things about the GitHub Actions cache</span>
+        <p>It is <strong>branch-scoped</strong>: a pull request branch can read the default branch's cache but cannot write into it, and sibling branches cannot see each other's. So the first build on a new branch warms nothing for anyone else, and a long-lived branch drifts. It is also <strong>size-capped per repository</strong> with least-recently-used eviction, so a <code>mode=max</code> cache for several large images can evict itself and produce mysteriously variable build times. When either bites, move to <code>type=registry</code>, which has neither property.</p>
+      </div>
+      <p><code>mode=max</code> caches intermediate stages as well as the final one, which matters for multi-stage builds because it lets a later run reuse the <code>deps</code> stage (chapters 6 and 7). It also stores considerably more, which is what interacts badly with a capped cache.</p>
+    </section>
+
+    <section id="integration">
+      <h2 data-nav="Integration tests">Integration tests</h2>
+      <p class="sub">Real dependencies, three ways.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">service containers — the CI system runs them for you</span><button class="copy">Copy</button></div>
+<pre data-lang="yaml">  integration:
+    needs: build
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: test }
+        options: &gt;-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-retries 10
+        ports: ["5432:5432"]
+    steps:
+      - run: |
+          docker run --rm --network host \
+            -e DATABASE_URL=postgres://postgres:test@localhost:5432/postgres \
+            ghcr.io/${{ github.repository }}@${{ needs.build.outputs.digest }} \
+            npm run test:integration</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Approach</th><th>Good</th><th>Less good</th></tr></thead>
+          <tbody>
+            <tr><td>Service containers</td><td>The CI system handles health and teardown</td><td>Syntax differs per CI system; not reproducible locally</td></tr>
+            <tr><td>Compose (chapter 13)</td><td><b>Identical locally and in CI</b>; one file</td><td>You manage readiness and cleanup</td></tr>
+            <tr><td>Testcontainers</td><td>Per-test isolation, defined in test code</td><td>Needs a working Docker socket inside the job</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Compose is usually the right default precisely because it removes a difference between environments: the same <code>compose.test.yaml</code> a developer runs is the one CI runs, so a failure reproduces on a laptop without translation.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Getting Docker inside a CI job</th><th>Isolation</th><th>Risk</th></tr></thead>
+          <tbody>
+            <tr><td>The runner's own daemon</td><td>Shared with the runner</td><td>Fine on a hosted ephemeral runner</td></tr>
+            <tr><td>Mount <code>/var/run/docker.sock</code></td><td>None</td><td><b>Root-equivalent on the host</b> (chapter 18)</td></tr>
+            <tr><td>Docker-in-Docker (<code>docker:dind</code>)</td><td>Good</td><td>Needs <code>--privileged</code>; no cache reuse between jobs</td></tr>
+            <tr><td>Rootless DinD, or a BuildKit daemon</td><td>Good</td><td>More setup; some feature limits</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="matrix">
+      <h2 data-nav="Multi-arch">Multi-arch in CI</h2>
+      <p class="sub">Chapter 8's choice, expressed as jobs.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">native runners per platform, then one merge</span><button class="copy">Copy</button></div>
+<pre data-lang="yaml">jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { platform: linux/amd64, runner: ubuntu-latest }
+          - { platform: linux/arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/acme/api,push-by-digest=true,name-canonical=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+  merge:
+    needs: build
+    steps:
+      - run: |
+          docker buildx imagetools create \
+            -t ghcr.io/acme/api:sha-${{ github.sha }} \
+            ghcr.io/acme/api@${{ needs.build.outputs.digest-amd64 }} \
+            ghcr.io/acme/api@${{ needs.build.outputs.digest-arm64 }}</pre>
+      </div>
+      <p>Each platform builds natively and pushes <strong>by digest only</strong>, with no tag; the merge job then assembles those digests into one index under the real tag (chapters 3 and 8). Two details make it work: a per-platform cache <code>scope</code>, since otherwise the two jobs fight over one cache key, and <code>imagetools create</code>, which builds the index server-side without moving layers.</p>
+      <div class="note">
+        <span class="lbl">When a single QEMU job is the better answer</span>
+        <p>If your CI provider has no native ARM runners, or the build is not compilation-heavy — an interpreted application with no native modules — a single job with <code>docker/setup-qemu-action</code> and <code>--platform linux/amd64,linux/arm64</code> is far less YAML and the emulation penalty is small (chapter 8's model prices it). Reach for the matrix when the penalty is real.</p>
+      </div>
+    </section>
+
+    <section id="security">
+      <h2 data-nav="CI security">CI security</h2>
+      <p class="sub">A pipeline with registry credentials is a production credential holder.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Practice</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td><b>OIDC rather than stored tokens</b></td><td>Short-lived credentials minted per job; nothing to leak or rotate (chapter 15)</td></tr>
+            <tr><td>Least-privilege <code>permissions:</code></td><td>Default to <code>contents: read</code> and grant <code>packages: write</code> only in the job that pushes</td></tr>
+            <tr><td>Never expose secrets to fork pull requests</td><td>A PR can change the workflow it runs</td></tr>
+            <tr><td>Avoid <code>pull_request_target</code> with a checkout of the PR head</td><td>It runs untrusted code <b>with secrets</b>. A well-known escalation</td></tr>
+            <tr><td>Pin actions by commit SHA</td><td>A tag on a third-party action can be repointed — chapter 15's mutability, applied to your pipeline</td></tr>
+            <tr><td>Secrets via <code>--mount=type=secret</code></td><td>Not <code>--build-arg</code>, which lands in history and provenance (chapter 8)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="warn">
+        <span class="lbl">A pull request from a fork must not build with your credentials</span>
+        <p>If a fork's pull request can trigger a workflow that has registry write access, whoever opened it can push whatever they like to your registry — because the workflow file itself is part of the changes under review. The safe split is: run tests on untrusted pull requests with <strong>no secrets and no push</strong>, and build-and-push only from branches in your own repository, after review. This is the same trust boundary chapter 18 draws around the Docker socket, one layer up.</p>
+      </div>
+    </section>
+
+    <section id="worked">
+      <h2 data-nav="A worked pipeline">A worked pipeline</h2>
+      <p class="sub">Everything above, in one file.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">.github/workflows/ci.yaml</span><button class="copy">Copy</button></div>
+<pre data-lang="yaml">name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+
+permissions: { contents: read }
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write, id-token: write }
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: true
+          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+  unit:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --target test --cache-from type=gha .
+
+  integration:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          docker compose -f compose.test.yaml run --rm test
+          docker compose -f compose.test.yaml down -v
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}@${{ needs.build.outputs.digest }}
+
+  scan:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ needs.build.outputs.digest }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+  promote:
+    needs: [unit, integration, scan]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions: { packages: write, id-token: write }
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag the tested digest as staging
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE }}:staging \
+            ${{ env.IMAGE }}@${{ needs.build.outputs.digest }}
+      - uses: sigstore/cosign-installer@v3
+      - run: cosign sign --yes ${{ env.IMAGE }}@${{ needs.build.outputs.digest }}</pre>
+      </div>
+      <p>Every job after <code>build</code> refers to the image <strong>by digest</strong>, so all of them examine the same bytes. <code>promote</code> moves a tag onto that digest rather than rebuilding, and signs the digest rather than the tag. Nothing in the pipeline can produce a situation where the scanned image and the shipped image differ.</p>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 16 in eight lines</h2>
+        <ul>
+          <li><b>Build once and pass the digest.</b> Every later job refers to the same bytes, or your tests do not apply to what you ship.</li>
+          <li>Push immediately under a per-commit tag; make <b>promotion</b> the gate rather than pushing.</li>
+          <li>Ephemeral runners have no local cache, so a cache backend is not optional — <code>type=gha</code> to start, <code>type=registry</code> when it stops fitting.</li>
+          <li>The Actions cache is <b>branch-scoped and size-capped</b>, which produces both cold branches and self-evicting caches.</li>
+          <li>Prefer Compose for integration tests, because the same file runs on a laptop.</li>
+          <li>Mounting the Docker socket into a job is <b>root-equivalent on the host</b>; DinD needs <code>--privileged</code>.</li>
+          <li>Multi-arch: native runners per platform pushing <b>by digest</b>, then one <code>imagetools create</code> to build the index.</li>
+          <li>Untrusted pull requests get <b>no secrets and no push</b>. Pin third-party actions by SHA.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary>Your pipeline builds in the test job and again in the deploy job, from the same commit. Name the failure mode.</summary>
+        <div class="ans"><p>They are different images. Between the two builds the base image may have been republished under its tag, dependency resolution may pick a newer patch, and timestamps differ — so the digests differ and possibly the contents (chapter 8). The tests passed against an artefact that was then thrown away, and something never tested was deployed. The vulnerability scan has the same problem, only worse, because its report names an image nobody runs. Build once, and reference the digest everywhere downstream; the tracer above shows the digests diverging.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Builds on <code>main</code> take two minutes; the first build on any new branch takes eleven. Both use <code>cache-from: type=gha</code>.</summary>
+        <div class="ans"><p>The Actions cache is branch-scoped. A new branch can <em>read</em> the default branch's cache but writes into its own scope, so it warms on first use and shares nothing back — and if the branch was created before the last <code>main</code> build, it may miss the newest entries entirely. Options: accept it, since the second build on that branch is fast; or move to <code>type=registry</code>, where one cache ref is shared by every branch with no scoping. The second also avoids the size cap that can silently evict a <code>mode=max</code> cache.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Why push a per-commit tag before the tests have passed, rather than after?</summary>
+        <div class="ans"><p>Because the alternative is worse. Withholding the push means either rebuilding after the tests (which changes the artefact) or shipping the image around as a tarball artefact (which costs an upload and download of the whole thing per job). An image sitting in a registry under <code>sha-&lt;commit&gt;</code> is not deployed — nothing references it — so pushing early costs only storage, which a retention rule handles by expiring unpromoted commit tags (chapter 15). Make promotion the gate instead: the tag that means "deployable" is only moved when everything is green.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A colleague suggests mounting <code>/var/run/docker.sock</code> into the test job so Testcontainers works. What do you say?</summary>
+        <div class="ans"><p>That it grants the job root-equivalent control of the host: anything that can talk to the daemon can start a privileged container mounting the host filesystem (chapter 18). On a hosted ephemeral runner that is destroyed after the job it may be an acceptable trade, since the "host" is disposable and already runs your build. On a shared self-hosted runner it is not, because a compromised dependency in one repository's tests can reach every other job on that machine. Safer options: rootless DinD, a remote BuildKit or Docker endpoint scoped to the job, or Compose-managed services instead of Testcontainers.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Part 4 is complete. Chapter 17 opens Part 5 with vulnerability scanning and supply chain: reading a scan honestly, base image currency, and policy that blocks the right things.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li>Check whether any job in your pipeline rebuilds the image.</li>
+        <li>Add <code>cache-from</code> and <code>cache-to</code> and compare timings.</li>
+        <li>Grep your workflows for <code>pull_request_target</code>.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>Docker's build-push-action and cache-backend documentation, GitHub's Actions cache and security-hardening guides, and the buildx multi-platform CI examples.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — pipeline wall clock
+   ============================================================ */
+(function () {
+  var STRATS = [
+    { id: "once", label: "build once, pass the digest" },
+    { id: "rebuild", label: "each job rebuilds" },
+    { id: "single", label: "one job does everything" }
+  ];
+  var CACHES = [
+    { id: "cold", label: "cold cache", factor: 1.0 },
+    { id: "warm", label: "warm cache", factor: 0.22 }
+  ];
+  var strat = "once", cache = "warm";
+
+  /* seconds */
+  var BUILD_COLD = 210, PULL = 14, UNIT = 95, LINT = 40, INTEG = 165, SCAN = 55, PROMOTE = 8;
+
+  var stratHost = document.getElementById("p-strat");
+  var cacheHost = document.getElementById("p-cache");
+  var chart = document.getElementById("p-chart");
+  var out = document.getElementById("p-out");
+  var note = document.getElementById("p-note");
+
+  function group(host, list, get, set) {
+    list.forEach(function (item) {
+      var b = document.createElement("button");
+      b.className = "btn mono" + (get() === item.id ? " on" : "");
+      b.textContent = item.label;
+      b.addEventListener("click", function () {
+        set(item.id);
+        Array.prototype.forEach.call(host.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+        b.classList.add("on");
+        render();
+      });
+      host.appendChild(b);
+    });
+  }
+  group(stratHost, STRATS, function () { return strat; }, function (v) { strat = v; });
+  group(cacheHost, CACHES, function () { return cache; }, function (v) { cache = v; });
+
+  function buildTime() {
+    var f = CACHES.filter(function (c) { return c.id === cache; })[0].factor;
+    return BUILD_COLD * f;
+  }
+
+  function jobs() {
+    var B = buildTime();
+    if (strat === "single") {
+      return [{ name: "everything", t: B + UNIT + LINT + INTEG + SCAN + PROMOTE, deps: [] }];
+    }
+    if (strat === "rebuild") {
+      /* every consumer rebuilds from its own runner */
+      return [
+        { name: "build", t: B, deps: [] },
+        { name: "unit", t: B + UNIT, deps: [] },
+        { name: "lint", t: B + LINT, deps: [] },
+        { name: "integration", t: B + INTEG, deps: [] },
+        { name: "scan", t: B + SCAN, deps: [] },
+        { name: "promote", t: B + PROMOTE, deps: ["unit", "lint", "integration", "scan"] }
+      ];
+    }
+    return [
+      { name: "build", t: B, deps: [] },
+      { name: "unit", t: PULL + UNIT, deps: ["build"] },
+      { name: "lint", t: PULL + LINT, deps: ["build"] },
+      { name: "integration", t: PULL + INTEG, deps: ["build"] },
+      { name: "scan", t: PULL + SCAN, deps: ["build"] },
+      { name: "promote", t: PROMOTE, deps: ["unit", "lint", "integration", "scan"] }
+    ];
+  }
+
+  /* list scheduling: a job starts when its deps are done and a runner is free */
+  function schedule(list, runners) {
+    var done = {}, start = {}, finish = {}, free = new Array(runners).fill(0);
+    var pending = list.slice();
+    var guard = 0;
+    while (pending.length && guard++ < 200) {
+      var ready = pending.filter(function (j) {
+        return j.deps.every(function (d) { return finish[d] !== undefined; });
+      });
+      if (!ready.length) break;
+      /* earliest-available runner, longest job first */
+      ready.sort(function (a, b) { return b.t - a.t; });
+      var j = ready[0];
+      var depDone = j.deps.reduce(function (a, d) { return Math.max(a, finish[d]); }, 0);
+      var li = free.indexOf(Math.min.apply(null, free));
+      var s = Math.max(depDone, free[li]);
+      start[j.name] = s; finish[j.name] = s + j.t; free[li] = s + j.t;
+      pending.splice(pending.indexOf(j), 1);
+    }
+    var wall = Math.max.apply(null, list.map(function (j) { return finish[j.name] || 0; }));
+    var minutes = list.reduce(function (a, j) { return a + j.t; }, 0);
+    return { start: start, finish: finish, wall: wall, minutes: minutes };
+  }
+
+  function fmt(s) { return s >= 90 ? (s / 60).toFixed(1) + " min" : Math.round(s) + " s"; }
+
+  function render() {
+    var runners = parseInt(document.getElementById("p-runners").value, 10);
+    document.getElementById("p-runnersv").textContent = runners;
+    var list = jobs();
+    var sch = schedule(list, runners);
+
+    var W = 470, rowH = 19, H = list.length * rowH + 14;
+    var x = function (t) { return 74 + (t / (sch.wall * 1.04)) * (W - 84); };
+    var svg = ['<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;max-width:' + W + 'px;height:auto;font-family:var(--mono)">'];
+    list.forEach(function (j, i) {
+      var y = 6 + i * rowH;
+      svg.push('<text x="4" y="' + (y + 11) + '" font-size="9" fill="#54677A">' + j.name + "</text>");
+      var s = sch.start[j.name] || 0, f = sch.finish[j.name] || 0;
+      svg.push('<rect x="' + x(0) + '" y="' + (y + 3) + '" width="' + (W - 84) + '" height="11" rx="2" fill="#F1F4F6"/>');
+      var col = j.name === "build" || j.name === "everything" ? "#3D4CC0" : j.name === "promote" ? "#1F7A52" : "#7C8CF8";
+      svg.push('<rect x="' + x(s) + '" y="' + (y + 3) + '" width="' + Math.max(1.5, x(f) - x(s)) +
+        '" height="11" rx="2" fill="' + col + '"/>');
+      svg.push('<text x="' + (x(f) + 3) + '" y="' + (y + 12) + '" font-size="8" fill="#7F8FA1">' + Math.round(j.t) + "s</text>");
+    });
+    svg.push("</svg>");
+    chart.innerHTML = svg.join("");
+
+    var B = buildTime();
+    var rebuilds = strat === "rebuild" ? list.filter(function (j) { return j.name !== "build"; }).length + 1 : 1;
+    var integrity = strat !== "rebuild";
+
+    out.innerHTML = "";
+    tile("Wall clock", fmt(sch.wall), "with " + runners + " runners", true);
+    tile("Runner minutes", fmt(sch.minutes), "what you pay for");
+    tile("Image builds", String(rebuilds), rebuilds > 1 ? "different artefacts" : "one artefact", rebuilds === 1);
+    tile("Tested = shipped", integrity ? "yes" : "no", integrity ? "" : "digests differ", integrity);
+
+    var msgs = [];
+    if (strat === "rebuild") {
+      msgs.push("<b>" + rebuilds + " separate builds of the same commit</b>, so " + rebuilds +
+        " potentially different artefacts — and the one that gets promoted was never the one the tests or the scan looked at. It also costs " +
+        fmt(sch.minutes) + " of runner time against " +
+        fmt(schedule((function () { var s = strat; strat = "once"; var l = jobs(); strat = s; return l; })(), runners).minutes) +
+        " for build-once. This pattern is usually adopted for simplicity and is both slower and incorrect.");
+    } else if (strat === "single") {
+      msgs.push("<b>One job, no handoff, no parallelism.</b> Wall clock is the sum of everything (" +
+        fmt(sch.wall) + "), but there is exactly one artefact and nothing to get wrong — a perfectly reasonable choice for a small project, and it stops being one as soon as the test suite grows.");
+    } else {
+      msgs.push("<b>Build once, then fan out.</b> Wall clock is the build plus the longest consumer (" +
+        fmt(sch.wall) + "), and every job examines the same digest. Adding runners only helps while the fan-out is wider than the runner count — beyond that the critical path is <code>build → integration → promote</code>.");
+    }
+    if (cache === "cold") {
+      msgs.push("With a cold cache the build dominates everything, which is why a cache backend is the first thing to fix on ephemeral runners: the same pipeline warm is " +
+        fmt(schedule((function () { var c = cache; cache = "warm"; var l = jobs(); cache = c; return l; })(), runners).wall) + ".");
+    }
+    msgs.push("<b>Assumptions:</b> a " + BUILD_COLD + "s cold build (×" +
+      CACHES.filter(function (c) { return c.id === cache; })[0].factor + " warm), " + PULL +
+      "s to pull by digest, and unit " + UNIT + "s, lint " + LINT + "s, integration " + INTEG +
+      "s, scan " + SCAN + "s. List scheduling, longest job first.");
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  document.getElementById("p-runners").addEventListener("input", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — artefact integrity tracer (real SHA-256)
+   ============================================================ */
+(function () {
+  var MODES = [
+    { id: "digest", label: "push once, pull by digest" },
+    { id: "tag", label: "push once, pull by tag" },
+    { id: "rebuild", label: "each job rebuilds" },
+    { id: "tarball", label: "save/load a tarball artefact" }
+  ];
+  var mode = "digest", republishAfter = -1;   /* -1 = never */
+
+  var host = document.getElementById("i-mode");
+  var term = document.getElementById("i-term");
+  var out = document.getElementById("i-out");
+  var note = document.getElementById("i-note");
+
+  MODES.forEach(function (m) {
+    var b = document.createElement("button");
+    b.className = "btn mono" + (m.id === mode ? " on" : "");
+    b.textContent = m.label;
+    b.addEventListener("click", function () {
+      mode = m.id;
+      Array.prototype.forEach.call(host.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      render();
+    });
+    host.appendChild(b);
+  });
+  /* republishAfter = k means jobs with index > k resolve the new base,
+     i.e. the republish landed just after JOBS[k] */
+  var WHENS = [
+    { v: -1, label: "never" },
+    { v: 1, label: "after unit" },
+    { v: 2, label: "after integration" },
+    { v: 3, label: "after scan" }
+  ];
+  var whenHost = document.getElementById("i-when");
+  WHENS.forEach(function (w) {
+    var b = document.createElement("button");
+    b.className = "btn mono" + (w.v === republishAfter ? " on" : "");
+    b.textContent = w.label;
+    b.addEventListener("click", function () {
+      republishAfter = w.v;
+      Array.prototype.forEach.call(whenHost.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      render();
+    });
+    whenHost.appendChild(b);
+  });
+
+  var JOBS = ["build", "unit", "integration", "scan", "promote"];
+
+  /* an image digest is a hash of its layer set; the base layer is one of them */
+  function imageDigest(baseTag) {
+    return sha256Text(JSON.stringify({
+      base: baseTag,
+      app: "src@a1b2c3d",
+      deps: "lock@412"
+    }));
+  }
+
+  function trace() {
+    var baseAtStart = "node22alpine@build-4718";
+    var baseLater = "node22alpine@build-4731";
+    var built = imageDigest(baseAtStart);
+
+    return JOBS.map(function (j, i) {
+      if (j === "build") return { job: j, digest: built, how: "built here" };
+      if (mode === "digest") return { job: j, digest: built, how: "pulled @" + built.slice(0, 10) + "…" };
+      if (mode === "tarball") return { job: j, digest: built, how: "docker load from artefact" };
+      if (mode === "tag") {
+        /* the tag still points at the build's digest unless something repushed it;
+           a republished BASE does not move our tag */
+        return { job: j, digest: built, how: "pulled :sha-a1b2c3d" };
+      }
+      /* rebuild: each job resolves the base tag afresh when it happens to start,
+         so which jobs see the new base depends purely on timing */
+      var sawNew = republishAfter !== -1 && i > republishAfter;
+      var d = imageDigest(sawNew ? baseLater : baseAtStart);
+      return { job: j, digest: d, how: "rebuilt from source" + (sawNew ? "  (new base)" : "") };
+    });
+  }
+
+  function render() {
+    var t = trace();
+    var buildD = t[0].digest;
+    var promoteD = t[t.length - 1].digest;
+    var distinct = {};
+    t.forEach(function (r) { distinct[r.digest] = true; });
+    var n = Object.keys(distinct).length;
+    var tested = t.filter(function (r) { return r.job === "unit" || r.job === "integration"; });
+    var scanned = t.filter(function (r) { return r.job === "scan"; })[0];
+    var shippedWasTested = tested.every(function (r) { return r.digest === promoteD; });
+    var shippedWasScanned = scanned.digest === promoteD;
+
+    term.innerHTML = t.map(function (r) {
+      var same = r.digest === buildD;
+      return '<span class="d">' + r.job.padEnd(13, "\u00a0") + "</span>" +
+        (same ? '<span class="g">' : '<span class="r">') + r.digest.slice(0, 22) + "…</span>" +
+        '<span class="d">   ' + r.how + "</span>";
+    }).join("\n") +
+      "\n\n" + (n === 1
+        ? '<span class="g">one artefact throughout — tested, scanned and shipped are identical</span>'
+        : '<span class="r">' + n + " distinct artefacts in one pipeline</span>") +
+      "\n" + (shippedWasScanned
+        ? '<span class="g">the scan report describes the image being deployed</span>'
+        : '<span class="r">the scan report describes an image nobody will run</span>');
+
+    out.innerHTML = "";
+    tile("Distinct digests", String(n), n === 1 ? "one artefact" : "in one run", n === 1);
+    tile("Tested = shipped", shippedWasTested ? "yes" : "no", "", shippedWasTested);
+    tile("Scanned = shipped", shippedWasScanned ? "yes" : "no", "", shippedWasScanned);
+    tile("Base moved", republishAfter === -1 ? "no" : "yes",
+      republishAfter === -1 ? "stable" : "after " + JOBS[republishAfter], republishAfter === -1);
+
+    var msgs = [];
+    if (mode === "digest") {
+      msgs.push("<b>Every job names the same digest, so there is nothing to diverge</b> — even with the base image republished mid-pipeline, because a digest reference cannot resolve to different bytes. This is the only handoff that is <em>structurally</em> safe rather than safe by luck.");
+    } else if (mode === "tarball") {
+      msgs.push("A tarball is also exact: <code>docker load</code> restores the identical layers, so the digest is preserved. It costs an upload and download of the whole image per job, which is why pushing by digest is usually better — but it is the right answer when policy forbids pushing before tests pass.");
+    } else if (mode === "tag") {
+      msgs.push("Pulling by an <b>immutable per-commit tag</b> happens to be safe here: nothing repushed <code>sha-a1b2c3d</code>, so it still resolves to the built digest. Note the guarantee is a convention rather than a mechanism — anyone with push access could repoint that tag between jobs, and a digest reference removes the possibility rather than relying on nobody doing it.");
+    } else {
+      if (republishAfter !== -1) {
+        var diverged = t.filter(function (r) { return r.digest !== buildD; }).map(function (r) { return r.job; });
+        var agreeing = t.filter(function (r) { return r.digest === promoteD && r.job !== "promote"; }).map(function (r) { return r.job; });
+        msgs.push("<b>" + n + " distinct artefacts.</b> The base image was republished under its tag partway through, so <b>" +
+          diverged.join(", ") + "</b> rebuilt onto different layers while the earlier jobs did not. " +
+          "The promoted digest matches only " + (agreeing.length ? "<b>" + agreeing.join(" and ") + "</b>" : "<b>nothing else in the run</b>") +
+          " — and <b>which jobs land on which side is pure timing</b>. Move the republish earlier or later and a different set agrees; nothing in the pipeline reports any of it.");
+      } else {
+        msgs.push("Every job rebuilt and, this time, got the same result — because nothing upstream changed during the run. <b>That is luck, not a guarantee.</b> Set a republish point and watch the same pipeline produce several artefacts with no error anywhere.");
+      }
+    }
+    if (!shippedWasScanned) {
+      msgs.push("<b>Note what this does to the scan.</b> The report is about an image that will not be deployed, so the pipeline is green, the evidence is real, and it applies to the wrong thing — the most expensive kind of false assurance.");
+    }
+    msgs.push("Digests here are genuine SHA-256 over the layer set, chained as in chapter 3.");
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

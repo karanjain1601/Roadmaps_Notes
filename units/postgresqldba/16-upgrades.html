@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Upgrades — PostgreSQL</title>
+<meta name="description" content="Minor releases, major upgrades with pg_upgrade, the logical replication route, and extension compatibility.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 16 · At scale</div>
+    <h1>Upgrades</h1>
+    <p class="standfirst">Minor upgrades are a package update and a restart. Major upgrades are a project — and the cost of putting one off is that the next one is worse, until you are running an unsupported version and the decision has been made for you.</p>
+    <div class="chap-meta">
+      <span class="tagpill">minor</span>
+      <span class="tagpill">pg_upgrade</span>
+      <span class="tagpill">logical</span>
+      <span class="tagpill">extensions</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Minor upgrades</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">16.2 to 16.6 — do these promptly</span><button class="copy">Copy</button></div>
+<pre><code># The on-disk format never changes within a major version, so a minor upgrade
+# is: install the new binaries, restart. Typically under a minute of downtime.
+
+apt-get install --only-upgrade postgresql-16
+systemctl restart postgresql@16-main
+
+# On a replicated cluster, upgrade standbys first, then switch over, then
+# upgrade the old primary. Downtime is one planned switchover (chapter 14):
+patronictl switchover --leader node1 --candidate node2
+
+# Minor releases are bug and security fixes only — no new features, no
+# behaviour changes. The project ships them quarterly and they routinely
+# include data-corruption fixes.
+#
+# Read the release notes anyway. Occasionally a fix requires action, such as
+# reindexing indexes built by a version with a known bug. That instruction
+# appears in the notes and nowhere else, and skipping it leaves you with
+# indexes that silently return wrong results.
+
+SELECT version();
+SHOW server_version_num;    -- 160006</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Never skip minor releases</span>
+  <p>The changelog for a typical minor version includes fixes for crashes, wrong query results and index corruption. Running six months behind means running with known, published, exploitable-or-corrupting bugs that someone has already written a patch for. The upgrade is a restart and it is compatible in both directions. <b>Apply them within a few weeks</b>, and automate it if you can — the risk of applying them is far lower than the risk of not.</p>
+</div>
+
+<h2><span class="h-rule"></span>Major upgrades</h2>
+
+<div class="demo" id="upg">
+  <div class="demo-head">
+    <b>Which route, and what it costs</b>
+    <span>Three methods with very different downtime, complexity and rollback stories.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="u-method">Method</label>
+        <select id="u-method">
+          <option value="dump">pg_dump and restore</option>
+          <option value="link" selected>pg_upgrade --link</option>
+          <option value="copy">pg_upgrade (copy)</option>
+          <option value="logical">Logical replication</option>
+          <option value="blue">Logical replication, both directions</option>
+        </select>
+      </div>
+      <div>
+        <label for="u-size">Database size — <span id="u-sizev">500 GB</span></label>
+        <input type="range" id="u-size" min="1" max="7" step="1" value="4">
+      </div>
+      <div>
+        <label for="u-tables">Tables and indexes — <span id="u-tablesv">2,000</span></label>
+        <input type="range" id="u-tables" min="1" max="6" step="1" value="3">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="u-down">—</b><span>downtime</span></div>
+      <div><b id="u-disk">—</b><span>extra disk</span></div>
+      <div><b id="u-back">—</b><span>rollback</span></div>
+      <div><b id="u-risk">—</b><span>complexity</span></div>
+    </div>
+    <div id="u-bars"></div>
+    <div class="out" id="u-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>pg_upgrade</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the standard route</span><button class="copy">Copy</button></div>
+<pre><code># 1. Install the new major version alongside the old. Both must be present.
+apt-get install postgresql-17
+
+# 2. CHECK MODE. Runs against the live cluster, changes nothing, and reports
+#    every problem — missing extensions above all. Run this weeks ahead.
+/usr/lib/postgresql/17/bin/pg_upgrade \
+    --old-datadir=/var/lib/postgresql/16/main \
+    --new-datadir=/var/lib/postgresql/17/main \
+    --old-bindir=/usr/lib/postgresql/16/bin \
+    --new-bindir=/usr/lib/postgresql/17/bin \
+    --check
+
+# 3. Stop both clusters. This is where downtime begins.
+systemctl stop postgresql@16-main postgresql@17-main
+
+# 4. Run it. --link uses hard links instead of copying, so the time depends on
+#    the number of relations rather than the volume of data.
+/usr/lib/postgresql/17/bin/pg_upgrade … --link --jobs=8
+
+# 5. Start the new cluster, then IMMEDIATELY rebuild statistics. pg_upgrade
+#    does not carry them across, so the planner starts blind — this is the
+#    classic "the upgrade made everything slow" incident.
+systemctl start postgresql@17-main
+vacuumdb --all --analyze-in-stages --jobs=8
+
+# --analyze-in-stages runs three passes of increasing accuracy, so you get
+# rough statistics in seconds rather than waiting for a full analyse.
+
+# 6. Once satisfied:
+./delete_old_cluster.sh</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">--link means you cannot start the old cluster again</span>
+  <p>Hard links make the upgrade fast — minutes rather than hours, because no data is copied — and the two clusters now share the same files on disk. The moment the new cluster writes anything, the old data directory is corrupt from the old version's point of view. <b>There is no rollback after startup.</b> Your fallback becomes a restore from backup, so take one immediately before, verify it, and know how long the restore takes (chapter 12). If you cannot accept that, use copy mode or logical replication instead — both keep the old cluster intact and startable.</p>
+</div>
+
+<h2><span class="h-rule"></span>The logical replication route</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">near-zero downtime, at the cost of complexity</span><button class="copy">Copy</button></div>
+<pre><code>-- Because logical replication decodes WAL into row changes (chapter 13), the
+-- subscriber can be a DIFFERENT major version. That is what makes this work.
+
+-- 1. Build a new cluster on the new version. Copy the schema across.
+pg_dump --schema-only -d orders | psql -h newhost -d orders
+
+-- 2. Publish and subscribe. copy_data does the initial sync.
+--    On the old primary (needs wal_level = logical — a RESTART, so check
+--    this before you need it):
+CREATE PUBLICATION upgrade_pub FOR ALL TABLES;
+
+--    On the new cluster:
+CREATE SUBSCRIPTION upgrade_sub
+    CONNECTION 'host=old dbname=orders user=replicator password=…'
+    PUBLICATION upgrade_pub WITH (copy_data = true, streaming = on);
+
+-- 3. Wait for the initial copy, then for lag to reach near zero.
+SELECT * FROM pg_stat_subscription;
+
+-- 4. THE CUTOVER. This is the only downtime, and it is seconds:
+--      a. stop writes to the old cluster
+--      b. confirm the subscriber has caught up completely
+--      c. advance every sequence — logical replication does NOT copy them
+--      d. point the application at the new cluster
+--      e. drop the subscription
+
+-- Step (c) is the one that gets forgotten, and the symptom is duplicate-key
+-- errors on the new cluster from the first insert onward:
+SELECT 'SELECT setval(' || quote_literal(seq) || ', ' || last_value || ');'
+FROM (SELECT sequencename AS seq,
+             pg_sequence_last_value(sequencename::regclass) AS last_value
+      FROM pg_sequences WHERE schemaname = 'public') s;
+-- Run that output on the new cluster, with a safety margin added.</code></pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Also not replicated logically</th><th>Handle by</th></tr></thead>
+<tbody>
+<tr><td>Sequences</td><td><code>setval</code> at cutover, with a margin</td></tr>
+<tr><td>DDL</td><td>None should happen during the migration. Freeze schema changes</td></tr>
+<tr><td>Large objects</td><td>Not supported — dump and restore them separately</td></tr>
+<tr><td>Tables without a primary key</td><td>Set a <code>REPLICA IDENTITY</code>, or accept insert-only replication</td></tr>
+<tr><td>Materialised views</td><td>Refresh on the new cluster after cutover</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Practise the cutover, then practise rolling back</span>
+  <p>The logical route's real advantage is not the low downtime — it is that <b>the old cluster is untouched and still running</b>. If something is wrong ten minutes after cutover, you point the application back. Make that genuinely available by setting up reverse replication before you switch: publish from the new cluster, subscribe on the old, so writes that land on the new one flow back. Then rolling back is a configuration change rather than a data-loss event. This is what turns a major upgrade from a one-way door into a reversible decision.</p>
+</div>
+
+<h2><span class="h-rule"></span>What breaks between major versions</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Category</th><th>Check</th></tr></thead>
+<tbody>
+<tr><td><b>Extensions</b></td><td>Every one needs a build for the new version, installed <em>before</em> the upgrade. The commonest blocker by a wide margin</td></tr>
+<tr><td><b>Removed settings</b></td><td>The server refuses to start on an unrecognised setting. <code>--check</code> catches these</td></tr>
+<tr><td><b>Deprecated syntax</b></td><td>Rare, and the release notes list it</td></tr>
+<tr><td><b>Collation changes</b></td><td>A glibc or ICU version change alters text sort order and <b>silently corrupts text indexes</b>. See below</td></tr>
+<tr><td><b>Planner behaviour</b></td><td>Plans change. Usually better; occasionally a query regresses. Capture baselines first</td></tr>
+<tr><td><b>Default value changes</b></td><td>e.g. <code>checkpoint_completion_target</code> became 0.9 in 14. Diff <code>pg_settings</code> before and after</td></tr>
+<tr><td><b>Client library versions</b></td><td>Old drivers usually work; check anything using replication or COPY protocols</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the collation problem, which is worse than it sounds</span><button class="copy">Copy</button></div>
+<pre><code>-- Text indexes are ordered according to the operating system's collation
+-- rules. If glibc changes those rules — which happened significantly in
+-- glibc 2.28, shipping in RHEL 8, Debian 10 and Ubuntu 18.10 — then existing
+-- B-tree indexes on text are ordered by rules the server no longer uses.
+--
+-- The symptoms are appalling: queries silently miss rows that exist, unique
+-- constraints stop detecting duplicates, and nothing errors.
+
+SELECT datname, datcollate, datctype, datcollversion FROM pg_database;
+SELECT collname, collversion, pg_collation_actual_version(oid)
+FROM pg_collation WHERE collprovider <> 'c';
+-- A mismatch between collversion and the actual version is the warning.
+
+-- If the OS collation changed, REINDEX every text index:
+REINDEX DATABASE CONCURRENTLY orders;      -- PG12+
+ALTER DATABASE orders REFRESH COLLATION VERSION;
+
+-- Avoiding it in future, in order of preference:
+--   1. ICU collations (PG15+ can use ICU as the default provider). ICU
+--      versions its collations explicitly, so a change is detectable
+--   2. C collation for columns that only need byte ordering — identifiers,
+--      codes, hashes. Faster too, and it never changes
+--
+-- This is not strictly an upgrade issue: it bites whenever the OS changes,
+-- including a base image bump. But a major upgrade is usually when the OS
+-- changes, which is why it belongs here.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Planning one</h2>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Run <code>pg_upgrade --check</code>, weeks ahead</b><span>Safe on a live cluster. It lists every extension and setting problem</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Confirm every extension has a build</b><span>The blocker that stops projects. Resolve it before scheduling anything</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Capture query baselines</b><span>Snapshot <code>pg_stat_statements</code>, and save plans for your critical queries</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Rehearse on a production-sized copy</b><span>Time it. The rehearsal duration is your maintenance window</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Take and verify a backup</b><span>Then confirm how long a restore takes, because that is your rollback</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>6 · Upgrade, then <code>vacuumdb --analyze-in-stages</code></b><span>Immediately. Statistics do not survive</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>7 · Compare against the baselines</b><span>For a week. Regressions show up under real traffic, not in a rehearsal</span></div>
+</div>
+
+<div class="note trap">
+  <span class="note-t">The upgrade is not finished when the server starts</span>
+  <p>Two things routinely make a technically successful upgrade look like a disaster. <b>Statistics are gone</b>, so until you analyse, every plan is built for a table the planner believes is empty — run <code>vacuumdb --analyze-in-stages</code> as the very next command, not as a follow-up task. And <b>plans change</b>: a new version's planner is generally better and occasionally worse for a specific query. Having the pre-upgrade <code>pg_stat_statements</code> snapshot is what lets you identify a regression in minutes rather than argue about whether things feel slower.</p>
+</div>
+
+<h2><span class="h-rule"></span>Keeping current</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Practice</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><b>Upgrade one major version a year</b></td><td>Each release is supported for five years. Upgrading annually means never being close to the edge</td></tr>
+<tr><td><b>Do not wait for a compelling feature</b></td><td>The reason to upgrade is that skipping accumulates risk, not that 17 has a nice feature</td></tr>
+<tr><td><b>Run <code>--check</code> quarterly</b></td><td>Free, safe, and it tells you which extension is about to become a problem</td></tr>
+<tr><td><b>Treat extension choice as an upgrade decision</b></td><td>Chapter 10 — an extension that lags releases pins your cluster</td></tr>
+<tr><td><b>Rehearse against production data</b></td><td>The only way to know the duration and to find the surprises</td></tr>
+<tr><td><b>Track the end-of-life date</b></td><td>An unsupported version stops receiving security fixes, and then the upgrade is an emergency</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">Falling behind is the actual risk</span>
+  <p>Every skipped year makes the next upgrade harder: more extension churn, more collation drift, a bigger jump in planner behaviour, more accumulated schema that nobody understands, and less institutional memory of how the last one went. Teams that upgrade annually find it routine. Teams that have not upgraded in four years find it a quarter-long project with real risk — and they are usually forced into it by an end-of-life date rather than choosing the timing. <b>The best upgrade strategy is doing them regularly enough that each one is boring.</b></p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Minor upgrades are a restart.</b> Never skip them — they contain crash, wrong-result and corruption fixes.</li>
+    <li>Read the minor release notes anyway; occasionally one requires a reindex, and that instruction appears nowhere else.</li>
+    <li><b><code>pg_upgrade --check</code> is safe on a live cluster.</b> Run it weeks ahead and quarterly thereafter.</li>
+    <li><b><code>--link</code> is fast and one-way.</b> After the new cluster starts, your rollback is a restore from backup.</li>
+    <li><b>Logical replication gives near-zero downtime and a real rollback</b> — set up reverse replication before cutover.</li>
+    <li><b>Advance the sequences at cutover.</b> Logical replication does not copy them, and the symptom is duplicate keys immediately.</li>
+    <li><b>Collation changes silently corrupt text indexes.</b> Check <code>datcollversion</code>, and prefer ICU or C where you can.</li>
+    <li><b>Statistics do not survive.</b> <code>vacuumdb --analyze-in-stages</code> is the next command after starting the new cluster.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("16-upgrades.html");
+
+(function(){
+  const root = document.getElementById("upg");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const SIZE = [10, 50, 100, 500, 1000, 5000, 20000];
+  const TBL  = [50, 500, 2000, 10000, 50000, 200000];
+
+  function dur(min){
+    if(min < 1) return (min*60).toFixed(0) + "s";
+    if(min < 90) return min.toFixed(0) + " min";
+    return (min/60).toFixed(1) + " hr";
+  }
+
+  const M = {
+    dump: {disk: s => s * 0.35, back:"full — old cluster untouched", risk:"low",
+      down: (s,t) => s / 12 * 60 + t / 400,
+      note:"Dump everything and restore into the new cluster. Simple, thoroughly understood, and by far the slowest — the restore replays every INSERT and rebuilds every index from scratch.\n\nIt is a genuinely good choice below about 50 GB, where the whole thing fits in a maintenance window and the simplicity is worth more than the speed. Above that the downtime becomes unacceptable quickly.\n\nOne real advantage: the new cluster is freshly written with no bloat and perfectly packed indexes, which occasionally matters on a database that has been neglected for years."},
+    link: {disk: () => 0, back:"NONE after startup", risk:"medium",
+      down: (s,t) => 1.5 + t / 900,
+      note:"Hard-links the data files instead of copying them, so the duration depends on the NUMBER of relations rather than on how much data there is. A multi-terabyte database upgrades in minutes.\n\nThe cost is that there is no rollback. The two clusters share files on disk, so once the new one starts and writes anything, the old data directory is unusable by the old version. Your fallback is a restore from backup — take one immediately before, verify it, and know how long it takes (chapter 12).\n\nThis is the standard route for large databases where a short maintenance window is acceptable."},
+    copy: {disk: s => s, back:"full — old cluster intact", risk:"low",
+      down: (s,t) => s / 400 * 60 + t / 900,
+      note:"The same mechanism as --link but copying the files rather than linking them. Slower and it needs a full second copy of the database on disk.\n\nWhat you buy is a real rollback: the old cluster is untouched and can be started again immediately. On a database small enough that the copy fits in the window, this is a better trade than --link — the extra minutes are cheap insurance against a bad surprise.\n\nUse --jobs to copy several tablespaces in parallel if you have them."},
+    logical: {disk: s => s, back:"switch back, if you prepared it", risk:"high",
+      down: () => 0.5,
+      note:"Build the new cluster, replicate into it, and cut over in seconds. Downtime is only the time to stop writes, verify catch-up, advance sequences and repoint the application.\n\nThe complexity is real: an initial sync that can take hours on a large database, a schema freeze for the duration, sequences to advance manually, and tables without a primary key to deal with (chapter 13).\n\nThe underrated advantage is that the old cluster keeps running throughout. Set up reverse replication before cutover and rolling back becomes a configuration change rather than a data-loss event — which is what makes this the right choice when the upgrade genuinely cannot be a one-way door."},
+    blue: {disk: s => s * 1.1, back:"immediate, with no data loss", risk:"highest",
+      down: () => 0.2,
+      note:"Logical replication in both directions: the new cluster subscribes to the old, and the old subscribes back to the new. After cutover, writes landing on the new cluster flow back to the old one.\n\nThat makes rollback genuinely free — point the application back and no data is lost, because the old cluster has been kept current the whole time.\n\nThe cost is the most complex setup here. Bidirectional replication needs care to avoid loops, conflicting writes have no automatic resolution, and you are running two live databases with a schema freeze across both. Worth it when the cost of a bad upgrade is very high and the cost of an extra week of preparation is not."}
+  };
+
+  function render(){
+    const k = $("u-method").value;
+    const m = M[k];
+    const size = SIZE[parseInt($("u-size").value,10)-1];
+    const tables = TBL[parseInt($("u-tables").value,10)-1];
+    $("u-sizev").textContent   = size >= 1000 ? (size/1000) + " TB" : size + " GB";
+    $("u-tablesv").textContent = tables.toLocaleString();
+
+    const down = m.down(size, tables);
+    const disk = m.disk(size);
+    const analyze = Math.max(1, size / 900 * 60);
+
+    $("u-down").textContent = dur(down);
+    $("u-disk").textContent = disk === 0 ? "none" : (disk >= 1000 ? (disk/1000).toFixed(1) + " TB" : Math.round(disk) + " GB");
+    $("u-back").textContent = m.back;
+    $("u-risk").textContent = m.risk;
+
+    const bars = [["Cutover downtime", down], ["Statistics rebuild", analyze]];
+    const max = Math.max.apply(null, bars.map(b => b[1]));
+    $("u-bars").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      'Time</div>' +
+      bars.map(([lab, v], i) =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px">' +
+        '<span style="min-width:168px;font-size:13px">' + lab + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + Math.max(1, v/max*100).toFixed(0) +
+        '%' + (i === 0 && down > 60 ? ';background:#E2574C' : i === 0 ? ';background:#3FB984' : ';background:#F2A03D') +
+        '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:62px;text-align:right">' +
+        dur(v) + '</span></div>').join("");
+
+    const notes = [m.note];
+
+    notes.push("Note the second bar. pg_upgrade does not carry statistics across, so the new cluster starts with none and every plan is built for a table the planner thinks is empty. " +
+               "vacuumdb --analyze-in-stages must be the next command after starting — it runs three passes of increasing accuracy so you get usable estimates in seconds rather than waiting " +
+               dur(analyze) + " for a full analyse.");
+
+    if(down > 60)
+      notes.push("A " + dur(down) + " maintenance window. If that is not acceptable, the logical replication route trades it for setup complexity — the cutover itself is seconds regardless of database size.");
+
+    if(k === "link")
+      notes.push("Before running this: take a backup, verify it restores, and note the restore duration. That number IS your rollback plan, because there is no other one once the new cluster starts.");
+
+    if(tables >= 50000)
+      notes.push(tables.toLocaleString() + " relations is a lot, and it dominates pg_upgrade's runtime — the tool works per relation regardless of how much data each holds. " +
+                 "Use --jobs to parallelise, and note that a heavily partitioned schema (chapter 15) multiplies this count substantially.");
+
+    notes.push("Whichever route: run pg_upgrade --check weeks ahead. It is safe on a live cluster and it lists every missing extension and removed setting — and a missing extension build is the single most common thing that stops a major upgrade dead.");
+    $("u-note").textContent = notes.join("\n\n");
+  }
+
+  ["u-method","u-size","u-tables"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

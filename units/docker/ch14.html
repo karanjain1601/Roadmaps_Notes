@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · The development loop — Docker</title>
+<meta name="description" content="Making the edit-to-result loop fast: bind mounts versus compose watch, hot reload mechanics, attaching a debugger and mapping paths, running tests in the shipped image, and dev containers.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Crect x='6' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='19' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='10' width='5' height='5' fill='%23fff'/%3E%3Cpath d='M4 22h22a5 5 0 004-4' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch14">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Docker
+    </a>
+    <div class="chno"><b>Chapter 14</b><span>Composition and workflow</span></div>
+    <h1>The development loop</h1>
+    <p class="lede">Containers make an environment reproducible and, done naively, make the edit-to-result loop forty times slower. <b>The fix is not one technique but matching the technique to the change</b> — a source edit and a dependency bump want completely different handling, and the tools that feel magical are the ones that let you say so.</p>
+    <div class="meta"><span>24 min</span><span>2 demos</span><span>8 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="loop">
+      <h2 data-nav="The loop">The loop is the metric</h2>
+      <p class="sub">Everything else in this chapter is about one number.</p>
+      <p>The only measure that matters for development tooling is <strong>how long from saving a file to seeing the result</strong>. Under a second and you stay in flow; ten seconds and you check your messages; a minute and you batch changes, which is how five small bugs become one large one.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Loop time model</h3>
+          <span class="hint">Five approaches against four kinds of change — assumptions underneath</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:88px">you changed</span>
+            <span id="l-change" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl">
+            <label for="l-edits" style="min-width:150px">edits per day <b id="l-editsv">60</b></label>
+            <input type="range" id="l-edits" min="5" max="300" step="5" value="60" style="width:130px">
+            <span class="sep"></span>
+            <button class="btn mono" id="l-desktop">Docker Desktop (VM boundary)</button>
+          </div>
+          <div id="l-table" style="overflow-x:auto"></div>
+          <div class="rgrid" id="l-out"></div>
+          <p class="readout" id="l-note"></p>
+        </div>
+      </div>
+      <p>The result that matters: <strong>no single approach is right for every change.</strong> A live-reload approach — bind mount or sync — turns a source edit into a second or two and is simply <em>wrong</em> for a dependency bump, because the container's <code>node_modules</code> never gets updated. Which of the two live approaches is faster depends on the platform: on Linux a bind mount has no overhead and wins narrowly, while across the Docker Desktop VM boundary sync wins clearly. That is why the good tools take a list of rules rather than a single mode.</p>
+    </section>
+
+    <section id="bind">
+      <h2 data-nav="Bind mount + watcher">Bind mount plus a watcher</h2>
+      <p class="sub">The classic approach, and its three failure modes.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">compose.override.yaml — the development delta</span><button class="copy">Copy</button></div>
+<pre data-lang="yaml">services:
+  api:
+    build:
+      target: build            # the stage with dev dependencies (ch. 7)
+    command: ["npm", "run", "dev"]
+    volumes:
+      - ./src:/app/src         # mount the source
+      - /app/node_modules      # ...but keep dependencies in the container (ch. 11)
+    environment:
+      CHOKIDAR_USEPOLLING: "true"     # only needed on Docker Desktop
+    ports:
+      - "9229:9229"            # the debugger
+    user: "${UID:-1000}:${GID:-1000}"</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Failure</th><th>Cause</th><th>Fix</th></tr></thead>
+          <tbody>
+            <tr><td>Watcher never fires</td><td>inotify events do not cross the Docker Desktop VM boundary</td><td>Enable polling, or use <code>compose watch</code></td></tr>
+            <tr><td>Everything is slow</td><td>Thousands of small dependency files crossing that boundary</td><td>Anonymous volume over <code>node_modules</code></td></tr>
+            <tr><td>Host <code>node_modules</code> shadows the container's</td><td>The mount brings your macOS-built binaries into a Linux container</td><td>Same fix — and never <code>npm install</code> on the host</td></tr>
+            <tr><td>New files are owned by root</td><td>Container runs as root, no user namespace (ch. 11)</td><td><code>--user</code> matching your UID</td></tr>
+            <tr><td>Server unreachable on the published port</td><td>The dev server bound <code>127.0.0.1</code> inside the container (ch. 12)</td><td>Bind <code>0.0.0.0</code>, or <code>vite --host</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Framework</th><th>Development command</th></tr></thead>
+          <tbody>
+            <tr><td>Node</td><td><code>nodemon --legacy-watch src/server.js</code>, or <code>node --watch</code></td></tr>
+            <tr><td>Vite</td><td><code>vite --host 0.0.0.0</code>, plus <code>server.watch.usePolling</code> on Desktop</td></tr>
+            <tr><td>Django</td><td><code>python manage.py runserver 0.0.0.0:8000</code></td></tr>
+            <tr><td>Go</td><td><code>air</code> — rebuilds and restarts the binary</td></tr>
+            <tr><td>Rust</td><td><code>cargo watch -x run</code></td></tr>
+            <tr><td>Spring Boot</td><td>devtools, with the restart trigger file on the mount</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="watch">
+      <h2 data-nav="compose watch">compose watch</h2>
+      <p class="sub">Rules per path, which is what the loop-time model asked for.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">the develop section</span><button class="copy">Copy</button></div>
+<pre data-lang="yaml">services:
+  api:
+    build: .
+    develop:
+      watch:
+        - path: ./src
+          action: sync            # copy the file in; the watcher reloads
+          target: /app/src
+        - path: ./public
+          action: sync
+          target: /app/public
+        - path: ./package.json
+          action: rebuild          # a dependency change needs a real build
+        - path: ./config
+          action: sync+restart     # config is read at boot, so restart
+          target: /app/config
+      ignore:
+        - node_modules/
+        - "*.test.ts"</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Action</th><th>Does</th><th>Right for</th></tr></thead>
+          <tbody>
+            <tr><td><code>sync</code></td><td>Copies changed files into the running container</td><td>Source that a watcher inside will reload</td></tr>
+            <tr><td><code>rebuild</code></td><td>Rebuilds the image and recreates the container</td><td>Dependency manifests, the Dockerfile itself</td></tr>
+            <tr><td><code>sync+restart</code></td><td>Copies, then restarts the container</td><td>Config read only at startup</td></tr>
+            <tr><td><code>sync+exec</code></td><td>Copies, then runs a command inside</td><td>Regenerating something after a sync — migrations, codegen</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">running it</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker compose watch                 # start everything and watch
+$ docker compose up --watch             # same, with logs interleaved</pre>
+      </div>
+      <div class="key">
+        <span class="lbl">Why sync beats a bind mount on macOS and Windows</span>
+        <p>A bind mount makes every file read cross the VM boundary, forever. A sync <em>copies</em> the changed file into the container's own filesystem, so reads afterwards are native — you pay a one-off transfer per edit rather than a permanent tax on every access. On Linux a bind mount is already native and the difference is small; on Docker Desktop it is the difference between a usable and an unusable loop. The demo above shows both.</p>
+      </div>
+    </section>
+
+    <section id="debug">
+      <h2 data-nav="Debuggers">Attaching a debugger</h2>
+      <p class="sub">Two things to get right: the port, and the path mapping.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">exposing the debug port</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># Node — bind 0.0.0.0, or nothing outside the container can attach
+$ node --inspect=0.0.0.0:9229 src/server.js
+
+# Python
+$ python -m debugpy --listen 0.0.0.0:5678 --wait-for-client manage.py runserver
+
+# Go — delve needs extra privileges to ptrace
+$ docker run -p 2345:2345 --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+    app dlv exec --headless --listen=:2345 --api-version=2 /app/server
+
+# Java
+$ java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005 -jar app.jar</pre>
+      </div>
+      <p>The port is the easy half. The half that consumes an afternoon is that your editor knows about <code>/Users/you/proj/src/index.ts</code> and the runtime knows about <code>/app/src/index.ts</code>, and until something translates between them your breakpoints stay unbound.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Path mapping resolver</h3>
+          <span class="hint">Whether a breakpoint binds, and the configuration that makes it</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:96px">mount</span>
+            <span id="d-mount" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:96px">runs</span>
+            <span id="d-build" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:96px">editor config</span>
+            <span id="d-cfg" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="term" id="d-term"></div>
+          <div class="rgrid" id="d-out"></div>
+          <p class="readout" id="d-note"></p>
+        </div>
+      </div>
+
+      <div class="code">
+        <div class="code-top"><span class="tag">.vscode/launch.json</span><button class="copy">Copy</button></div>
+<pre data-lang="text">{
+  "configurations": [{
+    "type": "node",
+    "request": "attach",
+    "name": "Attach to container",
+    "address": "localhost",
+    "port": 9229,
+    "localRoot": "${workspaceFolder}",
+    "remoteRoot": "/app",
+    "skipFiles": ["&lt;node_internals&gt;/**", "**/node_modules/**"]
+  }]
+}</pre>
+      </div>
+    </section>
+
+    <section id="tests">
+      <h2 data-nav="Tests">Tests in the image you ship</h2>
+      <p class="sub">The strongest argument for containerising the test run.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">a test stage, from chapter 7</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker build --target test .                    # one command, real environment
+$ docker compose run --rm api npm test             # with dependencies started
+$ docker compose run --rm --no-deps api npm run lint    # without them</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Approach</th><th>Tests run against</th><th>Catches</th></tr></thead>
+          <tbody>
+            <tr><td>Tests on the CI runner</td><td>The runner's toolchain and libraries</td><td>Logic bugs. Misses environment differences entirely</td></tr>
+            <tr><td><code>--target test</code></td><td>The same base image and dependency tree you ship</td><td>Version skew, missing system libraries, locale and timezone issues</td></tr>
+            <tr><td>Compose with real services</td><td>A real database, cache and queue</td><td>Migration bugs, SQL that only fails on the real engine</td></tr>
+            <tr><td>Testcontainers</td><td>Containers the test code starts itself</td><td>Same, with per-test isolation and no Compose file</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">integration tests against a real database</span><button class="copy">Copy</button></div>
+<pre data-lang="yaml"># compose.test.yaml
+services:
+  db:
+    image: postgres:16
+    environment: { POSTGRES_PASSWORD: test }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      retries: 15
+    tmpfs: [/var/lib/postgresql/data]      # RAM-backed: fast, and disposable
+
+  test:
+    build: { context: ., target: test }
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgres://postgres:test@db:5432/postgres</pre>
+      </div>
+      <p>Two details make that pattern good. The database's data directory is a <strong>tmpfs</strong>, so it is fast and leaves nothing behind. And the dependency is gated on <code>service_healthy</code> (chapter 13), so the suite does not fail on a cold start — which is otherwise the flakiest thing in any containerised test setup.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">the whole run, exit code and all</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker compose -f compose.test.yaml run --rm --build test; ec=$?
+$ docker compose -f compose.test.yaml down -v
+$ exit $ec</pre>
+      </div>
+    </section>
+
+    <section id="devcontainers">
+      <h2 data-nav="Dev containers">Dev containers</h2>
+      <p class="sub">The whole toolchain in the container, not just the application.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">.devcontainer/devcontainer.json</span><button class="copy">Copy</button></div>
+<pre data-lang="text">{
+  "name": "acme-api",
+  "dockerComposeFile": "../compose.yaml",
+  "service": "api",
+  "workspaceFolder": "/app",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "forwardPorts": [3000, 9229],
+  "postCreateCommand": "npm ci",
+  "remoteUser": "node",
+  "customizations": {
+    "vscode": { "extensions": ["dbaeumer.vscode-eslint", "esbenp.prettier-vscode"] }
+  }
+}</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Gains</th><th>Costs</th></tr></thead>
+          <tbody>
+            <tr><td>A new colleague is productive in one command</td><td>An editor-specific layer to maintain</td></tr>
+            <tr><td>Toolchain versions are pinned for everyone</td><td>Slower first start, and a large image</td></tr>
+            <tr><td>The debugger and extensions are configured already</td><td>Editor integrations are uneven outside VS Code</td></tr>
+            <tr><td>No "works on my machine" from tool versions</td><td>Fighting the container when you want a host tool</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Worth it for a team onboarding regularly or a project with a fussy toolchain; overkill for a service whose dependencies are a language runtime and a database. Note it reuses your existing Compose file rather than replacing it, so adopting it is additive.</p>
+    </section>
+
+    <section id="hygiene">
+      <h2 data-nav="Hygiene">Development hygiene</h2>
+      <p class="sub">Four habits that prevent the usual annoyances.</p>
+      <ul>
+        <li><strong>A separate override for development</strong>, not a modified base file. <code>compose.yaml</code> stays production-shaped; <code>compose.override.yaml</code> adds the mounts, the dev command and the debug port — and it is picked up automatically, so nobody has to remember a flag.</li>
+        <li><strong>Match your UID.</strong> <code>user: "${UID:-1000}:${GID:-1000}"</code> with <code>UID</code> and <code>GID</code> exported from your shell profile, so files created in a bind mount belong to you (chapter 11).</li>
+        <li><strong>Prune on a schedule.</strong> A month of development leaves tens of gigabytes in the build cache and dangling images — <code>docker system df</code> then <code>docker image prune</code> and <code>docker builder prune</code>. Never <code>--volumes</code> without checking.</li>
+        <li><strong>Keep <code>.dockerignore</code> honest.</strong> It is what keeps the context small and the cache stable (chapters 5 and 6), and in development it also stops your local <code>.env</code> from being copied into an image.</li>
+      </ul>
+      <div class="code">
+        <div class="code-top"><span class="tag">a weekly clean-up that is safe to run</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker system df
+$ docker container prune -f              # stopped containers
+$ docker image prune -f                   # dangling images only
+$ docker builder prune -f --filter until=168h
+$ docker volume ls -f dangling=true       # look before you prune these</pre>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 14 in eight lines</h2>
+        <ul>
+          <li>The metric is <b>save to result</b>. Under a second keeps you in flow; a minute changes how you work.</li>
+          <li><b>No single approach fits every change.</b> Live reload makes a source edit near-instant; syncing a dependency manifest does nothing useful at all.</li>
+          <li>Bind mount plus a watcher is the classic approach; on Docker Desktop it needs polling and an anonymous volume over <code>node_modules</code>.</li>
+          <li>Never <code>npm install</code> on the host if you bind-mount the project — the host's binaries shadow the container's.</li>
+          <li><code>compose watch</code> takes <b>rules per path</b>: <code>sync</code> for source, <code>rebuild</code> for manifests, <code>sync+restart</code> for config.</li>
+          <li>Sync copies into the container's own filesystem, so subsequent reads are native — the reason it beats a bind mount across a VM boundary.</li>
+          <li>Debuggers need the port bound to <b><code>0.0.0.0</code></b> and a <b>path mapping</b>; without the mapping, breakpoints stay unbound.</li>
+          <li>Run tests with <code>--target test</code> so they execute in the image you ship, with dependencies gated on <code>service_healthy</code>.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary>A colleague adds a dependency, and their container still cannot import it — though the file change is clearly synced. Why?</summary>
+        <div class="ans"><p>Syncing <code>package.json</code> copies the file into the container and nothing else: no install runs, so <code>node_modules</code> is unchanged. A dependency change needs the image rebuilt (or at minimum an install executed inside), which is exactly why <code>compose watch</code> distinguishes <code>sync</code> from <code>rebuild</code> and why the rules are per path. The same applies to a bind-mount setup — the mount makes the manifest visible instantly and installs nothing. Add a <code>rebuild</code> rule for the manifest, or run <code>compose up --build</code> after dependency changes.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Hot reload works on your Linux machine and not on a colleague's Mac, with the same Compose file. Explain, and give two fixes.</summary>
+        <div class="ans"><p>Docker Desktop runs a Linux VM, and inotify events from the macOS host do not reliably propagate across that boundary — so the watcher inside the container never learns the file changed. On Linux the bind mount is a native mount and events arrive normally. Fixes: enable polling in the watcher (<code>CHOKIDAR_USEPOLLING</code>, <code>--legacy-watch</code>, <code>usePolling</code>), which costs CPU but works; or switch to <code>compose watch</code> with a <code>sync</code> rule, where Compose itself detects the change on the host and pushes the file in, sidestepping inotify entirely. The second is better, and also faster to read from afterwards.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Your debugger attaches but every breakpoint shows as unbound. The port is published and the process has <code>--inspect</code>. What is missing?</summary>
+        <div class="ans"><p>The path mapping. Your editor identifies the file as <code>/Users/you/proj/src/index.js</code>; the runtime reports <code>/app/src/index.js</code>. Without a translation the debugger cannot match them, so it accepts the connection and binds nothing — which is why it looks like a connection problem and is not. Set <code>localRoot</code> to the workspace folder and <code>remoteRoot</code> to the container's working directory (or <code>pathMappings</code> for debugpy). If only a subdirectory is mounted, the roots are the mounted pair, not the project root — and with a build step in between you also need source maps, or you are mapping to files the runtime never executes.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Why run the test suite with <code>docker build --target test</code> rather than on the CI runner directly?</summary>
+        <div class="ans"><p>Because it runs against the same base image, system libraries and dependency tree you are about to ship, so it catches the class of failure that only appears in the deployed environment: a missing shared library, a different OpenSSL, a locale or timezone difference, a version of the runtime the runner does not have. Testing on the runner validates your logic against <em>the runner's</em> environment, which is not the artefact. It also reuses the cached dependency layers from the build (chapter 6), so it is usually no slower — and it gives you one command that behaves identically on a laptop and in CI.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Chapter 15 turns to distribution: tags versus digests in practice, registries and authentication, retention, and signing.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li>Time your current loop: save a file, count until the result.</li>
+        <li>Add a <code>develop.watch</code> section and run <code>docker compose watch</code>.</li>
+        <li><code>docker compose run --rm --no-deps api npm test</code>.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>Docker's Compose <code>develop</code> and watch documentation, the dev containers specification, and the Node, debugpy and delve remote-debugging guides.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — development loop time model
+   ============================================================ */
+(function () {
+  var CHANGES = [
+    { id: "source", label: "a source file" },
+    { id: "asset", label: "a static asset" },
+    { id: "manifest", label: "package.json" },
+    { id: "dockerfile", label: "the Dockerfile" }
+  ];
+  var change = "source", desktop = false;
+
+  /* seconds, stated in the note */
+  var T = {
+    context: 1.2, copyLayer: 0.5, install: 42, buildStep: 18,
+    recreate: 2.0, boot: 3.0, reload: 1.2, restart: 2.2,
+    detectInotify: 0.3, detectPoll: 1.6, syncCopy: 0.25, bindPenalty: 1.4
+  };
+
+  var chHost = document.getElementById("l-change");
+  var table = document.getElementById("l-table");
+  var out = document.getElementById("l-out");
+  var note = document.getElementById("l-note");
+
+  CHANGES.forEach(function (c) {
+    var b = document.createElement("button");
+    b.className = "btn" + (c.id === change ? " on" : "");
+    b.textContent = c.label;
+    b.addEventListener("click", function () {
+      change = c.id;
+      Array.prototype.forEach.call(chHost.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      render();
+    });
+    chHost.appendChild(b);
+  });
+  var dBtn = document.getElementById("l-desktop");
+  dBtn.addEventListener("click", function () { desktop = !desktop; dBtn.classList.toggle("on", desktop); render(); });
+
+  function model() {
+    var detect = desktop ? T.detectPoll : T.detectInotify;
+    var bindTax = desktop ? T.bindPenalty : 0;
+
+    function rows() {
+      var r = [];
+      /* full rebuild, no cache */
+      r.push({ name: "docker build --no-cache && run",
+        t: T.context + T.install + T.buildStep + T.recreate + T.boot, correct: true });
+
+      /* cached rebuild: what reruns depends on what changed */
+      var cached = T.context + T.recreate + T.boot;
+      if (change === "manifest") cached += T.install + T.buildStep;
+      else if (change === "dockerfile") cached += T.install + T.buildStep;
+      else cached += T.copyLayer + T.buildStep;
+      r.push({ name: "docker compose up --build", t: cached, correct: true });
+
+      /* bind mount + in-container watcher */
+      if (change === "source" || change === "asset") {
+        r.push({ name: "bind mount + watcher", t: detect + T.reload + bindTax, correct: true });
+      } else {
+        r.push({ name: "bind mount + watcher", t: detect + T.reload + bindTax, correct: false,
+          why: change === "manifest" ? "the manifest is visible but nothing installs it"
+                                     : "the Dockerfile is not read by a running container" });
+      }
+
+      /* compose watch: sync */
+      if (change === "source" || change === "asset") {
+        r.push({ name: "compose watch — sync", t: T.syncCopy + detect + T.reload, correct: true });
+      } else {
+        r.push({ name: "compose watch — sync", t: T.syncCopy + detect + T.reload, correct: false,
+          why: change === "manifest" ? "copies the file, installs nothing"
+                                     : "the Dockerfile is not part of the container" });
+      }
+
+      /* compose watch: rebuild */
+      var rb = T.context + T.recreate + T.boot + (change === "manifest" || change === "dockerfile" ? T.install + T.buildStep : T.copyLayer + T.buildStep);
+      r.push({ name: "compose watch — rebuild", t: rb, correct: true });
+      return r;
+    }
+    return rows();
+  }
+
+  function render() {
+    var edits = parseInt(document.getElementById("l-edits").value, 10);
+    document.getElementById("l-editsv").textContent = edits;
+    var rows = model();
+    var valid = rows.filter(function (r) { return r.correct; });
+    var best = valid.reduce(function (a, r) { return r.t < a.t ? r : a; });
+    var worst = rows.reduce(function (a, r) { return r.t > a.t ? r : a; });
+
+    table.innerHTML = '<table class="tbl"><thead><tr><th>approach</th><th>loop time</th><th>per day</th><th>picks up this change?</th></tr></thead><tbody>' +
+      rows.map(function (r) {
+        var perDay = (r.t * edits) / 60;
+        return "<tr><td><code>" + r.name + "</code></td><td><b>" +
+          (r.t < 10 ? r.t.toFixed(1) + " s" : Math.round(r.t) + " s") + "</b>" +
+          (r.correct && r.t === best.t ? ' <span style="color:var(--good);font-weight:600">fastest</span>' : "") +
+          "</td><td>" + (r.correct ? (perDay < 60 ? perDay.toFixed(0) + " min" : (perDay / 60).toFixed(1) + " h") : "—") +
+          "</td><td>" + (r.correct ? '<span style="color:var(--good)">yes</span>'
+            : '<span style="color:var(--bad)">no — ' + r.why + "</span>") + "</td></tr>";
+      }).join("") + "</tbody></table>";
+
+    out.innerHTML = "";
+    tile("Fastest correct", best.t < 10 ? best.t.toFixed(1) + "s" : Math.round(best.t) + "s", best.name.split(" ")[0], true);
+    tile("Slowest", Math.round(worst.t) + "s", "full rebuild");
+    tile("Ratio", (worst.t / best.t).toFixed(0) + "×", "between them");
+    tile("Wrong answers", String(rows.length - valid.length), "for this change", rows.length === valid.length);
+
+    var msgs = [];
+    if (change === "source") {
+      msgs.push("<b>The common case, and the ratio is the whole argument:</b> " +
+        (worst.t / best.t).toFixed(0) + "× between a full rebuild and <code>" + best.name +
+        "</code>. At " + edits + " edits a day that is the difference between " +
+        ((best.t * edits) / 60).toFixed(0) + " minutes and " + ((worst.t * edits) / 3600).toFixed(1) +
+        " hours of waiting. Note which live approach wins: " +
+        (desktop ? "with the VM boundary, sync's one-off copy beats a bind mount's permanent read tax."
+                 : "on Linux a bind mount has no overhead, so it edges out sync — which pays a small copy per edit. Turn on Docker Desktop and the order reverses."));
+    } else if (change === "manifest") {
+      msgs.push("<b>Two approaches are simply wrong here.</b> Syncing <code>package.json</code> or exposing it through a bind mount makes the file visible and installs nothing, so the container still cannot import the new dependency — a failure that looks like a tooling bug. Only a rebuild is correct, and it costs " +
+        Math.round(best.t) + " seconds. This is precisely why <code>compose watch</code> takes a rule per path.");
+    } else if (change === "dockerfile") {
+      msgs.push("A Dockerfile change cannot be picked up by anything short of a rebuild — the running container has no relationship to the file. Both live-reload approaches report success and change nothing.");
+    } else {
+      msgs.push("Static assets behave like source: a sync is fastest, and the watcher (or the browser) picks them up. The one caveat is assets consumed at build time by a bundler, which need whatever step produces them to rerun.");
+    }
+    if (desktop) {
+      msgs.push("<b>With Docker Desktop</b>, inotify is unreliable so the watcher polls (" + T.detectPoll +
+        "s to notice instead of " + T.detectInotify + "s), and every bind-mounted read pays the VM crossing — modelled here as " +
+        T.bindPenalty + "s. The sync approach avoids both, because Compose watches on the host and the file then lives in the container's own filesystem.");
+    }
+    msgs.push("<b>Assumptions:</b> a " + T.install + "s dependency install, " + T.buildStep +
+      "s build step, " + T.context + "s context transfer, " + T.recreate + "s recreate and " + T.boot +
+      "s process boot; " + T.reload + "s in-process reload. Your numbers will differ — measure the loop rather than trusting these.");
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  document.getElementById("l-edits").addEventListener("input", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — debugger path mapping resolver
+   ============================================================ */
+(function () {
+  var HOST_ROOT = "/Users/you/proj";
+  var MOUNTS = [
+    { id: "whole", label: "./:/app", host: "/Users/you/proj", ctr: "/app" },
+    { id: "src", label: "./src:/app/src", host: "/Users/you/proj/src", ctr: "/app/src" }
+  ];
+  var BUILDS = [
+    { id: "direct", label: "runs src/ directly", exec: "/app/src/index.js", maps: true },
+    { id: "compiled", label: "compiles src/ → dist/", exec: "/app/dist/index.js", maps: false }
+  ];
+  var CFGS = [
+    { id: "none", label: "no mapping" },
+    { id: "root", label: "localRoot=${workspaceFolder}, remoteRoot=/app" },
+    { id: "sub", label: "localRoot=…/src, remoteRoot=/app/src" }
+  ];
+  var mount = "whole", build = "direct", cfg = "root", sourcemaps = false;
+
+  var term = document.getElementById("d-term");
+  var out = document.getElementById("d-out");
+  var note = document.getElementById("d-note");
+
+  function group(hostId, list, get, set) {
+    var host = document.getElementById(hostId);
+    list.forEach(function (item) {
+      var b = document.createElement("button");
+      b.className = "btn mono" + (get() === item.id ? " on" : "");
+      b.textContent = item.label;
+      b.addEventListener("click", function () {
+        set(item.id);
+        Array.prototype.forEach.call(host.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+        b.classList.add("on");
+        render();
+      });
+      host.appendChild(b);
+    });
+  }
+  group("d-mount", MOUNTS, function () { return mount; }, function (v) { mount = v; });
+  group("d-build", BUILDS, function () { return build; }, function (v) { build = v; });
+  group("d-cfg", CFGS, function () { return cfg; }, function (v) { cfg = v; });
+  var smBtn = document.createElement("button");
+  smBtn.className = "btn mono";
+  smBtn.textContent = "source maps";
+  smBtn.addEventListener("click", function () { sourcemaps = !sourcemaps; smBtn.classList.toggle("on", sourcemaps); render(); });
+  document.getElementById("d-cfg").appendChild(smBtn);
+
+  function resolve() {
+    var M = MOUNTS.filter(function (x) { return x.id === mount; })[0];
+    var B = BUILDS.filter(function (x) { return x.id === build; })[0];
+
+    /* the file the editor knows about */
+    var hostFile = HOST_ROOT + "/src/index.js";
+    /* the path the runtime reports for the frame */
+    var runtimeFile = B.exec;
+
+    /* what the configured mapping translates the runtime path into */
+    var mapped = null, pair = null;
+    if (cfg === "root") { pair = ["/Users/you/proj", "/app"]; }
+    else if (cfg === "sub") { pair = ["/Users/you/proj/src", "/app/src"]; }
+    if (pair && runtimeFile.indexOf(pair[1]) === 0) {
+      mapped = pair[0] + runtimeFile.slice(pair[1].length);
+    }
+
+    /* a compiled build reports dist/, so the mapping alone points at the wrong file
+       unless source maps rewrite the frame back to src/ first */
+    var effectiveRuntime = runtimeFile;
+    if (!B.maps && sourcemaps) {
+      effectiveRuntime = "/app/src/index.js";
+      mapped = pair && effectiveRuntime.indexOf(pair[1]) === 0
+        ? pair[0] + effectiveRuntime.slice(pair[1].length) : null;
+    }
+
+    var binds = mapped === hostFile;
+    /* the mount must also actually contain the file for edits to matter */
+    var mountedHere = hostFile.indexOf(M.host) === 0;
+
+    return { M: M, B: B, hostFile: hostFile, runtimeFile: runtimeFile,
+             effectiveRuntime: effectiveRuntime, mapped: mapped, binds: binds,
+             mountedHere: mountedHere, pair: pair };
+  }
+
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+
+  function render() {
+    var r = resolve();
+    var lines = [];
+    lines.push('<span class="d">editor has a breakpoint in</span>');
+    lines.push("  " + esc(r.hostFile));
+    lines.push('<span class="d">runtime reports the frame as</span>');
+    lines.push("  " + esc(r.runtimeFile) +
+      (r.effectiveRuntime !== r.runtimeFile ? '<span class="y">  → ' + esc(r.effectiveRuntime) + "  (source map)</span>" : ""));
+    lines.push("");
+    if (!r.pair) {
+      lines.push('<span class="r">no mapping configured — the debugger cannot relate the two paths</span>');
+    } else {
+      lines.push('<span class="d">mapping</span>  ' + esc(r.pair[0]) + '  <span class="d">↔</span>  ' + esc(r.pair[1]));
+      lines.push('<span class="d">translates to</span>');
+      lines.push("  " + (r.mapped ? (r.binds ? '<span class="g">' : '<span class="r">') + esc(r.mapped) + "</span>"
+                                  : '<span class="r">nothing — the remote root does not prefix that path</span>'));
+    }
+    lines.push("");
+    lines.push(r.binds ? '<span class="g">✔ breakpoint bound</span>'
+                       : '<span class="r">✘ breakpoint unbound — "Cannot find corresponding location"</span>');
+    if (!r.mountedHere) {
+      lines.push('<span class="y">note: ' + esc(r.M.label) + " does not include this file, so edits will not reach the container</span>");
+    }
+    term.innerHTML = lines.join("\n");
+
+    out.innerHTML = "";
+    tile("Breakpoint", r.binds ? "bound" : "unbound", "", r.binds);
+    tile("Mapping", r.pair ? "configured" : "missing", r.pair ? r.pair[1] : "", !!r.pair);
+    tile("Runtime path", r.effectiveRuntime.split("/").slice(-2).join("/"), r.B.maps ? "as written" : sourcemaps ? "remapped" : "compiled");
+    tile("Mount covers it", r.mountedHere ? "yes" : "no", "", r.mountedHere);
+
+    var msgs = [];
+    if (r.binds) {
+      msgs.push("<b>Bound.</b> The mapping translates the runtime's path to exactly the file the editor has open, so the debugger can match them. Note that all this configuration does is string substitution on paths — there is no discovery, which is why an off-by-one directory silently produces nothing.");
+    } else if (!r.pair) {
+      msgs.push("<b>No mapping, so nothing binds.</b> The debugger connects happily — the port is fine — and then cannot relate <code>/app/src/index.js</code> to any file it knows. This is why the symptom looks like a connection problem and is not: attach succeeds, breakpoints go grey.");
+    } else if (!r.mapped) {
+      msgs.push("The configured <code>remoteRoot</code> (<code>" + esc(r.pair[1]) +
+        "</code>) is not a prefix of the path the runtime reported (<code>" + esc(r.effectiveRuntime) +
+        "</code>), so the substitution does not apply at all and the frame stays unmapped. The two roots must be the pair that the <b>mount</b> establishes.");
+    } else {
+      msgs.push("The mapping produced <code>" + esc(r.mapped) + "</code>, which is not the file the editor has open (<code>" +
+        esc(r.hostFile) + "</code>) — so it is off by a directory and binds nothing.");
+    }
+    if (!r.B.maps && !sourcemaps) {
+      msgs.push("<b>There is a build step in the way.</b> The runtime executes <code>dist/</code>, so even a correct root mapping points at compiled output rather than your source. Source maps are what rewrite the frame back to <code>src/</code> first — turn them on and the same mapping starts working.");
+    }
+    if (mount === "src" && cfg === "root") {
+      msgs.push("Mounting only <code>./src</code> while mapping the <em>project</em> root is a common mismatch: the mapping is arithmetically fine for files under <code>src</code>, but anything outside the mount is not the file you are editing at all.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "12.5px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

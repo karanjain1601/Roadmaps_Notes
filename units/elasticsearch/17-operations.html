@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Operating it — Elasticsearch</title>
+<meta name="description" content="Cluster health, the CAT API, the metrics that predict incidents, upgrades, and a playbook for the day the cluster goes yellow.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 17 · Running it</div>
+    <h1>Operating it</h1>
+    <p class="standfirst">Elasticsearch tells you a great deal about itself through one family of endpoints, and almost every incident is diagnosable in four commands. The skill is knowing which four, and knowing that a yellow cluster is a warning rather than an emergency.</p>
+    <div class="chap-meta">
+      <span class="tagpill">cat api</span>
+      <span class="tagpill">health</span>
+      <span class="tagpill">circuit breakers</span>
+      <span class="tagpill">upgrades</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The first four commands</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">before forming a theory</span><button class="copy">Copy</button></div>
+<pre><code># 1. WHAT COLOUR, AND WHY
+GET /_cluster/health
+GET /_cluster/health?level=indices          # per index
+GET /_cluster/allocation/explain            # WHY is that shard unassigned
+#    ^ the single most useful diagnostic in Elasticsearch. It answers in
+#      plain English: disk watermark, no matching node attributes, too many
+#      copies for the node count, an allocation filter, a failed recovery.
+
+# 2. WHAT IS THE CLUSTER DOING RIGHT NOW
+GET /_cat/nodes?v&h=name,node.role,heap.percent,ram.percent,cpu,load_1m,disk.avail
+GET /_cat/tasks?v&detailed              # long-running operations
+GET /_cat/pending_tasks?v               # cluster-state updates queued —
+                                        # a growing queue means the master
+                                        # is struggling
+GET /_cat/recovery?v&active_only=true   # shards being copied
+
+# 3. WHERE IS THE DATA
+GET /_cat/indices?v&s=store.size:desc
+GET /_cat/shards?v&s=store:desc
+GET /_cat/allocation?v                  # disk per node
+GET /_cat/thread_pool/search,write?v&h=node_name,name,active,queue,rejected
+
+# 4. WHAT IS UNDER PRESSURE
+GET /_nodes/stats/breaker               # circuit breaker trips
+GET /_nodes/stats/jvm                   # heap used, GC counts and durations
+GET /_nodes/stats/indices/search,indexing,merges,refresh
+
+# THE HEALTH REPORT API, which is newer and underused:
+GET /_health_report
+# It runs the diagnostics itself and returns findings with symptoms,
+# impacts and suggested actions — including the specific documentation link.
+# Start here before the manual dig; it often names the problem outright.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>The playbook</h2>
+
+<div class="demo" id="pb">
+  <div class="demo-head">
+    <b>Symptom to cause</b>
+    <span>Ten things that actually happen, with the command that identifies each.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="b-sym">Symptom</label>
+        <select id="b-sym">
+          <option value="yellow" selected>Cluster is yellow</option>
+          <option value="red">Cluster is red</option>
+          <option value="readonly">Writes rejected, index read-only</option>
+          <option value="429">429 rejections on bulk indexing</option>
+          <option value="slow">Searches suddenly slow</option>
+          <option value="heap">Heap at 90%, constant GC</option>
+          <option value="breaker">Circuit breaker exceptions</option>
+          <option value="pending">Cluster state updates piling up</option>
+          <option value="master">Master keeps changing</option>
+          <option value="disk">Disk filling up</option>
+        </select>
+      </div>
+    </div>
+    <div id="b-cmd"></div>
+    <div class="stat">
+      <div><b id="b-sev">—</b><span>severity</span></div>
+      <div><b id="b-avail">—</b><span>is the cluster serving?</span></div>
+      <div><b id="b-ch">—</b><span>background in</span></div>
+    </div>
+    <div class="out" id="b-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Yellow is not an outage</span>
+  <p>It is worth being emphatic because the colour causes more unnecessary alarm than any other signal in the product. <b>Yellow means every primary shard is assigned and at least one replica is not.</b> Every document is readable, every document is writable, every search returns complete results. What you have lost is redundancy — the next failure might hurt — and Elasticsearch will usually rebuild the missing copies by itself within minutes. A single-node cluster with the default one replica is permanently yellow and entirely healthy. <b>Alert on red, and on yellow that persists</b> beyond the time a recovery should take; paging on yellow itself trains people to ignore the alert.</p>
+</div>
+
+<h2><span class="h-rule"></span>The metrics worth recording</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Metric</th><th>Alert when</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td><code>status</code></td><td>red, or yellow &gt; 15 min</td><td>Red means data is unreachable</td></tr>
+<tr><td><code>unassigned_shards</code></td><td>&gt; 0 and not falling</td><td>Recovery is stuck, not in progress</td></tr>
+<tr><td>JVM heap used</td><td>sustained &gt; 85%</td><td>GC pressure; the node is about to become unresponsive</td></tr>
+<tr><td>GC old-generation time</td><td>rising</td><td>Long pauses look like network failures to the cluster</td></tr>
+<tr><td>Disk used</td><td>&gt; 80%</td><td>Watermarks stop allocation at 85% and force read-only at 95%</td></tr>
+<tr><td><code>thread_pool.write.rejected</code></td><td>rising</td><td>Indexing is past capacity</td></tr>
+<tr><td><code>thread_pool.search.rejected</code></td><td>any</td><td>Queries are queueing and being dropped</td></tr>
+<tr><td>Breaker <code>tripped</code> counts</td><td>rising</td><td>Requests asking for more memory than exists</td></tr>
+<tr><td><code>pending_tasks</code></td><td>&gt; 10 sustained</td><td>The master cannot keep up — often too many shards</td></tr>
+<tr><td>Search latency p99</td><td>your budget</td><td>Split query phase from fetch phase (chapter 14)</td></tr>
+<tr><td>Indexing rate and latency</td><td>step changes</td><td>A mapping or pipeline change usually explains it</td></tr>
+<tr><td>Total shard count</td><td>growth trend</td><td>Predicts the oversharding wall months ahead</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the disk watermarks, since they cause the scariest failure</span><button class="copy">Copy</button></div>
+<pre><code>cluster.routing.allocation.disk.watermark.low: 85%
+#   no NEW shards allocated to this node
+cluster.routing.allocation.disk.watermark.high: 90%
+#   Elasticsearch starts MOVING shards off this node
+cluster.routing.allocation.disk.watermark.flood_stage: 95%
+#   every index with a shard on this node is set to read-only-allow-delete
+
+# THE FLOOD STAGE IS THE ONE THAT HURTS. It applies an index block:
+#   "index.blocks.read_only_allow_delete": true
+# and your application starts getting:
+#   "cluster_block_exception: index [logs-000042] blocked by:
+#    [TOO_MANY_REQUESTS/12/disk usage exceeded flood-stage watermark,
+#    index has read-only-allow-delete block];"
+#
+# THE BLOCK IS NOT REMOVED AUTOMATICALLY IN OLDER VERSIONS. Free the disk,
+# then clear it explicitly:
+PUT /_all/_settings
+{ "index.blocks.read_only_allow_delete": null }
+# Newer versions release it once usage falls below the high watermark, but
+# check rather than assume — this has caught many people mid-incident,
+# having freed space and wondered why writes were still failing.
+
+# ALSO WORTH KNOWING: the watermarks are evaluated per node, so ONE full
+# node can make EVERY index that has a shard there read-only. A single
+# unbalanced node takes down writes cluster-wide.
+
+# EMERGENCY SPACE:
+DELETE /logs-2025.11.*                  # oldest indices first
+POST /logs-000041/_forcemerge?max_num_segments=1    # reclaims deleted docs
+PUT /_cluster/settings
+{ "transient": { "cluster.routing.allocation.disk.watermark.flood_stage": "97%" } }
+#   ^ buys minutes, not a fix. Set it back.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Upgrades</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">a rolling upgrade, and the rules</span><button class="copy">Copy</button></div>
+<pre><code>THE COMPATIBILITY RULES:
+  * rolling upgrades work between minor versions, and from the LAST minor
+    of one major to the next major (7.17 -> 8.x, 8.19 -> 9.x)
+  * an index created two majors ago cannot be read. You must reindex it, or
+    restore it from a snapshot taken by a version that can read it
+  * you cannot downgrade. Ever. A node that has started on a newer version
+    has upgraded its data directory
+  * snapshots restore forward, generally one major version, never backward
+
+THE PROCEDURE, per node:
+  1. GET /_cluster/health          — must be green before starting
+  2. disable shard allocation, so a stopped node does not trigger a full
+     rebalance of its shards onto everything else:
+       PUT /_cluster/settings
+       { "persistent": { "cluster.routing.allocation.enable": "primaries" } }
+  3. stop indexing if you can, and flush:
+       POST /_flush
+  4. stop the node, upgrade it, start it
+  5. re-enable allocation:
+       PUT /_cluster/settings
+       { "persistent": { "cluster.routing.allocation.enable": null } }
+  6. WAIT FOR GREEN before touching the next node
+  7. repeat
+
+  Upgrade MASTER-ELIGIBLE NODES LAST. A newer node can join a cluster
+  whose master is older; an older node cannot join one whose master is
+  newer.
+
+BEFORE ANY OF IT:
+  * take a snapshot, and confirm it completed
+  * read the breaking changes and the deprecation log:
+      GET /_migration/deprecations
+    This endpoint tells you what in YOUR configuration will break, which is
+    far more useful than reading the release notes cold
+  * upgrade Kibana AFTER Elasticsearch, and clients after that
+  * test on a restored snapshot in a scratch cluster first, on real data.
+    Mapping and query incompatibilities show up there and not in the notes</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Two settings that will save an incident</span>
+  <p><b><code>cluster.routing.allocation.enable: primaries</code> before any planned node restart.</b> Without it, stopping a node for sixty seconds makes the cluster decide its shards are gone and begin copying every one of them onto the remaining nodes — hundreds of gigabytes of network and disk I/O that becomes wasted work the moment the node returns. Related: <code>index.unassigned.node_left.delayed_timeout</code> (one minute by default) is what stops a brief network blip from triggering the same storm, and raising it to five minutes is reasonable on a cluster where restarts are routine. <b>And <code>action.destructive_requires_name: true</code></b>, which refuses wildcard deletes — it is the setting that stands between a fat-fingered <code>DELETE /logs-*</code> and a very bad afternoon.</p>
+</div>
+
+<h2><span class="h-rule"></span>What to have in place beforehand</h2>
+
+<ul class="check">
+  <li><b>The metrics table above as a time series</b>, with a year of history. Nearly everything in <code>_cat</code> and <code>_nodes/stats</code> is a point-in-time reading and the useful signal is the trend.</li>
+  <li><b>Shard count and index count trended</b> — they predict the oversharding wall months before it arrives.</li>
+  <li><b>Slow logs enabled</b> for search, fetch and indexing, shipped somewhere searchable (chapter 14).</li>
+  <li><b>Deprecation logging on</b>, and read before every upgrade.</li>
+  <li><b>Index templates in version control</b>, so "what changed" has an answer.</li>
+  <li><b>A restore test, dated, with its duration recorded</b> (chapter 15). That duration is your real recovery time.</li>
+  <li><b>An ILM policy on every time-series index</b>, and an alert for indices with no policy.</li>
+  <li><b><code>_cluster/allocation/explain</code> in your runbook</b>, because it answers the question you will have at 3am.</li>
+  <li><b>A scratch cluster</b> you can restore a snapshot into. It is where upgrades and mapping changes get tested.</li>
+</ul>
+
+<div class="note tip">
+  <span class="note-t">Do not run <code>_forcemerge</code>, <code>_flush</code> or <code>_cache/clear</code> as a reflex</span>
+  <p>All three appear in Stack Overflow answers as fixes and all three are usually wrong. <b><code>_forcemerge</code> on a live index</b> creates one enormous segment the merge policy will never reconsider, so deleted documents in it are stuck permanently (chapter 14) — it belongs in ILM's warm phase, on read-only indices. <b><code>_flush</code></b> commits the translog, which Elasticsearch already does on its own schedule; calling it manually achieves nothing except during a planned shutdown. <b><code>_cache/clear</code></b> discards the caches that were making your queries fast, so throughput gets worse for the next several minutes. The reflex worth building instead is <code>GET /_cluster/allocation/explain</code> and <code>GET /_health_report</code>, both of which are read-only and frequently name the problem outright.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Four commands first</b>: cluster health, <code>allocation/explain</code>, <code>_cat/nodes</code>, and the thread pools.</li>
+    <li><b><code>_cluster/allocation/explain</code> is the best diagnostic in the product</b> — it says in plain English why a shard is unassigned.</li>
+    <li><b><code>_health_report</code> runs the diagnosis for you</b> and is underused.</li>
+    <li><b>Yellow is not an outage.</b> Alert on red, and on yellow that persists.</li>
+    <li><b>The flood-stage watermark makes indices read-only at 95%</b>, and one full node can block writes cluster-wide.</li>
+    <li><b>Disable allocation before a planned restart</b>, or you trigger a pointless rebalance of every shard on that node.</li>
+    <li><b>Rolling upgrades: masters last, green between nodes</b>, and check <code>_migration/deprecations</code> first.</li>
+    <li><b>Do not force-merge, flush or clear caches reflexively.</b> All three usually make things worse.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("17-operations.html");
+
+(function(){
+  const root = document.getElementById("pb");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const P = {
+    yellow: {sev:"low", avail:"fully", ch:"chapter 2",
+      cmd:'GET /_cluster/health?level=indices\nGET /_cluster/allocation/explain\nGET /_cat/shards?v&h=index,shard,prirep,state,unassigned.reason',
+      note:"Every primary is assigned and at least one replica is not. The cluster is FULLY FUNCTIONAL — every document readable, every document writable, every search complete. You have lost redundancy, not data.\n\nThe usual causes, in order of frequency: more replicas configured than nodes available (a single-node cluster with the default 1 replica is permanently yellow, and correct); a node that just left and whose replicas are being rebuilt; disk watermarks preventing allocation; or allocation filtering that no node satisfies.\n\nallocation/explain answers which, in plain English. If replicas are actively recovering, _cat/recovery shows progress and the right action is to wait.\n\nAlert on yellow that PERSISTS beyond a plausible recovery time. Paging on yellow itself trains people to ignore the alert."},
+    red: {sev:"critical", avail:"partially", ch:"chapters 2, 15",
+      cmd:'GET /_cluster/health?level=indices\nGET /_cluster/allocation/explain\nGET /_cat/shards?v | grep UNASSIGNED\nGET /_cat/recovery?v&active_only=true',
+      note:"At least one PRIMARY shard is unassigned. That portion of an index is unreachable: searches over it return partial results and writes routed to it fail.\n\nFirst question: is it recovering? _cat/recovery with active_only shows shards being copied, and if the answer is yes the action is to wait rather than intervene.\n\nIf not, allocation/explain gives the reason. A node with the data is down and will return — wait. The node is gone permanently and there were no replicas — restore from a snapshot (chapter 15), and this is the moment you learn whether you had one. A corrupted shard — allocate_stale_primary or allocate_empty_primary exist as last resorts and both mean accepting data loss, deliberately.\n\nOne behaviour to check while red: searches return PARTIAL results by default rather than failing. Silently incomplete answers are worse than an error for most applications; allow_partial_search_results: false is the setting (chapter 9)."},
+    readonly: {sev:"critical", avail:"reads only", ch:"chapter 15",
+      cmd:'GET /_cat/allocation?v\nGET /_cluster/settings?include_defaults=true&filter_path=**.disk.watermark*\nGET /logs-000042/_settings?filter_path=**.blocks*',
+      note:"Almost always the disk FLOOD STAGE watermark. At 95% usage on a node, every index with a shard on that node gets index.blocks.read_only_allow_delete, and your application starts seeing cluster_block_exception.\n\nNote the scope: the watermark is evaluated PER NODE, so one full node makes every index that has a shard there read-only. A single unbalanced node takes down writes cluster-wide.\n\nFree space first — delete the oldest indices, which is instant, rather than delete_by_query, which is a merge storm (chapter 15). Then CLEAR THE BLOCK EXPLICITLY:\n\n    PUT /_all/_settings\n    { \"index.blocks.read_only_allow_delete\": null }\n\nNewer versions release it automatically once usage drops below the high watermark, and this has caught a great many people mid-incident who freed space and could not understand why writes were still failing. Check rather than assume.\n\nThe other cause is somebody having set index.blocks.write deliberately — by ILM's readonly action, or by hand during a migration and then forgotten."},
+    "429": {sev:"medium", avail:"degraded writes", ch:"chapters 6, 14",
+      cmd:'GET /_cat/thread_pool/write?v&h=node_name,active,queue,rejected\nGET /_nodes/stats/indices/indexing\nGET /_nodes/stats/thread_pool/write',
+      note:"The write thread pool queue is full and requests are being rejected. This is BACKPRESSURE, not an error — the cluster is telling you it is at capacity, and the correct client behaviour is to retry with exponential backoff.\n\nThe most common mistake is treating 429 as a failure and either dropping the documents or retrying immediately in a tight loop, which makes it worse.\n\nWhat to change, in order: reduce client concurrency until rejections stop; raise refresh_interval, since every refresh makes a segment and segments must be merged; check whether merges are keeping up via total_throttled_time_in_millis; check whether ingest pipelines are the bottleneck rather than indexing itself; and look at the mapping, because indexing fewer fields is the largest lever of all (chapter 4).\n\nRaising the thread pool queue size is available and almost always wrong — it converts fast rejections into slow timeouts and hides the capacity problem."},
+    slow: {sev:"medium", avail:"degraded", ch:"chapter 14",
+      cmd:'GET /_nodes/stats/indices/search\n  // compare query_time_in_millis with fetch_time_in_millis\nGET /_cat/thread_pool/search?v&h=node_name,active,queue,rejected\nGET /index/_search { "profile": true, "query": { ... } }',
+      note:"Split the query phase from the fetch phase before anything else, because the fixes have nothing in common (chapter 14).\n\nSLOW QUERY PHASE: an unbounded aggregation, a leading wildcard, deep pagination, too many shards to fan out to, or an expensive scoring function. profile: true names the clause.\n\nSLOW FETCH PHASE: matching was fine and retrieving documents is the problem — large _source, highlighting over big fields, or too many hits requested.\n\nThen the things that changed underneath: a new segment count after heavy indexing, merges falling behind, the page cache cold after a restart, or another workload on the same nodes. GET /_cat/segments shows whether segment count has grown.\n\nAnd check the boring causes first. A deploy that changed a query, a client-side connection pool that is exhausted, or a node that is quietly swapping."},
+    heap: {sev:"critical", avail:"about to degrade", ch:"chapter 14",
+      cmd:'GET /_cat/nodes?v&h=name,heap.percent,heap.max,ram.percent\nGET /_nodes/stats/jvm\n  // gc.collectors.old.collection_count and collection_time_in_millis\nGET /_nodes/stats/breaker\nGET /_cat/fielddata?v',
+      note:"Sustained heap above 85% means the JVM is spending an increasing fraction of its time collecting garbage rather than doing work, and old-generation GC pauses of several seconds make the node look FAILED to the rest of the cluster — which triggers shard reallocation and turns a memory problem into an availability problem.\n\nWhat consumes heap, in rough order: per-shard Lucene structures (so, oversharding — chapter 14), aggregation buckets in flight, fielddata if anyone enabled it, the query and request caches, and in-flight request bodies.\n\nCheck _cat/fielddata first because it should be near zero. If it is not, someone sorted or aggregated on a text field and enabled fielddata to make the error go away (chapter 3). Add a .keyword sub-field and disable it.\n\nThen check shard count per node against the 20-per-GB-of-heap guidance, and check for an aggregation with an unbounded size (chapter 12).\n\nMore heap is the last resort, and it stops working above ~31 GB where compressed pointers are lost."},
+    breaker: {sev:"medium", avail:"some requests fail", ch:"chapter 12",
+      cmd:'GET /_nodes/stats/breaker\n  // parent, fielddata, request, in_flight_requests: tripped counts\nGET /_cluster/settings?include_defaults=true&filter_path=**.breaker*',
+      note:"A circuit breaker refused a request that would have needed more memory than is available. This is the system working: a 429 or 503 is very much better than an out-of-memory node taking its shards with it.\n\nThe breaker that tripped tells you what to look at. `request` means a single request asked for too much — usually an aggregation with a huge bucket count (chapter 12) or a very large terms size. `fielddata` means someone is loading text-field data into heap and should not be. `in_flight_requests` means request bodies are too large — check bulk sizing. `parent` means total accounting across all of them, which is the general memory-pressure signal.\n\nRaising the breaker limits is available and is the wrong move: it removes the guard rather than the cause, and the failure mode you get instead is an OOM.\n\nFind the query. The slow log and _tasks with detailed will usually identify it, and the fix is almost always a bounded size or a composite aggregation."},
+    pending: {sev:"high", avail:"degraded", ch:"chapters 2, 4",
+      cmd:'GET /_cat/pending_tasks?v\nGET /_cluster/health?filter_path=number_of_pending_tasks,task_max_waiting_in_queue_millis\nGET /_cat/shards?v | wc -l\nGET /_cluster/state/metadata?filter_path=metadata.indices.*.mappings --> size',
+      note:"Cluster-state updates are queueing behind the master. Every mapping change, index creation, shard movement and setting update goes through this single serialised path, and the whole state is propagated to every node on each change.\n\nTwo causes dominate. TOO MANY SHARDS, so the state document is enormous and every update is expensive to compute and distribute (chapter 2). Or MAPPING EXPLOSION, where dynamic mapping over user-controlled keys has produced tens of thousands of fields (chapter 4) — and each new field is another state update.\n\nBoth develop slowly and present as general cluster sickness rather than as a configuration mistake, which is why they are so persistent.\n\nCheck total shard count against 20 per GB of heap per node, and check the size of the mappings in the cluster state. If a flood of new indices is being created, look at whether an index template is missing and indices are being created implicitly.\n\nDedicated master nodes help by removing query load from the coordination path. They do not fix an oversharded cluster."},
+    master: {sev:"critical", avail:"intermittent", ch:"chapter 2",
+      cmd:'GET /_cat/master?v\nGET /_cat/nodes?v&h=name,node.role,master\nGET /_nodes/stats/jvm  // GC pauses on master-eligible nodes\n// and the logs: "master not discovered", "failed to join"',
+      note:"A master election happening repeatedly means the cluster cannot agree on a leader, and while that is true, no cluster-state change can complete — index creation, shard allocation and mapping updates all stall.\n\nThe causes, in order of likelihood: LONG GC PAUSES on a master-eligible node, which make it look dead to the others and trigger an election it then contests when it wakes up. This is why dedicated master nodes matter on larger clusters — a heavy aggregation on a data node that is also master-eligible can destabilise coordination.\n\nThen network: packet loss or latency between master-eligible nodes, or a firewall interfering with port 9300.\n\nThen configuration: an EVEN number of master-eligible nodes, or exactly two, which cannot form a majority when one fails (chapter 2). Three is the standard answer, on separate hosts.\n\nSince version 7 the split-brain setting is gone and consensus is handled properly, so a partition takes the minority side read-only rather than producing two clusters. That removed the data-loss failure mode and not the availability one."},
+    disk: {sev:"high", avail:"fully, for now", ch:"chapter 15",
+      cmd:'GET /_cat/allocation?v\nGET /_cat/indices?v&s=store.size:desc\nGET /_cat/indices?v&h=index,docs.count,docs.deleted,store.size\nGET /index/_disk_usage?run_expensive_tasks=true',
+      note:"Act before the watermarks do. At 85% no new shards are allocated to that node, at 90% Elasticsearch starts moving shards off it, and at 95% every index with a shard there becomes read-only.\n\nWhere the space goes, in order of what to check: indices that should have been deleted, which means an ILM policy is missing or failing — GET /index/_ilm/explain says which step it is stuck on. Then docs.deleted relative to docs.count, which is dead weight awaiting a merge. Then _disk_usage per field, which regularly reveals that one field is half the index (chapter 4).\n\nThe fastest safe reclamation is deleting whole old indices — instant, no merge storm. Force-merging a read-only index reclaims its deleted documents. Both are better than delete_by_query, which writes tombstones and generates hours of merge I/O (chapter 15).\n\nThe structural fixes are an ILM policy with tier movement, keyword-only strings for log data, and doc_values off for fields you never aggregate."}
+  };
+
+  function render(){
+    const s = P[$("b-sym").value];
+    const SC = {low:"#3FB984", medium:"#F2A03D", high:"#E8823A", critical:"#E2574C"};
+
+    $("b-sev").textContent   = s.sev;
+    $("b-sev").style.color   = SC[s.sev];
+    $("b-avail").textContent = s.avail;
+    $("b-ch").textContent    = s.ch;
+
+    $("b-cmd").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin:16px 0 8px">What to run</div>' +
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid ' + SC[s.sev] +
+      ';border-radius:5px;padding:11px 13px;margin:0 0 12px;font-family:var(--mono);' +
+      'font-size:11.5px;line-height:1.7;overflow-x:auto">' +
+      s.cmd.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>';
+
+    $("b-note").textContent = s.note +
+      "\n\nRecord the relevant metrics as a time series rather than checking them during an incident. Almost everything in _cat and _nodes/stats is a point-in-time reading, and the useful signal is nearly always the trend — which only exists if you were collecting before the problem started.";
+  }
+
+  $("b-sym").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

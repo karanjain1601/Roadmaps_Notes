@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · The aggregation pipeline — MongoDB</title>
+<meta name="description" content="Stages, the order that matters, $lookup and its limits, $group, faceting, and where the pipeline stops being the right tool.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 05 · Working with data</div>
+    <h1>The aggregation pipeline</h1>
+    <p class="standfirst">A sequence of stages, each transforming the stream of documents it receives and passing the result on. It is procedural where SQL is declarative, which makes it easier to reason about step by step and easier to write in a catastrophically wrong order.</p>
+    <div class="chap-meta">
+      <span class="tagpill">stages</span>
+      <span class="tagpill">order matters</span>
+      <span class="tagpill">$lookup</span>
+      <span class="tagpill">$group</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Stages in sequence</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">the shape</span><button class="copy">Copy</button></div>
+<pre><code>db.orders.aggregate([
+  { $match:  { status: "paid", placedAt: { $gte: startOfMonth } } },
+  { $unwind: "$items" },
+  { $group:  { _id: "$items.sku",
+               units:   { $sum: "$items.qty" },
+               revenue: { $sum: { $multiply: ["$items.qty", "$items.price"] } } } },
+  { $sort:   { revenue: -1 } },
+  { $limit:  10 }
+]);
+
+// Read it top to bottom: filter to this month's paid orders, split each into
+// one document per line item, group by sku summing quantity and revenue,
+// sort, take ten.
+//
+// The SQL equivalent is one statement the optimiser rearranges freely. Here
+// the order you write IS largely the order of execution — with a few
+// automatic optimisations noted below. That is the trade: more control,
+// more responsibility.</code></pre>
+</div>
+
+<div class="demo" id="pipe">
+  <div class="demo-head">
+    <b>Watch the documents change</b>
+    <span>Five orders through a real pipeline. Add stages and see the stream transform.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="p-upto">Run through stage — <span id="p-uptov">2</span></label>
+        <input type="range" id="p-upto" min="0" max="5" step="1" value="2">
+      </div>
+      <div>
+        <label for="p-order">Stage order</label>
+        <select id="p-order">
+          <option value="good" selected>$match first (correct)</option>
+          <option value="bad">$match last (the classic mistake)</option>
+        </select>
+      </div>
+    </div>
+    <div id="p-stages"></div>
+    <div class="stat">
+      <div><b id="p-docs">—</b><span>documents at this point</span></div>
+      <div><b id="p-scan">—</b><span>documents read from disk</span></div>
+      <div><b id="p-index">—</b><span>index used?</span></div>
+    </div>
+    <div id="p-out"></div>
+    <div class="out" id="p-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">$match first, always</span>
+  <p>Only the <em>first</em> stage can use an index — once documents are flowing through the pipeline, there is no index on the intermediate stream. A <code>$match</code> at the top is an indexed query that reads a hundred documents; the same <code>$match</code> after a <code>$group</code> reads the entire collection, groups all of it, and then throws nearly all of it away. MongoDB does move some <code>$match</code> stages earlier automatically, and it cannot move one past a <code>$group</code> or <code>$project</code> that changed the field it references. <b>Put the filter first yourself and do not rely on the optimiser.</b></p>
+</div>
+
+<h2><span class="h-rule"></span>The stages worth knowing</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Stage</th><th>Does</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><code>$match</code></td><td>Filter</td><td>Same syntax as <code>find</code>. <b>First</b></td></tr>
+<tr><td><code>$project</code></td><td>Reshape — include, exclude, compute</td><td>Reduces what flows onward</td></tr>
+<tr><td><code>$addFields</code> / <code>$set</code></td><td>Add computed fields, keep the rest</td><td>Usually what you meant by <code>$project</code></td></tr>
+<tr><td><code>$unset</code></td><td>Remove fields</td><td>The readable inverse of excluding</td></tr>
+<tr><td><code>$group</code></td><td>Aggregate by a key</td><td>Blocking — buffers until input ends</td></tr>
+<tr><td><code>$sort</code></td><td>Order</td><td>Uses an index only as the first stage. 100 MB limit otherwise</td></tr>
+<tr><td><code>$limit</code> / <code>$skip</code></td><td>Slice</td><td><code>$sort</code> + <code>$limit</code> together is optimised into a top-N</td></tr>
+<tr><td><code>$unwind</code></td><td>One document per array element</td><td>Multiplies the stream. Costly</td></tr>
+<tr><td><code>$lookup</code></td><td>Join to another collection</td><td>Real limits — see below</td></tr>
+<tr><td><code>$facet</code></td><td>Several pipelines over the same input</td><td>Counts and results in one round trip</td></tr>
+<tr><td><code>$bucket</code> / <code>$bucketAuto</code></td><td>Histogram</td><td>Ranges into buckets</td></tr>
+<tr><td><code>$setWindowFields</code></td><td>Window functions</td><td>5.0+. Running totals, rank, lag (SQL chapter 8)</td></tr>
+<tr><td><code>$graphLookup</code></td><td>Recursive traversal</td><td>Hierarchies. The recursive CTE equivalent</td></tr>
+<tr><td><code>$merge</code> / <code>$out</code></td><td>Write results to a collection</td><td>How rollups are materialised</td></tr>
+<tr><td><code>$count</code></td><td>Count documents at this point</td><td></td></tr>
+<tr><td><code>$sample</code></td><td>Random documents</td><td>Efficient only in specific conditions</td></tr>
+<tr><td><code>$densify</code> / <code>$fill</code></td><td>Fill gaps in a series</td><td>5.1+. The "missing zeros" problem, solved</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>$group</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">the accumulator set</span><button class="copy">Copy</button></div>
+<pre><code>{ $group: {
+    _id: "$customerId",                        // the grouping key
+    orders:    { $sum: 1 },                    // count
+    revenue:   { $sum: "$total" },
+    average:   { $avg: "$total" },
+    biggest:   { $max: "$total" },
+    first:     { $first: "$placedAt" },        // needs a $sort before it
+    last:      { $last: "$placedAt" },
+    allRefs:   { $push: "$reference" },        // array of every value
+    uniqueSkus:{ $addToSet: "$items.sku" },    // array of distinct values
+    stdDev:    { $stdDevPop: "$total" }
+} }
+
+// _id: null groups everything into one document.
+// _id can be a composite:
+{ $group: { _id: { year: { $year: "$placedAt" },
+                   month: { $month: "$placedAt" } }, … } }
+
+// Conditional aggregation — the SQL unit's chapter 6, same idea:
+{ $group: {
+    _id: "$region",
+    paid:      { $sum: { $cond: [{ $eq: ["$status", "paid"] }, 1, 0] } },
+    cancelled: { $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] } },
+    paidValue: { $sum: { $cond: [{ $eq: ["$status", "paid"] }, "$total", 0] } }
+} }
+
+// $push and $addToSet are UNBOUNDED. Grouping a million documents and
+// pushing each into an array builds a document that exceeds 16 MB and the
+// stage fails. Use them only when the group is known to be small — or add
+// { $slice: … } after, which does not help because the array was already
+// built. Bound the input instead.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Blocking stages buffer, and they have limits</span>
+  <p><code>$group</code>, <code>$sort</code>, <code>$bucket</code> and <code>$setWindowFields</code> cannot emit anything until they have seen all their input, so they hold state in memory — capped at <b>100 MB per stage</b>. Exceed it and the pipeline fails unless <code>allowDiskUse: true</code> lets it spill, which works and is much slower. From MongoDB 6.0 spilling is allowed by default, so the failure mode became "mysteriously slow" rather than "clear error", which is arguably worse. The real fix is nearly always <code>$match</code> earlier and <code>$project</code> away fields you do not need before the blocking stage.</p>
+</div>
+
+<h2><span class="h-rule"></span>$lookup</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">it is a join, and it is not SQL's join</span><button class="copy">Copy</button></div>
+<pre><code>db.orders.aggregate([
+  { $match: { status: "paid" } },
+  { $lookup: {
+      from: "customers",
+      localField: "customerId",
+      foreignField: "_id",
+      as: "customer"            // ALWAYS an array, even for one match
+  } },
+  { $unwind: "$customer" }      // usually needed immediately after
+]);
+
+// The general form, when you need conditions beyond equality:
+{ $lookup: {
+    from: "reviews",
+    let: { pid: "$_id" },
+    pipeline: [
+      { $match: { $expr: { $and: [ { $eq: ["$productId", "$$pid"] },
+                                   { $gte: ["$stars", 4] } ] } } },
+      { $sort: { helpful: -1 } },
+      { $limit: 5 }
+    ],
+    as: "topReviews"
+} }
+
+// WHAT TO KNOW:
+//   * it is a LEFT OUTER join. No match gives an empty array, not nothing
+//   * it is executed as a nested loop: one lookup PER INPUT DOCUMENT.
+//     Index the foreign field or it is a collection scan per document
+//   * there is no join reordering, no hash join, no merge join. The
+//     optimiser will not rescue a badly-shaped pipeline
+//   * on a SHARDED collection the foreign side has restrictions, and
+//     performance is materially worse (chapter 13)
+//   * the result must fit in one 16 MB document, arrays included
+
+// The honest summary: $lookup exists and works, and it is for occasional
+// joins on modest result sets, not for a schema built around joining. If
+// your hot path needs $lookup, chapter 2's extended reference is usually
+// the answer — and if most paths do, chapter 18 is.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>$unwind</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">one document per element, with the costs that implies</span><button class="copy">Copy</button></div>
+<pre><code>// { _id: 1, items: [a, b, c] }  ->  three documents, each with one item
+{ $unwind: "$items" }
+
+{ $unwind: {
+    path: "$items",
+    preserveNullAndEmptyArrays: true,   // keep documents with no items —
+                                        // otherwise they VANISH silently
+    includeArrayIndex: "position"
+} }
+
+// That default is a real trap: an order with an empty items array disappears
+// from the pipeline entirely, so counts come out low and nobody notices
+// because the documents that vanished are the ones nobody was looking at.
+
+// $unwind multiplies the stream. Five thousand orders averaging four items
+// becomes twenty thousand documents, each carrying a full copy of the order.
+// $project away what you do not need FIRST:
+[
+  { $match: { … } },
+  { $project: { items: 1, placedAt: 1 } },   // drop everything else
+  { $unwind: "$items" },
+  { $group: { … } }
+]
+
+// And often you do not need it at all. To sum an array within each document,
+// use an expression rather than unwinding and regrouping:
+{ $addFields: { itemCount: { $sum: "$items.qty" } } }
+{ $addFields: { total: { $reduce: {
+    input: "$items", initialValue: 0,
+    inVal: { $add: ["$$value", { $multiply: ["$$this.qty", "$$this.price"] }] }
+} } } }</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>$facet</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">results and their count, in one round trip</span><button class="copy">Copy</button></div>
+<pre><code>db.products.aggregate([
+  { $match: { category: "keyboards", active: true } },
+  { $facet: {
+      results: [ { $sort: { popularity: -1 } }, { $skip: 0 }, { $limit: 24 } ],
+      total:   [ { $count: "n" } ],
+      byBrand: [ { $group: { _id: "$brand", n: { $sum: 1 } } },
+                 { $sort: { n: -1 } } ],
+      byPrice: [ { $bucket: { groupBy: "$price",
+                              boundaries: [0, 50, 100, 200, 10000],
+                              default: "other",
+                              output: { n: { $sum: 1 } } } } ]
+  } }
+]);
+
+// Each sub-pipeline sees the SAME input documents. One pass over the data
+// produces the page of results, the total count and both facet breakdowns —
+// which would otherwise be four round trips.
+//
+// Two caveats. Sub-pipelines cannot use an index (only the $match before
+// $facet can), and the whole result must fit in 16 MB. So $facet is right
+// for a filtered set of thousands and wrong for a whole large collection.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Window functions</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">$setWindowFields, since 5.0</span><button class="copy">Copy</button></div>
+<pre><code>// Running totals, rankings and comparisons to neighbouring rows, without
+// collapsing the documents — the SQL unit's chapter 8, arriving late but
+// arriving.
+db.sales.aggregate([
+  { $setWindowFields: {
+      partitionBy: "$region",
+      sortBy: { day: 1 },
+      output: {
+        runningTotal: {
+          $sum: "$amount",
+          window: { documents: ["unbounded", "current"] }
+        },
+        sevenDayAvg: {
+          $avg: "$amount",
+          window: { range: [-6, 0], unit: "day" }
+        },
+        rank:      { $rank: {} },
+        previous:  { $shift: { output: "$amount", by: -1 } }
+      }
+  } }
+]);
+
+// Before 5.0 this required $group with $push, then $unwind, then arithmetic
+// on array indices — which is exactly as unpleasant as it sounds. If you
+// find that pattern in an existing codebase, this is what replaces it.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>$merge</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">materialising a rollup</span><button class="copy">Copy</button></div>
+<pre><code>// Chapter 3's rollup pattern, implemented. Run on a schedule; the dashboard
+// then reads documents instead of aggregating.
+db.orders.aggregate([
+  { $match: { placedAt: { $gte: yesterday, $lt: today } } },
+  { $group: {
+      _id: { day: "$day", category: "$category" },
+      revenue: { $sum: "$total" }, orders: { $sum: 1 } } },
+  { $merge: {
+      into: "dailyRevenue",
+      on: "_id",
+      whenMatched: "replace",      // or "merge", "keepExisting", "fail",
+                                   // or a custom update pipeline
+      whenNotMatched: "insert"
+  } }
+]);
+
+// $merge is INCREMENTAL — it updates matching documents and inserts new
+// ones, so re-running it for one day is safe and idempotent.
+// $out REPLACES the whole target collection, which is simpler and means the
+// collection is briefly wrong if anyone reads it mid-run. Prefer $merge.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Writing a fast pipeline</h2>
+
+<ul class="check">
+  <li><b><code>$match</code> first</b>, and make sure an index serves it. Only the first stage can use one.</li>
+  <li><b><code>$sort</code> early if an index supplies it</b>, late otherwise — a sort on an indexed field as stage one is free.</li>
+  <li><b><code>$project</code> or <code>$unset</code> before an expensive stage.</b> Do not carry fields through a <code>$unwind</code> or a <code>$group</code> that you will discard.</li>
+  <li><b><code>$limit</code> as early as correctness allows.</b> <code>$sort</code> followed by <code>$limit</code> is optimised into a top-N and never materialises the full sort.</li>
+  <li><b>Index the foreign field of every <code>$lookup</code></b>, or each input document triggers a collection scan.</li>
+  <li><b>Avoid <code>$unwind</code> when an expression will do</b> — <code>$sum</code>, <code>$reduce</code>, <code>$filter</code>, <code>$map</code> operate on arrays in place.</li>
+  <li><b>Watch for unbounded <code>$push</code></b> in a <code>$group</code>, which builds documents that hit 16 MB.</li>
+  <li><b>Check it with <code>explain</code></b>: <code>db.c.aggregate(p, {explain: true})</code> shows which stages ran and what got rewritten.</li>
+</ul>
+
+<div class="note tip">
+  <span class="note-t">Build it one stage at a time</span>
+  <p>The pipeline's procedural nature is its best debugging property. Run the first stage alone with a <code>$limit</code> and look at the output. Add the second. Look again. A pipeline that produces the wrong answer is nearly always a stage where the documents stopped being the shape the next stage assumed — usually a <code>$unwind</code> dropping empty arrays, a <code>$project</code> removing a field a later stage references, or a <code>$group</code> renaming everything into <code>_id</code>. Watching the stream at each step finds all three in seconds, where reading the whole pipeline finds none of them.</p>
+</div>
+
+<div class="note key">
+  <span class="note-t">When the pipeline is the wrong tool</span>
+  <p>The aggregation framework can express a great deal, and expressing something is not the same as it being a good idea. A pipeline with eight <code>$lookup</code> stages across five collections is a query the SQL unit would write in fifteen readable lines with an optimiser that reorders the joins — and it is a sign your data is normalised in a database that does not reward normalising. The honest options are: denormalise so the query becomes simple (chapters 2 and 3), materialise it with <code>$merge</code> so it runs once rather than per request, or move that workload somewhere relational. <b>An enormous pipeline is a schema symptom, not a skill to develop.</b></p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Stages transform a stream in sequence. <b>Only the first stage can use an index.</b></li>
+    <li><b><code>$match</code> first, always.</b> The optimiser moves some filters earlier and cannot move them past a <code>$group</code>.</li>
+    <li><b><code>$group</code> and <code>$sort</code> are blocking</b>, capped at 100 MB, and spill to disk by default since 6.0 — so the failure looks like slowness.</li>
+    <li><b><code>$lookup</code> is a nested loop, per input document.</b> Index the foreign field, and do not build a schema around it.</li>
+    <li><b><code>$unwind</code> silently drops documents with empty arrays</b> unless you set <code>preserveNullAndEmptyArrays</code>.</li>
+    <li><b>Prefer array expressions to <code>$unwind</code> + <code>$group</code></b> — <code>$sum</code>, <code>$reduce</code>, <code>$filter</code>, <code>$map</code>.</li>
+    <li><b><code>$facet</code></b> gets results, counts and breakdowns in one pass; <b><code>$merge</code></b> materialises rollups incrementally.</li>
+    <li><b>Build it one stage at a time</b>, and treat an enormous pipeline as a schema symptom.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("05-aggregation.html");
+
+(function(){
+  const root = document.getElementById("pipe");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const ORDERS = [
+    { ref:"NW-01", status:"paid",      region:"eu", items:[{sku:"TSH",qty:2,price:25},{sku:"MUG",qty:1,price:12}] },
+    { ref:"NW-02", status:"paid",      region:"eu", items:[{sku:"MUG",qty:3,price:12}] },
+    { ref:"NW-03", status:"cancelled", region:"us", items:[{sku:"TSH",qty:1,price:25}] },
+    { ref:"NW-04", status:"paid",      region:"us", items:[{sku:"PEN",qty:5,price:3},{sku:"TSH",qty:1,price:25}] },
+    { ref:"NW-05", status:"paid",      region:"eu", items:[] }
+  ];
+
+  const NAMES = ["$match { status: 'paid' }", "$unwind '$items'",
+                 "$group by sku, sum qty & revenue", "$sort { revenue: -1 }", "$limit 2"];
+
+  function run(upto, matchLast){
+    let s = ORDERS.map(o => ({...o}));
+    const trace = [];
+    const order = matchLast ? [1,2,3,4,0] : [0,1,2,3,4];
+
+    for(let i = 0; i < upto; i++){
+      const st = order[i];
+      if(st === 0) s = s.filter(d => d.status === "paid" || d._id !== undefined);
+      if(st === 0) s = s.filter(d => d.status === undefined || d.status === "paid");
+      if(st === 1){
+        const out = [];
+        s.forEach(d => (d.items || []).forEach(it => out.push({...d, items: it})));
+        s = out;                      // note: empty arrays vanish
+      }
+      if(st === 2){
+        const g = {};
+        s.forEach(d => {
+          const k = d.items ? d.items.sku : "—";
+          g[k] = g[k] || { _id: k, units: 0, revenue: 0 };
+          if(d.items){ g[k].units += d.items.qty; g[k].revenue += d.items.qty * d.items.price; }
+        });
+        s = Object.values(g);
+      }
+      if(st === 3) s = s.slice().sort((a,b) => (b.revenue||0) - (a.revenue||0));
+      if(st === 4) s = s.slice(0, 2);
+      trace.push({ name: NAMES[st], n: s.length });
+    }
+    return { docs: s, trace, order };
+  }
+
+  function render(){
+    const upto = parseInt($("p-upto").value, 10);
+    const matchLast = $("p-order").value === "bad";
+    $("p-uptov").textContent = upto;
+    const { docs, trace, order } = run(upto, matchLast);
+
+    $("p-stages").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:16px 0 8px">' +
+      'Pipeline</div>' +
+      order.map((st, i) => {
+        const done = i < upto;
+        return '<div style="background:' + (done ? "#fff" : "#F4F7F9") + ';border:1px solid ' +
+          (done ? "#E1E7EC" : "#EDF1F4") + ';border-left:3px solid ' +
+          (i === upto - 1 ? "#25B7C4" : done ? "#CFD8E0" : "#EDF1F4") +
+          ';border-radius:4px;padding:7px 12px;margin-bottom:4px;display:flex;gap:10px;align-items:baseline">' +
+          '<span style="font-family:var(--mono);font-size:11px;color:#8FA0AF">' + (i+1) + '</span>' +
+          '<span style="flex:1;font-family:var(--mono);font-size:12px;color:' +
+          (done ? "#25323E" : "#B4C0CA") + '">' + NAMES[st].replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</span>' +
+          (done ? '<span style="font-family:var(--mono);font-size:11px;color:#0F7A85;font-weight:700">' +
+                  trace[i].n + ' docs</span>' : '') + '</div>';
+      }).join("");
+
+    const scanned = matchLast ? ORDERS.length : ORDERS.filter(o => o.status === "paid").length;
+    $("p-docs").textContent  = upto === 0 ? ORDERS.length : trace[upto-1].n;
+    $("p-scan").textContent  = upto === 0 ? "—" : scanned + " of " + ORDERS.length;
+    $("p-index").textContent = matchLast ? "no" : "yes";
+
+    $("p-out").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      'The stream at this point</div>' +
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-radius:5px;padding:11px 13px;margin:0 0 12px;' +
+      'font-family:var(--mono);font-size:11.5px;line-height:1.65;overflow-x:auto;max-height:220px">' +
+      (docs.length === 0 ? "// empty" : docs.map(d => {
+        if(d._id !== undefined && d.units !== undefined)
+          return '{ _id: "' + d._id + '", units: ' + d.units + ', revenue: ' + d.revenue + ' }';
+        const it = d.items && d.items.sku
+          ? '{ sku: "' + d.items.sku + '", qty: ' + d.items.qty + ', price: ' + d.items.price + ' }'
+          : '[' + (d.items || []).map(i => i.sku).join(", ") + ']';
+        return '{ ref: "' + d.ref + '", status: "' + d.status + '", items: ' + it + ' }';
+      }).join("\n")) + '</pre>';
+
+    const notes = [];
+
+    if(upto === 0)
+      notes.push("Nothing has run. Five orders in the collection — four paid, one cancelled, and note NW-05 has an EMPTY items array. Watch what happens to it at $unwind.");
+
+    if(matchLast){
+      notes.push("$match has been moved to the END, which is the classic mistake. Every document in the collection is read, unwound and grouped — and only then is the cancelled one filtered out.\n\nOn five documents this is invisible. On ten million it is the difference between an indexed lookup returning a hundred documents and a full collection scan followed by grouping everything.\n\nThe reason it matters so much: only the FIRST stage can use an index. Once documents are flowing through the pipeline there is no index on the intermediate stream, so a late $match is a linear filter over whatever reached it.");
+      notes.push("MongoDB's optimiser does move some $match stages earlier automatically, and it cannot move one past a $group or a $project that changed the field being matched. Do not rely on it — put the filter first yourself and check with explain.");
+    } else if(upto >= 1) {
+      notes.push("$match ran first, so an index on { status: 1 } serves it and only the four paid orders enter the pipeline. Everything downstream processes four documents instead of five — and on a real collection, hundreds instead of millions.");
+    }
+
+    if(upto >= 2){
+      const unwoundHere = order.indexOf(1) < upto;
+      if(unwoundHere)
+        notes.push("$unwind produced one document per array element, and each carries a full copy of the parent order. This is where a pipeline's document count multiplies — five thousand orders averaging four items becomes twenty thousand documents.\n\nAlso notice NW-05 is GONE. Its items array was empty, and $unwind drops documents with empty or missing arrays by default. That is a silent correctness bug: counts come out low, and the documents that vanished are exactly the ones nobody thinks to check. Set preserveNullAndEmptyArrays: true when you need them.");
+    }
+
+    if(upto >= 3 && order.indexOf(2) < upto)
+      notes.push("$group collapsed the stream to one document per sku. Note that the shape changed completely — the grouping key is now _id and every other field had to be explicitly accumulated. Any later stage referencing 'status' or 'region' would find nothing, which is a common cause of a stage that silently matches zero documents.\n\n$group is also BLOCKING: it cannot emit anything until it has seen all its input, so it buffers in memory with a 100 MB cap. Since MongoDB 6.0 it spills to disk automatically instead of erroring, which turned a clear failure into a mysterious slowdown.");
+
+    if(upto >= 5)
+      notes.push("$sort followed by $limit is recognised by the optimiser and executed as a top-N — it keeps only the two best seen so far rather than sorting everything and discarding the rest. That optimisation is worth knowing, because it means putting $limit right after $sort is genuinely free.");
+
+    notes.push("Build pipelines exactly like this: one stage at a time, looking at the output. A wrong answer is nearly always a stage where the documents stopped being the shape the next stage assumed.");
+    $("p-note").textContent = notes.join("\n\n");
+  }
+
+  ["p-upto","p-order"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

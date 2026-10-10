@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Networking — Docker</title>
+<meta name="description" content="Bridges and veth pairs, network drivers, embedded DNS between containers, port publishing and the firewall bypass, connectivity between containers, and debugging.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Crect x='6' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='19' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='10' width='5' height='5' fill='%23fff'/%3E%3Cpath d='M4 22h22a5 5 0 004-4' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch12">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Docker
+    </a>
+    <div class="chno"><b>Chapter 12</b><span>Running containers</span></div>
+    <h1>Networking</h1>
+    <p class="lede">A container gets its own network stack — its own interfaces, routes and firewall rules — and Docker wires that stack to the outside with a virtual cable and a NAT rule. <b>Two consequences catch nearly everyone: containers on the default bridge cannot resolve each other by name, and publishing a port can walk straight through your host firewall.</b></p>
+    <div class="meta"><span>30 min</span><span>2 demos</span><span>8 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="model">
+      <h2 data-nav="The wiring">The wiring</h2>
+      <p class="sub">A network namespace, a virtual cable, and a bridge.</p>
+      <p>Chapter 2 established that a container gets its own <code>net</code> namespace: its own interfaces, IP addresses, routing table and iptables rules, all separate from the host's. Docker connects that namespace to the world with a <strong>veth pair</strong> — a virtual cable with one end inside the container as <code>eth0</code> and the other end plugged into a bridge on the host.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">both ends of the cable</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run -d --name web nginx
+$ docker exec web ip -br addr
+lo     UNKNOWN  127.0.0.1/8
+eth0   UP       172.17.0.2/16              # inside
+
+$ ip -br link | grep -E 'docker0|veth'
+docker0        UP      172.17.0.1/16       # the bridge, and the container's gateway
+veth3f9c2a1@if7 UP                          # the host end of the same cable
+
+$ docker exec web ip route
+default via 172.17.0.1 dev eth0             # everything leaves via the bridge
+172.17.0.0/16 dev eth0 scope link</pre>
+      </div>
+      <p>Outbound traffic is <strong>masqueraded</strong>: a NAT rule rewrites the container's source address to the host's, so the wider network sees traffic from the host and never learns the container exists. Inbound is the reverse and does not happen unless you ask for it, which is what publishing a port means.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">what Docker wrote into iptables</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ sudo iptables -t nat -S | grep -E 'MASQUERADE|DOCKER'
+-A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE      # outbound
+-A DOCKER ! -i docker0 -p tcp -m tcp --dport 8080 \
+   -j DNAT --to-destination 172.17.0.2:80                        # -p 8080:80</pre>
+      </div>
+    </section>
+
+    <section id="drivers">
+      <h2 data-nav="Drivers">The drivers</h2>
+      <p class="sub">Six of them, and you will use two.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Driver</th><th>Gives the container</th><th>Use for</th></tr></thead>
+          <tbody>
+            <tr><td><strong>bridge</strong> (user-defined)</td><td>A private subnet with <b>DNS by container name</b></td><td>Nearly everything. The default for Compose</td></tr>
+            <tr><td><code>bridge</code> (the default <code>docker0</code>)</td><td>A private subnet with <b>no DNS</b></td><td>Nothing deliberately — it is the legacy fallback</td></tr>
+            <tr><td><strong>host</strong></td><td>The host's own stack, no isolation</td><td>Performance-critical or port-scanning workloads</td></tr>
+            <tr><td><code>none</code></td><td>Loopback only</td><td>Batch jobs that must not touch the network</td></tr>
+            <tr><td><code>macvlan</code> / <code>ipvlan</code></td><td>A real address on your physical LAN</td><td>Legacy services that need to look like a machine</td></tr>
+            <tr><td><code>overlay</code></td><td>A subnet spanning several hosts</td><td>Swarm. Kubernetes uses its own (chapter 22)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">creating and using networks</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker network create backend
+$ docker network create --subnet 10.42.0.0/24 --gateway 10.42.0.1 frontend
+$ docker network create --internal secure        # no route to the outside at all
+
+$ docker run -d --name db --network backend postgres:16
+$ docker network connect frontend api             # a container can be on several
+$ docker network disconnect frontend api
+$ docker network inspect backend -f '{{json .Containers}}'
+$ docker network prune</pre>
+      </div>
+      <div class="key">
+        <span class="lbl">Create a network. Always.</span>
+        <p>The default <code>docker0</code> bridge exists for backwards compatibility and behaves worse in every respect: <strong>no DNS between containers</strong>, every container on the host shares one flat network, and the only way to link two was the deprecated <code>--link</code> flag. A user-defined bridge costs one command, gives you name resolution, and isolates its members from containers on other networks. Compose creates one per project automatically, which is a large part of why Compose feels easier than raw <code>docker run</code>.</p>
+      </div>
+    </section>
+
+    <section id="dns">
+      <h2 data-nav="DNS">DNS between containers</h2>
+      <p class="sub">An embedded resolver at a fixed address.</p>
+      <p>On a user-defined network, Docker runs a DNS server at <strong>127.0.0.11</strong> inside each container's namespace. It answers for container names, network aliases, and forwards anything else to the host's resolvers.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">seeing it work</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker network create app
+$ docker run -d --name db --network app postgres:16
+$ docker run --rm --network app alpine cat /etc/resolv.conf
+nameserver 127.0.0.11
+options ndots:0
+
+$ docker run --rm --network app alpine nslookup db
+Name: db
+Address: 172.18.0.2
+
+# aliases, for when the name your code expects differs from the container name
+$ docker run -d --name pg-primary --network app --network-alias db postgres:16
+$ docker run -d --name pg-primary --network app --network-alias postgres postgres:16</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Resolves</th><th>On a user-defined network</th><th>On the default bridge</th></tr></thead>
+          <tbody>
+            <tr><td>Another container's name</td><td class="yes">yes</td><td class="no">no</td></tr>
+            <tr><td><code>--network-alias</code></td><td class="yes">yes, several per container</td><td class="no">no</td></tr>
+            <tr><td>Its own hostname</td><td class="yes">yes</td><td class="yes">yes</td></tr>
+            <tr><td>Public names</td><td class="yes">forwarded to the host's resolvers</td><td class="yes">yes</td></tr>
+            <tr><td><code>host.docker.internal</code></td><td>Docker Desktop only, unless you add it</td><td>Same</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">reaching the host from a container on Linux</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run --add-host host.docker.internal:host-gateway alpine \
+    ping -c1 host.docker.internal            # resolves to the bridge gateway
+
+$ docker run --dns 1.1.1.1 --dns-search corp.example.com alpine nslookup intranet</pre>
+      </div>
+      <div class="trap">
+        <span class="lbl">DNS names are not the same as reachability</span>
+        <p>Name resolution and connectivity are separate. A container can resolve a name it cannot reach — for instance a stale DNS entry after a container was recreated with a new IP, which is why long-lived connection pools sometimes keep dialling an address that no longer exists. Applications that cache DNS results indefinitely (some JVM configurations, by default) are the classic victim. And on an <code>--internal</code> network, public names still resolve while nothing outside is reachable at all.</p>
+      </div>
+    </section>
+
+    <section id="publishing">
+      <h2 data-nav="Publishing ports">Publishing ports</h2>
+      <p class="sub">The one place a Docker default is genuinely dangerous.</p>
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Port publishing resolver</h3>
+          <span class="hint">Where it listens, who can reach it, and whether your firewall gets a say</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight" id="p-presets"></div>
+          <div class="ctrl">
+            <label for="p-in" style="min-width:40px">flag</label>
+            <input type="text" id="p-in" spellcheck="false" style="flex:1 1 240px;font-family:var(--mono);font-size:12.5px" value="-p 8080:80">
+            <span class="sep"></span>
+            <button class="btn mono" id="p-ufw">ufw deny incoming</button>
+          </div>
+          <div class="term" id="p-term"></div>
+          <div class="rgrid" id="p-out"></div>
+          <p class="readout" id="p-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Form</th><th>Binds</th></tr></thead>
+          <tbody>
+            <tr><td><code>-p 80</code></td><td>Container port 80 to a random host port on all interfaces</td></tr>
+            <tr><td><code>-p 8080:80</code></td><td>Host 8080 on <b>every interface</b> — including the public one</td></tr>
+            <tr><td><code>-p 127.0.0.1:8080:80</code></td><td>Loopback only. Reachable from the host, nowhere else</td></tr>
+            <tr><td><code>-p 8080:80/udp</code></td><td>UDP rather than TCP; both need publishing separately</td></tr>
+            <tr><td><code>-p 8000-8010:8000-8010</code></td><td>A range, one rule per port</td></tr>
+            <tr><td><code>-P</code></td><td>Every <code>EXPOSE</code>d port to random high ports</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="warn">
+        <span class="lbl">Docker publishes past ufw and firewalld</span>
+        <p>Published ports are implemented as <strong>DNAT rules in the nat table</strong>, so the traffic is rewritten in <code>PREROUTING</code> and then traverses <code>FORWARD</code> — while <code>ufw</code> and most firewalld setups filter <code>INPUT</code>. The packet never passes the chain your rules are in. So a host with "deny incoming" configured, running <code>-p 5432:5432</code>, has an open database on the public internet and a firewall that reports everything is blocked. Two fixes: <strong>bind to loopback</strong> (<code>-p 127.0.0.1:5432:5432</code>) so nothing leaves the machine, or put your rules in the <strong><code>DOCKER-USER</code></strong> chain, which Docker evaluates first and never overwrites.</p>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">filtering that Docker respects</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># DOCKER-USER is evaluated before Docker's own rules and survives restarts
+$ sudo iptables -I DOCKER-USER -i eth0 ! -s 10.0.0.0/8 -j DROP
+
+# check what is actually published, and on which address
+$ docker port web
+80/tcp -> 0.0.0.0:8080
+$ sudo ss -tlnp | grep docker-proxy
+$ sudo iptables -t nat -S DOCKER</pre>
+      </div>
+      <p>Note that <strong>publishing has nothing to do with container-to-container traffic</strong>. Two containers on the same network reach each other on every port, published or not — publishing is exclusively about access from outside the Docker network. A database that needs to serve only the API container should publish nothing at all.</p>
+    </section>
+
+    <section id="between">
+      <h2 data-nav="Container to container">Container to container</h2>
+      <p class="sub">Membership decides everything.</p>
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Connectivity matrix</h3>
+          <span class="hint">Who can reach whom, by name and by address</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:98px">api is also on</span>
+            <span id="n-api" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+            <span class="sep"></span>
+            <button class="btn mono" id="n-internal">make backend --internal</button>
+          </div>
+          <div id="n-matrix" style="overflow-x:auto"></div>
+          <div class="rgrid" id="n-out"></div>
+          <p class="readout" id="n-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Situation</th><th>Result</th></tr></thead>
+          <tbody>
+            <tr><td>Same user-defined network</td><td>Reachable by name, on <b>every</b> port</td></tr>
+            <tr><td>Same default bridge</td><td>Reachable by IP only — no name resolution</td></tr>
+            <tr><td>Different networks</td><td>Not reachable at all, by either</td></tr>
+            <tr><td>One container on both networks</td><td>It bridges them, which is how a tiered setup works</td></tr>
+            <tr><td><code>--network container:web</code></td><td>Shares <code>web</code>'s namespace — both see the same interfaces and talk over <code>localhost</code></td></tr>
+            <tr><td><code>--internal</code> network</td><td>Members reach each other and nothing outside</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="key">
+        <span class="lbl">The tiered pattern this makes possible</span>
+        <p>Put <code>db</code> on <code>backend</code> only, <code>web</code> on <code>frontend</code> only, and <code>api</code> on both. The API can reach the database; the web tier cannot, no matter what it tries, because there is no route between the two networks. That is real network segmentation from three <code>docker network</code> commands, and it is what a Compose file with two networks is quietly doing.</p>
+      </div>
+    </section>
+
+    <section id="debug">
+      <h2 data-nav="Debugging">Debugging</h2>
+      <p class="sub">Most network problems are one of five things.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">a toolbox container, sharing the target's namespace</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># netshoot joins the container's network namespace, so it sees exactly what it sees
+$ docker run --rm -it --network container:api nicolaka/netshoot
+  ip addr; ss -tlnp; dig db; curl -v http://db:5432; tcpdump -i eth0 -n
+
+# or from the host, into the namespace directly
+$ sudo nsenter -t $(docker inspect -f '{{.State.Pid}}' api) -n ss -tlnp</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Symptom</th><th>Usual cause</th><th>Check</th></tr></thead>
+          <tbody>
+            <tr><td>"Name or service not known"</td><td>Containers are on the default bridge, or on different networks</td><td><code>docker inspect -f '{{json .NetworkSettings.Networks}}'</code></td></tr>
+            <tr><td>Connection refused</td><td>The app is bound to <code>127.0.0.1</code> inside the container</td><td><code>ss -tlnp</code> inside — it must listen on <code>0.0.0.0</code></td></tr>
+            <tr><td>Connection times out</td><td>Different networks, or a firewall between hosts</td><td>Ping the IP; check network membership</td></tr>
+            <tr><td>Works by IP, fails by name</td><td>Default bridge, or a stale cached DNS entry</td><td><code>nslookup</code> from inside</td></tr>
+            <tr><td>Small requests work, large ones hang</td><td><b>MTU mismatch</b>, usually behind a VPN</td><td><code>ping -M do -s 1400</code>; set the network MTU</td></tr>
+            <tr><td>Nothing on the LAN can connect</td><td>Published to <code>127.0.0.1</code> only</td><td><code>docker port</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="trap">
+        <span class="lbl">Binding to localhost inside a container publishes nothing</span>
+        <p>A development server defaulting to <code>127.0.0.1:3000</code> is bound to the <em>container's</em> loopback, which nothing outside that namespace can reach — so <code>-p 3000:3000</code> forwards to a port that refuses connections. The fix is in the application, not in Docker: bind <code>0.0.0.0</code>. Frameworks that do this by default include Flask, Rails and Vite, and it is the single most common "my container will not respond" question.</p>
+      </div>
+    </section>
+
+    <section id="advanced">
+      <h2 data-nav="Beyond one host">Beyond one host</h2>
+      <p class="sub">And two configuration issues that bite in corporate networks.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Need</th><th>Approach</th></tr></thead>
+          <tbody>
+            <tr><td>Containers across several hosts</td><td><code>overlay</code> with Swarm, or an orchestrator's own network (chapter 22)</td></tr>
+            <tr><td>A container with a real LAN address</td><td><code>macvlan</code> — it gets its own MAC and DHCP lease</td></tr>
+            <tr><td>IPv6</td><td>Enable in <code>daemon.json</code> and give the network a v6 subnet</td></tr>
+            <tr><td>Fixed addresses</td><td><code>--ip</code> on a network with a defined <code>--subnet</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">/etc/docker/daemon.json — the two settings worth knowing</span><button class="copy">Copy</button></div>
+<pre data-lang="text">{
+  "default-address-pools": [
+    { "base": "10.201.0.0/16", "size": 24 }
+  ],
+  "mtu": 1400
+}</pre>
+      </div>
+      <p><strong>Address pools</strong> matter because Docker's defaults (<code>172.17.0.0/16</code> onward) collide with plenty of corporate VPN ranges — and when they do, the symptom is that the VPN works until you start Docker, then a whole subnet becomes unreachable. <strong>MTU</strong> matters for the opposite reason: a VPN or overlay reduces the usable packet size, and a container still using 1500 sends packets that are silently dropped. Small requests succeed, large responses hang forever, and nothing logs an error.</p>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 12 in eight lines</h2>
+        <ul>
+          <li>Each container gets a network namespace joined to a bridge by a <b>veth pair</b>; outbound traffic is masqueraded to the host's address.</li>
+          <li><b>Create a user-defined network.</b> The default bridge has no DNS between containers and no isolation.</li>
+          <li>DNS is an embedded resolver at <b>127.0.0.11</b> answering for container names and <code>--network-alias</code>.</li>
+          <li><code>-p 8080:80</code> binds <b>every interface</b>; <code>-p 127.0.0.1:8080:80</code> binds loopback only.</li>
+          <li><b>Published ports bypass ufw and firewalld</b>, because DNAT sends traffic through FORWARD rather than INPUT. Use loopback binding or the <code>DOCKER-USER</code> chain.</li>
+          <li>Publishing is only about access from outside — containers on one network already reach each other on every port.</li>
+          <li>Put a container on two networks to bridge tiers; that is real segmentation for three commands.</li>
+          <li>An app bound to <code>127.0.0.1</code> inside a container is unreachable however you publish it. Bind <code>0.0.0.0</code>.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary>A server has <code>ufw</code> with "deny incoming" and one container run with <code>-p 5432:5432</code>. Is the database exposed?</summary>
+        <div class="ans"><p>Yes, to the entire internet. Docker implements publishing as a DNAT rule in the nat table, so the packet is rewritten in <code>PREROUTING</code> and then traverses the <code>FORWARD</code> chain — while ufw's rules live in <code>INPUT</code>. The firewall is not wrong, it is simply not in the path. Fix by binding to loopback (<code>-p 127.0.0.1:5432:5432</code>) if only the host needs it, or by adding rules to <code>DOCKER-USER</code>, which Docker evaluates before its own and does not overwrite. Best of all, publish nothing: if only the API container talks to it, being on the same network is sufficient.</p></div>
+      </details>
+      <details class="chk">
+        <summary><code>docker run --name api app</code> cannot resolve <code>db</code>, though both containers are running. Why, and what is the one-line fix?</summary>
+        <div class="ans"><p>They are on the <b>default bridge</b>, which has no DNS between containers — a deliberate legacy behaviour, previously worked around with <code>--link</code>. They can reach each other by IP address, which is why "ping the IP works but the name does not" is the signature. The fix is to create a user-defined network and put both on it: <code>docker network create app</code> and <code>--network app</code> on each. Compose does this automatically for every project, which is most of why service names simply work there.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Your API container reaches the database fine; the web container must not. Describe the setup.</summary>
+        <div class="ans"><p>Two networks. <code>db</code> joins <code>backend</code> only, <code>web</code> joins <code>frontend</code> only, and <code>api</code> joins both — so the API bridges the tiers while the web container has no route to the database at all, regardless of credentials or configuration. Add <code>--internal</code> to <code>backend</code> and the database also loses outbound internet access, which is usually correct for a database. This is ordinary routing rather than a policy engine: without a shared network there is simply no path.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A container serves small API responses correctly but hangs on any large file. Same image works on another host.</summary>
+        <div class="ans"><p>An MTU mismatch, almost certainly a VPN or overlay on the failing host reducing the usable packet size below 1500. Small responses fit in one packet and succeed; a large transfer produces full-size packets that are dropped silently, so the connection stalls rather than failing — which is why nothing appears in the logs. Confirm with <code>ping -M do -s 1400</code> from inside the container, then set the MTU on the Docker network or globally in <code>daemon.json</code>. The related corporate-network problem is a Docker subnet colliding with a VPN route, fixed with <code>default-address-pools</code>.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Part 3 is complete. Chapter 13 opens Part 4 with Compose, which turns everything in Parts 1 to 3 into a file you can commit.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li><code>docker network create t &amp;&amp; docker run --rm --network t alpine cat /etc/resolv.conf</code>.</li>
+        <li><code>sudo iptables -t nat -S DOCKER</code> after publishing a port.</li>
+        <li><code>docker run --rm -it --network container:&lt;name&gt; nicolaka/netshoot</code>.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>Docker's networking overview and driver documentation, the port-publishing and packet-filtering references including <code>DOCKER-USER</code>, and the embedded DNS notes.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — port publishing resolver
+   ============================================================ */
+(function () {
+  var ufw = false;
+  var input = document.getElementById("p-in");
+  var term = document.getElementById("p-term");
+  var out = document.getElementById("p-out");
+  var note = document.getElementById("p-note");
+  var ufwBtn = document.getElementById("p-ufw");
+
+  ufwBtn.addEventListener("click", function () {
+    ufw = !ufw;
+    ufwBtn.classList.toggle("on", ufw);
+    render();
+  });
+
+  [
+    "-p 8080:80",
+    "-p 127.0.0.1:8080:80",
+    "-p 0.0.0.0:5432:5432",
+    "-p 80",
+    "-p 8080:80/udp",
+    "-p 8000-8002:8000-8002",
+    "-P",
+    "(no publish flag)"
+  ].forEach(function (p) {
+    var b = document.createElement("button");
+    b.className = "btn mono";
+    b.textContent = p;
+    b.addEventListener("click", function () { input.value = p; render(); });
+    document.getElementById("p-presets").appendChild(b);
+  });
+
+  function parse(spec) {
+    spec = spec.trim();
+    if (/^\(no publish/.test(spec)) return { none: true };
+    if (spec === "-P") return { all: true, bind: "0.0.0.0", host: "random", ctr: "every EXPOSEd port", proto: "tcp" };
+    var m = /^-p\s+(.+)$/.exec(spec);
+    if (!m) return { err: "not a -p flag" };
+    var body = m[1], proto = "tcp";
+    var pm = /^(.*)\/(tcp|udp)$/.exec(body);
+    if (pm) { body = pm[1]; proto = pm[2]; }
+    var parts = body.split(":");
+    if (parts.length === 1) return { bind: "0.0.0.0", host: "random", ctr: parts[0], proto: proto, implicit: true };
+    if (parts.length === 2) return { bind: "0.0.0.0", host: parts[0], ctr: parts[1], proto: proto, implicit: true };
+    if (parts.length === 3) return { bind: parts[0], host: parts[1], ctr: parts[2], proto: proto };
+    return { err: "too many colons" };
+  }
+
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+
+  function render() {
+    var p = parse(input.value);
+    var lines = [], warns = [];
+
+    if (p.err) {
+      term.innerHTML = '<span class="r">' + esc(p.err) + "</span>";
+      out.innerHTML = ""; note.innerHTML = "Docker rejects the flag before creating the container.";
+      return;
+    }
+
+    var loopback, lan, internet;
+    if (p.none) {
+      loopback = lan = internet = false;
+    } else {
+      var isLoopback = p.bind === "127.0.0.1" || p.bind === "localhost";
+      loopback = true;
+      lan = !isLoopback;
+      internet = !isLoopback;
+    }
+
+    lines.push('<span class="p">$</span> docker run -d --name api ' + esc(input.value.replace("(no publish flag)", "")) + " app");
+    lines.push("");
+    if (p.none) {
+      lines.push('<span class="d">no ports published — nothing outside the Docker network can connect</span>');
+      lines.push('<span class="d">other containers on the same network still reach it on every port</span>');
+    } else {
+      lines.push('<span class="p">$</span> docker port api');
+      lines.push((p.all ? "every EXPOSEd port" : p.ctr + "/" + p.proto) + " -> " + p.bind + ":" + p.host);
+      lines.push("");
+      lines.push('<span class="p">$</span> sudo iptables -t nat -S DOCKER');
+      lines.push('<span class="y">-A DOCKER ! -i docker0 -p ' + p.proto + " -m " + p.proto +
+        " --dport " + (p.host === "random" ? "&lt;random&gt;" : p.host) +
+        (p.bind !== "0.0.0.0" ? " -d " + p.bind : "") + " \\</span>");
+      lines.push('<span class="y">   -j DNAT --to-destination 172.18.0.2:' + (p.all ? "&lt;port&gt;" : p.ctr) + "</span>");
+      lines.push("");
+      lines.push('<span class="d">reachable from…</span>');
+      lines.push("  localhost on the host      " + (loopback ? '<span class="g">yes</span>' : '<span class="r">no</span>'));
+      lines.push("  another machine on the LAN " + (lan ? '<span class="r">yes</span>' : '<span class="g">no</span>'));
+      lines.push("  the public internet        " + (internet ? '<span class="r">yes, if the host has a public address</span>' : '<span class="g">no</span>'));
+    }
+
+    if (!p.none && ufw) {
+      lines.push("");
+      lines.push('<span class="p">$</span> sudo ufw status');
+      lines.push("Status: active   Default: deny (incoming)");
+      if (lan) {
+        lines.push('<span class="r">…and it makes no difference: DNAT sends this traffic through FORWARD,</span>');
+        lines.push('<span class="r">   while ufw filters INPUT. The port is open.</span>');
+      } else {
+        lines.push('<span class="d">nothing to block — the bind address already keeps it on the host</span>');
+      }
+    }
+    term.innerHTML = lines.join("\n");
+
+    if (!p.none && lan) {
+      warns.push("<b>This binds every interface</b>, so on a machine with a public address the service is on the internet. <code>-p 127.0.0.1:" +
+        (p.host === "random" ? "&lt;port&gt;" : p.host) + ":" + (p.all ? "…" : p.ctr) + "</code> keeps it local.");
+    }
+    if (!p.none && lan && ufw) {
+      warns.push("<b>And the firewall does not stop it.</b> ufw's default-deny lives in the <code>INPUT</code> chain; published ports are DNAT-ed in <code>PREROUTING</code> and then traverse <code>FORWARD</code>, so the rules never apply. Put filtering in <code>DOCKER-USER</code>, which Docker evaluates first.");
+    }
+    if (p.implicit && !p.err && !p.none) {
+      warns.push("No bind address was given, so Docker used <code>0.0.0.0</code>. That default — rather than loopback — is what makes accidental exposure so easy.");
+    }
+    if (p.proto === "udp") {
+      warns.push("Publishing UDP does not publish TCP on the same number: they are separate rules, and a service needing both needs two flags.");
+    }
+    if (p.all) {
+      warns.push("<code>-P</code> publishes every <code>EXPOSE</code>d port to random high ports on all interfaces — convenient locally, and rarely what you want on a server, since you cannot predict what ends up open.");
+    }
+    if (p.none) {
+      warns.push("<b>Publishing nothing is the right default for internal services.</b> Containers on the same network reach each other on every port regardless, so a database serving only the API needs no <code>-p</code> at all — and then no firewall question arises.");
+    }
+
+    out.innerHTML = "";
+    tile("Binds", p.none ? "nothing" : p.bind, p.none ? "" : "host side", p.none || !lan);
+    tile("From the LAN", p.none ? "no" : lan ? "reachable" : "no", "", !lan);
+    tile("From the internet", p.none ? "no" : internet ? "reachable" : "no", "", !internet);
+    tile("Firewall applies", !ufw ? "not set" : lan ? "NO — bypassed" : "n/a", ufw && lan ? "DOCKER-USER" : "", !(ufw && lan));
+
+    note.innerHTML = warns.join(" ") || "Bound to loopback: the port is usable from the host and invisible everywhere else, which is the safe default for anything you are only proxying to.";
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  input.addEventListener("input", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — connectivity matrix
+   ============================================================ */
+(function () {
+  var apiNets = { frontend: true, backend: true };
+  var internal = false;
+
+  var NODES = [
+    { id: "web", label: "web", nets: function () { return ["frontend"]; } },
+    { id: "api", label: "api", nets: function () { return Object.keys(apiNets).filter(function (n) { return apiNets[n]; }); } },
+    { id: "db", label: "db", nets: function () { return ["backend"]; } },
+    { id: "legacy", label: "legacy", nets: function () { return ["bridge"]; } },
+    { id: "batch", label: "batch", nets: function () { return []; } }
+  ];
+
+  var apiHost = document.getElementById("n-api");
+  var matrix = document.getElementById("n-matrix");
+  var out = document.getElementById("n-out");
+  var note = document.getElementById("n-note");
+
+  ["frontend", "backend"].forEach(function (n) {
+    var b = document.createElement("button");
+    b.className = "btn mono" + (apiNets[n] ? " on" : "");
+    b.textContent = n;
+    b.addEventListener("click", function () {
+      apiNets[n] = !apiNets[n];
+      b.classList.toggle("on", apiNets[n]);
+      render();
+    });
+    apiHost.appendChild(b);
+  });
+  var intBtn = document.getElementById("n-internal");
+  intBtn.addEventListener("click", function () { internal = !internal; intBtn.classList.toggle("on", internal); render(); });
+
+  function shared(a, b) {
+    var an = a.nets(), bn = b.nets();
+    return an.filter(function (n) { return bn.indexOf(n) !== -1; });
+  }
+
+  /* by name only on a user-defined network; the default bridge has no DNS */
+  function reach(a, b) {
+    if (a.id === b.id) return { name: true, ip: true, self: true };
+    var s = shared(a, b);
+    if (!s.length) return { name: false, ip: false };
+    var userDefined = s.some(function (n) { return n !== "bridge"; });
+    return { name: userDefined, ip: true, via: s.join(", ") };
+  }
+
+  function internet(a) {
+    var n = a.nets();
+    if (!n.length) return false;                       /* --network none */
+    if (internal && n.length === 1 && n[0] === "backend") return false;
+    return true;
+  }
+
+  function render() {
+    var cells = NODES.map(function (a) {
+      return NODES.map(function (b) { return reach(a, b); });
+    });
+
+    matrix.innerHTML = '<table class="tbl"><thead><tr><th>from ↓ / to →</th>' +
+      NODES.map(function (b) { return "<th>" + b.label + "</th>"; }).join("") +
+      "<th>internet</th><th>networks</th></tr></thead><tbody>" +
+      NODES.map(function (a, i) {
+        return "<tr><td><b>" + a.label + "</b></td>" +
+          NODES.map(function (b, j) {
+            var r = cells[i][j];
+            if (r.self) return '<td style="color:var(--text-3)">—</td>';
+            if (r.name) return '<td style="color:var(--good);font-weight:600">name + IP</td>';
+            if (r.ip) return '<td style="color:var(--warn);font-weight:600">IP only</td>';
+            return '<td style="color:var(--bad)">no route</td>';
+          }).join("") +
+          "<td>" + (internet(a) ? '<span style="color:var(--good)">yes</span>' : '<span style="color:var(--bad)">no</span>') +
+          '</td><td style="color:var(--text-2);font-family:var(--mono);font-size:11px">' +
+          (a.nets().join(", ") || "none") + "</td></tr>";
+      }).join("") + "</tbody></table>";
+
+    var api = NODES[1], web = NODES[0], db = NODES[2];
+    var webToDb = reach(web, db);
+    var apiToDb = reach(api, db);
+    var pairs = 0, named = 0;
+    NODES.forEach(function (a, i) { NODES.forEach(function (b, j) {
+      if (i !== j) { pairs++; if (cells[i][j].name) named++; }
+    }); });
+
+    out.innerHTML = "";
+    tile("Reachable pairs", named + "/" + pairs, "by name");
+    tile("web → db", webToDb.ip ? "reachable" : "blocked", "", !webToDb.ip);
+    tile("api → db", apiToDb.name ? "by name" : apiToDb.ip ? "IP only" : "blocked", "", apiToDb.name);
+    tile("db → internet", internet(db) ? "yes" : "no", internal ? "--internal" : "", !internet(db));
+
+    var msgs = [];
+    if (apiNets.frontend && apiNets.backend && !webToDb.ip) {
+      msgs.push("<b>This is the tiered pattern.</b> <code>api</code> sits on both networks and bridges them; <code>web</code> has no route to <code>db</code> at all — not a blocked port, no route. Real segmentation from network membership alone.");
+    }
+    if (!apiNets.backend) {
+      msgs.push("<b><code>api</code> has left <code>backend</code>, so it can no longer reach <code>db</code>.</b> Nothing about the database changed — connectivity here is purely a question of shared network membership.");
+    }
+    if (!apiNets.frontend && !apiNets.backend) {
+      msgs.push("<code>api</code> is on no network at all and is now unreachable in both directions, including outbound. This is what <code>--network none</code> gives you.");
+    }
+    msgs.push("<b><code>legacy</code> is on the default bridge</b>, so it is isolated from the user-defined networks entirely — and even if something joined it there, resolution would be by IP only, because the default bridge runs no DNS.");
+    if (internal) {
+      msgs.push("With <code>backend</code> marked <code>--internal</code>, <code>db</code> loses outbound internet access while still serving <code>api</code> — usually correct for a database, and it stops a compromised one from calling home.");
+    }
+    msgs.push("<code>batch</code> has no network: loopback only, no inbound, no outbound.");
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

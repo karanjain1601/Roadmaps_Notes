@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Migrations and operations — SQL</title>
+<meta name="description" content="Zero-downtime schema changes, views, triggers and procedures, monitoring the queries that matter, and what to do at 3am.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 16 · In production</div>
+    <h1>Migrations and operations</h1>
+    <p class="standfirst">Every schema change is a deployment against a running system holding data you cannot recreate. This chapter is the set of habits that make that routine rather than frightening — and the short list of things worth knowing before the alert fires.</p>
+    <div class="chap-meta">
+      <span class="tagpill">zero downtime</span>
+      <span class="tagpill">expand and contract</span>
+      <span class="tagpill">monitoring</span>
+      <span class="tagpill">incidents</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The lock is the whole problem</h2>
+
+<p>Chapter 10 introduced <code>ACCESS EXCLUSIVE</code> — the lock that blocks everything including reads. Most schema changes take one. The question for every migration is not "how long does this take" but <b>"what does it block, and for how long"</b>.</p>
+
+<div class="demo" id="mig">
+  <div class="demo-head">
+    <b>What does this migration lock?</b>
+    <span>Pick a change and a table size. PostgreSQL behaviour; other engines differ, sometimes favourably.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="m-op">Change</label>
+        <select id="m-op">
+          <option value="addnull" selected>ADD COLUMN, nullable, no default</option>
+          <option value="adddefault">ADD COLUMN with a default</option>
+          <option value="addnotnull">ADD COLUMN NOT NULL with a default</option>
+          <option value="setnotnull">SET NOT NULL on an existing column</option>
+          <option value="rename">RENAME COLUMN</option>
+          <option value="type">ALTER TYPE varchar → text</option>
+          <option value="typewide">ALTER TYPE int → bigint</option>
+          <option value="index">CREATE INDEX</option>
+          <option value="indexcc">CREATE INDEX CONCURRENTLY</option>
+          <option value="fk">ADD FOREIGN KEY</option>
+          <option value="check">ADD CHECK</option>
+          <option value="drop">DROP COLUMN</option>
+        </select>
+      </div>
+      <div>
+        <label for="m-rows">Rows — <span id="m-rowsv">50 million</span></label>
+        <input type="range" id="m-rows" min="1" max="6" step="1" value="5">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="m-lock">—</b><span>lock taken</span></div>
+      <div><b id="m-dur">—</b><span>held for</span></div>
+      <div><b id="m-blocks">—</b><span>blocks</span></div>
+      <div><b id="m-safe">—</b><span>verdict</span></div>
+    </div>
+    <div id="m-fix"></div>
+    <div class="out" id="m-note"></div>
+  </div>
+</div>
+
+<div class="note warn">
+  <span class="note-t">The lock queue is worse than the lock</span>
+  <p>The failure that actually causes outages is not a long migration — it is a short one that has to wait. <code>ALTER TABLE</code> requests an <code>ACCESS EXCLUSIVE</code> lock, and if a long-running <code>SELECT</code> holds a weaker lock, the <code>ALTER</code> waits. <b>Every subsequent query then queues behind the <code>ALTER</code></b>, because lock requests are ordered. A one-millisecond migration blocks the entire table for as long as that one slow report takes to finish. Always set <code>lock_timeout</code> before DDL — a few seconds — so the migration fails fast and retries instead of taking the site down.</p>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the preamble every migration should have</span><button class="copy">Copy</button></div>
+<pre><code>SET lock_timeout = '3s';        -- fail fast rather than queueing behind a
+                                -- long query and blocking everything after it
+SET statement_timeout = '60s';  -- do not let a rewrite run unbounded
+
+ALTER TABLE orders ADD COLUMN region text;
+
+-- If the lock cannot be acquired in 3 seconds the statement errors, nothing
+-- is blocked, and you retry in a moment. Make your migration runner catch
+-- the timeout and retry with backoff — that turns the riskiest class of
+-- migration into a non-event.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Expand and contract</h2>
+
+<p>The pattern behind every zero-downtime schema change. Never change a thing; add the new one, migrate to it, then remove the old one — with a deploy between each step, so that at every moment the running code and the current schema are compatible.</p>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Expand</b><span>Add the new column, table or index. Nothing reads it yet. Backwards-compatible</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · Dual write</b><span>Deploy code writing both old and new. Both schemas valid</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Backfill</b><span>Batched, resumable, idempotent (chapter 9)</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Switch reads</b><span>Deploy code reading the new column. Verify before continuing</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Stop writing the old</b><span>Deploy. Now nothing touches it</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>6 · Contract</b><span>Drop the old column — days later, once you are certain</span></div>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">renaming a column without downtime</span><button class="copy">Copy</button></div>
+<pre><code>-- A RENAME is instant and it is NOT safe: the old code is still running during
+-- the deploy and refers to the old name. Every request from an old instance
+-- errors until the rollout finishes.
+
+-- Migration 1 — expand
+ALTER TABLE customers ADD COLUMN full_name text;
+
+-- Deploy A — write both, read the old
+--   customer.name = value; customer.full_name = value
+
+-- Migration 2 — backfill, batched (chapter 9)
+UPDATE customers SET full_name = name
+WHERE full_name IS NULL AND id BETWEEN … AND …;
+
+-- Deploy B — read the new, still write both
+-- Deploy C — write only the new
+
+-- Migration 3 — contract, a few days later
+ALTER TABLE customers DROP COLUMN name;
+
+-- Six steps for a rename. That is the actual cost of zero downtime, and it is
+-- why "can we just take two minutes of downtime at 4am" is sometimes the right
+-- engineering answer rather than a failure of ambition.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Every migration must be safe with the previous version still running</span>
+  <p>This is the rule that generates the whole pattern. During any rollout, old and new application code run simultaneously against one schema — so the schema must satisfy both. It rules out renames, type narrowing, adding <code>NOT NULL</code> to a column old code does not populate, and dropping anything still referenced. Check each migration against the question directly: <em>if the deploy stalls halfway for an hour, does everything still work?</em></p>
+</div>
+
+<h2><span class="h-rule"></span>Migration hygiene</h2>
+
+<ul class="check">
+  <li><b>Versioned files in the repository</b>, applied in order, recorded in a table. Never hand-run DDL in production.</li>
+  <li><b>Forward-only.</b> Down-migrations are rarely tested and rarely correct; roll forward with a new migration instead.</li>
+  <li><b>One logical change per migration</b>, so a failure has an obvious blast radius.</li>
+  <li><b>Never mix DDL and a large backfill</b> in one transaction — the DDL lock is then held for the whole backfill.</li>
+  <li><b>Run against a production-sized copy first.</b> A migration that takes 40ms on 10,000 rows can take 40 minutes on 50 million.</li>
+  <li><b><code>lock_timeout</code> on every migration</b>, with retry.</li>
+  <li><b><code>CREATE INDEX CONCURRENTLY</code> cannot run in a transaction</b> — most frameworks need an explicit escape hatch.</li>
+  <li><b>Review migrations more carefully than code.</b> Code can be reverted; a dropped column cannot.</li>
+</ul>
+
+<h2><span class="h-rule"></span>Views, procedures and where logic belongs</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Object</th><th>Good for</th><th>Watch out</th></tr></thead>
+<tbody>
+<tr><td><b>View</b></td><td>Naming a query, access control, a compatibility shim during a migration</td><td>Nesting views several deep makes plans hard to reason about</td></tr>
+<tr><td><b>Materialised view</b></td><td>Expensive aggregates (chapter 14)</td><td>Staleness; refresh cost; needs a unique index for concurrent refresh</td></tr>
+<tr><td><b>Function</b></td><td>Reusable expressions; keeping complex SQL in one place</td><td>Mark volatility correctly, or the planner cannot optimise around it</td></tr>
+<tr><td><b>Procedure</b></td><td>Multi-transaction batch work run inside the database</td><td>Harder to test, version and observe than application code</td></tr>
+<tr><td><b>Trigger</b></td><td><code>updated_at</code>, audit logs, maintaining derived columns (chapter 11)</td><td>Invisible; fires on bulk operations; can cascade</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">a view as a migration shim</span><button class="copy">Copy</button></div>
+<pre><code>-- Splitting one table into two, without breaking every existing query.
+-- Old code keeps working against a view with the original shape.
+CREATE VIEW customers AS
+SELECT c.id, c.name, c.created_at,
+       a.line1, a.city, a.postcode
+FROM customers_core c
+LEFT JOIN customer_addresses a ON a.customer_id = c.id AND a.is_primary;
+
+-- Writes need rules or an INSTEAD OF trigger, which is where this gets
+-- involved — so use it for a read-mostly transition period, and set a date to
+-- remove it. A compatibility view that survives two years is a second schema
+-- nobody documented.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>What to monitor</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Metric</th><th>Why</th><th>Alert when</th></tr></thead>
+<tbody>
+<tr><td>Connections in use / max</td><td>Pool exhaustion presents as total unavailability</td><td>Above ~80%</td></tr>
+<tr><td>Replication lag</td><td>Stale reads, and a failover data-loss window</td><td>Above your tolerance, usually seconds</td></tr>
+<tr><td>Longest running transaction</td><td>Blocks vacuum and holds locks (chapter 10)</td><td>Above a few minutes</td></tr>
+<tr><td>Deadlocks per minute</td><td>Rising means a new lock-ordering bug</td><td>Any sustained increase</td></tr>
+<tr><td>Cache hit ratio</td><td>Below ~99% usually means the working set exceeds memory</td><td>Sustained drop</td></tr>
+<tr><td>Dead tuples / bloat</td><td>Autovacuum is not keeping up</td><td>Growing steadily</td></tr>
+<tr><td>Disk free, and WAL size</td><td>A full disk stops writes entirely</td><td>Below 20%, and always trend it</td></tr>
+<tr><td>Transaction id age</td><td>Wraparound protection shuts the database down</td><td>Well before the threshold — this one is fatal</td></tr>
+<tr><td>Slowest queries by total time</td><td>Chapter 14</td><td>Review weekly rather than alerting</td></tr>
+<tr><td>Backup age and restore test date</td><td>An untested backup is a hope</td><td>Backup older than a day; restore untested for a month</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">The two that quietly kill a PostgreSQL instance</span>
+  <p><b>Transaction id wraparound</b>: if autovacuum cannot freeze old rows fast enough, the database refuses new writes to protect itself. It is preventable, it is visible for weeks in <code>age(datfrozenxid)</code>, and it is almost always caused by a long-running transaction or a stuck replication slot blocking vacuum. <b>An abandoned replication slot</b>: an inactive slot makes the primary retain WAL indefinitely, and the disk fills. Both have taken down real systems, both are on the dashboard above, and neither is difficult to avoid once you know the name.</p>
+</div>
+
+<h2><span class="h-rule"></span>When the alert fires</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the queries worth having saved</span><button class="copy">Copy</button></div>
+<pre><code>-- What is running right now, longest first.
+SELECT pid, now() - query_start AS runtime, state, wait_event_type, wait_event,
+       left(query, 100) AS query
+FROM pg_stat_activity
+WHERE state <> 'idle' AND pid <> pg_backend_pid()
+ORDER BY query_start;
+
+-- Who is blocking whom. The single most useful query in an incident.
+SELECT blocked.pid       AS blocked_pid,
+       blocked.query     AS blocked_query,
+       blocking.pid      AS blocking_pid,
+       blocking.query    AS blocking_query,
+       now() - blocking.query_start AS blocking_for
+FROM pg_stat_activity blocked
+JOIN pg_stat_activity blocking
+  ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
+WHERE cardinality(pg_blocking_pids(blocked.pid)) > 0;
+
+-- Transactions left open and idle — the classic cause of everything stopping.
+SELECT pid, now() - state_change AS idle_for, left(query, 80)
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+ORDER BY state_change;
+
+-- Cancel a query (polite), or terminate the connection (not polite).
+SELECT pg_cancel_backend(12345);
+SELECT pg_terminate_backend(12345);</code></pre>
+</div>
+
+<div class="flow stack">
+  <div class="step"><b>1 · Is it the database at all?</b><span>Check connections and CPU before assuming. Often it is the application</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>2 · What is running, and what is blocking?</b><span>The two queries above. Usually one culprit</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>3 · Cancel the offender</b><span>A runaway report, a forgotten migration, an idle transaction</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>4 · Check disk and replication</b><span>These fail in ways that look like everything else failing</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>5 · Only then look at plans</b><span>A query that was fine yesterday is rarely today's cause</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>6 · Write down what you ran</b><span>The next person, at 3am, will be you</span></div>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Test the restore, not the backup</span>
+  <p>Backups that have never been restored fail at a remarkable rate — wrong permissions, missing extensions, an unnoticed error in the nightly job, a retention policy that quietly deleted everything older than the corruption you need to recover from. Restore to a scratch instance on a schedule, verify a row count and a checksum, and record the time it took: <b>that duration is your actual recovery objective</b>, whatever the policy document says. Most teams discover theirs is four hours rather than the twenty minutes they assumed, and they discover it during an incident.</p>
+</div>
+
+<h2><span class="h-rule"></span>Where this unit ends</h2>
+
+<p>Sixteen chapters from one claim: SQL is declarative, and the unit of work is a set rather than a row. Nearly everything since followed from taking that seriously. Joins multiply because they are filtered Cartesian products. Aggregates double-count because the multiplication happened first. Window functions exist because sometimes you want the group's answer without losing the rows. Indexes work because sorted order permits binary search. Query plans are readable because the planner is choosing between a small number of physical strategies for the same declarative request.</p>
+
+<p>The chapters that will matter most in practice are probably not the ones that felt hardest. <b>NULL</b>, because it produces wrong answers rather than errors. <b>Fan-out</b>, because the wrong number is plausible. <b>Lost updates</b>, because the default isolation level permits them and almost nobody knows. <b>Foreign key indexes</b>, because they are missing nearly everywhere. Those four are worth re-reading; the rest you will look up when you need them, which is fine.</p>
+
+<p>The next step is not more reading. Open the slowest query in something you already run, put <code>EXPLAIN (ANALYZE, BUFFERS)</code> in front of it, and find out what it is actually doing. It will not be what you expected, and that gap is where the learning is.</p>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>For every migration, ask <b>what it locks and for how long</b> — not how long it takes.</li>
+    <li><b>The lock queue is worse than the lock.</b> Set <code>lock_timeout</code> and retry, always.</li>
+    <li><b>Expand and contract:</b> add, dual-write, backfill, switch reads, stop writing, drop. Six steps, and that is the real cost of zero downtime.</li>
+    <li>Every migration must be <b>safe with the previous version still running</b>. If the deploy stalls for an hour, does everything work?</li>
+    <li><b>Forward-only migrations</b>, one logical change each, tested against production-sized data.</li>
+    <li>Monitor <b>connections, replication lag, longest transaction, bloat, disk and transaction id age</b> — the last two kill instances quietly.</li>
+    <li>Keep the <b>blocking-pid query</b> saved. In an incident it is the one that identifies the culprit in seconds.</li>
+    <li><b>Test the restore.</b> Its duration is your real recovery objective, whatever the document says.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("16-operations.html");
+
+(function(){
+  const root = document.getElementById("mig");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const ROWS = [10000, 100000, 1000000, 10000000, 50000000, 200000000];
+  const RLBL = ["10 thousand","100 thousand","1 million","10 million","50 million","200 million"];
+
+  const OPS = {
+    addnull:    {lock:"ACCESS EXCLUSIVE", scan:false, safe:true,
+      note:"Metadata only — the new column is recorded in the catalogue and no existing row is touched. Milliseconds regardless of table size.\n\nThis is the safest migration there is, and it is the first step of nearly every expand-and-contract sequence."},
+    adddefault: {lock:"ACCESS EXCLUSIVE", scan:false, safe:true,
+      note:"Since PostgreSQL 11 a constant default is stored in the catalogue and applied on read, so no rewrite happens. Instant.\n\nWorth knowing the history: before 11 this rewrote the entire table, and it was one of the classic accidental outages. Plenty of guidance written before 2018 still warns against it, and plenty of teams still avoid it unnecessarily. A NON-constant default — now(), a sequence, a function call — still rewrites."},
+    addnotnull:{lock:"ACCESS EXCLUSIVE", scan:false, safe:true,
+      note:"Also fine on modern PostgreSQL: the default is stored in the catalogue, and NOT NULL is satisfied because every row is known to have the default. Instant.\n\nOn MySQL and older Postgres this rewrites the table."},
+    setnotnull:{lock:"ACCESS EXCLUSIVE", scan:true, safe:false,
+      fix:"-- Two steps, the second under a weak lock:\nALTER TABLE t ADD CONSTRAINT c_not_null\n    CHECK (col IS NOT NULL) NOT VALID;\nALTER TABLE t VALIDATE CONSTRAINT c_not_null;   -- scans, does not block\nALTER TABLE t ALTER COLUMN col SET NOT NULL;    -- PG12+ skips the rescan\nALTER TABLE t DROP CONSTRAINT c_not_null;",
+      note:"Requires a full scan to prove no NULLs exist, under a lock that blocks reads as well as writes.\n\nThe workaround adds a NOT VALID check constraint first — instant — then validates it under a lock that permits reads and writes. PostgreSQL 12+ recognises the validated constraint and skips the scan when you finally SET NOT NULL."},
+    rename:    {lock:"ACCESS EXCLUSIVE", scan:false, safe:false,
+      fix:"-- Do not rename. Expand and contract:\nALTER TABLE t ADD COLUMN new_name text;  -- then dual-write, backfill,\n                                          -- switch reads, drop the old",
+      note:"Instant at the database level, and unsafe at the application level — which is a different kind of danger, because the migration itself looks harmless.\n\nDuring the rollout, old instances still refer to the old name and every one of their requests errors. The lock is microseconds; the outage is however long your deploy takes."},
+    type:      {lock:"ACCESS EXCLUSIVE", scan:false, safe:true,
+      note:"varchar(n) to text is a metadata-only change in PostgreSQL — the on-disk representation is identical. Instant.\n\nWidening varchar(50) to varchar(100) is also free. Narrowing is not, and neither is any change that alters the storage format."},
+    typewide:  {lock:"ACCESS EXCLUSIVE", scan:true, safe:false,
+      fix:"-- Add a new column, dual-write, backfill in batches, swap.\nALTER TABLE t ADD COLUMN id_new bigint;\n-- backfill (chapter 9), then switch reads, then rename in a brief window",
+      note:"int to bigint changes the on-disk width, so every row is rewritten and every index rebuilt, under a lock that blocks reads.\n\nThis is the migration teams discover they need at 2.1 billion rows, under time pressure, which is the worst possible moment. Chapter 4's advice to use bigint from the start exists precisely to avoid it."},
+    index:     {lock:"SHARE", scan:true, safe:false,
+      fix:"CREATE INDEX CONCURRENTLY idx_name ON t (col);",
+      note:"A SHARE lock permits reads and BLOCKS ALL WRITES for the duration of the build. On a large table that is an outage for anything that writes.\n\nCONCURRENTLY does two passes, never blocks writes, and takes roughly twice as long. Always worth it on a live table."},
+    indexcc:   {lock:"SHARE UPDATE EXCLUSIVE", scan:true, safe:true,
+      note:"Reads and writes both continue throughout. Slower than a plain build, and the correct default on any live table.\n\nTwo caveats: it cannot run inside a transaction, so most migration frameworks need an explicit escape hatch; and if it fails it leaves an INVALID index behind that is not used by the planner but is still maintained on every write. Check for those with: SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;"},
+    fk:        {lock:"SHARE ROW EXCLUSIVE", scan:true, safe:false,
+      fix:"ALTER TABLE t ADD CONSTRAINT fk FOREIGN KEY (x)\n    REFERENCES p(id) NOT VALID;\nALTER TABLE t VALIDATE CONSTRAINT fk;   -- weaker lock, scans",
+      note:"Validating existing rows requires scanning the child table and locking the parent too.\n\nAdd it NOT VALID first — instant, and new rows are checked from that moment — then VALIDATE under a lock that permits reads and writes.\n\nAnd add the index on the referencing column while you are here. Chapter 11: PostgreSQL does not create it for you, and without it every parent delete scans this table."},
+    check:     {lock:"ACCESS EXCLUSIVE", scan:true, safe:false,
+      fix:"ALTER TABLE t ADD CONSTRAINT c CHECK (…) NOT VALID;\nALTER TABLE t VALIDATE CONSTRAINT c;",
+      note:"Same pattern as a foreign key: the scan is what needs the lock, so split the declaration from the verification.\n\nFind the violating rows before validating — VALIDATE fails on the first bad row and you start again. Remember that NOT (x > 0) is UNKNOWN for NULL x, so count those separately (chapter 3)."},
+    drop:      {lock:"ACCESS EXCLUSIVE", scan:false, safe:false,
+      note:"Instant — the column is marked dropped in the catalogue and the space is reclaimed lazily by vacuum. The lock is microseconds.\n\nThe danger is not the lock, it is that old application instances still SELECT the column during the rollout. Drop only after a deploy in which nothing references it, and preferably days later. It is also the one migration you genuinely cannot revert."}
+  };
+
+  function time(s){
+    if(s < 0.01) return "~instant";
+    if(s < 1) return (s*1000).toFixed(0) + "ms";
+    if(s < 90) return s.toFixed(1) + "s";
+    if(s < 5400) return (s/60).toFixed(1) + " min";
+    return (s/3600).toFixed(1) + " hr";
+  }
+
+  function render(){
+    const key = $("m-op").value;
+    const op = OPS[key];
+    const n = ROWS[parseInt($("m-rows").value, 10) - 1];
+    $("m-rowsv").textContent = RLBL[parseInt($("m-rows").value, 10) - 1];
+
+    const dur = op.scan ? n * (key === "index" || key === "indexcc" ? 0.0000022 : 0.0000009)
+                          * (key === "indexcc" ? 2.1 : 1) : 0.004;
+
+    const blocks = op.lock === "ACCESS EXCLUSIVE" ? "reads + writes"
+                 : op.lock === "SHARE" ? "writes"
+                 : op.lock === "SHARE ROW EXCLUSIVE" ? "writes"
+                 : "nothing";
+
+    $("m-lock").textContent   = op.lock.replace("ACCESS ", "ACCESS\u00A0");
+    $("m-dur").textContent    = time(dur);
+    $("m-blocks").textContent = blocks;
+    const risky = !op.safe && dur > 1;
+    $("m-safe").textContent   = op.safe ? "safe" : (dur > 30 ? "outage" : risky ? "risky" : "care");
+
+    $("m-fix").innerHTML = op.fix
+      ? '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 6px">Safe version</div>' +
+        '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid #3FB984;border-radius:5px;' +
+        'padding:11px 13px;margin:0 0 12px;font-family:var(--mono);font-size:12px;line-height:1.55;overflow-x:auto">' +
+        op.fix.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>'
+      : '';
+
+    const notes = [op.note];
+    if(op.scan && dur > 30)
+      notes.push("At " + RLBL[parseInt($("m-rows").value,10)-1] + " rows this holds the lock for roughly " + time(dur) +
+                 ". Every query arriving during that window queues, connection pools fill, and health checks start failing — " +
+                 "so the symptom is a total application outage rather than a slow database.");
+    if(op.lock === "ACCESS EXCLUSIVE")
+      notes.push("Whatever the duration, set lock_timeout before running this. If a long SELECT is holding a weaker lock, the ALTER waits — and every query behind it waits too, because lock requests are ordered. " +
+                 "A three-second timeout turns that from an outage into a retry.");
+    $("m-note").textContent = notes.join("\n\n");
+  }
+
+  ["m-op","m-rows"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

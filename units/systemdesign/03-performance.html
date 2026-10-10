@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Performance, scalability and the queue — System Design Notes</title>
+<meta name="description" content="Latency vs throughput, percentiles, Little's Law, the utilisation curve, tail amplification, Amdahl and the Universal Scalability Law.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/notes.css">
+</head>
+<body>
+<div class="readbar"></div>
+
+<header class="top">
+  <div class="top-inner">
+    <a class="home" href="../../index.html"><span class="mark"></span>All roadmaps</a>
+    <span class="top-sep">/</span>
+    <a class="home" href="index.html" style="color:var(--band-text)">System Design</a>
+    <span class="top-spacer"></span>
+    <button class="rail-toggle" aria-expanded="false">Contents</button>
+    <nav class="top-nav" aria-label="Chapter navigation"></nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail" id="rail" aria-label="Chapter and section navigation"></aside>
+
+  <article>
+    <p class="crumb">Part 1 · Groundwork &nbsp;·&nbsp; <b>Chapter 03</b></p>
+    <h1>Performance, scalability and the queue</h1>
+    <p class="standfirst">Why a system that is fast at 60% load falls over at 85%, why the average response time tells you almost nothing, and why adding servers can make throughput worse. Four formulas explain most production performance behaviour; this chapter is those four formulas and what they imply.</p>
+    <div class="meta">
+      <span>~35 min read</span>
+      <span>Little's Law · queueing · tail latency · USL</span>
+      <span>3 interactive panels</span>
+      <span>Prerequisite: chapter 2</span>
+    </div>
+
+    <div class="body">
+
+      <h2><span class="h2n">3.1</span>Four words that are not synonyms</h2>
+
+      <p>People say "the system is slow" to mean at least four different things, and the fix differs for each.</p>
+
+      <dl>
+        <dt>Performance</dt>
+        <dd>How fast the system is <em>for one user with nobody else on it</em>. If it is slow with a single user, you have a performance problem: an inefficient algorithm, a missing index, too many sequential round trips. Adding machines will not help.</dd>
+        <dt>Scalability</dt>
+        <dd>How performance holds up <em>as load grows</em>. If it is fast for one user and slow for ten thousand, you have a scalability problem: contention, a saturated resource, a bottleneck that cannot be split. Optimising the single-user path may not help either.</dd>
+        <dt>Latency</dt>
+        <dd>The time to complete one operation. Measured per request, and only meaningful as a distribution.</dd>
+        <dt>Throughput</dt>
+        <dd>The number of operations completed per unit of time. Measured for the system, not the request.</dd>
+      </dl>
+
+      <p>The classic illustration: a lorry full of hard drives driven across a country has appalling latency (nine hours) and spectacular throughput (petabytes per hour). A fibre link has excellent latency and, by comparison, poor throughput. Which one you want depends entirely on the job, and a system can be excellent at one while being terrible at the other.</p>
+
+      <div class="note key">
+        <span class="lab">The relationship you can rely on</span>
+        <p>Latency and throughput are not opposites, but they are coupled through queueing: as you push throughput towards a resource's capacity, latency rises — slowly at first, then vertically. The goal is not "minimum latency" or "maximum throughput" but <b>maximum throughput subject to a latency ceiling</b>. Phrase capacity that way and the design gets easier: "how many requests per second can we serve while keeping p99 under 200 ms?"</p>
+      </div>
+
+      <h2><span class="h2n">3.2</span>Percentiles, because averages lie</h2>
+
+      <p>Suppose 99 requests take 10 ms and one takes 5 seconds. The average is 60 ms, which describes no request that actually happened. Averages hide exactly the behaviour that makes users angry, because a distribution of response times is not a bell curve — it is a tight cluster with a long, fat tail.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Reading a latency distribution</caption>
+          <thead><tr><th>Statistic</th><th>What it tells you</th><th>Use it for</th></tr></thead>
+          <tbody>
+            <tr><td>p50 (median)</td><td>The typical experience</td><td>Whether the common path is efficient</td></tr>
+            <tr><td>p90 / p95</td><td>The mildly unlucky</td><td>Capacity planning, day-to-day tuning</td></tr>
+            <tr><td>p99</td><td>1 request in 100 is worse than this</td><td>SLOs. This is the number to defend</td></tr>
+            <tr><td>p99.9</td><td>The genuinely bad experiences</td><td>Finding pathological cases: GC, lock convoys, retries</td></tr>
+            <tr><td>max</td><td>One event, possibly a machine reboot</td><td>Almost nothing — do not set targets on it</td></tr>
+            <tr><td>mean</td><td>A number pulled around by outliers</td><td>Cost modelling, not user experience</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Two properties of percentiles catch people out. First, <strong>percentiles do not average</strong>. You cannot take the p99 of ten servers and average them to get the fleet p99; you need the merged distribution, which is why metrics systems store histograms rather than pre-computed percentiles. Second, <strong>a user's experience is not one request</strong>. If loading a page makes 20 backend calls and each has a 1% chance of being slow, the chance that the page as a whole is slow is 1 − 0.99<sup>20</sup> = 18%. The user's p99 experience is governed by your p99.9.</p>
+
+      <div class="note trap">
+        <span class="lab">Coordinated omission</span>
+        <p>Most naive load-test harnesses send a request, wait for the response, then send the next. When the system stalls for two seconds, the harness simply <em>does not send</em> the requests it would have sent during the stall — so the stall is measured once instead of a thousand times, and the reported p99 is fantasy. Use an open-loop generator that issues requests on a schedule regardless of whether previous ones have returned, or a tool that corrects for it. A tail that looks suspiciously clean usually means the measurement is wrong, not the system.</p>
+      </div>
+
+      <h3>Where the tail comes from</h3>
+
+      <p>Long tails are not bugs, they are the sum of many rare, independent events. Knowing the list makes tail investigations quick:</p>
+
+      <ul>
+        <li><b>Queueing behind other requests</b> — the dominant cause, and the subject of the next section.</li>
+        <li><b>Garbage collection or compaction pauses</b> — tens to hundreds of milliseconds, on a schedule you do not control.</li>
+        <li><b>Lock contention and convoys</b> — one slow holder makes everybody wait, and the queue does not drain smoothly.</li>
+        <li><b>Cache misses</b> — a cold or evicted entry costs the full backend path, perhaps 50× the hit path.</li>
+        <li><b>Network retransmits</b> — a dropped packet costs a retransmit timeout, historically hundreds of milliseconds.</li>
+        <li><b>Noisy neighbours</b> — someone else's job on your host or your shared storage volume.</li>
+        <li><b>Retries and reconnections</b> — a failed connection plus backoff can silently add a second.</li>
+        <li><b>Skew</b> — one shard, one key, one tenant does far more work than the others.</li>
+      </ul>
+
+      <h2><span class="h2n">3.3</span>Little's Law</h2>
+
+      <p>The most useful formula in the discipline, and it takes ten seconds to learn:</p>
+
+      <div class="codewrap">
+        <span class="lang">Little's Law</span>
+        <pre><code>L = λ × W
+
+  L = average number of items in the system   (concurrency, queue depth)
+  λ = average arrival rate                    (throughput, requests/second)
+  W = average time an item spends in system   (latency, seconds)</code></pre>
+      </div>
+
+      <p>It holds for any stable system, regardless of the arrival distribution, the service distribution or the scheduling policy. That generality is why it is so useful — you never have to justify applying it.</p>
+
+      <p>Three routine uses:</p>
+
+      <dl>
+        <dt>Sizing a thread or connection pool</dt>
+        <dd>You serve 2 000 requests/second and each takes 50 ms. Concurrency = 2 000 × 0.05 = <b>100 requests in flight</b>. A pool of 20 threads cannot possibly sustain that rate; a pool of 100 can, exactly. A pool of 1 000 does not help and wastes memory and context switches.</dd>
+        <dt>Predicting the effect of a slowdown</dt>
+        <dd>A downstream service's latency doubles from 50 ms to 100 ms while arrivals stay at 2 000/s. Required concurrency doubles to 200. If your pool is 100, requests now queue <em>outside</em> the pool, latency rises further, and the concurrency required rises again. This is how a modest downstream slowdown becomes a total outage — the feedback loop is the whole story of a cascading failure.</dd>
+        <dt>Deriving a latency budget from a queue depth</dt>
+        <dd>A queue holds 50 000 messages and consumers process 1 000/s. W = L/λ = 50 seconds of backlog. If your freshness requirement is 5 seconds, you need 10× the consumers or a way to shed load.</dd>
+      </dl>
+
+      <h2><span class="h2n">3.4</span>The utilisation curve, and why 100% is a mirage</h2>
+
+      <p>Here is the behaviour that surprises people the most. Take a single server that takes a fixed time <em>S</em> to handle a request, and feed it requests that arrive randomly. Define utilisation ρ as arrival rate ÷ service rate. The average response time is not flat until ρ = 1 and then broken. It follows a hyperbola:</p>
+
+      <div class="codewrap">
+        <span class="lang">M/M/1 response time</span>
+        <pre><code>R = S / (1 − ρ)
+
+  ρ = 0.5   →  R = 2 S     the queue doubles your latency already
+  ρ = 0.7   →  R = 3.3 S
+  ρ = 0.8   →  R = 5 S
+  ρ = 0.9   →  R = 10 S
+  ρ = 0.95  →  R = 20 S
+  ρ = 0.99  →  R = 100 S   the same work, a hundred times slower</code></pre>
+      </div>
+
+      <p>Nothing broke between 90% and 99% utilisation. The server is doing exactly the same amount of work per request. The extra time is entirely waiting behind other requests, and it exists because arrivals are random: sometimes three requests turn up in the time it takes to service one, and the excess has to wait. The only way to avoid it is to leave slack.</p>
+
+      <p>Real systems are worse than this formula, because service times are variable too. Kingman's approximation adds a variability term:</p>
+
+      <div class="codewrap">
+        <span class="lang">Kingman's approximation</span>
+        <pre><code>Wq ≈ S × ( ρ / (1 − ρ) ) × ( (c²ₐ + c²ₛ) / 2 )
+
+  c²ₐ = squared coefficient of variation of arrivals
+  c²ₛ = squared coefficient of variation of service time
+
+Uniform work, smooth arrivals (c² ≈ 0.2):  queueing is mild
+Mixed workload, bursty arrivals (c² ≈ 4):  queueing is 10× worse
+                                            at the same utilisation</code></pre>
+      </div>
+
+      <p>This is the mathematical justification for several practices that otherwise look like superstition: separating fast and slow requests into different pools (reduces c²ₛ), rejecting or smoothing bursts (reduces c²ₐ), and putting a hard timeout on slow work (truncates the tail of the service distribution).</p>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>The utilisation curve</h4>
+          <p>Drag utilisation towards 1 and watch latency leave the building.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="u-rho">Utilisation <b><span id="u-rhov">70</span>%</b></label>
+              <input type="range" id="u-rho" min="5" max="98" step="1" value="70">
+            </div>
+            <div class="ctrl">
+              <label for="u-s">Service time <b><span id="u-sv">20</span> ms</b></label>
+              <input type="range" id="u-s" min="1" max="200" step="1" value="20">
+            </div>
+            <div class="ctrl">
+              <label for="u-cv">Workload variability</label>
+              <select id="u-cv">
+                <option value="0.4">Very uniform work (c² = 0.4)</option>
+                <option value="1" selected>Typical / exponential (c² = 1)</option>
+                <option value="4">Mixed fast and slow (c² = 4)</option>
+                <option value="10">Highly variable, bursty (c² = 10)</option>
+              </select>
+            </div>
+          </div>
+          <canvas id="u-chart" width="900" height="330" aria-label="Response time against utilisation"></canvas>
+          <div class="legend">
+            <span><i style="background:var(--line)"></i>Response time at your variability</span>
+            <span><i style="background:var(--text-3)"></i>Ideal M/M/1</span>
+            <span><i style="background:var(--ok)"></i>Service time floor</span>
+          </div>
+          <div class="out">
+            <div class="stats" id="u-stats"></div>
+            <p id="u-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <div class="note key">
+        <span class="lab">Why the target is 60–70%</span>
+        <p>At 70% utilisation, queueing roughly triples response time versus an idle system, which is usually acceptable, and there is enough slack to absorb a burst or the loss of a node without falling off the cliff. Above 80% the derivative gets steep: a 5% traffic increase can double latency. Autoscaling thresholds, capacity plans and "we should add a node" conversations should all be anchored around 60–70%, not 90%.</p>
+      </div>
+
+      <h2><span class="h2n">3.5</span>Tail amplification in fan-out systems</h2>
+
+      <p>Modern requests are rarely served by one machine. A search request might touch 100 index shards and combine the results; a page might call 30 microservices. When a request must wait for <em>all</em> of N parallel calls, its latency is the <em>maximum</em> of N samples, and the maximum of many samples lands far out in the tail.</p>
+
+      <div class="codewrap">
+        <span class="lang">The arithmetic</span>
+        <pre><code>P(request is slow) = 1 − (1 − p)^N
+
+  Each server is slow 1% of the time (p = 0.01):
+    N = 1    →  1.0%   of requests are slow
+    N = 10   →  9.6%
+    N = 30   →  26%
+    N = 100  →  63%
+    N = 200  →  87%
+
+  A p99 of 500 ms per server becomes the *median* experience
+  once you fan out to 100 of them.</code></pre>
+      </div>
+
+      <p>This is the reason large fan-out systems obsess over tail latency in a way that smaller systems do not have to. Four families of mitigation exist:</p>
+
+      <dl>
+        <dt>Hedged requests</dt>
+        <dd>Send the request to one replica; if no answer arrives by the 95th-percentile time, send a duplicate to another replica and take whichever returns first. Costs about 5% extra traffic and can cut p99.9 by an order of magnitude. Cancel the loser to avoid doing the work twice.</dd>
+        <dt>Tied requests</dt>
+        <dd>Send to two replicas immediately, each telling the other where its twin is; whichever starts work first cancels the other. Lower latency than hedging, more coupling.</dd>
+        <dt>Reduce the fan-out</dt>
+        <dd>Fewer, larger shards; batching several lookups into one call; a cache in front so most sub-requests never leave the process. Halving N does more for the tail than shaving 10% off each call.</dd>
+        <dt>Return partial results</dt>
+        <dd>Search engines do this constantly: at the deadline, return whatever came back and mark the response as degraded. Users prefer 95% of results now to 100% in two seconds.</dd>
+      </dl>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Tail amplification and Little's Law</h4>
+          <p>Two calculators that between them explain most capacity incidents.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="t-n">Parallel calls per request <b><span id="t-nv">30</span></b></label>
+              <input type="range" id="t-n" min="1" max="300" step="1" value="30">
+            </div>
+            <div class="ctrl">
+              <label for="t-p">Chance one call is slow <b><span id="t-pv">1.0</span>%</b></label>
+              <input type="range" id="t-p" min="0.1" max="10" step="0.1" value="1">
+            </div>
+            <div class="ctrl">
+              <label for="t-qps">Throughput <b><span id="t-qpsv">2000</span> req/s</b></label>
+              <input type="range" id="t-qps" min="10" max="20000" step="10" value="2000">
+            </div>
+            <div class="ctrl">
+              <label for="t-lat">Latency per request <b><span id="t-latv">50</span> ms</b></label>
+              <input type="range" id="t-lat" min="1" max="1000" step="1" value="50">
+            </div>
+          </div>
+          <div class="out">
+            <div class="stats" id="t-stats"></div>
+            <p id="t-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">3.6</span>Why adding machines stops working</h2>
+
+      <p>Two laws bound what parallelism can buy you.</p>
+
+      <h3>Amdahl's law: the serial fraction is a ceiling</h3>
+
+      <div class="codewrap">
+        <span class="lang">Amdahl</span>
+        <pre><code>speedup(N) = 1 / ( (1 − p) + p/N )
+
+  p = the fraction of work that can be parallelised
+
+  p = 0.95, N = 10   →  6.9×
+  p = 0.95, N = 100  →  16.8×
+  p = 0.95, N = ∞    →  20×      ← the ceiling, whatever you spend
+  p = 0.99, N = ∞    →  100×</code></pre>
+      </div>
+
+      <p>If 5% of the work is inherently serial — a global lock, a single counter, a coordinator that must see every request — then twenty times is all you will ever get, and the hundredth machine adds almost nothing. In system design, the serial fraction usually has a name: the primary database, the sequence generator, the leader election, the shared cache lock.</p>
+
+      <h3>The Universal Scalability Law: it can get worse than a ceiling</h3>
+
+      <p>Amdahl is optimistic, because it ignores the cost of nodes coordinating with each other. The USL adds a second penalty term:</p>
+
+      <div class="codewrap">
+        <span class="lang">Universal Scalability Law</span>
+        <pre><code>X(N) = N / ( 1 + σ(N − 1) + κN(N − 1) )
+
+  σ (sigma) = contention   — waiting for a shared resource     (Amdahl's term)
+  κ (kappa) = coherency    — the cost of keeping nodes in sync (the new term)
+
+κ grows with N², because every node may have to agree with every other node.
+When κ > 0 the curve has a maximum: past some N, adding nodes REDUCES throughput.</code></pre>
+      </div>
+
+      <p>This retrograde behaviour is real and commonly observed: a database that goes faster from 8 to 32 cores and slower from 32 to 64; a cluster that handles more traffic with nine nodes than with fifteen. The cause is coordination — cache-line ping-pong, distributed locks, gossip traffic, cross-shard queries, consensus rounds. The design lesson is blunt: <strong>the way to scale is to remove coordination, not to add machines.</strong> Sharding by a key that never needs cross-shard transactions has κ ≈ 0; a design where every node must agree on a global order does not.</p>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Scaling curves</h4>
+          <p>Amdahl against the Universal Scalability Law. Watch the USL curve turn over.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="s-sig">Contention σ <b><span id="s-sigv">0.03</span></b></label>
+              <input type="range" id="s-sig" min="0" max="0.3" step="0.005" value="0.03">
+            </div>
+            <div class="ctrl">
+              <label for="s-kap">Coherency κ <b><span id="s-kapv">0.0002</span></b></label>
+              <input type="range" id="s-kap" min="0" max="0.002" step="0.00005" value="0.0002">
+            </div>
+            <div class="ctrl">
+              <label for="s-n">Nodes shown <b><span id="s-nv">64</span></b></label>
+              <input type="range" id="s-n" min="8" max="256" step="8" value="64">
+            </div>
+          </div>
+          <canvas id="s-chart" width="900" height="330" aria-label="Throughput against node count"></canvas>
+          <div class="legend">
+            <span><i style="background:var(--line)"></i>Universal Scalability Law</span>
+            <span><i style="background:var(--text-3)"></i>Amdahl (contention only)</span>
+            <span><i style="background:var(--ok)"></i>Linear (the fantasy)</span>
+          </div>
+          <div class="out"><div class="stats" id="s-stats"></div></div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">3.7</span>Vertical and horizontal scaling</h2>
+
+      <div class="tw">
+        <table>
+          <caption>Scale up or scale out</caption>
+          <thead><tr><th></th><th>Vertical (bigger machine)</th><th>Horizontal (more machines)</th></tr></thead>
+          <tbody>
+            <tr><td>Complexity</td><td class="yes">None — the code does not change</td><td class="no">Distribution, coordination, partial failure</td></tr>
+            <tr><td>Ceiling</td><td class="no">Hard. Largest cloud instances are ~200 vCPU / 24 TB RAM</td><td class="yes">Effectively none, if the workload partitions</td></tr>
+            <tr><td>Failure domain</td><td class="no">One machine is the whole service</td><td class="yes">Losing one node costs 1/N of capacity</td></tr>
+            <tr><td>Cost curve</td><td class="no">Superlinear at the top end</td><td class="yes">Roughly linear in commodity units</td></tr>
+            <tr><td>Downtime to scale</td><td class="mid">Usually a restart or failover</td><td class="yes">Add a node, no interruption</td></tr>
+            <tr><td>Transactions and joins</td><td class="yes">Free and correct</td><td class="no">Distributed, slow, or forbidden</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The pragmatic order of operations, which is also the cheapest: <b>optimise first, scale up second, scale out third.</b> An index that turns a table scan into a lookup is worth more than any number of replicas, and it is a day's work. Modern hardware is startlingly large — a single machine with 128 cores and a terabyte of RAM handles workloads that would have needed a cluster fifteen years ago, and it comes with transactions and joins for free. Distribute when you must: when you exceed the biggest box, when you need availability that a single machine cannot give, or when the data has a natural partition and the team is ready for the operational cost.</p>
+
+      <div class="note trap">
+        <span class="lab">Stateless is what makes horizontal scaling easy</span>
+        <p>Adding an application server is trivial <em>because</em> the server holds nothing you cannot lose. The moment a server keeps session state in local memory, adding a node means either sticky routing (which breaks when a node dies and makes load uneven) or lost sessions. Push state to a shared store — a cache, a database, a signed token in the client — and the tier becomes disposable. Everything hard about horizontal scaling is about state; see <a href="11-app-layer.html">Chapter 11</a>.</p>
+      </div>
+
+      <h2><span class="h2n">3.8</span>The four ways to make anything faster</h2>
+
+      <p>Every performance intervention is one of these. When stuck, walk the list in order.</p>
+
+      <ol>
+        <li><b>Do less work.</b> Cache the result. Precompute it. Add the index. Return fewer fields. Compress before sending. Delete the N+1 query. This is nearly always the largest win and the cheapest.</li>
+        <li><b>Do it later.</b> Move it off the request path into a queue. The user's latency drops to the cost of enqueueing, and the work becomes retryable and batchable. Cost: eventual consistency and a second failure mode to operate.</li>
+        <li><b>Do it in parallel.</b> Shard the data, fan out the query, use more cores. Bounded by Amdahl and the USL, and it introduces tail amplification, so it is the third lever rather than the first.</li>
+        <li><b>Do it closer.</b> Move computation or data nearer the user — CDN, edge, regional replicas — or nearer the data: push the filter into the database instead of pulling rows into the application. Physics is the one constraint that does not yield to cleverness.</li>
+      </ol>
+
+      <h2><span class="h2n">3.9</span>Measuring: load testing that tells the truth</h2>
+
+      <p>A design's performance claims are hypotheses until measured. The vocabulary is worth having straight, because the tests answer different questions:</p>
+
+      <div class="tw">
+        <table>
+          <caption>Kinds of load test</caption>
+          <thead><tr><th>Test</th><th>Shape</th><th>Question it answers</th></tr></thead>
+          <tbody>
+            <tr><td>Smoke</td><td>Minimal load, short</td><td>Does the test harness and the deployment work at all?</td></tr>
+            <tr><td>Load</td><td>Expected peak, sustained</td><td>Do we meet the SLO at the traffic we expect?</td></tr>
+            <tr><td>Stress</td><td>Ramp until it breaks</td><td>Where is the knee, what breaks first, and how does it fail?</td></tr>
+            <tr><td>Soak</td><td>Moderate load, hours to days</td><td>Leaks, unbounded growth, disk fill, connection exhaustion</td></tr>
+            <tr><td>Spike</td><td>Instant 10× then back</td><td>Do autoscaling, queues and breakers behave, and does it recover?</td></tr>
+            <tr><td>Capacity</td><td>Step increases, measure at each</td><td>The utilisation curve for this system, for real</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Three rules for making the results mean anything. Use an <b>open-loop</b> generator that sends at a target rate regardless of responses, or you will measure a fantasy (see coordinated omission above). <b>Warm up</b> — caches, JIT compilers and connection pools all need a few minutes before numbers stabilise. And <b>use realistic data and key distributions</b>: a test that reads the same key a million times measures your cache, not your system, and will miss the hot-key and cold-cache behaviour that will actually take you down.</p>
+
+      <details class="check">
+        <summary>Your service handles 500 req/s with 200 ms latency. The connection pool to the database has 40 connections and each query takes 30 ms. Is the pool big enough?</summary>
+        <div class="ans">
+          <p>Little's Law on the database leg: 500 req/s × 0.03 s = <b>15 connections in use on average</b>. Forty is enough on average — but averages are the trap. At a 3× burst you need 45 and the pool becomes the bottleneck, adding queueing time in front of the database that looks, from the outside, like the database being slow. Also check the other direction: 40 connections × the number of app nodes is what the database actually sees, and that total is the number that matters to Postgres.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>A team proposes running their fleet at 90% CPU to save money. What do you say?</summary>
+        <div class="ans">
+          <p>That at 90% utilisation, queueing theory puts response time at roughly 10× the service time, versus 3.3× at 70% — so latency roughly triples for a 22% saving in machines. Worse, there is no headroom: a lost node pushes the survivors past 100% and the service collapses rather than degrading, and any traffic spike does the same. If cost is the real constraint, the better levers are reducing the work per request, improving the cache hit ratio, or using autoscaling so the fleet is small at night rather than dangerous at noon.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Your search backend fans out to 50 shards. Each shard's p99 is 100 ms and its p50 is 8 ms. What is the user-visible p50, roughly, and what would you do about it?</summary>
+        <div class="ans">
+          <p>The user waits for the slowest of 50. The chance all 50 come back under their p99 is 0.99<sup>50</sup> ≈ 61%, so roughly 39% of requests contain at least one 100 ms-class shard — meaning the user-visible median is far closer to 100 ms than to 8 ms. Fixes, in order of value: cut the fan-out (fewer, larger shards, or a cache in front); add hedging so a shard that has not answered by ~30 ms gets a duplicate request to a replica; and set a deadline with partial results so the response is bounded regardless. Optimising the shard's p50 from 8 ms to 5 ms would achieve essentially nothing.</p>
+        </div>
+      </details>
+
+      <div class="recap">
+        <h2>Recap</h2>
+        <ol>
+          <li><b>Performance is single-user speed; scalability is how it holds up under load.</b> They have different causes and different fixes.</li>
+          <li><b>Report percentiles, not averages,</b> and remember that percentiles do not average across servers and that a user's experience spans many requests.</li>
+          <li><b>Little's Law: L = λW.</b> Concurrency is throughput times latency — it sizes pools, predicts backlogs, and explains cascading failure.</li>
+          <li><b>Response time is S/(1 − ρ).</b> At 90% utilisation latency is 10× the service time. Target 60–70% and leave room for the node you will lose.</li>
+          <li><b>Variability makes queueing much worse.</b> Separate fast from slow work, smooth bursts, and time out the tail.</li>
+          <li><b>Fan-out amplifies the tail:</b> 1 − (1 − p)<sup>N</sup>. Reduce N, hedge, or return partial results.</li>
+          <li><b>Amdahl caps speedup at 1/(1 − p); the USL says it can turn negative.</b> Scale by removing coordination, not by adding machines to a coordinated design.</li>
+          <li><b>Optimise, then scale up, then scale out</b> — in that order, because that is also cheapest-first.</li>
+        </ol>
+      </div>
+
+      <nav class="pn" aria-label="Previous and next chapter"></nav>
+    </div>
+  </article>
+</div>
+
+<script src="assets/notes.js"></script>
+<script>
+/* ---------- shared tiny chart helper ---------- */
+function chart(canvas) {
+  var dpr = window.devicePixelRatio || 1;
+  var css = getComputedStyle(document.body);
+  var cs = function (n) { return css.getPropertyValue(n).trim(); };
+  var w = canvas.clientWidth || 900, h = 330;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  canvas.style.height = h + "px";
+  var c = canvas.getContext("2d");
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.clearRect(0, 0, w, h);
+  return {
+    c: c, w: w, h: h, css: cs,
+    pad: { l: 58, r: 14, t: 14, b: 34 },
+    axes: function (xlab, ylab, xticks, yticks) {
+      var p = this.pad;
+      c.strokeStyle = cs("--rule"); c.lineWidth = 1;
+      c.beginPath(); c.moveTo(p.l, p.t); c.lineTo(p.l, h - p.b); c.lineTo(w - p.r, h - p.b); c.stroke();
+      c.fillStyle = cs("--text-3");
+      c.font = "11px Archivo, sans-serif";
+      c.textAlign = "center";
+      xticks.forEach(function (t) {
+        c.fillText(t.l, t.x, h - p.b + 15);
+        c.strokeStyle = cs("--rule-2");
+        c.beginPath(); c.moveTo(t.x, p.t); c.lineTo(t.x, h - p.b); c.stroke();
+      });
+      c.textAlign = "right";
+      yticks.forEach(function (t) {
+        c.fillText(t.l, p.l - 7, t.y + 4);
+        c.strokeStyle = cs("--rule-2");
+        c.beginPath(); c.moveTo(p.l, t.y); c.lineTo(w - p.r, t.y); c.stroke();
+      });
+      c.textAlign = "center";
+      c.fillStyle = cs("--text-2");
+      c.font = "600 11.5px Archivo, sans-serif";
+      c.fillText(xlab, p.l + (w - p.l - p.r) / 2, h - 4);
+      c.save(); c.translate(13, p.t + (h - p.t - p.b) / 2); c.rotate(-Math.PI / 2);
+      c.fillText(ylab, 0, 0); c.restore();
+    },
+    line: function (pts, colour, width, dash) {
+      c.save();
+      c.strokeStyle = colour; c.lineWidth = width || 2.4;
+      if (dash) c.setLineDash(dash);
+      c.beginPath();
+      pts.forEach(function (p, i) { i ? c.lineTo(p[0], p[1]) : c.moveTo(p[0], p[1]); });
+      c.stroke(); c.restore();
+    },
+    dot: function (x, y, colour) {
+      c.fillStyle = colour; c.beginPath(); c.arc(x, y, 4.5, 0, 7); c.fill();
+      c.strokeStyle = cs("--card"); c.lineWidth = 2; c.stroke();
+    }
+  };
+}
+
+/* ---------- utilisation curve ---------- */
+(function () {
+  var rho = document.getElementById("u-rho"), s = document.getElementById("u-s"),
+      cv = document.getElementById("u-cv"), cvs = document.getElementById("u-chart"),
+      stats = document.getElementById("u-stats"), note = document.getElementById("u-note");
+
+  function R(r, S, c2) { return r >= 0.999 ? 1e6 : S * (1 + (r / (1 - r)) * ((1 + c2) / 2)); }
+
+  function stat(k, v, tone) {
+    var d = document.createElement("div"); d.className = "stat";
+    var a = document.createElement("div"); a.className = "k"; a.textContent = k;
+    var b = document.createElement("div"); b.className = "v"; b.textContent = v;
+    if (tone) b.style.color = tone;
+    d.append(a, b); return d;
+  }
+
+  function draw() {
+    var r = +rho.value / 100, S = +s.value, c2 = +cv.value;
+    document.getElementById("u-rhov").textContent = +rho.value;
+    document.getElementById("u-sv").textContent = S;
+
+    var ch = chart(cvs), p = ch.pad;
+    var maxY = Math.max(R(0.9, S, c2), S * 6);
+    var X = function (u) { return p.l + u * (ch.w - p.l - p.r); };
+    var Y = function (v) { return ch.h - p.b - Math.min(1, v / maxY) * (ch.h - p.t - p.b); };
+
+    var xt = [], yt = [];
+    [0, 0.2, 0.4, 0.6, 0.8, 1].forEach(function (u) { xt.push({ x: X(u), l: Math.round(u * 100) + "%" }); });
+    for (var i = 0; i <= 4; i++) { var v = maxY * i / 4; yt.push({ y: Y(v), l: Math.round(v) + " ms" }); }
+    ch.axes("Utilisation", "Response time", xt, yt);
+
+    var a = [], b = [];
+    for (var u = 0; u <= 0.985; u += 0.005) {
+      a.push([X(u), Y(R(u, S, c2))]);
+      b.push([X(u), Y(R(u, S, 1))]);
+    }
+    ch.line([[X(0), Y(S)], [X(1), Y(S)]], ch.css("--ok"), 1.6, [5, 4]);
+    ch.line(b, ch.css("--text-3"), 1.8, [4, 3]);
+    ch.line(a, ch.css("--line"), 2.6);
+    ch.dot(X(r), Y(R(r, S, c2)), ch.css("--line"));
+
+    var here = R(r, S, c2), mult = here / S;
+    stats.innerHTML = "";
+    stats.appendChild(stat("Response time", Math.round(here) + " ms", mult > 5 ? "var(--line)" : ""));
+    stats.appendChild(stat("Waiting in queue", Math.round(here - S) + " ms"));
+    stats.appendChild(stat("Slowdown vs idle", mult.toFixed(1) + "×", mult > 5 ? "var(--line)" : mult < 2.5 ? "var(--ok)" : ""));
+    stats.appendChild(stat("Extra load to 2× latency",
+      (function () {
+        for (var u = r; u < 0.999; u += 0.001) { if (R(u, S, c2) >= here * 2) return "+" + Math.round((u / r - 1) * 100) + "%"; }
+        return "—";
+      })(), "var(--line)"));
+
+    note.textContent = r < 0.6
+      ? "Comfortable. Queueing adds little, and there is room to lose a node without leaving this zone."
+      : r < 0.78
+      ? "The working range. Latency is a small multiple of service time and a burst is survivable."
+      : r < 0.9
+      ? "The knee. Small increases in load now cause large increases in latency — this is where autoscaling should already have fired."
+      : "Past the knee. The system is doing the same work per request and taking many times longer. Losing a single node from here causes a collapse, not a degradation.";
+  }
+  [rho, s, cv].forEach(function (n) { n.addEventListener("input", draw); n.addEventListener("change", draw); });
+  addEventListener("resize", draw);
+  draw();
+})();
+
+/* ---------- tail amplification + Little's Law ---------- */
+(function () {
+  var n = document.getElementById("t-n"), p = document.getElementById("t-p"),
+      q = document.getElementById("t-qps"), l = document.getElementById("t-lat"),
+      stats = document.getElementById("t-stats"), note = document.getElementById("t-note");
+  function stat(k, v, tone) {
+    var d = document.createElement("div"); d.className = "stat";
+    var a = document.createElement("div"); a.className = "k"; a.textContent = k;
+    var b = document.createElement("div"); b.className = "v"; b.textContent = v;
+    if (tone) b.style.color = tone;
+    d.append(a, b); return d;
+  }
+  function draw() {
+    var N = +n.value, pp = +p.value / 100, qps = +q.value, lat = +l.value / 1000;
+    document.getElementById("t-nv").textContent = N;
+    document.getElementById("t-pv").textContent = (+p.value).toFixed(1);
+    document.getElementById("t-qpsv").textContent = qps;
+    document.getElementById("t-latv").textContent = +l.value;
+
+    var slow = 1 - Math.pow(1 - pp, N);
+    var conc = qps * lat;
+    stats.innerHTML = "";
+    stats.appendChild(stat("Requests hitting a slow call", (slow * 100).toFixed(1) + "%", slow > 0.2 ? "var(--line)" : slow < 0.05 ? "var(--ok)" : ""));
+    stats.appendChild(stat("Fan-out N", N));
+    stats.appendChild(stat("Concurrency in flight", Math.round(conc) < 1 ? conc.toFixed(1) : Math.round(conc)));
+    stats.appendChild(stat("Threads/connections needed", Math.max(1, Math.ceil(conc * 1.5))));
+    stats.appendChild(stat("Backlog if latency doubles", Math.round(conc * 2)));
+
+    note.textContent = slow > 0.5
+      ? "Most requests now include at least one slow call, so the per-server tail has become the typical user experience. Cutting fan-out or hedging is worth far more than tuning the median."
+      : slow > 0.15
+      ? "A meaningful share of requests inherit a tail event. Consider hedged requests to a second replica after the p95 deadline."
+      : "Fan-out is low enough that the per-server tail stays a tail. Concurrency shown is what Little's Law says you must provision for.";
+  }
+  [n, p, q, l].forEach(function (x) { x.addEventListener("input", draw); });
+  draw();
+})();
+
+/* ---------- scaling curves ---------- */
+(function () {
+  var sig = document.getElementById("s-sig"), kap = document.getElementById("s-kap"),
+      nn = document.getElementById("s-n"), cvs = document.getElementById("s-chart"),
+      stats = document.getElementById("s-stats");
+  function usl(N, s, k) { return N / (1 + s * (N - 1) + k * N * (N - 1)); }
+  function stat(k, v, tone) {
+    var d = document.createElement("div"); d.className = "stat";
+    var a = document.createElement("div"); a.className = "k"; a.textContent = k;
+    var b = document.createElement("div"); b.className = "v"; b.textContent = v;
+    if (tone) b.style.color = tone;
+    d.append(a, b); return d;
+  }
+  function draw() {
+    var s = +sig.value, k = +kap.value, maxN = +nn.value;
+    document.getElementById("s-sigv").textContent = s.toFixed(3);
+    document.getElementById("s-kapv").textContent = k.toFixed(5);
+    document.getElementById("s-nv").textContent = maxN;
+
+    var best = 1, bestX = usl(1, s, k), lastX = 0;
+    for (var i = 1; i <= 4096; i++) {
+      var x = usl(i, s, k);
+      if (x > bestX) { bestX = x; best = i; }
+    }
+    var ch = chart(cvs), p = ch.pad;
+    var maxY = Math.max(bestX * 1.15, usl(maxN, s, 0) * 1.05, 4);
+    var X = function (v) { return p.l + (v / maxN) * (ch.w - p.l - p.r); };
+    var Y = function (v) { return ch.h - p.b - Math.min(1, v / maxY) * (ch.h - p.t - p.b); };
+    var xt = [], yt = [];
+    for (var t = 0; t <= 4; t++) xt.push({ x: X(maxN * t / 4), l: Math.round(maxN * t / 4) });
+    for (var u = 0; u <= 4; u++) yt.push({ y: Y(maxY * u / 4), l: (maxY * u / 4).toFixed(0) + "×" });
+    ch.axes("Nodes", "Throughput vs one node", xt, yt);
+
+    var lin = [], amd = [], us = [];
+    for (var i2 = 1; i2 <= maxN; i2++) {
+      lin.push([X(i2), Y(i2)]);
+      amd.push([X(i2), Y(usl(i2, s, 0))]);
+      us.push([X(i2), Y(usl(i2, s, k))]);
+    }
+    ch.line(lin, ch.css("--ok"), 1.6, [5, 4]);
+    ch.line(amd, ch.css("--text-3"), 1.8, [4, 3]);
+    ch.line(us, ch.css("--line"), 2.6);
+    if (best <= maxN) ch.dot(X(best), Y(bestX), ch.css("--line"));
+
+    stats.innerHTML = "";
+    stats.appendChild(stat("Speedup at " + maxN + " nodes", usl(maxN, s, k).toFixed(1) + "×"));
+    stats.appendChild(stat("Amdahl ceiling", s > 0 ? (1 / s).toFixed(0) + "×" : "none"));
+    stats.appendChild(stat("Peak throughput at", best + " nodes", best <= maxN ? "var(--line)" : ""));
+    stats.appendChild(stat("Efficiency per node", ((usl(maxN, s, k) / maxN) * 100).toFixed(0) + "%",
+      usl(maxN, s, k) / maxN < 0.5 ? "var(--line)" : ""));
+  }
+  [sig, kap, nn].forEach(function (x) { x.addEventListener("input", draw); });
+  addEventListener("resize", draw);
+  draw();
+})();
+</script>
+</body>
+</html>

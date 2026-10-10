@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · Monitoring and observability — System Design Notes</title>
+<meta name="description" content="Metrics, logs and traces; RED and USE; cardinality; SLO burn-rate alerting; dashboards that survive an incident.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/notes.css">
+</head>
+<body>
+<div class="readbar"></div>
+
+<header class="top">
+  <div class="top-inner">
+    <a class="home" href="../../index.html"><span class="mark"></span>All roadmaps</a>
+    <span class="top-sep">/</span>
+    <a class="home" href="index.html" style="color:var(--band-text)">System Design</a>
+    <span class="top-spacer"></span>
+    <button class="rail-toggle" aria-expanded="false">Contents</button>
+    <nav class="top-nav" aria-label="Chapter navigation"></nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail" id="rail" aria-label="Chapter and section navigation"></aside>
+
+  <article>
+    <p class="crumb">Part 6 · Running it &nbsp;·&nbsp; <b>Chapter 18</b></p>
+    <h1>Monitoring and observability</h1>
+    <p class="standfirst">A design is not finished when it works. It is finished when you can tell that it is working, find out quickly when it is not, and answer a question you did not anticipate. This chapter covers the three signals and what each costs, the frameworks that stop you guessing what to measure, cardinality as the thing that actually bankrupts you, and burn-rate alerting — the only alerting scheme that reliably wakes people for the right reasons.</p>
+    <div class="meta">
+      <span>~35 min read</span>
+      <span>Metrics · logs · traces · RED/USE · alerting</span>
+      <span>2 interactive panels</span>
+      <span>Prerequisite: chapter 4</span>
+    </div>
+
+    <div class="body">
+
+      <h2><span class="h2n">18.1</span>Monitoring, observability, and the difference that matters</h2>
+
+      <p><b>Monitoring</b> is watching for conditions you anticipated: is the error rate above 1%, is disk above 85%. <b>Observability</b> is the ability to answer questions you did not anticipate: why are requests from Android clients in Brazil failing only for accounts created this week? The first is a set of alerts; the second is a property of the data you collect — specifically, whether it retains enough dimensions to slice along an axis nobody thought of in advance.</p>
+
+      <p>The practical implication is about <em>where</em> you aggregate. A pre-aggregated counter of "total errors" answers one question forever. The same errors recorded with attributes — endpoint, status, region, client version, tenant — answer thousands, at a cost. Most of this chapter is about managing that cost without collapsing back to numbers that cannot explain anything.</p>
+
+      <h2><span class="h2n">18.2</span>The three signals</h2>
+
+      <div class="tw">
+        <table>
+          <caption>What each is for, and what it costs</caption>
+          <thead><tr><th></th><th>Metrics</th><th>Logs</th><th>Traces</th></tr></thead>
+          <tbody>
+            <tr><td>Shape</td><td>Numbers over time, with labels</td><td>Discrete events with structure and text</td><td>A causal tree of spans across services</td></tr>
+            <tr><td>Answers</td><td>Is something wrong? How much, and since when?</td><td>What exactly happened to this request?</td><td>Where did the time go, and who called whom?</td></tr>
+            <tr><td>Cost</td><td class="yes">Cheap and bounded — until cardinality explodes</td><td class="no">Expensive; grows with traffic</td><td class="mid">Expensive per trace, so usually sampled</td></tr>
+            <tr><td>Retention</td><td class="yes">Months to years, cheaply</td><td class="mid">Days to weeks</td><td class="mid">Days</td></tr>
+            <tr><td>Query latency</td><td class="yes">Milliseconds</td><td class="mid">Seconds</td><td class="mid">Seconds</td></tr>
+            <tr><td>Good for</td><td>Alerting, dashboards, capacity, SLOs</td><td>Forensics, audit, rare-event debugging</td><td>Latency attribution, dependency maps, fan-out</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>A fourth signal is worth knowing: <b>continuous profiling</b>, which samples CPU and memory stacks in production. It answers "which function is burning the CPU right now", a question no other signal can. It is cheap enough to run permanently on modern runtimes and is chronically underused.</p>
+
+      <div class="note key">
+        <span class="lab">How they compose in an incident</span>
+        <p>A metric tells you <em>something</em> is wrong and when it started. A dashboard slice tells you <em>which dimension</em> — one region, one endpoint, one client version. A trace tells you <em>where</em> in the call graph the time or the error appears. A log line tells you <em>exactly what</em> that request did. Skipping a step is how incidents run long: people jump from "errors are up" straight to reading logs, and drown. The signals form a funnel and are worth using in order.</p>
+      </div>
+
+      <h2><span class="h2n">18.3</span>Metrics: types and traps</h2>
+
+      <dl>
+        <dt>Counter</dt>
+        <dd>Only goes up; you query its rate. <code>http_requests_total</code>. Resets on restart, which the query engine handles for you — so never compute rates yourself in application code.</dd>
+        <dt>Gauge</dt>
+        <dd>A value that moves in both directions: queue depth, memory in use, active connections, temperature.</dd>
+        <dt>Histogram</dt>
+        <dd>Counts observations into buckets, so percentiles can be computed <em>after</em> aggregating across instances. This is the only correct way to get a fleet-wide p99.</dd>
+        <dt>Summary</dt>
+        <dd>Percentiles computed per instance. Cheaper to query and <b>mathematically un-aggregatable</b> — see below.</dd>
+      </dl>
+
+      <div class="note trap">
+        <span class="lab">You cannot average percentiles</span>
+        <p>Ten instances each reporting a p99 of 100 ms does not mean the fleet's p99 is 100 ms. Percentiles are not linear, and the average of ten p99s is a number with no meaning at all — it can be far below the true fleet p99 when one instance is slow, which is exactly the case you built the alert for. Emit <b>histograms</b> and let the query engine sum the buckets before computing the quantile. If your dashboards show "avg(p99)" anywhere, they are lying to you, and they are lying most during an incident.</p>
+      </div>
+
+      <h3>Cardinality is the thing that bankrupts you</h3>
+
+      <p>Each unique combination of label values is a separate <b>time series</b>, stored and indexed independently. Series count is the product of the cardinalities of every label, and products grow explosively.</p>
+
+      <div class="codewrap">
+        <span class="lang">How it happens</span>
+        <pre><code>http_requests_total{ method, status, endpoint, region }
+  5 methods × 8 statuses × 40 endpoints × 4 regions   =  6 400 series
+  Fine.
+
+Someone adds a user id "for debugging":
+  × 2 000 000 users                        = 12 800 000 000 series
+  The metrics system falls over within the hour.
+
+Labels that are ALWAYS wrong:
+  user id · session id · request id · trace id · email
+  full URL with path parameters (/orders/8f2c1…)
+  raw error message · timestamp · IP address
+
+Those belong in logs and traces, which are built for high
+cardinality. Metrics are built for bounded dimensions.</code></pre>
+      </div>
+
+      <p>The rule: a label's value set must be <b>small and bounded by design</b>, not merely small today. Normalise URL paths to route templates (<code>/orders/{id}</code>), bucket continuous values, and treat any label whose cardinality grows with traffic as a bug.</p>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Cardinality calculator</h4>
+          <p>Series count is a product. Add one unbounded label and watch it stop being a metrics problem.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="c-metrics">Distinct metric names <b><span id="c-metricsv">200</span></b></label>
+              <input type="range" id="c-metrics" min="10" max="2000" step="10" value="200">
+            </div>
+            <div class="ctrl">
+              <label for="c-ep">Endpoints / routes <b><span id="c-epv">40</span></b></label>
+              <input type="range" id="c-ep" min="1" max="500" step="1" value="40">
+            </div>
+            <div class="ctrl">
+              <label for="c-inst">Instances <b><span id="c-instv">60</span></b></label>
+              <input type="range" id="c-inst" min="1" max="2000" step="1" value="60">
+            </div>
+            <div class="ctrl">
+              <label for="c-other">Other bounded labels (status × region × …) <b><span id="c-otherv">32</span></b></label>
+              <input type="range" id="c-other" min="1" max="500" step="1" value="32">
+            </div>
+            <div class="ctrl">
+              <label for="c-bad">Add one unbounded label</label>
+              <select id="c-bad">
+                <option value="1" selected>None</option>
+                <option value="500">Tenant id (500)</option>
+                <option value="50000">Customer id (50 k)</option>
+                <option value="2000000">User id (2 M)</option>
+              </select>
+            </div>
+            <div class="ctrl">
+              <label for="c-scrape">Scrape interval <b><span id="c-scrapev">15</span> s</b></label>
+              <input type="range" id="c-scrape" min="5" max="120" step="5" value="15">
+            </div>
+          </div>
+          <div class="bars" id="c-bars"></div>
+          <div class="out">
+            <div class="stats" id="c-stats"></div>
+            <p id="c-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">18.4</span>What to measure: RED, USE and the golden signals</h2>
+
+      <p>Three frameworks that between them cover almost everything, and prevent the usual failure of instrumenting whatever was easy.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Pick by what you are measuring</caption>
+          <thead><tr><th>Framework</th><th>Applies to</th><th>Measure</th></tr></thead>
+          <tbody>
+            <tr><td><b>RED</b></td><td>Request-driven services</td><td><b>R</b>ate (requests/s), <b>E</b>rrors (failed/s or as a ratio), <b>D</b>uration (a latency histogram)</td></tr>
+            <tr><td><b>USE</b></td><td>Resources: CPU, disk, network, pools</td><td><b>U</b>tilisation (% busy), <b>S</b>aturation (queue depth / wait), <b>E</b>rrors (drops, retries)</td></tr>
+            <tr><td><b>Four golden signals</b></td><td>Anything user-facing</td><td>Latency, traffic, errors, saturation — RED plus saturation</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p><b>Saturation</b> is the one people omit and the one with the most predictive power. Utilisation tells you how busy something is; saturation tells you how much work is <em>waiting</em> — the queue depth, the pool wait time, the run queue length. Per <a href="03-performance.html">Chapter 3</a>, latency is a hyperbola in utilisation, so saturation starts climbing while utilisation still looks acceptable. It is your earliest reliable warning.</p>
+
+      <p>For each dependency your service calls, emit RED metrics from the <em>caller's</em> side as well. The provider's dashboard says the database is fine; yours says calls to it are timing out. Both can be true — the difference is the connection pool, the network, or a slow query only you issue — and only the caller-side view finds it.</p>
+
+      <h2><span class="h2n">18.5</span>Logs</h2>
+
+      <ul>
+        <li><b>Structured, always.</b> JSON or logfmt with typed fields, never interpolated prose. <code>{"event":"payment_failed","order_id":"o91","reason":"insufficient_funds","amount_cents":4999}</code> is queryable; "Payment failed for order o91 because of insufficient funds" is a regular expression waiting to break.</li>
+        <li><b>One correlation id through everything.</b> Generated at the edge, propagated on every call and every message, present in every log line. Without it, correlating a user's failure across six services is manual work; with it, it is one query.</li>
+        <li><b>Levels with a policy.</b> ERROR means a human should look; WARN means it is degraded but handled; INFO is the record of what happened; DEBUG is off in production, and enableable per request or per tenant when you need it.</li>
+        <li><b>Sample the boring ones.</b> Log every error, and 1% of successes. You lose nothing diagnostically and cut volume by two orders of magnitude.</li>
+        <li><b>Never log secrets or personal data.</b> Redact at the logging library, not by remembering — because the one place you forget is the one that ends up in an incident report. Field-level allow-lists beat deny-lists.</li>
+        <li><b>Derive metrics from logs sparingly.</b> It works and it is expensive; a counter costs a millionth of what the equivalent log query costs. Use logs to explain, metrics to alert.</li>
+      </ul>
+
+      <h2><span class="h2n">18.6</span>Traces</h2>
+
+      <p>A trace is a tree of <b>spans</b> — each span an operation with a start, a duration, attributes and a parent. The trace id and parent span id travel in request headers (<code>traceparent</code>, per W3C) and in message metadata, which is how the tree is assembled from services that never talk to each other.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Sampling strategies</caption>
+          <thead><tr><th>Strategy</th><th>How</th><th>Trade-off</th></tr></thead>
+          <tbody>
+            <tr><td><b>Head sampling</b></td><td>Decide at the first span, propagate the decision</td><td class="yes">Cheap and simple. <span class="no">You throw away the slow and failing traces you actually wanted</span></td></tr>
+            <tr><td><b>Tail sampling</b></td><td>Buffer the whole trace, decide after it completes</td><td class="yes">Keep every error and every slow trace. <span class="no">Needs a collector holding traces in memory until complete</span></td></tr>
+            <tr><td><b>Rate-limited head</b></td><td>N traces per second per endpoint</td><td>Guarantees coverage of rare endpoints that percentage sampling would miss entirely</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Tail sampling is what you want if you can afford the collector: keep 100% of errors, 100% of anything slower than a threshold, and 0.1% of the rest. The traces you need during an incident are precisely the ones head sampling discards. Instrument HTTP and RPC boundaries, database and cache calls, queue publish and consume, and any expensive internal computation — and add attributes for tenant, route and version, since traces are where high cardinality belongs.</p>
+
+      <div class="note trap">
+        <span class="lab">Traces stop dead at a queue unless you carry the context</span>
+        <p>The natural boundary of a trace is a synchronous call. Publish a message and the trace ends; a consumer starts a new, unrelated one. Put the trace context in the message headers and link the consumer span to the producer's, and you can follow an order from the checkout button through the outbox, the broker, three consumers and back to the confirmation email. Without it you have two disconnected halves of every asynchronous flow — which is most of your interesting flows.</p>
+      </div>
+
+      <h2><span class="h2n">18.7</span>Alerting that works</h2>
+
+      <p>Two rules cover most of it.</p>
+
+      <p><b>Alert on symptoms, not causes.</b> "Error rate for checkout exceeds the SLO" is a symptom — it is always worth waking someone for, whatever caused it. "CPU above 80%" is a cause, and it is usually fine: a service can run at 90% CPU while serving perfectly. Cause-based alerts produce false pages when the cause is benign, and miss real outages caused by something you did not think to alert on. Keep cause metrics on dashboards for diagnosis, and page on user-visible symptoms.</p>
+
+      <p><b>Every page must be actionable.</b> If the recipient's only possible response is "yes, I see it too", it should not have been a page. The test: can you write a runbook with a first step? If not, it is a dashboard panel, not an alert.</p>
+
+      <h3>Burn-rate alerting</h3>
+
+      <p>The problem with "error rate above 1% for 5 minutes" is that it is simultaneously too sensitive (a 90-second blip pages you) and too insensitive (0.9% errors for three days silently destroys a month's budget). Burn-rate alerting fixes both by measuring consumption of the <b>error budget</b> from <a href="04-availability.html">Chapter 4</a>.</p>
+
+      <div class="codewrap">
+        <span class="lang">The definition</span>
+        <pre><code>burn rate = observed error rate / (1 − SLO)
+
+  SLO 99.9%  →  budget is 0.1% errors
+  observed 1% errors  →  burn rate 10×
+  At 10× you consume a 30-day budget in 3 days.
+
+The standard multi-window, multi-burn scheme:
+
+  burn ≥ 14.4× over 1h   (and 5m)   → PAGE   2% of budget gone
+  burn ≥ 6×    over 6h   (and 30m)  → PAGE   5% of budget gone
+  burn ≥ 3×    over 24h  (and 2h)   → TICKET 10% gone
+  burn ≥ 1×    over 72h  (and 6h)   → TICKET 10% gone
+
+The short second window stops an alert firing on an incident that
+has already ended; the long window stops it firing on a blip.</code></pre>
+      </div>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Burn-rate alerting</h4>
+          <p>How fast a given failure rate is detected, and how much budget is gone by then.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="a-slo">SLO</label>
+              <select id="a-slo">
+                <option value="99">99%</option>
+                <option value="99.9" selected>99.9%</option>
+                <option value="99.95">99.95%</option>
+                <option value="99.99">99.99%</option>
+              </select>
+            </div>
+            <div class="ctrl">
+              <label for="a-err">Observed error rate <b><span id="a-errv">2.00</span>%</b></label>
+              <input type="range" id="a-err" min="0.01" max="20" step="0.01" value="2">
+            </div>
+            <div class="ctrl">
+              <label for="a-window">Long window <b><span id="a-windowv">1</span> h</b></label>
+              <input type="range" id="a-window" min="0.25" max="72" step="0.25" value="1">
+            </div>
+            <div class="ctrl">
+              <label for="a-burn">Burn threshold <b><span id="a-burnv">14.4</span>×</b></label>
+              <input type="range" id="a-burn" min="1" max="30" step="0.1" value="14.4">
+            </div>
+          </div>
+          <div class="bars" id="a-bars"></div>
+          <div class="out">
+            <div class="stats" id="a-stats"></div>
+            <p id="a-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">18.8</span>The five kinds of monitoring</h2>
+
+      <div class="tw">
+        <table>
+          <caption>Coverage checklist for a design review</caption>
+          <thead><tr><th>Kind</th><th>Question</th><th>Typical signals</th></tr></thead>
+          <tbody>
+            <tr><td><b>Health</b></td><td>Is each component alive and able to work?</td><td>Liveness and readiness checks, dependency probes, instance counts</td></tr>
+            <tr><td><b>Availability</b></td><td>Can a user complete the core journey?</td><td>SLIs measured at the edge, plus synthetic checks running the journey continuously</td></tr>
+            <tr><td><b>Performance</b></td><td>Is it fast enough, and where is the time?</td><td>Latency histograms per route, saturation, traces, real-user monitoring</td></tr>
+            <tr><td><b>Security</b></td><td>Is anyone doing something they should not?</td><td>Auth failure rates, permission denials, anomalous access patterns, audit logs</td></tr>
+            <tr><td><b>Usage</b></td><td>Who uses what, how much, and what does it cost?</td><td>Per-tenant request and storage counters, feature adoption, cost per request</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Two are habitually missing. <b>Synthetic monitoring</b> — a robot performing the real user journey from outside your network every minute — catches whole classes of failure that internal metrics cannot see: an expired certificate, a broken DNS record, a CDN misconfiguration, a JavaScript bundle that fails to load. Your servers report perfect health while nobody can use the product. And <b>usage monitoring</b> is what lets you answer "which customer caused this spike" and "what does this feature cost to run", both of which turn out to be operational questions as often as commercial ones.</p>
+
+      <h2><span class="h2n">18.9</span>Dashboards</h2>
+
+      <p>Two kinds, and conflating them is why dashboards rot. A <b>service dashboard</b> is small, standard across every service, and answers "is this healthy" in five seconds:</p>
+
+      <ol class="tight">
+        <li>Request rate, split by status class.</li>
+        <li>Error rate against the SLO threshold, with the error budget remaining.</li>
+        <li>Latency p50/p95/p99, with the SLO threshold drawn on it.</li>
+        <li>Saturation: the resource nearest its limit — pool wait, queue depth, CPU, connections.</li>
+        <li>Dependencies: RED for each downstream call, from this service's point of view.</li>
+      </ol>
+
+      <p>A <b>debugging dashboard</b> is deep, specific to one subsystem, and exists to answer a question you had during an incident. Build them freely, link them from the runbook, and delete them when the subsystem changes. Attempting to make one dashboard do both jobs produces a wall of forty panels that nobody can read under pressure.</p>
+
+      <p>Practical details that matter more than they should: put the SLO threshold as a line on the graph, so "is this bad" needs no interpretation; annotate deploys on the time axis, because the answer is usually "the deploy"; and make every panel's time range linked, so shifting one shifts all.</p>
+
+      <h2><span class="h2n">18.10</span>Controlling the cost</h2>
+
+      <p>Observability routinely reaches 10–30% of infrastructure spend, and unlike most spend it grows with traffic <em>and</em> with the number of things you instrument. Four levers, roughly in order of value:</p>
+
+      <ul class="tight">
+        <li><b>Cardinality discipline.</b> The single biggest lever. Audit series counts by metric, and reject unbounded labels in code review.</li>
+        <li><b>Sampling.</b> Tail sampling for traces; 1% of successful logs; full fidelity for errors.</li>
+        <li><b>Retention tiers.</b> Full resolution for a week, downsampled for a year. Nobody queries per-second data from nine months ago.</li>
+        <li><b>Drop what nobody queries.</b> Most systems can report which metrics have never appeared in a dashboard or an alert. That list is usually long.</li>
+      </ul>
+
+      <details class="check">
+        <summary>Your service dashboard shows the average of each instance's p99 latency. Why is that dangerous, and what should it show?</summary>
+        <div class="ans">
+          <p>Percentiles do not average. If nine instances have a p99 of 50 ms and one has 3 000 ms, the mean of the ten p99s is 345 ms — a number describing no request that occurred, and one that badly understates the true fleet p99 while also failing to reveal that a single instance is broken. It fails in exactly the situation you built the panel for. Emit latency as a <b>histogram</b> with shared bucket boundaries, sum the buckets across instances at query time, and compute the quantile from the merged distribution. Then add a second panel showing p99 <em>by instance</em>, which is what makes a single sick host visible instead of averaged away.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Why alert on burn rate rather than on "error rate above 1% for five minutes"?</summary>
+        <div class="ans">
+          <p>Because a fixed threshold cannot express both urgency and significance. A 90-second spike to 5% errors crosses it and pages someone at 3 a.m. for an event that is already over and consumed 0.1% of the month's budget. Meanwhile 0.5% errors sustained for four days never crosses it and quietly burns the entire budget. Burn rate normalises the error rate by the budget, so the alert means "at this rate you will exhaust the month", and pairing a long window with a short one ensures the alert both requires a sustained problem and stops firing when it ends. The result is fewer pages, each of which corresponds to something that genuinely threatens the objective you agreed to.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>A user reports a failure. Your metrics look fine. What is the most likely explanation and what would have caught it?</summary>
+        <div class="ans">
+          <p>Most likely: the failure is in a dimension your aggregate metrics wash out — one region, one client version, one tenant, one endpoint — or it is outside your servers entirely, in DNS, TLS, the CDN, or an asset that failed to load. Aggregate error rate over millions of requests moves imperceptibly when one tenant is completely broken. What catches it: metrics with enough (bounded) dimensions to slice by region, route and version; per-tenant usage metrics so a single customer's error rate is visible; synthetic checks running the real journey from outside the network, which is the only signal that sees an expired certificate or a broken bundle; and real-user monitoring from the browser, which measures what actually happened to the user rather than what happened to your server.</p>
+        </div>
+      </details>
+
+      <div class="recap">
+        <h2>Recap</h2>
+        <ol>
+          <li><b>Monitoring answers anticipated questions; observability answers new ones.</b> The difference is how many dimensions survive aggregation.</li>
+          <li><b>Metrics to alert, traces to locate, logs to explain.</b> Use them in that order during an incident.</li>
+          <li><b>Emit histograms, not summaries.</b> Percentiles cannot be averaged across instances.</li>
+          <li><b>Cardinality is a product.</b> Never label a metric with a user, session, request or trace id — those belong in logs and traces.</li>
+          <li><b>RED for services, USE for resources, and never skip saturation</b> — it moves before utilisation looks alarming.</li>
+          <li><b>Emit dependency metrics from the caller's side.</b> Both dashboards can be right and disagree.</li>
+          <li><b>Carry the trace context through queues,</b> or every asynchronous flow is two disconnected halves.</li>
+          <li><b>Page on symptoms, not causes,</b> and only when there is a first step in a runbook.</li>
+          <li><b>Use multi-window multi-burn-rate alerts</b> so pages correspond to real threats to the SLO.</li>
+          <li><b>Add synthetic checks.</b> They catch the outages where every internal signal says everything is fine.</li>
+        </ol>
+      </div>
+
+      <nav class="pn" aria-label="Previous and next chapter"></nav>
+    </div>
+  </article>
+</div>
+
+<script src="assets/notes.js"></script>
+<script>
+function st18(k, v, tone) {
+  var d = document.createElement("div"); d.className = "stat";
+  var a = document.createElement("div"); a.className = "k"; a.textContent = k;
+  var b = document.createElement("div"); b.className = "v"; b.textContent = v;
+  if (tone) b.style.color = tone;
+  d.append(a, b); return d;
+}
+function bar18(label, pct, value, colour) {
+  var row = document.createElement("div"); row.className = "bar";
+  var k = document.createElement("span"); k.textContent = label;
+  var t = document.createElement("span"); t.className = "track";
+  var f = document.createElement("span"); f.className = "fill";
+  f.style.width = Math.max(0.5, Math.min(100, pct)) + "%";
+  if (colour) f.style.background = colour;
+  t.appendChild(f);
+  var v = document.createElement("span"); v.className = "val"; v.textContent = value;
+  row.append(k, t, v); return row;
+}
+function fmtN18(n) {
+  if (n >= 1e12) return (n / 1e12).toFixed(1) + "T";
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "k";
+  return Math.round(n).toString();
+}
+function fmtB18(b) {
+  var u = ["B", "KB", "MB", "GB", "TB", "PB"], i = 0;
+  while (b >= 1000 && i < u.length - 1) { b /= 1000; i++; }
+  return (b < 10 ? b.toFixed(1) : Math.round(b)) + " " + u[i];
+}
+
+/* ---------- cardinality ---------- */
+(function () {
+  var m = document.getElementById("c-metrics"), ep = document.getElementById("c-ep"),
+      inst = document.getElementById("c-inst"), other = document.getElementById("c-other"),
+      bad = document.getElementById("c-bad"), scrape = document.getElementById("c-scrape"),
+      bars = document.getElementById("c-bars"), stats = document.getElementById("c-stats"),
+      note = document.getElementById("c-note");
+  var BYTES_PER_SERIES = 3000;   /* index + chunk headroom, order of magnitude */
+
+  function draw() {
+    var M = +m.value, E = +ep.value, I = +inst.value, O = +other.value,
+        B = +bad.value, S = +scrape.value;
+    document.getElementById("c-metricsv").textContent = M;
+    document.getElementById("c-epv").textContent = E;
+    document.getElementById("c-instv").textContent = I;
+    document.getElementById("c-otherv").textContent = O;
+    document.getElementById("c-scrapev").textContent = S;
+
+    /* only a fraction of metrics carry the endpoint label */
+    var clean = M * 0.25 * E * O * I + M * 0.75 * O * I;
+    var withBad = clean * B;
+    var mem = withBad * BYTES_PER_SERIES;
+    var samples = withBad / S;
+
+    var worst = Math.max(withBad, clean);
+    bars.innerHTML = "";
+    bars.appendChild(bar18("Bounded labels only", Math.sqrt(clean / worst) * 100, fmtN18(clean) + " series", "var(--ok)"));
+    bars.appendChild(bar18("With the extra label", Math.sqrt(withBad / worst) * 100, fmtN18(withBad) + " series",
+      B > 1 ? "var(--line)" : "var(--ok)"));
+
+    stats.innerHTML = "";
+    stats.appendChild(st18("Active series", fmtN18(withBad), withBad > 5e6 ? "var(--line)" : withBad > 1e6 ? "#B87A17" : "var(--ok)"));
+    stats.appendChild(st18("Multiplier from that label", B > 1 ? B + "×" : "—", B > 1 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st18("Memory, order of magnitude", fmtB18(mem), mem > 6e10 ? "var(--line)" : ""));
+    stats.appendChild(st18("Samples ingested", fmtN18(samples) + "/s", samples > 1e6 ? "var(--line)" : ""));
+    stats.appendChild(st18("Series per instance", fmtN18(withBad / I)));
+
+    note.textContent = B >= 50000
+      ? "This is no longer a metrics workload. " + fmtN18(withBad) + " series needs roughly " + fmtB18(mem) + " of resident memory and will take the metrics system down before it takes your service down. A per-user dimension belongs in traces and logs, which are designed for unbounded cardinality."
+      : B > 1
+      ? "One extra label multiplied everything by " + B + "×. Note that it multiplies the whole product, not just the metrics you were thinking about — every series carrying that label is duplicated per value."
+      : withBad > 2e6
+      ? "Even with only bounded labels this is a large installation. The usual culprits are instance count and metric count rather than labels: consider dropping metrics nobody queries, and check whether every metric really needs the endpoint dimension."
+      : "Comfortable. Keep it that way by treating any label whose value set grows with traffic as a defect in code review — that is the rule that prevents every version of this problem.";
+  }
+  [m, ep, inst, other, bad, scrape].forEach(function (x) { x.addEventListener("input", draw); x.addEventListener("change", draw); });
+  draw();
+})();
+
+/* ---------- burn rate ---------- */
+(function () {
+  var slo = document.getElementById("a-slo"), err = document.getElementById("a-err"),
+      win = document.getElementById("a-window"), burn = document.getElementById("a-burn"),
+      bars = document.getElementById("a-bars"), stats = document.getElementById("a-stats"),
+      note = document.getElementById("a-note");
+
+  function draw() {
+    var S = +slo.value / 100, E = +err.value / 100, W = +win.value, B = +burn.value;
+    document.getElementById("a-errv").textContent = (+err.value).toFixed(2);
+    document.getElementById("a-windowv").textContent = W;
+    document.getElementById("a-burnv").textContent = B.toFixed(1);
+
+    var budget = 1 - S;
+    var rate = E / budget;
+    var fires = rate >= B;
+    /* the windowed average reaches the threshold after this long */
+    var detectH = fires ? W * B / rate : Infinity;
+    var budgetAtDetect = fires ? (rate * detectH) / (30 * 24) : 0;
+    var exhaustH = rate > 0 ? (30 * 24) / rate : Infinity;
+
+    var scale = Math.max(rate, B) || 1;
+    bars.innerHTML = "";
+    bars.appendChild(bar18("Actual burn rate", Math.sqrt(rate / scale) * 100, rate.toFixed(1) + "×",
+      rate > B ? "var(--line)" : "var(--ok)"));
+    bars.appendChild(bar18("Alert threshold", Math.sqrt(B / scale) * 100, B.toFixed(1) + "×", "var(--text-3)"));
+
+    stats.innerHTML = "";
+    stats.appendChild(st18("Error budget", (budget * 100).toFixed(3) + "%"));
+    stats.appendChild(st18("Burn rate", rate.toFixed(1) + "×", rate > 1 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st18("Alert fires?", fires ? "yes" : "no", fires ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st18("Time to detect", fires ? (detectH < 1 ? Math.round(detectH * 60) + " min" : detectH.toFixed(1) + " h") : "never at this rate",
+      fires && detectH > 6 ? "var(--line)" : ""));
+    stats.appendChild(st18("Budget gone by then", fires ? (budgetAtDetect * 100).toFixed(1) + "%" : "—",
+      budgetAtDetect > 0.1 ? "var(--line)" : ""));
+    stats.appendChild(st18("Budget exhausted in", exhaustH > 720 ? "not this month" : exhaustH < 24 ? exhaustH.toFixed(1) + " h" : (exhaustH / 24).toFixed(1) + " d",
+      exhaustH < 72 ? "var(--line)" : ""));
+
+    note.textContent = !fires && rate > 1
+      ? "Burning budget faster than sustainable (" + rate.toFixed(1) + "×) but below this threshold, so this alert stays silent — the whole month's budget goes in " + (exhaustH / 24).toFixed(1) + " days. This is exactly the slow burn that a single fast-burn alert misses, and why the scheme uses several windows: a 3× over 24h ticket would catch it."
+      : fires && detectH < 0.25
+      ? "Detected in " + Math.round(detectH * 60) + " minutes with " + (budgetAtDetect * 100).toFixed(1) + "% of the budget spent. Fast detection is what the 1-hour, 14.4× page is for: it fires only when the incident is severe enough to matter within hours."
+      : fires
+      ? "Fires after " + detectH.toFixed(1) + " hours, by which point " + (budgetAtDetect * 100).toFixed(1) + "% of the month's budget is gone. Longer windows mean slower detection but far fewer false pages — which is why you run several pairs rather than picking one."
+      : "Within budget. At this error rate the SLO is not under threat, and paging someone would be a false positive — which is precisely the outcome a fixed error-rate threshold fails to deliver.";
+  }
+  [slo, err, win, burn].forEach(function (x) { x.addEventListener("input", draw); x.addEventListener("change", draw); });
+  draw();
+})();
+</script>
+</body>
+</html>

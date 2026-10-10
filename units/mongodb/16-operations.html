@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Operating it — MongoDB</title>
+<meta name="description" content="Backups and point-in-time restore, upgrades, the metrics worth watching, and a diagnostic playbook.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 16 · At scale</div>
+    <h1>Operating it</h1>
+    <p class="standfirst">Backups you have restored, upgrades that do not surprise you, a dozen metrics that predict trouble, and a playbook for the moment something is wrong. The same shape as the PostgreSQL unit's operational chapters, because the questions are the same even where the answers differ.</p>
+    <div class="chap-meta">
+      <span class="tagpill">backups</span>
+      <span class="tagpill">upgrades</span>
+      <span class="tagpill">metrics</span>
+      <span class="tagpill">playbook</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Backups</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Method</th><th>Point in time</th><th>Restore speed</th><th>Good for</th></tr></thead>
+<tbody>
+<tr><td><code>mongodump</code></td><td>No</td><td>Slow — reinserts and rebuilds indexes</td><td>Small databases, single collections, moving data</td></tr>
+<tr><td><b>Filesystem snapshot</b></td><td>No, but crash-consistent</td><td>Fast</td><td><b>The default for self-managed</b></td></tr>
+<tr><td><b>Snapshot + oplog</b></td><td><b>Yes</b></td><td>Fast, plus replay</td><td>Production disaster recovery</td></tr>
+<tr><td><b>Ops Manager / Cloud Manager</b></td><td>Yes</td><td>Fast</td><td>Enterprise, continuous backup</td></tr>
+<tr><td><b>Atlas backup</b></td><td>Yes</td><td>Fast</td><td>Managed. Check the retention you are paying for</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">and the details that decide whether they work</span><button class="copy">Copy</button></div>
+<pre><code># mongodump — fine below ~100 GB, painful above it
+mongodump --uri="mongodb://…/?replicaSet=rs0" \
+  --readPreference=secondary \
+  --oplog \
+  --gzip --archive=/backup/shop-$(date +%F).gz
+
+#   --oplog captures operations occurring DURING the dump, so the restore is
+#   consistent. Without it, a dump of a live database is a smear across time:
+#   collection A as of 02:00, collection B as of 02:40, and any change
+#   between them may be half-captured.
+mongorestore --oplogReplay --gzip --archive=/backup/shop-2026-03-14.gz
+
+# FILESYSTEM SNAPSHOT — the usual answer for anything large.
+#   * take it on a HIDDEN secondary, so the primary is untouched
+#   * journal and data files MUST be in the same snapshot. If pg_wal's
+#     equivalent — the journal directory — is on a separate volume snapshotted
+#     a moment later, the result may be unrecoverable
+#   * db.fsyncLock() flushes and blocks writes on that member if your
+#     platform cannot snapshot atomically; db.fsyncUnlock() afterwards
+
+# POINT IN TIME = snapshot + the oplog since. Restore the snapshot, then
+# replay oplog entries up to the moment before the mistake. This is the only
+# thing that undoes a bad deploy, and it depends entirely on the oplog window
+# (chapter 10) covering the gap between snapshots.
+
+# SHARDED CLUSTERS need coordination: snapshots of every shard plus the
+# config servers, at a consistent cluster time, with the balancer stopped.
+# Do not assemble this yourself — use Ops Manager, Atlas, or a tool built
+# for it. A naive per-shard backup restores to an inconsistent cluster.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">A replica set is not a backup</span>
+  <p>It replicates the <code>deleteMany</code> with the wrong filter within a second, faithfully, to every member. It protects against a machine failing and nothing else. This needs saying because MongoDB's replication is good enough that teams treat three members as their durability story and discover otherwise during an incident. Keep real backups, keep a <b>delayed hidden member</b> for the fast recovery from human error (chapter 10), and — the part that actually matters — <b>restore from a backup on a schedule and time it</b>. The restore duration is your real recovery objective, whatever the runbook claims, and it grows with the database.</p>
+</div>
+
+<h2><span class="h-rule"></span>Upgrades</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">rolling, one minor version at a time</span><button class="copy">Copy</button></div>
+<pre><code># MongoDB upgrades are rolling and generally undramatic, with one concept
+# you must understand: the FEATURE COMPATIBILITY VERSION.
+
+db.adminCommand({ getParameter: 1, featureCompatibilityVersion: 1 });
+
+# The FCV gates features that change the on-disk or wire format. After
+# upgrading binaries to 7.0, the cluster still behaves as 6.0 until you
+# raise the FCV — and while the FCV is still 6.0, you can DOWNGRADE the
+# binaries safely. Once raised, you cannot.
+#
+# That is the whole safety mechanism: upgrade binaries, run for a week,
+# then commit.
+
+# The procedure, for a replica set:
+#   1. check the release notes for your version jump
+#   2. upgrade each SECONDARY: stop, replace binaries, start, wait for
+#      SECONDARY state and zero lag
+#   3. rs.stepDown() on the primary — a clean handover
+#   4. upgrade the former primary
+#   5. run for a week on the new binaries at the OLD FCV
+#   6. db.adminCommand({ setFeatureCompatibilityVersion: "7.0" })
+
+# ONE MAJOR VERSION AT A TIME. 5.0 -> 7.0 is not supported directly; you go
+# through 6.0, raising the FCV at each step. Skipping is the commonest
+# upgrade planning error, and it doubles the timeline people budgeted.
+
+# Sharded clusters: config servers first, then shards, then mongos. Stop the
+# balancer for the duration.
+
+# Also check: driver compatibility. An old driver against a new server
+# usually works; the reverse frequently does not.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>The dashboard</h2>
+
+<div class="demo" id="ops">
+  <div class="demo-head">
+    <b>What to watch</b>
+    <span>Twelve metrics that between them predict nearly every incident in this unit.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="m-metric">Metric</label>
+        <select id="m-metric">
+          <option value="cache" selected>WiredTiger cache pressure</option>
+          <option value="lag">Replication lag</option>
+          <option value="oplog">Oplog window</option>
+          <option value="conn">Connections</option>
+          <option value="queue">Queued readers and writers</option>
+          <option value="scanned">Scanned-to-returned ratio</option>
+          <option value="slow">Slow query rate</option>
+          <option value="elections">Elections</option>
+          <option value="txn">Transaction aborts</option>
+          <option value="disk">Disk usage</option>
+          <option value="shard">Shard distribution skew</option>
+          <option value="backup">Backup and restore-test age</option>
+        </select>
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="m-alert">—</b><span>alert when</span></div>
+      <div><b id="m-sev">—</b><span>severity</span></div>
+      <div><b id="m-ch">—</b><span>covered in</span></div>
+    </div>
+    <div id="m-cmd"></div>
+    <div class="out" id="m-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>The first five minutes</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">four commands, before forming a theory</span><button class="copy">Copy</button></div>
+<pre><code>// 1. What is running, longest first.
+db.currentOp({ active: true, secs_running: { $gte: 3 } });
+//   read: ns, op, secs_running, planSummary, waitingForLock
+//   planSummary: COLLSCAN on a large collection is frequently the answer
+
+// 2. Is the cluster healthy, and is anything lagging?
+rs.status();
+rs.printSecondaryReplicationInfo();
+
+// 3. Connections and queueing.
+db.serverStatus().connections;      // current, available
+db.serverStatus().globalLock.currentQueue;   // readers, writers waiting
+
+// 4. Cache and disk.
+db.serverStatus().wiredTiger.cache;
+db.stats();                          // dataSize, storageSize, indexSize
+
+// Keep these in a file. Reconstructing them during an incident is not a
+// skill worth developing, and mongosh history is not a runbook.
+
+db.killOp(opid);      // stop one operation. Read the query first
+</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Ask whether it is the database at all</span>
+  <p>Two things make MongoDB look guilty when it is not. <b>The connection pool</b> — if it is exhausted, every request queues and the symptom is total unavailability while the server sits nearly idle; the classic cause is a <code>MongoClient</code> created per request rather than per process (chapter 9). <b>The application's own work</b> — an N+1 pattern issuing two hundred queries per page is two hundred round trips of network latency, and no index makes that faster. Both present as "the database is slow", both are visible in <code>db.serverStatus().connections</code> and your application traces, and neither is improved by touching the database.</p>
+</div>
+
+<h2><span class="h-rule"></span>The playbook</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Symptom</th><th>Check first</th><th>Usual cause</th></tr></thead>
+<tbody>
+<tr><td>Everything slow at once</td><td><code>currentOp</code>, cache stats</td><td>A collection scan evicting the working set (chapter 9)</td></tr>
+<tr><td>One query slow, nothing changed</td><td><code>explain</code>, plan cache</td><td>A cached plan suiting a different value (chapter 8)</td></tr>
+<tr><td>Cannot connect</td><td><code>connections</code>, client config</td><td>Pool exhausted, or a client per request</td></tr>
+<tr><td>Writes slow, reads fine</td><td><code>globalLock.currentQueue.writers</code></td><td>Cache dirty pressure, or a hot document</td></tr>
+<tr><td>Gradual degradation</td><td><code>$bsonSize</code> trend</td><td>Growing documents (chapter 9)</td></tr>
+<tr><td>A secondary stuck RECOVERING</td><td><code>rs.printReplicationInfo()</code></td><td>Fell outside the oplog window — needs a resync</td></tr>
+<tr><td>Frequent elections</td><td><code>electionMetrics</code>, network</td><td>An overloaded primary, or an unstable network</td></tr>
+<tr><td>Transactions failing</td><td><code>serverStatus().transactions</code></td><td>Write conflicts on a hot document (chapter 12)</td></tr>
+<tr><td>Disk filling</td><td><code>db.stats()</code>, oplog size</td><td>Deletes do not reclaim space; or an oversized oplog</td></tr>
+<tr><td>One shard hot</td><td><code>getShardDistribution()</code></td><td>A monotonic or skewed shard key (chapter 13)</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2><span class="h-rule"></span>Reclaiming space</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">deletes do not shrink anything</span><button class="copy">Copy</button></div>
+<pre><code>// WiredTiger marks freed space reusable within its files. A collection that
+// held 500 GB and now holds 50 still occupies 500 on disk.
+
+db.orders.stats().wiredTiger["block-manager"]["file bytes available for reuse"];
+
+// Options, in increasing disruption:
+//   1. Do nothing. The space is reused by new data. Usually correct
+//   2. compact — reclaims to the filesystem. Blocks operations on that
+//      collection for the duration. Run on secondaries, then step down and
+//      do the former primary
+db.runCommand({ compact: "orders" });
+
+//   3. RESYNC A SECONDARY — remove its data directory and let it do an
+//      initial sync. The rebuilt files are compact, and the member is out
+//      of the set while it happens. Rolling this around the members is the
+//      standard way to reclaim space with no downtime
+
+// PREVENTION is better in every case: TTL indexes for retention (chapter 7),
+// or bucketing plus dropping whole collections (chapter 3). Dropping a
+// collection returns its space immediately, where deleting its documents
+// does not.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>What to record before you need it</h2>
+
+<ul class="check">
+  <li><b>The twelve dashboard metrics</b> as a time series, with at least a year of history.</li>
+  <li><b>The slow query log</b>, aggregated by shape and sorted by total time — not average.</li>
+  <li><b><code>explain</code> output for your critical queries</b>, captured before every upgrade and major deploy.</li>
+  <li><b>Collection and index sizes weekly</b>, so growth is a trend rather than a surprise.</li>
+  <li><b>Document size and array length distributions</b>, which degrade silently before latency does.</li>
+  <li><b>Configuration in version control</b>, so "what changed" has an answer.</li>
+  <li><b>Restore test duration</b>, trended.</li>
+  <li><b>The oplog window</b>, because it shrinks as write volume grows and nothing announces it.</li>
+</ul>
+
+<div class="note tip">
+  <span class="note-t">The question you will be asked is "when did this start"</span>
+  <p>Nearly every serious investigation reduces to it, and answering requires history you were recording before anyone knew there was a problem. All of the above is cheap on a quiet afternoon and impossible to obtain retroactively. If you do one thing: aggregate the slow query log into a table on a schedule, keyed by query shape. With it, "which query changed behaviour on Tuesday" is one query against your own data; without it, it is a deploy log and guesswork.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Snapshot plus oplog is the production backup.</b> <code>mongodump</code> is for small databases and moving data.</li>
+    <li><b><code>mongodump --oplog</code></b>, or a dump of a live database is a smear across time.</li>
+    <li><b>A replica set is not a backup.</b> It replicates your mistakes within a second.</li>
+    <li><b>The FCV is the upgrade safety mechanism</b> — upgrade binaries, run a week, then commit. One major version at a time.</li>
+    <li><b>Sharded backups need coordination.</b> A naive per-shard snapshot restores to an inconsistent cluster.</li>
+    <li><b>Deletes do not reclaim disk.</b> Resync a secondary, or prevent it with TTL and collection drops.</li>
+    <li><b>Check the pool and the application first</b> — both look exactly like a slow database.</li>
+    <li><b>Record history before you need it.</b> "When did this start" is the question, and it cannot be answered retroactively.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("16-operations.html");
+
+(function(){
+  const root = document.getElementById("ops");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const M = {
+    cache: {alert:"eviction rising under steady load", sev:"page", ch:"chapter 9",
+      cmd:'const c = db.serverStatus().wiredTiger.cache;\nc["bytes currently in the cache"];\nc["maximum bytes configured"];\nc["tracked dirty bytes in the cache"];\nc["pages read into cache"];        // cumulative misses\nc["unmodified pages evicted"];     // pressure',
+      note:"The single most predictive MongoDB metric. When the working set exceeds the cache, reads stop being memory reads and become disk seeks — and the transition is a cliff rather than a slope, because one miss costs more than a thousand hits.\n\nWatch \"pages read into cache\" as a RATE. Rising under steady load means the working set has outgrown memory. Dirty bytes approaching 20% of the cache means writes are outpacing eviction, and that shows up as write stalls.\n\nThe fix is usually to shrink the working set rather than add RAM: project less, cover the hot query, archive cold data, drop unused indexes."},
+    lag: {alert:"above a few seconds sustained", sev:"page", ch:"chapters 10, 11",
+      cmd:'rs.printSecondaryReplicationInfo();\n\nrs.status().members.forEach(m =>\n  print(m.name, m.stateStr, m.optimeDate));',
+      note:"Lag matters for three separate reasons and it is worth being clear which one you care about.\n\nStale reads, if you route any reads to secondaries. A data-loss window, since w: \"majority\" needs a majority to be current. And narrowed failover options, because a lagging member cannot win an election — candidates must be at least as fresh as every voter.\n\nSustained lag under normal load usually means the secondary's storage is slower than the primary's. A spike usually means a long-running query on the secondary competing with replay."},
+    oplog: {alert:"below 24 hours", sev:"page", ch:"chapters 10, 14",
+      cmd:'rs.printReplicationInfo();\n//   "oplog first event time" .. "last event time"\n//   the difference IS the window\n\ndb.getSiblingDB("local").oplog.rs.stats().maxSize;\n\n// Resize without a restart:\ndb.adminCommand({ replSetResizeOplog: 1, size: 51200 });',
+      note:"The most under-monitored number in a MongoDB deployment, and it bounds three separate things: how long a secondary can be offline before needing a full resync, how long a change stream consumer can be down before losing history, and how far back point-in-time recovery can reach between snapshots.\n\nIt shrinks silently. The oplog is a fixed size, so as write volume grows the window covering it gets shorter — and nothing announces that, so the failure arrives one day with no configuration having changed.\n\nIt is a capped collection, so enlarging it costs disk and nothing else, and can be done without a restart. Size it for the longest outage you can imagine, not the average."},
+    conn: {alert:"above 80% of the limit", sev:"page", ch:"chapter 9",
+      cmd:'db.serverStatus().connections;\n//   current, available, totalCreated\n\n// totalCreated climbing fast relative to current means\n// connections are being churned rather than pooled —\n// usually a MongoClient created per request.',
+      note:"Pool exhaustion presents as total unavailability while the server is nearly idle, which is the most misleading failure mode in this chapter — every dashboard says the database is fine and every request is failing.\n\nRead totalCreated alongside current. If it is climbing rapidly, connections are being created and discarded rather than pooled, and the cause is almost always a MongoClient constructed per request instead of once per process. That is the classic serverless and framework mistake.\n\nOn Atlas and most managed deployments, connections are capped by tier, and exceeding the cap produces errors that look exactly like the database being down."},
+    queue: {alert:"any sustained queue", sev:"page", ch:"chapter 9",
+      cmd:'db.serverStatus().globalLock.currentQueue;\n//   { total, readers, writers }\n\ndb.serverStatus().globalLock.activeClients;',
+      note:"A sustained queue means operations are waiting rather than executing, and which side is queueing tells you where to look.\n\nQueued WRITERS usually means cache dirty pressure — writes arriving faster than WiredTiger can evict — or contention on a single hot document, since concurrency is per document.\n\nQueued READERS usually means the working set does not fit and reads are waiting on storage.\n\nBrief spikes during a checkpoint are normal. A queue that never drains is not."},
+    scanned: {alert:"ratio above ~10 on hot collections", sev:"ticket", ch:"chapter 8",
+      cmd:'const m = db.serverStatus().metrics;\nm.queryExecutor.scanned;         // index keys\nm.queryExecutor.scannedObjects;  // documents\nm.document.returned;\n\n// scannedObjects / returned is the cluster-wide\n// version of chapter 8\'s docs-to-returned ratio.',
+      note:"The cluster-wide version of the ratio from chapter 8. Documents examined divided by documents returned tells you how much work is being wasted reading rows that get discarded.\n\nA ratio near 1 means indexes are doing their job. A ratio in the hundreds means something is scanning — and because it is aggregated, it catches queries you did not know existed, including ones added by a deploy nobody flagged.\n\nUse it as the trigger to go looking, then use the slow query log and explain to find which query is responsible."},
+    slow: {alert:"a step change after a deploy", sev:"ticket", ch:"chapters 8, 9",
+      cmd:'db.setProfilingLevel(1, { slowms: 100 });\n\ndb.system.profile.aggregate([\n  { $group: { _id: "$command.filter",\n              n: { $sum: 1 },\n              total: { $sum: "$millis" } } },\n  { $sort: { total: -1 } }, { $limit: 20 }\n]);',
+      note:"Sort by TOTAL time, not average — the same argument as pg_stat_statements in the PostgreSQL unit. A 40ms query running ten thousand times a minute matters far more than a four-second one running hourly, and sorting by average hides exactly that.\n\nThe profiler writes to a capped collection in the same database, so it costs write throughput. Level 1 with a sensible threshold is the right setting; level 2 logs everything and is for a short diagnostic window only.\n\nSnapshot the aggregation on a schedule. Cumulative totals cannot answer \"what changed on Tuesday\" — a time series can."},
+    elections: {alert:"more than one unplanned per month", sev:"ticket", ch:"chapter 10",
+      cmd:'db.serverStatus().electionMetrics;\n//   numStepDownsCausedByHigherTerm\n//   electionTimeout, priorityTakeover, ...\n\nrs.status().members.forEach(m =>\n  print(m.name, m.electionTime, m.stateStr));',
+      note:"Each election is a brief write outage — typically ten to twelve seconds, dominated by the detection timeout rather than the vote.\n\nFrequent unplanned elections mean the primary is repeatedly failing to heartbeat in time. The usual causes are an overloaded primary that cannot respond promptly, or an unstable network between members.\n\nThe tempting fix is raising electionTimeoutMillis so the blips stop triggering elections. That treats the symptom and lengthens genuine failovers. Find out why heartbeats are being missed first."},
+    txn: {alert:"abort ratio above ~5%", sev:"ticket", ch:"chapter 12",
+      cmd:'db.serverStatus().transactions;\n//   totalStarted, totalCommitted, totalAborted\n\ndb.serverStatus().metrics.operation.writeConflicts;',
+      note:"MongoDB transactions are optimistic: conflicting transactions abort and retry rather than queueing. A high abort ratio is contention, not errors.\n\nThe pathological shape is every transaction touching one hot document — a global counter, a shared status record. Under load the retries themselves collide and throughput collapses quadratically.\n\nThe fix is rarely tuning. Move the contended change out of the transaction and make it a single-document atomic $inc, which never conflicts, or shard the hot document across several and sum on read."},
+    disk: {alert:"above 80%", sev:"page", ch:"this chapter",
+      cmd:'db.stats();          // dataSize, storageSize, indexSize\ndb.orders.stats().wiredTiger["block-manager"]\n  ["file bytes available for reuse"];\n\n// Per collection, largest first:\ndb.getCollectionNames().map(n =>\n  ({ n, size: db[n].stats().storageSize }))\n  .sort((a,b) => b.size - a.size).slice(0, 10);',
+      note:"Compare dataSize against storageSize. A large gap means space freed by deletes that WiredTiger has marked reusable but not returned to the filesystem — which is fine if new data will use it, and a problem if the collection is shrinking permanently.\n\nAlso check the oplog: it is a fixed size and can be a surprisingly large fraction of a small deployment's disk.\n\nReclaiming means compact, which blocks operations on that collection, or resyncing secondaries in rotation, which does not. Prevention through TTL indexes and dropping bucketed collections is better than either."},
+    shard: {alert:"any shard well above the average", sev:"ticket", ch:"chapter 13",
+      cmd:'db.orders.getShardDistribution();\n//   per shard: docs, data size, average object size\n\nsh.status();\ndb.adminCommand({ balancerStatus: 1 });',
+      note:"A shard holding substantially more than its share means the shard key is not distributing, and the balancer cannot fix it if the cause is structural — low cardinality, a dominant value, or a monotonic key sending every insert to one place.\n\nCheck write distribution separately from data distribution. A monotonic key can look perfectly balanced in stored data while 100% of new writes go to one shard, because the balancer keeps redistributing after the fact.\n\nThe fix is resharding, which is a heavy operation. That is why chapter 13 spends so long on getting the key right the first time."},
+    backup: {alert:"backup > 1 day, restore test > 1 month", sev:"page", ch:"this chapter",
+      cmd:'// No single command — this comes from your backup\n// tooling. What matters is the two ages:\n//   time since the last successful backup\n//   time since a restore was actually TESTED\n//\n// And the duration of that restore, trended.',
+      note:"The second age is the one nobody has a metric for, and it is the one that decides whether the first mattered.\n\nA backup nobody has restored is a hope. The restore DURATION is your real recovery time objective, whatever the runbook says, and it grows with the database — so a four-hour restore quietly becomes eleven hours and you find out during the incident.\n\nAutomate a weekly restore into a scratch environment, verify document counts against known figures, and record the elapsed time as a metric. That single job converts the most consequential unknown in your operations into a number on a graph."}
+  };
+
+  function render(){
+    const m = M[$("m-metric").value];
+    $("m-alert").textContent = m.alert;
+    $("m-sev").textContent   = m.sev;
+    $("m-ch").textContent    = m.ch;
+
+    const col = m.sev === "page" ? "#E2574C" : "#F2A03D";
+    $("m-cmd").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid ' + col +
+      ';border-radius:5px;padding:11px 13px;margin:14px 0 12px;font-family:var(--mono);' +
+      'font-size:12px;line-height:1.6;overflow-x:auto">' +
+      m.cmd.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>';
+
+    $("m-note").textContent = m.note +
+      "\n\nRecord this as a time series rather than checking it. Most values here are cumulative counters or point-in-time readings, and the useful signal is the rate of change — which only exists if you were collecting before the problem started.";
+  }
+
+  $("m-metric").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

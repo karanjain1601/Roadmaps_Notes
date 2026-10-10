@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · The network beneath — Backend Notes</title>
+<meta name="description" content="DNS resolution step by step, what TCP guarantees and what it costs, and the TLS handshake including the certificate chain trap.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%233FB984' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/notes.css">
+<style>
+  .dnsq{display:grid;gap:5px;margin:4px 0 12px}
+  .dq{display:grid;grid-template-columns:22px 1fr auto;gap:11px;align-items:center;padding:8px 12px;
+    border:1px solid var(--rule-2);border-radius:4px;background:var(--paper);
+    font-family:var(--mono);font-size:12.2px;opacity:.35;transition:opacity .2s}
+  .dq.shown{opacity:1}
+  .dq.hit{border-color:var(--ok);background:var(--ok-soft)}
+  .dq.miss{border-color:var(--line)}
+  .dq .st5{font-family:var(--sans);font-size:10.5px;font-weight:700;white-space:nowrap;
+    padding:1px 7px;border-radius:3px}
+  .dq.hit .st5{color:var(--ok);background:var(--card);border:1px solid var(--ok-edge)}
+  .dq.miss .st5{color:var(--line);background:var(--card);border:1px solid var(--line-edge)}
+</style>
+</head>
+<body>
+<div class="readbar"></div>
+
+<header class="top">
+  <div class="top-inner">
+    <a class="home" href="../../index.html"><span class="mark"></span>All roadmaps</a>
+    <span class="top-sep">/</span>
+    <a class="home" href="index.html" style="color:var(--band-text)">Backend</a>
+    <span class="top-spacer"></span>
+    <button class="rail-toggle" aria-expanded="false">Contents</button>
+    <nav class="top-nav" aria-label="Chapter navigation"></nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail" id="rail" aria-label="Chapter and section navigation"></aside>
+
+  <article>
+    <p class="crumb">Part 1 · Foundations &nbsp;·&nbsp; <b>Chapter 02</b></p>
+    <h1>The network beneath</h1>
+    <p class="standfirst">Before your application sees a single byte, three protocols have already run: a name was resolved, a connection was established, and a session was encrypted. On a cold connection that accounts for more time than everything your code does, and every one of the three has a failure mode that produces a confusing production incident. This chapter is what each does, what it costs, and which parts you control.</p>
+    <div class="meta">
+      <span>~30 min read</span>
+      <span>DNS · TCP · TLS</span>
+      <span>2 interactive panels</span>
+      <span>Prerequisite: chapter 1</span>
+    </div>
+
+    <div class="body">
+
+      <h2><span class="h2n">2.1</span>Why a backend engineer needs this</h2>
+
+      <p>Three practical reasons, and none of them is completeness.</p>
+
+      <ol>
+        <li><b>It is where cold-start latency lives.</b> DNS, TCP and TLS cost three round trips before your request moves. At 90 ms that is 270 ms of nothing happening, which is more than most requests spend doing work.</li>
+        <li><b>The failure modes are distinctive and confusing.</b> "It works from my laptop but not from the server", "it works in the browser but curl fails", "it broke for some users four hours after we changed something" — each has a specific cause in this chapter.</li>
+        <li><b>Several of your levers live here.</b> TTL values, keep-alive settings, connection pool behaviour, whether you get session resumption — all decided by how these protocols are configured.</li>
+      </ol>
+
+      <h2><span class="h2n">2.2</span>DNS</h2>
+
+      <p>DNS turns <code>api.shop.com</code> into an IP address. It is a distributed hierarchy with aggressive caching at every level, and the caching is both what makes it fast and what makes its failures strange.</p>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Resolving a name, step by step</h4>
+          <p>The resolver asks in sequence, and any cache along the way short-circuits the rest.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="d-state">Cache state</label>
+              <select id="d-state">
+                <option value="cold" selected>Nothing cached — first ever lookup</option>
+                <option value="tld">The resolver knows .com's nameservers</option>
+                <option value="ns">The resolver knows shop.com's nameservers</option>
+                <option value="full">The full answer is cached at the resolver</option>
+                <option value="os">Cached in the operating system</option>
+                <option value="neg">The name does not exist, and that is cached too</option>
+              </select>
+            </div>
+            <div class="ctrl">
+              <label for="d-rtt">Round trip to each nameserver <b><span id="d-rttv">18</span> ms</b></label>
+              <input type="range" id="d-rtt" min="1" max="120" step="1" value="18">
+            </div>
+            <div class="ctrl">
+              <label for="d-ttl">Record TTL <b><span id="d-ttlv">300</span> s</b></label>
+              <input type="range" id="d-ttl" min="30" max="86400" step="30" value="300">
+            </div>
+            <div class="ctrl">
+              <label for="d-qps">Lookups per second across your users <b><span id="d-qpsv">40</span></b></label>
+              <input type="range" id="d-qps" min="1" max="5000" step="1" value="40">
+            </div>
+          </div>
+          <div class="dnsq" id="d-steps"></div>
+          <div class="out">
+            <div class="stats" id="d-stats"></div>
+            <p id="d-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h3>Record types you will actually meet</h3>
+
+      <div class="tw">
+        <table>
+          <caption>The eight that matter</caption>
+          <thead><tr><th>Type</th><th>Maps to</th><th>Note</th></tr></thead>
+          <tbody>
+            <tr><td><b>A</b></td><td>An IPv4 address</td><td>Several may be returned; clients generally try them in order</td></tr>
+            <tr><td><b>AAAA</b></td><td>An IPv6 address</td><td>Clients race A and AAAA — "happy eyeballs" — and use whichever answers first</td></tr>
+            <tr><td><b>CNAME</b></td><td>Another name</td><td><b>Cannot coexist with any other record on the same name</b>, which is the apex problem below</td></tr>
+            <tr><td><b>MX</b></td><td>Mail servers, with priorities</td><td>Must point at a name, never at an IP</td></tr>
+            <tr><td><b>TXT</b></td><td>Arbitrary text</td><td>SPF, DKIM, DMARC and domain-ownership proofs all live here</td></tr>
+            <tr><td><b>NS</b></td><td>The nameservers authoritative for a zone</td><td>What delegation is made of</td></tr>
+            <tr><td><b>SOA</b></td><td>Zone metadata, including the negative-caching TTL</td><td>Controls how long "does not exist" is remembered</td></tr>
+            <tr><td><b>CAA</b></td><td>Which authorities may issue certificates for this name</td><td>Cheap, and it prevents a class of mis-issuance</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <span class="lab">CNAME at the apex</span>
+        <p>You cannot put a CNAME on <code>shop.com</code> itself, because the apex must carry SOA and NS records and a CNAME excludes all others. So the standard pattern — pointing at a load balancer's hostname — does not work at the root domain. Every DNS provider offers a proprietary workaround (ALIAS, ANAME, CNAME flattening) that resolves the target and serves an A record. It works, and it means your apex is <b>only as fast and as correct as your provider's resolution of that target</b>, which is worth knowing when the apex behaves differently from <code>www</code>.</p>
+      </div>
+
+      <h3>TTL is the only control you have, and it is a commitment</h3>
+
+      <p>Once a resolver has cached an answer, you cannot recall it. Not by deleting the record, not by contacting anyone — the answer is out there until it expires. That makes TTL a pre-commitment to how long a mistake or a failover will take, decided before you need it.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Choosing a TTL</caption>
+          <thead><tr><th>TTL</th><th>Failover takes</th><th>Query load</th><th>Use for</th></tr></thead>
+          <tbody>
+            <tr><td class="num">30–60 s</td><td class="yes">Under a minute</td><td class="no">High, and you pay per query on most providers</td><td>Anything you may need to move quickly; during a planned migration</td></tr>
+            <tr><td class="num">300 s</td><td>Up to 5 minutes</td><td>Moderate</td><td>The sensible default for a service endpoint</td></tr>
+            <tr><td class="num">3600 s</td><td class="no">Up to an hour</td><td class="yes">Low</td><td>Stable records: MX, TXT, things that do not move</td></tr>
+            <tr><td class="num">86400 s</td><td class="no">Up to a day</td><td class="yes">Very low</td><td>NS records, and nothing you will regret</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The operational rule that follows: <b>lower the TTL before you make a change, not during it.</b> Drop it to 60 seconds at least one old-TTL period ahead, make the change, confirm, then raise it again. Lowering it at the moment you need to fail over does nothing, because the old high TTL is already cached.</p>
+
+      <h3>The failure modes</h3>
+
+      <ul class="tight">
+        <li><b>Negative caching.</b> A NXDOMAIN answer is cached too, for the duration in the SOA record. Create a record after someone has already looked it up and they will keep getting "does not exist" until that expires — a very common "it works for me" report.</li>
+        <li><b>Stale answers after a change.</b> Some resolvers ignore short TTLs and impose a floor. You cannot control this, which is why DNS-based failover is never instant.</li>
+        <li><b>Resolution inside containers.</b> A container's resolver, its search domains and its ndots setting can turn one lookup into five failed ones. A surprising number of "the network is slow" reports in Kubernetes are this.</li>
+        <li><b>Connection-level caching in your own application.</b> Many runtimes cache DNS for the life of the process, so a database failover that changes an IP is not picked up until you restart. Check your runtime's policy — the JVM's default was famously infinite.</li>
+      </ul>
+
+      <h2><span class="h2n">2.3</span>TCP</h2>
+
+      <p>TCP gives you an ordered, reliable, error-checked byte stream between two endpoints. Everything it provides costs something, and the costs are visible in your latency numbers.</p>
+
+      <div class="codewrap">
+        <span class="lang">What you get, and what each guarantee costs</span>
+        <pre><code>ORDERED       bytes arrive in the order sent
+              cost: a packet lost at position 5 blocks 6, 7, 8
+                    even though they arrived — head-of-line blocking
+
+RELIABLE      lost packets are retransmitted
+              cost: detecting loss takes at least one round trip,
+                    and often a timeout
+
+CONNECTION-   both ends agree the conversation exists
+ORIENTED      cost: a three-way handshake before any data,
+                    and state held on both ends afterwards
+
+FLOW-         the sender does not overwhelm the receiver
+CONTROLLED    cost: the receive window bounds throughput —
+                    on a high-latency link this is the limit
+
+CONGESTION-   the sender does not overwhelm the network
+CONTROLLED    cost: SLOW START. A new connection begins with a
+                    small window and grows over several round
+                    trips, so early transfers are throttled</code></pre>
+      </div>
+
+      <p>Slow start is the one that surprises people. A brand-new TCP connection cannot use the available bandwidth immediately — it starts with a congestion window of about ten packets, roughly 14 KB, and doubles each round trip until it hits loss. A 200 KB response on a fresh connection therefore takes several round trips to deliver regardless of how fast the link is. Reusing a warmed connection avoids this entirely, which is a second, less obvious reason keep-alive matters.</p>
+
+      <h3>Connection reuse</h3>
+
+      <p>The single largest lever in this chapter. A handshake per request is three round trips of pure overhead plus a cold congestion window; a reused connection is zero. Concretely:</p>
+
+      <div class="tw">
+        <table>
+          <caption>Where reuse comes from</caption>
+          <thead><tr><th>Between</th><th>Mechanism</th><th>Watch for</th></tr></thead>
+          <tbody>
+            <tr><td>Browser and your edge</td><td>HTTP keep-alive, on by default in HTTP/1.1 and inherent in /2 and /3</td><td>Proxies with a short idle timeout closing connections the client thinks are open</td></tr>
+            <tr><td>Your app and another service</td><td>An HTTP client with a connection pool — and most default to no pooling or a tiny one</td><td>Creating a new client per request, which silently disables all of it</td></tr>
+            <tr><td>Your app and the database</td><td>A connection pool, always</td><td>Pool size, and what happens when it is empty — <a href="04-servers-and-concurrency.html">Chapter 4</a></td></tr>
+            <tr><td>Your app and Redis</td><td>A pool, or one multiplexed connection</td><td>Blocking commands holding a shared connection</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>What a connection costs, and what reuse saves</h4>
+          <p>Handshake overhead against the request itself, at your latency.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="c-rtt">Round-trip time <b><span id="c-rttv">25</span> ms</b></label>
+              <input type="range" id="c-rtt" min="1" max="200" step="1" value="25">
+            </div>
+            <div class="ctrl">
+              <label for="c-proto">Protocol</label>
+              <select id="c-proto">
+                <option value="h1-12">HTTP/1.1 over TLS 1.2</option>
+                <option value="h1-13" selected>HTTP/1.1 over TLS 1.3</option>
+                <option value="h2">HTTP/2 over TLS 1.3</option>
+                <option value="h3">HTTP/3 over QUIC</option>
+              </select>
+            </div>
+            <div class="ctrl">
+              <label for="c-reuse">Connection state</label>
+              <select id="c-reuse">
+                <option value="cold" selected>Brand new</option>
+                <option value="resume">New, but TLS session resumed</option>
+                <option value="warm">Reused — already open</option>
+              </select>
+            </div>
+            <div class="ctrl">
+              <label for="c-work">Server work per request <b><span id="c-workv">15</span> ms</b></label>
+              <input type="range" id="c-work" min="1" max="500" step="1" value="15">
+            </div>
+            <div class="ctrl">
+              <label for="c-reqs">Requests over this connection <b><span id="c-reqsv">1</span></b></label>
+              <input type="range" id="c-reqs" min="1" max="100" step="1" value="1">
+            </div>
+          </div>
+          <div class="bars" id="c-bars"></div>
+          <div class="out">
+            <div class="stats" id="c-stats"></div>
+            <p id="c-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">2.4</span>TLS</h2>
+
+      <p>TLS provides three things, and it is worth separating them because people conflate the first with the whole: <b>confidentiality</b> (nobody in the middle can read it), <b>integrity</b> (nobody can alter it undetected), and <b>authentication</b> (you are talking to who you think). The third is the one that produces production incidents.</p>
+
+      <h3>The handshake</h3>
+
+      <div class="codewrap">
+        <span class="lang">TLS 1.3 — one round trip</span>
+        <pre><code>Client → ClientHello
+           supported versions, cipher suites, a key share
+           (guessing the group the server will pick), and SNI —
+           the hostname, in the clear, so shared hosts can pick
+           the right certificate
+
+Server → ServerHello + key share
+         + Certificate + CertificateVerify + Finished
+           …all encrypted from this point except the hello
+
+Client → Finished, then application data
+
+ONE round trip. TLS 1.2 needed two, because the key exchange
+and the cipher negotiation happened in separate flights.
+
+0-RTT resumption: on a repeat visit the client can send data
+in the first flight. It is fast, and that early data is
+REPLAYABLE — so it must only carry idempotent requests.</code></pre>
+      </div>
+
+      <h3>Certificates, chains, and the trap</h3>
+
+      <p>A certificate binds a public key to a name, signed by an issuer. Your server's certificate is signed by an intermediate, which is signed by a root that is already in the client's trust store. The client must be able to build the chain from your certificate up to a root it trusts.</p>
+
+      <div class="note trap">
+        <span class="lab">The missing intermediate</span>
+        <p>Servers must send the <b>full chain</b> — leaf plus intermediates — not just the leaf. If you send only the leaf, browsers often still work, because they cache intermediates from other sites or fetch them via the AIA extension. But <code>curl</code>, your language's HTTP client, mobile apps and other servers frequently do not, and they fail with an unhelpful "unable to get local issuer certificate".</p>
+        <p>The symptom is unmistakable once you know it: <b>the site works in a browser and fails from everything else</b>, and it may work on your machine and not on a colleague's depending on what each browser happens to have cached. Test with <code>openssl s_client -connect host:443 -showcerts</code> from a machine that has never visited the site, and check the chain length.</p>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>The other TLS failures worth recognising on sight</caption>
+          <thead><tr><th>Symptom</th><th>Cause</th></tr></thead>
+          <tbody>
+            <tr><td>Works for a month, then fails suddenly at a precise moment</td><td>Certificate expiry. Alert on it at 30 and 7 days; automate renewal and alert on the automation failing</td></tr>
+            <tr><td>Hostname mismatch</td><td>The certificate does not cover the name used. Check the SAN list, not the common name, which modern clients ignore</td></tr>
+            <tr><td>Works from a browser, fails from a container</td><td>The container has no CA bundle, or an old one. Install <code>ca-certificates</code></td></tr>
+            <tr><td>Fails only for old clients</td><td>You disabled TLS 1.0/1.1 or an old cipher suite. Usually correct — confirm who is affected before reverting</td></tr>
+            <tr><td>Works on one server behind the load balancer</td><td>Certificates deployed inconsistently across instances</td></tr>
+            <tr><td>Intermittent failures after a renewal</td><td>Some instances still serving the old certificate — a rollout that did not complete</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Where TLS terminates</h3>
+
+      <p>A decision with real consequences. Terminating at the load balancer or CDN is simplest: one place manages certificates, and the application speaks plain HTTP internally. Terminating at the application means the traffic is encrypted end to end, which some compliance regimes require, at the cost of managing certificates everywhere. The middle option — re-encrypting between the proxy and the application — gets both, and is what a service mesh automates.</p>
+
+      <p>Whichever you choose, the practical consequence to remember: <b>once TLS terminates, the application no longer knows the client's IP or protocol</b> unless the proxy tells it. That is what <code>X-Forwarded-For</code> and <code>X-Forwarded-Proto</code> are, and trusting them blindly is a security bug, since a client can send them too. Configure your framework to trust them only from your own proxy's address.</p>
+
+      <h2><span class="h2n">2.5</span>What you actually control</h2>
+
+      <div class="tw">
+        <table>
+          <caption>Levers, in rough order of value</caption>
+          <thead><tr><th>Lever</th><th>Effect</th></tr></thead>
+          <tbody>
+            <tr><td><b>Connection reuse everywhere</b></td><td>Removes three round trips and slow start from every request after the first. The largest single win in this chapter</td></tr>
+            <tr><td><b>Terminate closer to the user</b></td><td>A CDN or edge point-of-presence does the handshake near the client, so those round trips are short even if your origin is far</td></tr>
+            <tr><td><b>TLS 1.3 and session resumption</b></td><td>One round trip instead of two, and zero on resumption</td></tr>
+            <tr><td><b>HTTP/2 or /3</b></td><td>One connection carrying many streams, so the handshake is paid once for the whole page</td></tr>
+            <tr><td><b>Sensible TTLs, lowered before a change</b></td><td>Determines how fast you can move traffic when you need to</td></tr>
+            <tr><td><b>Send the full certificate chain</b></td><td>Prevents the failure that only appears outside browsers</td></tr>
+            <tr><td><b>A CAA record</b></td><td>One line; restricts who can issue certificates for your domain</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <details class="check">
+        <summary>You lower a record's TTL from 3600 to 60 and immediately fail over. Why is traffic still going to the old server twenty minutes later?</summary>
+        <div class="ans">
+          <p>Because the resolvers that already had the answer cached it with the <em>old</em> TTL of 3600 seconds, and lowering it now does not reach them. A TTL is attached to an answer at the moment it is handed out; changing the record changes what future queries receive, not what has already been distributed. So resolvers that looked up the name shortly before your change will keep serving the old address for up to an hour, and there is no mechanism to recall it. This is why TTL is a pre-commitment: to fail over within a minute you must have been running a 60-second TTL for at least an hour beforehand. The operational pattern is to lower the TTL one full old-TTL period <em>ahead</em> of a planned change, verify from several networks that the short TTL is being served, make the change, then raise it again afterwards. And for unplanned failover, do not rely on DNS at all — put a load balancer or anycast address in front, so the IP never changes and the failover happens at a layer you control in seconds.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Your API works in Chrome and fails from a Python client with "certificate verify failed". What is the most likely cause?</summary>
+        <div class="ans">
+          <p>An incomplete certificate chain — your server is sending only the leaf certificate without the intermediates. Browsers frequently paper over this: they cache intermediates encountered on other sites, and they will fetch a missing one using the Authority Information Access extension in the certificate. Most non-browser clients do neither, so they cannot build a path from your leaf to a trusted root and reject the connection. The tell is exactly the pattern described — works in a browser, fails everywhere else, and may work on one developer's machine and not another's depending on browsing history. Confirm it with <code>openssl s_client -connect api.example.com:443 -showcerts</code> and count the certificates returned: you should see your leaf plus at least one intermediate. The fix is server configuration — point at the full-chain file your certificate authority provides rather than the leaf-only one; with Let's Encrypt that is <code>fullchain.pem</code>, not <code>cert.pem</code>. Two other candidates worth ruling out: the client's CA bundle being missing or stale, which is common in slim container images and is fixed by installing <code>ca-certificates</code>, and the certificate not covering the hostname in its SAN list.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Why is a fresh TCP connection slow even on a fast network with no packet loss?</summary>
+        <div class="ans">
+          <p>Slow start. TCP has no way to know how much bandwidth is available, so it begins conservatively — an initial congestion window of about ten segments, roughly 14 KB — and doubles it each round trip until it detects loss. That means the first round trip can carry only 14 KB no matter how fast the link is, the second 28 KB, and so on. A 200 KB response therefore needs four or five round trips just to get its congestion window large enough, entirely independently of bandwidth. On a 90 ms link that is close to half a second of ramp-up on a connection that could in principle have delivered the whole thing in one. Add the three handshake round trips and a cold connection is dramatically worse than a warm one for reasons that have nothing to do with your server. This is the second, less-cited argument for connection reuse: you keep not only the handshake but the <em>warmed congestion window</em>. It is also why HTTP/2 multiplexing helps so much — one warmed connection carrying all the page's requests, rather than six cold ones each restarting slow start.</p>
+        </div>
+      </details>
+
+      <div class="recap">
+        <h2>Recap</h2>
+        <ol>
+          <li><b>DNS, TCP and TLS run before your code sees anything,</b> and on a cold connection they cost three round trips.</li>
+          <li><b>DNS is a cached hierarchy;</b> the caching is why it is fast and why its failures are confusing. Negative answers are cached too.</li>
+          <li><b>TTL is a pre-commitment.</b> Lower it a full old-TTL period before a change, not during one.</li>
+          <li><b>CNAME cannot live at the apex,</b> so every provider has a proprietary workaround with its own behaviour.</li>
+          <li><b>TCP's guarantees each cost something:</b> ordering causes head-of-line blocking, and congestion control causes slow start.</li>
+          <li><b>Connection reuse is the biggest lever here</b> — it removes the handshakes <em>and</em> keeps the warmed congestion window.</li>
+          <li><b>TLS 1.3 is one round trip;</b> resumption is zero, and 0-RTT early data is replayable so it must be idempotent.</li>
+          <li><b>Send the full chain.</b> Working in a browser and failing elsewhere is the signature of a missing intermediate.</li>
+          <li><b>After termination the app is blind to the client</b> unless the proxy forwards it — and those headers must only be trusted from your own proxy.</li>
+        </ol>
+      </div>
+
+      <nav class="pn" aria-label="Previous and next chapter"></nav>
+    </div>
+  </article>
+</div>
+
+<script src="assets/notes.js"></script>
+<script>
+function st2b(k, v, tone) {
+  var d = document.createElement("div"); d.className = "stat";
+  var a = document.createElement("div"); a.className = "k"; a.textContent = k;
+  var b = document.createElement("div"); b.className = "v"; b.textContent = v;
+  if (tone) b.style.color = tone;
+  d.append(a, b); return d;
+}
+function bar2b(label, pct, value, colour) {
+  var row = document.createElement("div"); row.className = "bar";
+  var k = document.createElement("span"); k.textContent = label;
+  var t = document.createElement("span"); t.className = "track";
+  var f = document.createElement("span"); f.className = "fill";
+  f.style.width = Math.max(0.4, Math.min(100, pct)) + "%";
+  if (colour) f.style.background = colour;
+  t.appendChild(f);
+  var v = document.createElement("span"); v.className = "val"; v.textContent = value;
+  row.append(k, t, v); return row;
+}
+
+/* ---------- DNS resolution ---------- */
+(function () {
+  var state = document.getElementById("d-state"), rtt = document.getElementById("d-rtt"),
+      ttl = document.getElementById("d-ttl"), qps = document.getElementById("d-qps"),
+      steps = document.getElementById("d-steps"), stats = document.getElementById("d-stats"),
+      note = document.getElementById("d-note");
+
+  function draw() {
+    var S = state.value, R = +rtt.value, T = +ttl.value, Q = +qps.value;
+    document.getElementById("d-rttv").textContent = R;
+    document.getElementById("d-ttlv").textContent = T;
+    document.getElementById("d-qpsv").textContent = Q;
+
+    var all = [
+      { q: "browser cache", a: "checked first, in-process", cost: 0 },
+      { q: "OS resolver cache", a: "systemd-resolved, nscd, or the stub resolver", cost: 0.05 },
+      { q: "recursive resolver — do you have the answer?", a: "your ISP's, or 1.1.1.1 / 8.8.8.8", cost: R },
+      { q: "root nameserver → who serves .com?", a: "13 root server addresses, known from a hints file", cost: R },
+      { q: ".com nameserver → who serves shop.com?", a: "returns NS records — the delegation", cost: R },
+      { q: "shop.com nameserver → A record for api?", a: "authoritative answer", cost: R }
+    ];
+    var reach = { cold: 6, tld: 5, ns: 4, full: 3, os: 2, neg: 3 }[S];
+    var hitAt = { cold: 6, tld: 4, ns: 5, full: 3, os: 2, neg: 3 }[S];
+
+    steps.innerHTML = "";
+    var total = 0;
+    all.forEach(function (x, i) {
+      var n = i + 1;
+      var shown = n <= reach;
+      var isHit = shown && n === hitAt;
+      var d = document.createElement("div");
+      d.className = "dq" + (shown ? " shown" : "") + (isHit ? " hit" : shown ? " miss" : "");
+      var ix = document.createElement("span"); ix.textContent = n;
+      var q = document.createElement("span"); q.textContent = x.q + "   —   " + x.a;
+      var s5 = document.createElement("span"); s5.className = "st5";
+      s5.textContent = !shown ? "not reached" : isHit ? (S === "neg" ? "NXDOMAIN (cached)" : "HIT") : "miss";
+      if (shown) total += isHit ? x.cost : x.cost;
+      d.append(ix, q, s5);
+      steps.appendChild(d);
+    });
+
+    /* queries that actually leave the network, given TTL and traffic */
+    var lookupsPerTTL = Q * T;
+    var uncachedShare = lookupsPerTTL > 0 ? 1 / lookupsPerTTL : 1;
+    var authQPS = Q * uncachedShare;
+
+    stats.innerHTML = "";
+    stats.appendChild(st2b("Resolution time", total.toFixed(2) + " ms",
+      total > 40 ? "var(--line)" : total < 1 ? "var(--ok)" : "#B87A17"));
+    stats.appendChild(st2b("Round trips", all.slice(0, reach).filter(function (x) { return x.cost >= R; }).length));
+    stats.appendChild(st2b("Cached for", T >= 3600 ? (T / 3600).toFixed(1) + " h" : T + " s"));
+    stats.appendChild(st2b("Worst-case failover", T >= 3600 ? (T / 60).toFixed(0) + " min" : T + " s",
+      T > 900 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st2b("Queries reaching your nameservers", authQPS < 1
+      ? authQPS.toFixed(3) + "/s" : authQPS.toFixed(1) + "/s", "var(--ok)"));
+    stats.appendChild(st2b("Cache absorbs", ((1 - uncachedShare) * 100).toFixed(2) + "%", "var(--ok)"));
+
+    note.textContent = S === "cold"
+      ? "Four round trips — resolver, root, .com, then the authoritative server — because nothing anywhere had an answer. This happens once, and then the answer is cached at every level for the TTL. It is also why a brand-new domain feels slow for the first visitor and instant afterwards."
+      : S === "neg"
+      ? "The name does not exist, and that fact is itself cached — for the duration set in the SOA record, not the record's TTL, because there is no record. This is why creating a DNS entry after someone has already tried it can appear not to work: they are being served a cached NXDOMAIN, and there is nothing you can do but wait."
+      : S === "os" || S === "full"
+      ? "Answered from a cache in under a millisecond. With " + Q + " lookups a second and a " + T + "-second TTL, caching absorbs " + ((1 - uncachedShare) * 100).toFixed(2) + "% of traffic — your authoritative nameservers see about " + (authQPS < 1 ? authQPS.toFixed(3) : authQPS.toFixed(1)) + " queries a second. That ratio is the whole reason DNS scales."
+      : "A partial cache hit: the resolver already knows part of the delegation chain and can skip straight to it. Resolvers cache NS records aggressively, which is why the root and .com servers see far less traffic than the number of lookups would suggest.";
+  }
+  [state, rtt, ttl, qps].forEach(function (x) {
+    x.addEventListener("input", draw); x.addEventListener("change", draw);
+  });
+  draw();
+})();
+
+/* ---------- connection cost ---------- */
+(function () {
+  var rtt = document.getElementById("c-rtt"), proto = document.getElementById("c-proto"),
+      reuse = document.getElementById("c-reuse"), work = document.getElementById("c-work"),
+      reqs = document.getElementById("c-reqs"),
+      bars = document.getElementById("c-bars"), stats = document.getElementById("c-stats"),
+      note = document.getElementById("c-note");
+
+  function draw() {
+    var R = +rtt.value, P = proto.value, U = reuse.value, W = +work.value, N = +reqs.value;
+    document.getElementById("c-rttv").textContent = R;
+    document.getElementById("c-workv").textContent = W;
+    document.getElementById("c-reqsv").textContent = N;
+
+    /* handshake round trips */
+    var tcpRT = (P === "h3") ? 0 : 1;               /* QUIC folds transport into the crypto handshake */
+    var tlsRT = P === "h1-12" ? 2 : 1;
+    if (P === "h3") tlsRT = 1;
+    if (U === "resume") tlsRT = P === "h1-12" ? 1 : 0;
+    if (U === "warm") { tcpRT = 0; tlsRT = 0; }
+    var dnsRT = U === "warm" ? 0 : 0;               /* assume DNS cached; ch 2.2 covers it separately */
+
+    var handshake = (tcpRT + tlsRT + dnsRT) * R;
+    /* HTTP/1.1 serialises requests on one connection; /2 and /3 multiplex */
+    var perReq = R + W;
+    var requestTime = (P === "h1-12" || P === "h1-13") ? N * perReq : perReq + (N - 1) * W * 0.25 + R * 0.0;
+    var total = handshake + requestTime;
+    var idealWarm = (P === "h1-12" || P === "h1-13") ? N * perReq : perReq + (N - 1) * W * 0.25;
+
+    var max = Math.max(handshake, requestTime, 1);
+    bars.innerHTML = "";
+    bars.appendChild(bar2b("Handshakes", (handshake / (handshake + requestTime)) * 100,
+      handshake.toFixed(0) + " ms · " + (tcpRT + tlsRT) + " RTT",
+      handshake > requestTime ? "var(--line)" : handshake === 0 ? "var(--ok)" : "#B87A17"));
+    bars.appendChild(bar2b("Requests", (requestTime / (handshake + requestTime)) * 100,
+      requestTime.toFixed(0) + " ms", "var(--ok)"));
+
+    var savedVsCold = ((1 + (P === "h1-12" ? 2 : 1)) * R);
+
+    stats.innerHTML = "";
+    stats.appendChild(st2b("Total", total.toFixed(0) + " ms", total > 500 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st2b("Setup round trips", tcpRT + tlsRT, (tcpRT + tlsRT) === 0 ? "var(--ok)" : "var(--line)"));
+    stats.appendChild(st2b("Overhead share", ((handshake / total) * 100).toFixed(0) + "%",
+      handshake / total > 0.4 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st2b("Saved by reuse", U === "warm" ? savedVsCold.toFixed(0) + " ms" : "—",
+      U === "warm" ? "var(--ok)" : ""));
+    stats.appendChild(st2b("Per request", (total / N).toFixed(1) + " ms"));
+
+    note.textContent = U === "cold" && N === 1
+      ? "A single request on a brand-new connection spends " + ((handshake / total) * 100).toFixed(0) + "% of its time on handshakes — " + (tcpRT + tlsRT) + " round trips at " + R + " ms before a byte of your request moves. This is the cost that connection pooling, keep-alive and an edge terminator all exist to remove."
+      : U === "warm"
+      ? "Zero setup cost: the connection is already open and its congestion window is already warm. Note how the per-request figure falls as you increase the request count — the handshake is amortised, which is exactly what a connection pool buys you."
+      : P === "h3"
+      ? "QUIC folds the transport and cryptographic handshakes together, so a new connection costs one round trip rather than two or three. It also removes TCP's head-of-line blocking, because each stream is recovered independently — a lost packet stalls one response, not all of them."
+      : (P === "h2" || P === "h3") && N > 1
+      ? "Multiplexing means " + N + " requests share one connection and do not queue behind each other. Under HTTP/1.1 the same " + N + " requests on one connection are strictly serial, which is why browsers used to open six connections per host — six handshakes to work around one protocol limitation."
+      : "Session resumption removes the key exchange on a repeat connection. TLS 1.3 can go further with 0-RTT, sending application data in the first flight — but that early data is replayable, so it must only carry idempotent requests.";
+  }
+  [rtt, proto, reuse, work, reqs].forEach(function (x) {
+    x.addEventListener("input", draw); x.addEventListener("change", draw);
+  });
+  draw();
+})();
+</script>
+</body>
+</html>

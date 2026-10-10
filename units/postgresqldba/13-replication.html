@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Replication — PostgreSQL</title>
+<meta name="description" content="Streaming and logical replication, replication slots, synchronous commit, and reading from replicas safely.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 13 · Running it</div>
+    <h1>Replication</h1>
+    <p class="standfirst">Chapter 4's write-ahead log, shipped somewhere else and replayed. That one sentence covers streaming replication entirely — and the interesting decisions are all about what you give up in exchange for how much durability.</p>
+    <div class="chap-meta">
+      <span class="tagpill">streaming</span>
+      <span class="tagpill">logical</span>
+      <span class="tagpill">slots</span>
+      <span class="tagpill">lag</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Two kinds</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th>Streaming (physical)</th><th>Logical</th></tr></thead>
+<tbody>
+<tr><td>What travels</td><td>Raw WAL — byte-level page changes</td><td>Decoded row changes: insert, update, delete</td></tr>
+<tr><td>Scope</td><td>The entire cluster, all databases</td><td>Selected tables in one database</td></tr>
+<tr><td>Replica is</td><td>Read-only, byte-identical</td><td>A normal writable database</td></tr>
+<tr><td>Cross-version</td><td>No</td><td><b>Yes</b> — which is how zero-downtime upgrades work</td></tr>
+<tr><td>DDL</td><td>Replicated automatically</td><td><b>Not replicated</b> — you apply it on both sides</td></tr>
+<tr><td>Overhead</td><td>Low</td><td>Higher: decoding on the publisher, applying on the subscriber</td></tr>
+<tr><td>Use for</td><td>High availability, read scaling, backups</td><td>Upgrades, migrations, selective feeds, different schemas</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">setting up a streaming replica</span><button class="copy">Copy</button></div>
+<pre><code># On the primary — postgresql.conf
+wal_level = replica                 # the default; 'logical' also works
+max_wal_senders = 10
+max_replication_slots = 10
+# pg_hba.conf — note DATABASE is the literal word `replication` (chapter 11)
+#   hostssl  replication  replicator  10.0.9.0/24  scram-sha-256
+
+CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '…';
+
+# On the standby — one command builds the whole thing
+pg_basebackup \
+    -h primary.internal -U replicator \
+    -D /var/lib/postgresql/16/main \
+    -Fp -Xs -P -R \
+    --slot=standby1 --create-slot
+
+#   -R  writes standby.signal and the primary_conninfo setting for you
+#   --create-slot  creates a replication slot on the primary, so it retains
+#                  WAL this standby has not yet received
+
+# Then just start it. It connects, streams, and catches up.
+pg_ctl -D /var/lib/postgresql/16/main start</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Synchronous commit</h2>
+
+<div class="demo" id="rep">
+  <div class="demo-head">
+    <b>Durability against latency</b>
+    <span>Every level buys a stronger guarantee and pays for it on every single commit.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="s-level">synchronous_commit</label>
+        <select id="s-level">
+          <option value="off">off — do not wait for the local flush</option>
+          <option value="local" selected>local — local flush only (async replication)</option>
+          <option value="remote_write">remote_write — standby received it</option>
+          <option value="on">on — standby flushed it to disk</option>
+          <option value="remote_apply">remote_apply — standby applied it</option>
+        </select>
+      </div>
+      <div>
+        <label for="s-rtt">Network round trip to the standby — <span id="s-rttv">1.0</span> ms</label>
+        <input type="range" id="s-rtt" min="1" max="200" step="1" value="10">
+      </div>
+      <div>
+        <label for="s-tps">Commits per second — <span id="s-tpsv">2,000</span></label>
+        <input type="range" id="s-tps" min="1" max="6" step="1" value="4">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="s-lat">—</b><span>added commit latency</span></div>
+      <div><b id="s-rpo">—</b><span>data lost if the primary dies</span></div>
+      <div><b id="s-tput">—</b><span>max commits/sec per session</span></div>
+      <div><b id="s-read">—</b><span>read-your-writes on the replica</span></div>
+    </div>
+    <div id="s-bars"></div>
+    <div class="out" id="s-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">configuring it, and doing so per transaction</span><button class="copy">Copy</button></div>
+<pre><code>-- On the primary. The standby names come from their application_name,
+-- set in primary_conninfo.
+synchronous_standby_names = 'ANY 1 (standby1, standby2)';
+synchronous_commit = 'on';
+
+--   FIRST 1 (a, b)   wait for a; fall back to b — a strict priority order
+--   ANY 1 (a, b)     wait for whichever responds first — usually what you want
+--   ANY 2 (a, b, c)  wait for any two
+
+-- The setting is per transaction, which is the important part: pay for
+-- durability where it matters and not everywhere.
+BEGIN;
+SET LOCAL synchronous_commit = 'remote_apply';
+INSERT INTO payments …;          -- must survive, and must be readable
+COMMIT;
+
+ALTER ROLE analytics_writer SET synchronous_commit = 'off';   -- disposable
+
+SELECT application_name, state, sync_state, sync_priority,
+       write_lag, flush_lag, replay_lag
+FROM pg_stat_replication;
+--   sync_state: sync | potential | async | quorum</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">One synchronous standby is a single point of failure for writes</span>
+  <p>With <code>synchronous_standby_names = 'standby1'</code> and that standby down, <b>every commit on the primary blocks indefinitely</b>. The primary is healthy, the disk is fine, and the application is completely stalled — waiting for acknowledgement from a machine that is gone. This surprises people badly the first time, because they configured synchronous replication for safety and got an outage. Use <code>ANY 1 (a, b)</code> with at least two candidates, so losing one standby degrades nothing. And have the runbook step written down: <code>ALTER SYSTEM SET synchronous_standby_names = ''</code> plus a reload releases the writes immediately, at the cost of the guarantee.</p>
+</div>
+
+<h2><span class="h-rule"></span>Replication slots</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the guarantee, and the hazard</span><button class="copy">Copy</button></div>
+<pre><code>-- A slot records how far a consumer has got, and the primary retains WAL
+-- until that position. That is what stops a standby falling irrecoverably
+-- behind after a network blip.
+--
+-- It is also chapter 4's disk-filling hazard: an INACTIVE slot retains WAL
+-- forever, because as far as the primary knows the consumer will come back.
+
+SELECT slot_name, slot_type, active, wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn))
+           AS wal_retained,
+       age(xmin) AS xmin_age
+FROM pg_replication_slots
+ORDER BY pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) DESC;
+
+--   active = false with gigabytes retained: a decommissioned replica whose
+--            slot nobody dropped. This is the classic 3am page.
+--   xmin_age climbing: a LOGICAL slot also holds back vacuum, cluster-wide,
+--            exactly like a long transaction (chapters 2 and 3)
+
+-- The safety valve. Postgres invalidates a runaway slot rather than letting
+-- it take the primary down:
+ALTER SYSTEM SET max_slot_wal_keep_size = '100GB';   -- PG13+
+
+-- Set it. Without it, the trade is "lose one standby" against "lose the
+-- primary", and the default picks wrong.
+
+SELECT pg_drop_replication_slot('old_standby');</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Reading from replicas</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">what changes when the read is not on the primary</span><button class="copy">Copy</button></div>
+<pre><code>-- 1. Reads are stale by the replay lag. Usually milliseconds; occasionally
+--    much more. Read-your-writes breaks: a user saves a form, the redirect
+--    reads from a replica, and their change is not there.
+--    Route reads that follow a write to the primary, or use remote_apply
+--    for that specific transaction.
+
+-- 2. Long queries on the standby conflict with replay. The standby must
+--    apply changes that would remove rows the query is still reading, and
+--    something has to give:
+max_standby_streaming_delay = '30s';   -- pause replay for up to 30s...
+--    ...then CANCEL the query:
+--      ERROR: canceling statement due to conflict with recovery
+
+--    Or make the standby tell the primary what it needs kept:
+hot_standby_feedback = on;
+--    Now the primary will not vacuum rows the standby's queries need — which
+--    stops the cancellations AND causes bloat on the primary, driven by
+--    queries running on a different machine. Both settings are a trade
+--    between the two problems; pick deliberately.
+
+-- 3. No writes at all, including temporary tables and sequence nextval().
+--    An ORM that writes a session row on every request cannot use a replica.
+
+SELECT now() - pg_last_xact_replay_timestamp() AS replay_lag;
+SELECT pg_is_in_recovery();      -- true on a standby — useful for routing</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Read replicas are not free capacity</span>
+  <p>They are frequently proposed as a way to scale reads, and they solve a narrower problem than that. Every write still happens on every replica, so a write-heavy workload gains nothing. Reads are stale, so anything that needs its own writes back must go to the primary. Long analytical queries either get cancelled or cause bloat on the primary. What replicas <em>are</em> genuinely good for: <b>an analytics workload that tolerates staleness and would otherwise evict the OLTP working set from the primary's cache</b>, taking backups without touching the primary, and being ready to promote. That is a real set of wins — just not "add a replica and double your throughput".</p>
+</div>
+
+<h2><span class="h-rule"></span>Logical replication</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">publish and subscribe</span><button class="copy">Copy</button></div>
+<pre><code>-- Publisher: wal_level = logical  (a RESTART — decide this before go-live)
+CREATE PUBLICATION orders_pub FOR TABLE orders, line_items;
+CREATE PUBLICATION everything FOR ALL TABLES;
+CREATE PUBLICATION eu_only FOR TABLE customers WHERE (region = 'eu');  -- PG15+
+
+-- Subscriber: a normal, writable database
+CREATE SUBSCRIPTION orders_sub
+    CONNECTION 'host=primary dbname=orders user=replicator password=…'
+    PUBLICATION orders_pub
+    WITH (copy_data = true, streaming = on);
+
+SELECT * FROM pg_stat_subscription;
+SELECT * FROM pg_replication_slots WHERE slot_type = 'logical';
+
+-- Every replicated table needs a REPLICA IDENTITY so updates and deletes can
+-- identify the row. A primary key provides it automatically. Without one:
+ALTER TABLE t REPLICA IDENTITY USING INDEX some_unique_index;
+ALTER TABLE t REPLICA IDENTITY FULL;   -- the whole old row as the key.
+                                       -- Works, and is expensive
+-- A table with no primary key and no replica identity silently replicates
+-- INSERTs and fails on UPDATE and DELETE. Check before you rely on it.</code></pre>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Logical replication does not replicate</th><th>Consequence</th></tr></thead>
+<tbody>
+<tr><td><b>DDL</b></td><td>Apply schema changes on the subscriber <em>first</em>, then the publisher</td></tr>
+<tr><td>Sequence values</td><td>Advance them manually before promoting a subscriber</td></tr>
+<tr><td><code>TRUNCATE</code></td><td>Replicated since PG11, but only if included in the publication</td></tr>
+<tr><td>Large objects</td><td>Not supported at all</td></tr>
+<tr><td>Rows from other subscribers</td><td>No cascading by default — watch for loops in bidirectional setups</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Logical replication holds back vacuum on the publisher</span>
+  <p>A logical slot keeps an <code>xmin</code>, so it holds the cleanup horizon exactly like a long transaction (chapter 2). If a subscriber falls behind or stops consuming, the publisher accumulates dead tuples across <em>every</em> table while nothing looks wrong on that side. It also retains WAL. So a broken subscriber produces two slow-motion failures on a machine that is not the one with the problem — bloat and a filling disk. Monitor <code>pg_replication_slots.xmin_age</code> and <code>wal_retained</code> on the publisher, not just subscription health on the subscriber.</p>
+</div>
+
+<h2><span class="h-rule"></span>Monitoring lag</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">from both ends, because they answer different questions</span><button class="copy">Copy</button></div>
+<pre><code>-- On the PRIMARY: per-standby, in bytes and in time
+SELECT client_addr, application_name, state, sync_state,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn))   AS pending,
+       pg_size_pretty(pg_wal_lsn_diff(sent_lsn, replay_lsn))             AS to_apply,
+       write_lag, flush_lag, replay_lag
+FROM pg_stat_replication;
+
+--   write_lag   time until the standby wrote it
+--   flush_lag   ...flushed it to disk
+--   replay_lag  ...made it visible to queries    <- what readers experience
+
+-- On the STANDBY: how stale am I, in seconds
+SELECT CASE WHEN pg_is_in_recovery()
+            THEN coalesce(extract(epoch FROM now() - pg_last_xact_replay_timestamp()), 0)
+            ELSE 0 END AS lag_seconds;
+
+-- One caveat that causes false alarms: on an IDLE primary this number grows
+-- steadily, because there is nothing new to replay and the timestamp of the
+-- last replayed transaction keeps getting older. Alert on byte lag as well,
+-- or the pager fires every quiet Sunday.
+
+-- Why a standby is behind, when it is:
+SELECT wait_event_type, wait_event, count(*)
+FROM pg_stat_activity WHERE backend_type = 'startup' GROUP BY 1,2;
+-- Replay is single-threaded, so a standby on slower storage than the primary
+-- will fall behind under sustained write load and never catch up.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Choosing a topology</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Need</th><th>Setup</th></tr></thead>
+<tbody>
+<tr><td>Survive losing the machine</td><td>One async streaming standby, same region, plus WAL archiving (chapter 12)</td></tr>
+<tr><td>Survive it with zero data loss</td><td>Two standbys, <code>ANY 1</code> synchronous — never a single sync standby</td></tr>
+<tr><td>Survive losing the region</td><td>An async standby in another region; accept the extra RPO</td></tr>
+<tr><td>Offload analytics</td><td>An async standby with <code>hot_standby_feedback = on</code> and a long <code>max_standby_streaming_delay</code>, accepting bloat on the primary</td></tr>
+<tr><td>Catch a destructive mistake</td><td>A delayed standby: <code>recovery_min_apply_delay = '1h'</code></td></tr>
+<tr><td>Upgrade across major versions</td><td>Logical replication (chapter 16)</td></tr>
+<tr><td>Feed another system</td><td>Logical replication, or a change-data-capture tool reading the slot</td></tr>
+<tr><td>Write in two places</td><td>Genuinely hard. Conflict resolution is your problem — think very carefully first</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note tip">
+  <span class="note-t">A delayed standby is cheap insurance</span>
+  <p><code>recovery_min_apply_delay = '1h'</code> makes a standby stay deliberately one hour behind. When someone runs a <code>DELETE</code> without a <code>WHERE</code>, or a migration corrupts a column, you have an hour to notice — and the correct data is sitting on a running server you can query immediately, rather than at the end of a multi-hour restore. It costs one extra machine and nothing else. It is not a backup and it does not replace one; it is the fastest possible recovery for the specific, common failure of a human destroying data.</p>
+</div>
+
+<h2><span class="h-rule"></span>Timelines</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">why an old primary cannot just rejoin</span><button class="copy">Copy</button></div>
+<pre><code>When a standby is promoted it starts a new TIMELINE — an identifier that
+distinguishes "the WAL stream after this promotion" from "the WAL stream that
+would have continued on the old primary".
+
+    timeline 1  ────────────●───────────  old primary kept writing here
+                            │              (these changes are now orphaned)
+    timeline 2              └───────────   new primary, after promotion
+
+The old primary may have committed transactions after the last one the
+standby received. Those changes exist only on the old primary and diverge
+from the new history — so it cannot simply reconnect as a standby.
+
+Options:
+  pg_rewind    rewinds the old primary to the divergence point and lets it
+               follow the new one. Requires wal_log_hints = on or data
+               checksums, and it DISCARDS those diverged transactions
+  rebuild      pg_basebackup from the new primary. Slow, always correct
+
+Set wal_log_hints = on now — it is a restart-only setting, and without it
+pg_rewind is unavailable exactly when you want it. Data checksums (chapter 5)
+satisfy the same requirement, which is another reason to have them.</code></pre>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Streaming replication is <b>chapter 4's WAL, shipped and replayed</b>. Logical decodes it into row changes instead.</li>
+    <li><b>Never a single synchronous standby.</b> If it goes down, every commit blocks. Use <code>ANY 1</code> with two candidates.</li>
+    <li><code>synchronous_commit</code> is <b>per transaction</b> — pay for durability where it matters.</li>
+    <li>An <b>inactive replication slot</b> retains WAL forever. Set <code>max_slot_wal_keep_size</code>.</li>
+    <li>Replicas are <b>not free read capacity</b>: stale reads, no writes, and long queries either get cancelled or bloat the primary.</li>
+    <li>Logical replication <b>does not replicate DDL</b>, and its slot holds back vacuum on the publisher.</li>
+    <li>Time-based lag <b>grows on an idle primary</b>. Alert on byte lag too, or the pager fires every Sunday.</li>
+    <li>Set <b><code>wal_log_hints = on</code></b> now — it is restart-only, and without it <code>pg_rewind</code> is unavailable when you need it.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("13-replication.html");
+
+(function(){
+  const root = document.getElementById("rep");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const TPS = [50, 200, 500, 2000, 10000, 50000];
+
+  const L = {
+    off:          {wait:0,   local:false, rpo:"up to ~600ms locally", read:"no",
+      note:"Does not even wait for the local WAL flush. A crash loses up to about three times wal_writer_delay — a few hundred milliseconds of commits — but the database stays consistent: this is the one durability setting whose failure mode is lost commits rather than corruption (chapter 4).\n\nEntirely reasonable for analytics loads, bulk imports, session tables and audit trails. Set it per role or per transaction, not globally."},
+    local:        {wait:0,   local:true,  rpo:"everything not yet replicated", read:"no",
+      note:"The standard asynchronous setup: wait for the local disk flush, do not wait for any standby. Commit latency is unaffected by the network, and throughput is whatever the local storage allows.\n\nThe exposure is that if the primary is destroyed, everything the standby had not yet received is gone. In practice that is usually milliseconds of data — but it is not zero, and after a hard failure you cannot tell exactly what was lost."},
+    remote_write: {wait:1,   local:true,  rpo:"none, unless the standby also crashes", read:"no",
+      note:"Waits until a standby has RECEIVED the WAL and written it to its operating system, but not until it has been flushed to disk.\n\nThat covers the case that actually happens — the primary dies — and does not cover both machines failing simultaneously, since the standby's copy could still be in its page cache. A good middle position: most of the durability guarantee for meaningfully less latency than full synchronous."},
+    on:           {wait:1.6, local:true,  rpo:"none", read:"no",
+      note:"The standby has flushed the WAL to durable storage before the commit returns. Zero data loss on primary failure.\n\nNote what it still does not give you: the standby has the data on disk but may not have APPLIED it yet, so a read routed to that standby immediately after the commit can still miss it. If read-your-writes on a replica is the requirement, this level is not enough."},
+    remote_apply: {wait:2.4, local:true,  rpo:"none", read:"yes",
+      note:"Waits until the standby has applied the change and made it visible to queries. This is the only level that gives read-your-writes on a replica.\n\nIt is also the slowest by a clear margin, because replay is single-threaded on the standby and the commit now waits for it. Reserve it for the specific transactions that need it — SET LOCAL synchronous_commit = 'remote_apply' around the write, rather than as a cluster default."}
+  };
+
+  function render(){
+    const k = $("s-level").value;
+    const l = L[k];
+    const rtt = parseInt($("s-rtt").value,10) / 10;
+    const tps = TPS[parseInt($("s-tps").value,10)-1];
+    $("s-rttv").textContent = rtt.toFixed(1);
+    $("s-tpsv").textContent = tps.toLocaleString();
+
+    const localFlush = l.local ? 0.4 : 0;
+    const added = localFlush + l.wait * rtt;
+    const perSession = added > 0 ? Math.round(1000 / added) : 5000;
+
+    $("s-lat").textContent  = added === 0 ? "none" : added.toFixed(2) + " ms";
+    $("s-rpo").textContent  = l.rpo;
+    $("s-tput").textContent = added > 0 ? perSession.toLocaleString() : "storage-bound";
+    $("s-read").textContent = l.read;
+
+    const bars = [
+      ["Local WAL flush", localFlush],
+      ["Network wait", l.wait * rtt]
+    ].filter(b => b[1] > 0);
+    const max = Math.max(0.4, Math.max.apply(null, bars.length ? bars.map(b => b[1]) : [0.4]));
+    $("s-bars").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      'Where the commit latency goes</div>' +
+      (bars.length === 0
+        ? '<div class="out" style="margin:0">No synchronous wait at all — the commit returns immediately.</div>'
+        : bars.map(([lab, v], i) =>
+            '<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px">' +
+            '<span style="min-width:140px;font-size:13px">' + lab + '</span>' +
+            '<span class="bar" style="flex:1"><i style="width:' + Math.max(1, v/max*100).toFixed(0) +
+            '%' + (i === 1 && v > 5 ? ';background:#E2574C' : '') + '"></i></span>' +
+            '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:62px;text-align:right">' +
+            v.toFixed(2) + ' ms</span></div>').join(""));
+
+    const notes = [l.note];
+
+    if(l.wait > 0){
+      notes.push("Added latency is " + added.toFixed(2) + " ms per commit, which caps a single session at about " +
+                 perSession.toLocaleString() + " commits per second. At " + tps.toLocaleString() +
+                 " commits/sec across the application you need at least " + Math.ceil(tps / perSession) +
+                 " concurrent writing sessions just to keep up — and chapter 9's knee limits how many of those you can usefully have.");
+      if(rtt > 5)
+        notes.push("A " + rtt.toFixed(1) + " ms round trip is cross-availability-zone or cross-region territory. Synchronous replication over that distance makes every write pay the network latency, which is why zero-RPO across regions is expensive rather than merely a configuration choice. " +
+                   "The usual compromise is synchronous within a zone and asynchronous across regions.");
+    } else if(k === "local") {
+      notes.push("No network wait at all — commit latency is whatever the local disk gives you. This is why asynchronous replication is the default choice: it is free, and it still gets your data to the standby within milliseconds under normal conditions.");
+    }
+
+    notes.push("Whatever level you pick, do not configure a SINGLE synchronous standby. With synchronous_standby_names = 'standby1' and that machine down, every commit blocks indefinitely — the primary is healthy and the application is completely stalled. Use ANY 1 (a, b) so losing one standby degrades nothing.");
+
+    if(l.read === "no" && k !== "off" && k !== "local")
+      notes.push("Note the read-your-writes column. Even at synchronous_commit = 'on' the standby has the WAL on disk but may not have replayed it, so a read routed there right after the commit can still miss the change. Only remote_apply closes that gap, and it is expensive enough to reserve for specific transactions.");
+
+    notes.push("Latency model: ~0.4 ms local flush, plus a multiple of the round trip depending on how far the acknowledgement has to travel. Measure yours in pg_stat_replication's write_lag, flush_lag and replay_lag columns.");
+    $("s-note").textContent = notes.join("\n\n");
+  }
+
+  ["s-level","s-rtt","s-tps"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

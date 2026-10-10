@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>19 · Deployment and process management — Node.js</title>
+<meta name="description" content="Multi-stage images and layer caching, the flags containers need, signals and the shutdown sequence, probes, process managers and migrations in the pipeline.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%233FB984' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+<style>
+  .togs{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin-bottom:12px}
+  .tog{font-family:var(--sans);font-size:12px;padding:5px 11px;border-radius:4px;cursor:pointer;
+    background:var(--card);border:1px solid var(--rule-2);color:var(--text-2);transition:all .12s}
+  .tog:hover{border-color:var(--line)}
+  .tog.on{background:var(--line);border-color:var(--line);color:#fff;font-weight:600}
+</style>
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">Node.js</a><span class="sep">/</span><span>Chapter 19</span></p>
+    <p class="chno">Chapter 19 · Operating</p>
+    <h1>Deployment and process management</h1>
+    <p class="lede">Node deploys easily and shuts down badly. The default action for <code>SIGTERM</code> is immediate termination, which means an application that ignores it drops in-flight requests on every single release — and that is only the first of four things the shutdown path needs.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapters 07, 09, 16</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="image">
+<h2>The image</h2><div class="h2rule"></div>
+
+<div class="demo" id="d-img">
+  <div class="demo-top"><div class="demo-title">Six changes to a Dockerfile</div><div class="demo-hint">The second one changes the deploy, not the size</div></div>
+  <div class="demo-body">
+    <div class="togs" id="imTogs"></div>
+    <canvas id="cImg" aria-label="Image size, per-deploy transfer and attack surface as Dockerfile changes are applied"></canvas>
+    <div class="rgrid" id="imOut"></div>
+    <div class="readout" id="imNote"></div>
+  </div>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">dockerfile — the end state</span><button class="code-copy">Copy</button></div><pre><span class="c"># ---------- build ----------</span>
+FROM node:22-slim AS build
+WORKDIR /app
+
+COPY package*.json ./            <span class="c"># ① package files FIRST, so the</span>
+RUN npm ci --ignore-scripts      <span class="c">#   install layer is cached until a</span>
+                                 <span class="c">#   dependency actually changes.</span>
+COPY . .                         <span class="c">#   Chapter 8 on --ignore-scripts.</span>
+RUN npm run build
+
+<span class="c"># ---------- runtime ----------</span>
+FROM gcr.io/distroless/nodejs22-debian12
+WORKDIR /app
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/node_modules ./node_modules
+<span class="c"># distroless has no shell, no package manager, no curl — so an RCE</span>
+<span class="c"># has nothing to pivot with. It also means no exec debugging: keep a</span>
+<span class="c"># :debug variant of the tag for when you need one.</span>
+
+USER nonroot
+ENV NODE_ENV=production
+ENV NODE_OPTIONS="--max-old-space-size=768 --enable-source-maps"
+<span class="c">#   ✱ ~75% of the container's memory limit. V8 sizes its default heap</span>
+<span class="c">#     ceiling from the HOST, so without this it grows past your limit</span>
+<span class="c">#     and is OOM-killed instead of running a major GC. Chapter 16.</span>
+
+CMD ["dist/server.js"]           <span class="c"># no shell form, so the process is</span>
+                                 <span class="c"># PID 1 and receives SIGTERM directly</span>
+
+<span class="c"># ✱ do NOT run PM2, nodemon or a shell wrapper in a container. The</span>
+<span class="c">#   orchestrator is the process manager; a wrapper swallows signals</span>
+<span class="c">#   and hides crashes from the restart policy. PM2 and systemd are</span>
+<span class="c">#   for a VM, where nothing else is supervising you.</span>
+
+<span class="c"># ✱ .dockerignore — node_modules, .git, dist, coverage, .env</span>
+<span class="c">#   Without it the build context is hundreds of megabytes and your</span>
+<span class="c">#   local node_modules can shadow the installed one.</span></pre></div>
+</section>
+
+<section id="shutdown">
+<h2>Shutting down without dropping requests</h2><div class="h2rule"></div>
+
+<div class="demo" id="d-shut">
+  <div class="demo-top"><div class="demo-title">One rolling deploy</div><div class="demo-hint">Each fix removes a different failure</div></div>
+  <div class="demo-body">
+    <div class="togs" id="shTogs"></div>
+    <canvas id="cShut" aria-label="Requests dropped during shutdown as each fix is applied"></canvas>
+    <div class="ctrls" style="justify-content:center;flex-wrap:wrap">
+      <div class="ctrl"><label>Traffic</label><input type="range" id="shR" min="10" max="500" step="10" value="120"><output id="shRo">120/s</output></div>
+      <div class="ctrl"><label>Grace period</label><input type="range" id="shG" min="5" max="120" step="5" value="30"><output id="shGo">30 s</output></div>
+    </div>
+    <div class="rgrid" id="shOut"></div>
+    <div class="readout" id="shNote"></div>
+  </div>
+</div>
+
+<div class="tw">
+<table class="tight">
+<thead><tr><th>Probe</th><th>Asks</th><th>May check dependencies?</th></tr></thead>
+<tbody>
+<tr><td><strong>startup</strong></td><td>Has it finished booting? Suppresses the other two until it passes</td><td>Yes — it is the boot check</td></tr>
+<tr><td><strong>liveness</strong></td><td>Is this process wedged and unrecoverable?</td><td class="no">No. A database outage would restart the whole fleet</td></tr>
+<tr><td><strong>readiness</strong></td><td class="yes">Should traffic arrive <em>now</em>?</td><td class="yes">Yes — and it must go false at the start of a shutdown</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="kv">
+<dt>Validate configuration at boot, then freeze it</dt><dd class="yes">Parse every environment variable into a typed, frozen object at startup and refuse to start if something required is missing or malformed. A missing variable should be a container that never becomes ready, not a <code>TypeError</code> at 4pm on the one code path that reads it — chapter 3 of the Spring Boot unit.</dd>
+<dt><code>availableParallelism()</code> in the container</dt><dd class="no">Chapter 15's warning, and it applies to any library sizing a pool from core count. Check what your worker pool, image library and thread-pool settings are actually reading.</dd>
+<dt>Migrations are a pipeline step</dt><dd class="yes">A job before the rollout, never on application start — several instances would race, and a failed migration would stop every one of them from booting. Expand and contract: add the column, deploy code that writes both, backfill, deploy code that reads the new one, drop the old. Every intermediate state must work with both versions running, because during a rolling deploy they are.</dd>
+<dt>Pin the Node version everywhere</dt><dd>The same version in <code>engines</code>, the <code>.nvmrc</code>, the Dockerfile and CI. A minor difference in <code>fetch</code>, <code>structuredClone</code> or the module resolver is a genuine and very confusing source of "works on my machine".</dd>
+</div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>Why does copying <code>package*.json</code> before the source change the deploy rather than the image?
+<button class="reveal">Show answer</button><div class="ans">Because Docker layers are cached by their inputs. If the source is copied before <code>npm ci</code>, any code change invalidates the install layer and the dependencies are reinstalled and re-pushed every build. Copying the manifests first means the install layer is reused until a dependency actually changes, so a code-only deploy transfers a few megabytes instead of hundreds. The final image is the same size; the build and the push are transformed.</div></li>
+
+<li>What does a distroless base buy, and cost?
+<button class="reveal">Show answer</button><div class="ans">It removes the shell, the package manager and every utility, so a remote code execution has nothing to pivot with — no <code>curl</code> to fetch a payload, no <code>sh</code> to run one — and the vulnerability scanner has almost nothing to report. The cost is that you cannot <code>exec</code> into it to investigate. Keep the <code>:debug</code> tag available for when you need a shell, and rely on logs and metrics the rest of the time.</div></li>
+
+<li>Why must a Node process handle <code>SIGTERM</code> explicitly?
+<button class="reveal">Show answer</button><div class="ans">Because the default action is immediate termination. Every in-flight request is cut off mid-response and every keep-alive connection is severed, and since a rolling deploy sends <code>SIGTERM</code> to each instance in turn, an application without a handler drops requests on every release. It shows up as a small burst of 502s correlated with deploys, which is easy to attribute to the deploy tooling rather than to the application.</div></li>
+
+<li>Why is <code>server.close()</code> alone not enough?
+<button class="reveal">Show answer</button><div class="ans">For two reasons. It stops accepting new connections and waits for existing ones to end — but an idle keep-alive connection is not ended, so the callback may not fire until the keep-alive timeout, and the process is <code>SIGKILL</code>ed at the end of the grace period. <code>closeIdleConnections()</code> fixes that. And it does nothing about requests still arriving, because the load balancer has not yet learned this instance is going away.</div></li>
+
+<li>Why does a <code>preStop</code> delay matter more than everything else?
+<button class="reveal">Show answer</button><div class="ans">Because <code>SIGTERM</code> and the load-balancer update are concurrent, not sequential. The endpoint removal takes seconds to propagate, and during that window traffic is still being routed to a process that has stopped accepting it — at a few hundred requests a second, that is by far the largest number in the demo. Marking readiness false and sleeping a few seconds before closing the server lets the propagation finish while the instance is still serving.</div></li>
+
+<li>Why not run PM2 inside a container?
+<button class="reveal">Show answer</button><div class="ans">Because it duplicates what the orchestrator does and interferes with it. PM2 becomes PID 1, may not forward signals correctly, and restarts a crashed process internally — so the container stays "healthy" while the application is crash-looping invisibly, and the restart policy and crash metrics you actually rely on never fire. One process per container, PID 1, signals direct. PM2 and systemd are for a VM, where nothing else is supervising.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin:0">Chapter 20 is the reference: a decision table, the numbers worth memorising, checklists, a glossary and a self-quiz over the whole unit.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 19</h2><p>Deployment and process management. Part of the Node.js unit — <a href="index.html">all 20 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 20 — the deployment checklist collects everything here.</p></div>
+    <div><h2>Going deeper</h2><p>Chapter 21 of the Backend unit for rollout strategies; the Node Docker best-practices guide.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: the image ============ */
+(function(){
+  const cv=document.getElementById("cImg"); if(!cv) return;
+  const togs=document.getElementById("imTogs"), out=document.getElementById("imOut"), note=document.getElementById("imNote");
+  const F=[["ignore",".dockerignore"],["order","copy package*.json first"],["multi","multi-stage build"],
+           ["prod","npm ci --omit=dev"],["slim","node:22-slim base"],["distroless","distroless + nonroot"]];
+  const on={};
+  F.forEach(([k])=>on[k]=false);
+  function draw(){
+    let size=1350;
+    if(on.ignore) size-=70;
+    if(on.multi) size-=790;
+    if(on.prod) size-=on.multi?185:300;
+    if(on.slim) size-=on.multi?92:520;
+    if(on.distroless) size-=on.slim?38:70;
+    size=Math.max(112,size);
+    const transfer = on.order? (on.multi?9:38) : size;
+    const shell = !on.distroless;
+    const root = !on.distroless;
+    const cves = on.distroless? 2 : on.slim? 34 : 187;
+    const R=[
+      ["image size",size,1400,size>=1000?(size/1000).toFixed(2)+" GB":size+" MB",size>500?"#D9534F":size>250?"#F2A03D":"#3FB984"],
+      ["pushed per code-only deploy",transfer,1400,transfer>=1000?(transfer/1000).toFixed(2)+" GB":transfer+" MB",transfer>100?"#D9534F":"#3FB984"],
+      ["known CVEs in the base",cves,200,cves+"",cves>100?"#D9534F":cves>20?"#F2A03D":"#3FB984"]
+    ];
+    const w=cv.clientWidth||660, h=16+R.length*26+34, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h);
+    ctx.textBaseline="middle";
+    const lx=Math.min(224,w*0.41), rx=w-92, span=rx-lx;
+    R.forEach((r,i)=>{
+      const y=8+i*26;
+      ctx.fillStyle="#54677A"; ctx.font="10.5px Archivo, Arial"; ctx.textAlign="right";
+      const cut=Math.floor((lx-12)/5.3);
+      ctx.fillText(r[0].length>cut?r[0].slice(0,cut-1)+"…":r[0], lx-9, y+10);
+      const wd=Math.max(3,Math.min(1,r[1]/r[2])*span);
+      ctx.fillStyle=r[4]; ctx.globalAlpha=.87; ctx.fillRect(lx,y,wd,20); ctx.globalAlpha=1;
+      ctx.fillStyle="#54677A"; ctx.font="600 10px ui-monospace, monospace"; ctx.textAlign="left";
+      ctx.fillText(r[3], lx+wd+7, y+10);
+    });
+    const y0=14+R.length*26;
+    const hard=!shell&&!root;
+    ctx.fillStyle= hard?"#E7F7EF":"#FFF6E8"; ctx.strokeStyle= hard?"#3FB984":"#D98324"; ctx.lineWidth=2;
+    ctx.fillRect(16,y0,w-32,26); ctx.strokeRect(16.5,y0+.5,w-33,26);
+    ctx.fillStyle= hard?"#166B47":"#B0651A"; ctx.font="600 11px Archivo, Arial"; ctx.textAlign="center";
+    ctx.fillText(hard? "no shell, no package manager, non-root — an RCE has nothing to pivot with"
+      : (shell?"a shell and a package manager are present":"")+(shell&&root?", ":"")+(root?"running as root":""), w/2, y0+13);
+    const n=Object.values(on).filter(Boolean).length;
+    out.innerHTML=
+      '<div><span>changes</span><b>'+n+' of 6</b></div>'+
+      '<div><span>size</span><b style="color:'+(size>500?"#D9534F":"#1F7A52")+'">'+(size>=1000?(size/1000).toFixed(2)+" GB":size+" MB")+'</b></div>'+
+      '<div><span>per deploy</span><b style="color:'+(transfer>100?"#D9534F":"#1F7A52")+'">'+(transfer>=1000?(transfer/1000).toFixed(1)+" GB":transfer+" MB")+'</b></div>'+
+      '<div><span>shell present</span><b style="color:'+(shell?"#D9534F":"#1F7A52")+'">'+(shell?"yes":"no")+'</b></div>'+
+      '<div><span>runs as</span><b style="color:'+(root?"#D9534F":"#1F7A52")+'">'+(root?"root":"nonroot")+'</b></div>';
+    let msg;
+    if(n===0) msg="<b>1.35 GB, and the whole thing is re-pushed on every commit.</b> <code>FROM node:22</code>, <code>COPY . .</code>, <code>npm install</code> — the version in most tutorials. It contains the full Debian userland, your build toolchain, every dev dependency, your <code>.git</code> directory and probably a <code>.env</code> file, and it runs as root with a shell available. Every toggle below fixes something specific; start with the second one.";
+    else if(on.order&&!on.multi&&n<=2) msg="<b>The size barely moved and the per-deploy transfer went from "+size+" MB to "+transfer+" MB.</b> That is the point of this one: Docker caches layers by their inputs, so copying the manifests and running <code>npm ci</code> <em>before</em> copying the source means the install layer survives every code-only change. Nothing about the final image improved; the build and the push got an order of magnitude faster, which is what you feel on every commit.";
+    else if(hard&&n>=5) msg="<b>"+size+" MB, "+transfer+" MB per deploy, no shell, no package manager, non-root, "+cves+" known CVEs.</b> A twelvefold size reduction and a hundredfold reduction in what a deploy pushes, and the remaining attack surface is the Node binary and your code. Two things to keep in mind: distroless has no shell, so plan for logs and metrics (chapter 18) rather than <code>exec</code>; and set <code>--max-old-space-size</code> in <code>NODE_OPTIONS</code>, because chapter 16's ceiling problem is not fixed by any of this.";
+    else if(on.multi&&!on.prod) msg="<b>"+size+" MB — the build stage is gone, and your dev dependencies are still in the runtime image.</b> Multi-stage is the largest single reduction because it discards the compiler toolchain and the build cache entirely. What remains includes every test framework, type definition and linter in <code>node_modules</code>. Add <code>--omit=dev</code>.";
+    else msg="<b>"+size+" MB, "+transfer+" MB per deploy.</b> Keep going — and note that the three rows measure different things: size affects cold start and registry cost, transfer affects every deploy, and the CVE count is what a scanner will block your release over.";
+    note.innerHTML=msg;
+  }
+  togs.innerHTML=F.map(([k,l])=>'<button class="tog" data-k="'+k+'">'+l+'</button>').join("");
+  togs.querySelectorAll(".tog").forEach(b=>b.addEventListener("click",()=>{
+    on[b.dataset.k]=!on[b.dataset.k]; b.classList.toggle("on",on[b.dataset.k]); draw(); }));
+  draw(); debounceResize(draw);
+})();
+
+/* ============ demo 2: shutdown ============ */
+(function(){
+  const cv=document.getElementById("cShut"); if(!cv) return;
+  const togs=document.getElementById("shTogs"), rEl=document.getElementById("shR"), gEl=document.getElementById("shG"),
+        out=document.getElementById("shOut"), note=document.getElementById("shNote");
+  const F=[["sig","handle SIGTERM"],["close","server.close()"],["idle","closeIdleConnections()"],
+           ["pre","readiness false + preStop 6 s"],["dead","a 15 s exit deadline"]];
+  const on={};
+  F.forEach(([k])=>on[k]=false);
+  function draw(){
+    const R=+rEl.value, G=+gEl.value;
+    document.getElementById("shRo").textContent=R+"/s";
+    document.getElementById("shGo").textContent=G+" s";
+    const inflight=Math.round(R*0.28);
+    const lbLag=6;
+    let dropped=0, exitAt=0, killed=false, notes=[];
+    if(!on.sig){
+      dropped = inflight + R*lbLag;
+      exitAt=0; notes.push("terminated instantly");
+    } else {
+      dropped = on.pre? 0 : R*lbLag;
+      if(!on.close){ dropped += inflight; exitAt=0.2; }
+      else if(!on.idle){ exitAt=Math.min(G,65); killed=65>G; }
+      else exitAt=(on.pre?lbLag:0)+1.4;
+      if(on.dead) { exitAt=Math.min(exitAt,15+(on.pre?lbLag:0)); killed=false; }
+      if(killed) dropped+=Math.round(inflight*0.15);
+    }
+    const w=cv.clientWidth||660, h=150, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h);
+    ctx.textBaseline="middle";
+    const pad=20, bar=w-2*pad-160;
+    function row(y,lbl,frac,text,col){
+      ctx.fillStyle="#54677A"; ctx.font="600 10px Archivo, Arial"; ctx.textAlign="left";
+      ctx.fillText(lbl, pad, y+10);
+      ctx.fillStyle="#F2F5F7"; ctx.fillRect(pad+160,y,bar,20);
+      ctx.fillStyle=col; ctx.fillRect(pad+160,y,Math.max(3,Math.min(1,frac)*bar),20);
+      ctx.strokeStyle="#E1E7EC"; ctx.lineWidth=1; ctx.strokeRect(pad+160.5,y+.5,bar,20);
+      ctx.fillStyle= frac>0.3?"#fff":"#54677A"; ctx.font="600 10px ui-monospace, monospace"; ctx.textAlign="left";
+      ctx.fillText(text, frac>0.3?pad+168:pad+166+Math.min(1,frac)*bar, y+10);
+    }
+    row(14,"requests dropped",dropped/(inflight+R*lbLag),Math.round(dropped)+"",
+      dropped>0?"#D9534F":"#3FB984");
+    row(44,"in-flight, cut off",(on.sig&&on.close?0:inflight)/Math.max(inflight,1),
+      (on.sig&&on.close?"0":inflight+" of "+inflight),(on.sig&&on.close)?"#3FB984":"#D9534F");
+    row(74,"arrived after SIGTERM, refused",on.pre?0:(R*lbLag)/(R*lbLag),
+      on.pre?"0 — drained first":Math.round(R*lbLag)+" over "+lbLag+" s",on.pre?"#3FB984":"#D9534F");
+    const clean=dropped===0&&!killed;
+    ctx.fillStyle= clean?"#E7F7EF":"#FBEAE9"; ctx.strokeStyle= clean?"#D9534F":"#D9534F"; ctx.lineWidth=2;
+    if(clean) ctx.strokeStyle="#3FB984";
+    ctx.fillRect(pad,104,w-2*pad,30); ctx.strokeRect(pad+.5,104.5,w-2*pad,30);
+    ctx.fillStyle= clean?"#166B47":"#B0403C"; ctx.font="600 11.5px Archivo, Arial"; ctx.textAlign="center";
+    ctx.fillText(!on.sig? "SIGTERM's default action is immediate termination — "+Math.round(dropped)+" requests lost"
+      : killed? "still open at "+G+" s → SIGKILL, and whatever was mid-response is lost"
+      : clean? "exits cleanly in "+exitAt.toFixed(1)+" s, nothing dropped"
+      : Math.round(dropped)+" requests lost, exit at "+exitAt.toFixed(1)+" s", w/2, 119);
+    out.innerHTML=
+      '<div><span>fixes</span><b>'+Object.values(on).filter(Boolean).length+' of 5</b></div>'+
+      '<div><span>dropped</span><b style="color:'+(dropped?"#D9534F":"#1F7A52")+'">'+Math.round(dropped)+'</b></div>'+
+      '<div><span>exit after</span><b style="color:'+(killed?"#D9534F":"#1F7A52")+'">'+(killed?"SIGKILL at "+G+" s":exitAt.toFixed(1)+" s")+'</b></div>'+
+      '<div><span>per 10 instances</span><b style="color:'+(dropped?"#D9534F":"#1F7A52")+'">'+Math.round(dropped*10)+' per deploy</b></div>';
+    let msg;
+    if(!on.sig) msg="<b>"+Math.round(dropped)+" requests lost from one instance, "+Math.round(dropped*10)+" across a ten-instance rolling deploy.</b> <code>SIGTERM</code>'s default action is immediate termination: every in-flight response is cut mid-write and every request routed here in the following seconds is refused. This happens on <em>every release</em>, and it presents as a brief burst of 502s that correlates with deploys — which is usually blamed on the deploy tooling rather than on twelve missing lines in the application.";
+    else if(!on.close) msg="<b>The handler runs and the server still stops instantly, so all "+inflight+" in-flight requests die.</b> Catching the signal only gives you the opportunity to shut down properly; <code>server.close()</code> is what stops accepting new connections while letting existing responses finish. Without it you have written a logging statement.";
+    else if(killed) msg="<b>In-flight requests are safe, and the process will not exit — so it is <code>SIGKILL</code>ed at "+G+" seconds.</b> <code>server.close()</code> waits for existing connections to <em>end</em>, and an idle keep-alive connection never ends on its own; the callback does not fire until the keep-alive timeout, which chapter 9 told you to set above the proxy's. <code>closeIdleConnections()</code> — Node 18 and later — closes the ones sitting idle and lets the active ones finish. Add it, or add the deadline.";
+    else if(!on.pre) msg="<b>In-flight requests are safe and "+Math.round(R*lbLag)+" more are refused.</b> This is the fix people miss, and it is the largest number here: <code>SIGTERM</code> and the load-balancer update are <em>concurrent</em>. Endpoint removal takes several seconds to propagate, and for that whole window traffic is still routed to a process that has already stopped accepting it. Mark readiness false, sleep six seconds in a <code>preStop</code> hook, and only then close the server — so the propagation finishes while you are still serving.";
+    else msg="<b>Nothing dropped, clean exit in "+exitAt.toFixed(1)+" seconds.</b> Four things, each fixing a different failure: catch the signal so you get the chance; <code>close()</code> so in-flight responses finish; <code>closeIdleConnections()</code> so idle keep-alives do not hold the process open; and the readiness-plus-preStop drain so the load balancer stops sending before you stop accepting. The deadline is the fifth — a hung socket or an unfinished job should not turn a graceful shutdown into a "+G+"-second wait for <code>SIGKILL</code>.";
+    note.innerHTML=msg;
+  }
+  togs.innerHTML=F.map(([k,l])=>'<button class="tog" data-k="'+k+'">'+l+'</button>').join("");
+  togs.querySelectorAll(".tog").forEach(b=>b.addEventListener("click",()=>{
+    on[b.dataset.k]=!on[b.dataset.k]; b.classList.toggle("on",on[b.dataset.k]); draw(); }));
+  [rEl,gEl].forEach(e=>e.addEventListener("input",draw));
+  draw(); debounceResize(draw);
+})();
+</script>
+</body>
+</html>

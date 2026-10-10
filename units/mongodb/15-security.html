@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Security — MongoDB</title>
+<meta name="description" content="Authentication, role-based access, injection in a document database, encryption, and the defaults that have caused breaches.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 15 · At scale</div>
+    <h1>Security</h1>
+    <p class="standfirst">MongoDB's security reputation was earned by a default that no longer exists: for years a fresh install listened on all interfaces with no authentication. Tens of thousands of databases were found and ransomed. The default changed; the habits it created are still in circulation.</p>
+    <div class="chap-meta">
+      <span class="tagpill">authentication</span>
+      <span class="tagpill">rbac</span>
+      <span class="tagpill">injection</span>
+      <span class="tagpill">encryption</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The history, because it matters</h2>
+
+<div class="note key">
+  <span class="note-t">What actually happened</span>
+  <p>Before MongoDB 3.6, <code>mongod</code> bound to <code>0.0.0.0</code> by default and access control was off unless you turned it on. Anyone who started a server and did not read the security page had an open database on the internet, and from 2017 onwards automated scanners found them at scale — tens of thousands of databases were wiped and held for ransom. <b>MongoDB 3.6 changed the default bind to localhost</b>, and modern packages and Atlas require authentication. The remaining risk is not the default any more; it is a Docker image, a Helm chart, a tutorial or a development compose file written in the old style and carried into production. <b>Check <code>bindIp</code> and <code>security.authorization</code> on every deployment you inherit.</b></p>
+</div>
+
+<div class="code" data-lang="yaml">
+<div class="code-head"><span class="lang">mongod.conf — the four lines that matter</span><button class="copy">Copy</button></div>
+<pre><code>net:
+  bindIp: 127.0.0.1,10.0.1.15      # never 0.0.0.0 on a reachable network
+  port: 27017
+  tls:
+    mode: requireTLS
+    certificateKeyFile: /etc/ssl/mongodb.pem
+    CAFile: /etc/ssl/ca.pem
+
+security:
+  authorization: enabled            # OFF by default in a bare mongod
+  keyFile: /etc/mongo/keyfile       # members authenticate to each other
+
+setParameter:
+  authenticationMechanisms: SCRAM-SHA-256
+
+# Then, on the client, the setting people get wrong:
+#   mongodb://…/?tls=true                          encrypted, NOT verified
+#   mongodb://…/?tls=true&tlsCAFile=/etc/ca.pem    verified   ← this
+#
+# tlsAllowInvalidCertificates and tlsAllowInvalidHostnames exist for
+# development and turn verification off entirely. Finding either in a
+# production connection string means the TLS is decorative.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Roles</h2>
+
+<div class="demo" id="sec">
+  <div class="demo-head">
+    <b>Least privilege, by consumer</b>
+    <span>Pick who is connecting. The role, the reasoning, and what it deliberately cannot do.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="p-who">Who is connecting</label>
+        <select id="p-who">
+          <option value="app" selected>The application</option>
+          <option value="migrations">The migration runner in CI</option>
+          <option value="analytics">An analytics or BI tool</option>
+          <option value="monitoring">Monitoring</option>
+          <option value="support">A support engineer</option>
+          <option value="backup">The backup job</option>
+          <option value="dev">A developer, in production</option>
+        </select>
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="p-role">—</b><span>role</span></div>
+      <div><b id="p-scope">—</b><span>scope</span></div>
+      <div><b id="p-cannot">—</b><span>cannot</span></div>
+    </div>
+    <div id="p-code"></div>
+    <div class="out" id="p-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">built-in roles, and a custom one</span><button class="copy">Copy</button></div>
+<pre><code>// Per database:  read, readWrite, dbAdmin, dbOwner, userAdmin
+// Cluster-wide:  clusterMonitor, clusterManager, hostManager, backup, restore
+// All databases: readAnyDatabase, readWriteAnyDatabase, dbAdminAnyDatabase
+// Superuser:     root  — should belong to nobody in normal operation
+
+use admin;
+db.createUser({
+  user: "orders-api",
+  pwd: passwordPrompt(),                    // never a literal in a script
+  roles: [{ role: "readWrite", db: "shop" }]
+});
+
+// Custom roles are where least privilege actually happens — restricted to
+// specific collections and specific actions:
+db.createRole({
+  role: "ordersWriter",
+  privileges: [
+    { resource: { db: "shop", collection: "orders" },
+      actions: ["find", "insert", "update"] },      // note: no "remove"
+    { resource: { db: "shop", collection: "customers" },
+      actions: ["find"] }
+  ],
+  roles: []
+});
+
+db.getUser("orders-api");
+db.getRole("ordersWriter", { showPrivileges: true });
+
+// The pattern from the PostgreSQL unit applies unchanged: the application
+// role should not be able to change the schema. readWrite includes
+// createCollection, createIndex and dropCollection — so an application
+// running as readWrite CAN drop your collections. A custom role restricted
+// to find/insert/update/remove is the version that cannot.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Injection</h2>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">no string concatenation, and still injectable</span><button class="copy">Copy</button></div>
+<pre><code>// Queries are documents, not strings, so classic SQL injection does not
+// apply. A different version does.
+
+// THE OPERATOR INJECTION. A JSON body posts:
+//     { "username": "admin", "password": { "$ne": null } }
+// and this authenticates as admin:
+await users.findOne({ username: body.username, password: body.password });
+//     -> { username: "admin", password: { $ne: null } }
+// which matches, because the stored hash is not null.
+
+// The fix is to constrain types at the boundary, before the value ever
+// reaches a query:
+if (typeof body.password !== "string") throw new BadRequest();
+// or a schema validator — zod, joi, ajv — on every request body.
+// Most frameworks and ODMs cast to the declared type, which handles this;
+// raw driver code does not.
+
+// THE $where / $function INJECTION — arbitrary JavaScript on the server:
+db.users.find({ $where: `this.name === '${input}'` });    // NEVER
+// Disable server-side JavaScript entirely unless you have a specific need:
+//   security.javascriptEnabled: false
+// It also blocks $accumulator, $function and mapReduce, which is usually fine.
+
+// AGGREGATION PIPELINE INJECTION — a user-supplied pipeline stage can read
+// other collections with $lookup, or write with $merge:
+db.orders.aggregate(JSON.parse(req.query.pipeline));      // NEVER
+
+// REGEX DENIAL OF SERVICE — a crafted pattern that backtracks catastrophically:
+db.users.find({ name: { $regex: userInput } });
+// Escape it, or constrain the pattern shape. Never pass raw user input
+// as a regex.
+
+// The general rule: NEVER let user input decide the SHAPE of a query.
+// Values are fine once type-checked; field names, operators and pipeline
+// stages must come from your code.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Operator injection is the one to test for</span>
+  <p>It is easy to miss because it does not look like injection — there is no quoting, no escaping, no string building, and the code reads as a normal query. Any endpoint that passes a request field straight into a filter is vulnerable if the field can arrive as an object rather than a string, which in JSON it always can. Test it directly: send <code>{"$ne": null}</code>, <code>{"$gt": ""}</code> and <code>{"$regex": ".*"}</code> where a string is expected and see what the endpoint does. <b>Validating request body types is the single fix</b>, and it belongs at the boundary rather than at each query.</p>
+</div>
+
+<h2><span class="h-rule"></span>Encryption</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Layer</th><th>Protects against</th><th>Does not protect against</th></tr></thead>
+<tbody>
+<tr><td><b>TLS in transit</b></td><td>Network interception</td><td>Anything with database access</td></tr>
+<tr><td><b>Encryption at rest</b></td><td>A stolen disk or backup</td><td>Anyone who can query the database</td></tr>
+<tr><td><b>Client-side field level</b></td><td>The database, DBAs, a compromised server</td><td>A compromised application</td></tr>
+<tr><td><b>Queryable encryption</b></td><td>The same, while still allowing equality and range queries</td><td>The same</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="javascript">
+<div class="code-head"><span class="lang">client-side field level encryption</span><button class="copy">Copy</button></div>
+<pre><code>// The driver encrypts specific fields before they leave the application.
+// The server stores and returns ciphertext and never holds the key — so a
+// database compromise does not expose those fields.
+
+const client = new MongoClient(uri, {
+  autoEncryption: {
+    keyVaultNamespace: "encryption.__keyVault",
+    kmsProviders: { aws: { accessKeyId: …, secretAccessKey: … } },
+    schemaMap: {
+      "shop.patients": {
+        bsonType: "object",
+        properties: {
+          nationalId: {
+            encrypt: {
+              bsonType: "string",
+              algorithm: "AEAD_AES_256_CBC_HMAC_SHA_512-Deterministic"
+            }
+          }
+        }
+      }
+    }
+  }
+});
+
+//   Deterministic  — the same input gives the same ciphertext, so equality
+//                    queries work. It also leaks equality: an attacker with
+//                    the database can see which rows share a value, and
+//                    frequency analysis applies to low-cardinality fields
+//   Random         — no queries at all on that field, and no leakage
+//
+// QUERYABLE ENCRYPTION (6.0+, GA in 7.0) supports equality and range
+// queries on encrypted fields with much better leakage properties than
+// deterministic. Use it in preference where the driver supports it.
+
+// The point worth being clear about: encryption at rest protects a stolen
+// disk. It does nothing against anyone who can run a query — which is the
+// threat most people are actually worried about. Only client-side
+// encryption addresses that, and it costs queryability and key management.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Auditing</h2>
+
+<div class="code" data-lang="yaml">
+<div class="code-head"><span class="lang">Enterprise and Atlas</span><button class="copy">Copy</button></div>
+<pre><code>auditLog:
+  destination: file
+  format: JSON
+  path: /var/log/mongodb/audit.json
+  filter: '{ "atype": { "$in": ["authenticate", "createUser", "dropUser",
+                                "createRole", "dropCollection",
+                                "dropDatabase", "shutdown"] } }'
+
+# Auditing is an Enterprise and Atlas feature. On Community, the closest
+# equivalents are:
+#   * the ordinary log, with authentication events
+#   * a change stream writing to an append-only audit collection (chapter 14),
+#     which captures DATA changes but not administrative ones
+#
+# Neither substitutes for real audit logging if you have a compliance
+# requirement, and that is worth establishing before choosing an edition.
+
+# Also worth setting, and unrelated to the edition:
+#   * a log retention policy, since logs can contain query values
+#   * redaction on Enterprise: security.redactClientLogData: true</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>A review checklist</h2>
+
+<ul class="check">
+  <li><b><code>security.authorization: enabled</code></b> and <code>bindIp</code> not <code>0.0.0.0</code> — check on every deployment, especially containerised ones.</li>
+  <li><b>TLS with certificate verification</b>, and no <code>tlsAllowInvalidCertificates</code> in any production connection string.</li>
+  <li><b>SCRAM-SHA-256</b>, not SCRAM-SHA-1. X.509 or a cloud IAM mechanism where available.</li>
+  <li><b>A keyFile or X.509 for internal authentication</b> between replica set members.</li>
+  <li><b>No <code>root</code> in normal operation.</b> Per-service users with the narrowest role that works.</li>
+  <li><b>The application cannot change the schema</b> — a custom role, not <code>readWrite</code>.</li>
+  <li><b>Request body types validated</b> at the boundary, so an operator cannot arrive where a string is expected.</li>
+  <li><b><code>javascriptEnabled: false</code></b> unless something genuinely needs it.</li>
+  <li><b>The database is on a private network</b> with a default-deny firewall. Access control is the last line, not the first.</li>
+  <li><b>Backups encrypted and access-controlled separately</b> — a backup is a full copy of everything.</li>
+</ul>
+
+<div class="note trap">
+  <span class="note-t">The two most common findings on an inherited cluster</span>
+  <p><b>Everything connects as the same user</b>, usually one with <code>readWriteAnyDatabase</code> or <code>root</code>, because that is what the first tutorial did and nothing ever forced a change. Every service, every script and every developer therefore shares one credential with full access, and rotating it means coordinating every consumer at once — which is why nobody does. <b>And the connection string is in an environment variable in a repository</b>, or in a Kubernetes ConfigMap rather than a Secret. Neither is a MongoDB flaw and both are worth checking first, because they are the ones that turn a minor compromise into a total one.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>The insecure default was fixed in 3.6.</b> The risk now is a container image or chart written in the old style.</li>
+    <li><b>Check <code>bindIp</code> and <code>security.authorization</code></b> on every deployment you inherit.</li>
+    <li><b>TLS without <code>tlsCAFile</code> is encryption without verification</b> — the same trap as <code>sslmode=require</code>.</li>
+    <li><b>Operator injection is real</b> — <code>{"$ne": null}</code> where a string was expected. Validate request body types.</li>
+    <li><b>Never let user input decide the shape of a query</b>: no <code>$where</code>, no user-supplied pipelines, no raw regex.</li>
+    <li><b><code>readWrite</code> includes dropping collections.</b> Use a custom role for the application.</li>
+    <li><b>Encryption at rest protects a stolen disk</b> and nothing against someone who can query. Only client-side encryption does that.</li>
+    <li><b>One shared credential for everything</b> is the most common finding, and the reason a small compromise becomes a total one.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("15-security.html");
+
+(function(){
+  const root = document.getElementById("sec");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const W = {
+    app: {role:"a custom role", scope:"named collections", cannot:"change the schema",
+      code:'db.createRole({\n  role: "ordersApp",\n  privileges: [\n    { resource: { db: "shop", collection: "orders" },\n      actions: ["find", "insert", "update"] },\n    { resource: { db: "shop", collection: "customers" },\n      actions: ["find"] }\n  ], roles: []\n});\ndb.createUser({ user: "orders-api", pwd: passwordPrompt(),\n  roles: [{ role: "ordersApp", db: "shop" }] });',
+      note:"The instinct is readWrite on the database, and readWrite includes createCollection, createIndex, dropCollection and dropDatabase. An application running with it can drop your data — through a bug, a compromised dependency, or an injection that reaches an admin command.\n\nA custom role restricted to specific collections and specific actions cannot. Note the absence of \"remove\" here too: if the application only ever soft-deletes, it does not need the privilege to hard-delete.\n\nThis is the PostgreSQL unit's argument unchanged — the application should not own its schema. Migrations run as a different identity, from CI, with the privileges the application lacks."},
+    migrations: {role:"dbAdmin + readWrite", scope:"one database", cannot:"touch other databases",
+      code:'db.createUser({\n  user: "migrator", pwd: passwordPrompt(),\n  roles: [\n    { role: "readWrite", db: "shop" },\n    { role: "dbAdmin",   db: "shop" }\n  ]\n});',
+      note:"The identity that DOES change the schema: create collections, build indexes, run backfills, modify validators.\n\nIt should exist only in CI, with the credential in the CI secret store rather than in any application environment. Nothing that serves user requests should hold it.\n\nSeparating this from the application role is what makes the application role meaningful. If the application can also run migrations, the restriction achieves nothing — you have two names for the same set of privileges."},
+    analytics: {role:"read, or a view", scope:"read-only", cannot:"write anything",
+      code:'// Read-only on the database\ndb.createUser({ user: "bi", pwd: passwordPrompt(),\n  roles: [{ role: "read", db: "shop" }] });\n\n// Better: a VIEW that omits personal data,\n// with access to the view only\ndb.createView("ordersRedacted", "orders", [\n  { $project: { "customer.email": 0, "customer.phone": 0,\n                paymentToken: 0 } }\n]);',
+      note:"Two things to get right here, and the second is the one people skip.\n\nRead-only is obvious. Less obvious: an analytics tool usually does not need personal data, and giving it read access to the collection gives it everything. A view that projects away emails, phone numbers and payment tokens lets you grant access to the view alone — the analyst gets the columns their work needs and nothing else.\n\nAlso point this user at a secondary via readPreference, so a heavy scan does not evict the primary's working set (chapters 9 and 10). A hidden, priority-0 member with its own analytics indexes is better still."},
+    monitoring: {role:"clusterMonitor", scope:"metrics only", cannot:"read your data",
+      code:'db.createUser({\n  user: "monitoring", pwd: passwordPrompt(),\n  roles: [{ role: "clusterMonitor", db: "admin" }]\n});',
+      note:"clusterMonitor grants serverStatus, replSetGetStatus, the profiler collections and index statistics — everything a monitoring agent needs — and no access to the contents of your collections.\n\nThis matters more than it sounds. Monitoring credentials are widely distributed by nature: they live on every host, in the agent's configuration, in a dashboard's connection settings. A monitoring credential that can also read customer data means every one of those places is now holding a credential that can read customer data.\n\nThere is no reason to grant root here, and it is a common finding."},
+    support: {role:"read + a break-glass path", scope:"time-limited", cannot:"write, by default",
+      code:'// Standing access: read-only, on redacted views\ndb.createUser({ user: "support", pwd: passwordPrompt(),\n  roles: [{ role: "read", db: "shopRedacted" }] });\n\n// Elevated access: a separate credential, checked out\n// from a secret store, time-limited, and logged.',
+      note:"Standing write access for humans is how a support engineer running a filter without a limit becomes an incident.\n\nThe pattern that works: read-only by default, ideally against redacted views, plus a documented break-glass path for the rare case that needs more. The elevated credential is checked out from a secret store, expires, and every use is logged and reviewed.\n\nThe critical part is that break-glass must be genuinely available and quick. If it is slow or bureaucratic, people will keep a standing credential instead and the whole arrangement collapses into everyone having write access — which is where you started."},
+    backup: {role:"backup", scope:"read everything", cannot:"write",
+      code:'db.createUser({\n  user: "backup", pwd: passwordPrompt(),\n  roles: [{ role: "backup", db: "admin" }]\n});',
+      note:"The built-in backup role grants what mongodump and snapshot tooling need and no write privileges.\n\nThe security consideration is downstream rather than in the role: a backup is a complete, unencrypted-by-default copy of every collection, and it usually lives somewhere with weaker access control than the database — an object store bucket, a shared filesystem, a laptop.\n\nEncrypt backups, control access to them separately from database access, and confirm that the people who can read the backup bucket are the people who should be able to read your data. That is frequently not true, and it is not something the database can tell you."},
+    dev: {role:"none by default", scope:"—", cannot:"connect at all",
+      code:'// Production: no standing developer access.\n// Debugging happens against:\n//   - logs and metrics\n//   - a restored, anonymised copy\n//   - a redacted read-only view, if genuinely needed\n//\n// Emergency access: break-glass, time-limited, logged,\n// and reviewed afterwards.',
+      note:"Standing developer access to production is the norm in many organisations and it is worth being direct about the cost: it is unaudited access to customer data by people who do not need it for their daily work, and it is the route by which most accidental data destruction happens.\n\nThe replacements are usually adequate. Good logs and metrics answer most questions (chapter 16). A restored, anonymised copy answers the rest and is safe to explore freely. A redacted view covers the cases that genuinely need production data.\n\nWhen emergency access is required, break-glass: a time-limited credential, checked out deliberately, logged, and reviewed. The friction is the point, and it must still be fast enough that people use it rather than routing around it."}
+  };
+
+  function render(){
+    const w = W[$("p-who").value];
+    $("p-role").textContent   = w.role;
+    $("p-scope").textContent  = w.scope;
+    $("p-cannot").textContent = w.cannot;
+
+    $("p-code").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid #25B7C4;border-radius:5px;' +
+      'padding:11px 13px;margin:14px 0 12px;font-family:var(--mono);font-size:12px;line-height:1.6;overflow-x:auto">' +
+      w.code.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>';
+
+    $("p-note").textContent = w.note +
+      "\n\nWhichever role: a separate credential per consumer, held in a secret store rather than an environment variable in a repository. One shared credential for everything is the most common finding on an inherited cluster, and it is what turns a minor compromise into a total one — because it also makes rotation impossible in practice.";
+  }
+
+  $("p-who").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

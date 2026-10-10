@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Rate limiting and counting — Redis</title>
+<meta name="description" content="Fixed windows, sliding windows, token buckets and probabilistic counting — four algorithms, each with the Redis primitive that fits it.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 10 · Patterns</div>
+    <h1>Rate limiting and counting</h1>
+    <p class="standfirst">Four algorithms, in order of accuracy and cost, each mapping onto a Redis structure. The cheapest one has a flaw that lets through double the configured rate, and knowing whether that matters is the whole decision.</p>
+    <div class="chap-meta">
+      <span class="tagpill">fixed window</span>
+      <span class="tagpill">sliding</span>
+      <span class="tagpill">token bucket</span>
+      <span class="tagpill">hyperloglog</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Fixed window</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">two commands, and it is nearly right</span><button class="copy">Copy</button></div>
+<pre><code># Bucket by time period, count within it.
+window=$(( $(date +%s) / 60 ))
+key="rl:u41:$window"
+
+INCR   $key
+EXPIRE $key 120 NX          # NX so a later request cannot extend the window
+# reject if the INCR result exceeds the limit
+
+# One key per user per minute, expiring on its own. Constant memory, two
+# commands, no cleanup. This is what most rate limiters actually are.
+
+# Atomically, so the EXPIRE cannot be missed if the process dies between them:
+EVAL "
+  local n = redis.call('INCR', KEYS[1])
+  if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+  return n
+" 1 rl:u41:$window 120
+
+# THE BOUNDARY PROBLEM. A limit of 100 per minute permits 200 in a two-second
+# span: 100 requests at 11:59:59 fill one window, 100 at 12:00:01 fill the
+# next. Both are within the rules and the burst is twice the intended rate.
+#
+# Whether that matters depends entirely on what you are protecting. For a
+# public API quota it is fine — the intent is fairness over an hour, not a
+# hard ceiling per instant. For protecting a downstream service with a real
+# concurrency limit, it is the difference between working and not.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Comparing four</h2>
+
+<div class="demo" id="rl">
+  <div class="demo-head">
+    <b>The same burst, four algorithms</b>
+    <span>A limit of 10 per 10 seconds. Watch how each one handles a burst that straddles the window boundary.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="q-alg">Algorithm</label>
+        <select id="q-alg">
+          <option value="fixed" selected>Fixed window</option>
+          <option value="slidelog">Sliding window log</option>
+          <option value="slidecount">Sliding window counter</option>
+          <option value="bucket">Token bucket</option>
+        </select>
+      </div>
+      <div>
+        <label for="q-burst">Burst at the boundary — <span id="q-burstv">8</span> requests</label>
+        <input type="range" id="q-burst" min="1" max="14" step="1" value="8">
+      </div>
+    </div>
+    <div id="q-chart"></div>
+    <div class="stat">
+      <div><b id="q-allowed">—</b><span>allowed in 2 seconds</span></div>
+      <div><b id="q-over">—</b><span>vs. the intended rate</span></div>
+      <div><b id="q-mem">—</b><span>memory per user</span></div>
+      <div><b id="q-cost">—</b><span>commands</span></div>
+    </div>
+    <div id="q-code"></div>
+    <div class="out" id="q-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Sliding window log</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">exact, and it costs one entry per request</span><button class="copy">Copy</button></div>
+<pre><code># A sorted set scored by timestamp (chapter 5). Remove what has aged out,
+# add this request, count what remains.
+EVAL "
+  local now    = tonumber(ARGV[1])
+  local window = tonumber(ARGV[2])
+  local limit  = tonumber(ARGV[3])
+
+  redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - window)
+  local used = redis.call('ZCARD', KEYS[1])
+  if used >= limit then
+    return {0, used}
+  end
+  redis.call('ZADD',   KEYS[1], now, ARGV[4])
+  redis.call('PEXPIRE', KEYS[1], window)
+  return {1, used + 1}
+" 1 rl:u41 1741946400123 60000 100 "1741946400123-a9f2"
+
+# Exactly correct: at most `limit` requests in ANY rolling window, with no
+# boundary artefact.
+#
+# THE MEMBER MUST BE UNIQUE per request, or two requests in the same
+# millisecond collapse into one sorted-set member and one of them is not
+# counted. A random suffix or a request id does it.
+#
+# THE COST is one sorted-set entry per request in the window — roughly 70-100
+# bytes each. A limit of 1,000 per hour across a million users is a hundred
+# million entries, which is several gigabytes for a rate limiter. That is the
+# reason the next algorithm exists.
+#
+# Note the ZREMRANGEBYSCORE runs on every request, so the work is spread out
+# rather than accumulating. And PEXPIRE means an inactive user's key vanishes
+# instead of lingering (chapter 2).</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Sliding window counter</h2>
+
+<div class="code" data-lang="lua">
+<div class="code-head"><span class="lang">the practical compromise</span><button class="copy">Copy</button></div>
+<pre><code>-- Keep two fixed-window counters and weight the previous one by how much of
+-- it still overlaps the rolling window.
+--
+--     estimate = current + previous * (1 - elapsed_fraction)
+--
+-- Two seconds into a ten-second window, 80% of the previous window is still
+-- inside the rolling one, so 80% of its count is charged.
+
+local now      = tonumber(ARGV[1])
+local window   = tonumber(ARGV[2])
+local limit    = tonumber(ARGV[3])
+local this_win = math.floor(now / window)
+local elapsed  = (now % window) / window
+
+local cur  = tonumber(redis.call('GET', KEYS[1] .. ':' .. this_win) or 0)
+local prev = tonumber(redis.call('GET', KEYS[1] .. ':' .. (this_win - 1)) or 0)
+
+if cur + prev * (1 - elapsed) >= limit then return 0 end
+
+redis.call('INCR',   KEYS[1] .. ':' .. this_win)
+redis.call('EXPIRE', KEYS[1] .. ':' .. this_win, window * 2 / 1000)
+return 1
+
+-- Two small integers per user instead of one entry per request. The estimate
+-- assumes requests were spread evenly through the previous window, which is
+-- usually close enough — Cloudflare published measurements showing under
+-- 0.003% of requests wrongly allowed at scale.
+--
+-- This is what most production rate limiters use. It removes the boundary
+-- problem for a fraction of the memory of an exact log.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">The sliding window counter is the default worth reaching for</span>
+  <p>Fixed window is cheapest and lets through twice the rate at a boundary. Sliding log is exact and costs one entry per request, which does not scale to a large user base. <b>The sliding window counter gets essentially the accuracy of the log for the memory of the fixed window</b> — two integers per user — and the approximation error is small enough that it does not show up in practice. Unless you have a specific reason to need exactness, or your limits are so low that the log's memory is irrelevant, this is the one to build.</p>
+</div>
+
+<h2><span class="h-rule"></span>Token bucket</h2>
+
+<div class="code" data-lang="lua">
+<div class="code-head"><span class="lang">when you want to permit bursts deliberately</span><button class="copy">Copy</button></div>
+<pre><code>-- Tokens refill at a steady rate up to a capacity. Each request takes one.
+-- A user who has been idle has a full bucket and may burst; a sustained user
+-- is throttled to the refill rate.
+
+local capacity = tonumber(ARGV[1])       -- max burst
+local rate     = tonumber(ARGV[2])       -- tokens per second
+local now      = tonumber(ARGV[3])
+local want     = tonumber(ARGV[4] or 1)
+
+local state  = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(state[1]) or capacity
+local last   = tonumber(state[2]) or now
+
+tokens = math.min(capacity, tokens + (now - last) * rate)
+
+if tokens < want then
+  redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+  redis.call('EXPIRE', KEYS[1], math.ceil(capacity / rate) * 2)
+  return {0, tokens}                     -- rejected, and how many they have
+end
+
+redis.call('HSET', KEYS[1], 'tokens', tokens - want, 'ts', now)
+redis.call('EXPIRE', KEYS[1], math.ceil(capacity / rate) * 2)
+return {1, tokens - want}
+
+-- Tokens are computed on read from the elapsed time, so nothing has to run
+-- on a timer and an idle bucket costs nothing.
+--
+-- WHY THIS ONE IS DIFFERENT: the others answer "how many in the last N
+-- seconds". This one shapes traffic — it encodes both a sustained rate and
+-- an allowed burst as separate parameters, which is what an API quota
+-- usually wants. Capacity 100 with a rate of 10/s means "10 per second
+-- sustained, but you may spend up to 100 at once if you have been quiet".
+--
+-- LEAKY BUCKET is the same structure with capacity == 1 burst allowance:
+-- perfectly smooth output, no bursts at all. Use it when the downstream
+-- service has a hard concurrency limit rather than a rate quota.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Choosing</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Algorithm</th><th>Accuracy</th><th>Memory per user</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><b>Fixed window</b></td><td>Up to 2× at a boundary</td><td>One integer</td><td>Coarse quotas where fairness over the period is the point</td></tr>
+<tr><td><b>Sliding log</b></td><td>Exact</td><td>One entry per request</td><td>Low limits, or where exactness is required</td></tr>
+<tr><td><b>Sliding counter</b></td><td>~0.003% error</td><td>Two integers</td><td><b>The default</b></td></tr>
+<tr><td><b>Token bucket</b></td><td>Exact for its model</td><td>Two fields</td><td>Deliberate bursts, tiered API quotas</td></tr>
+<tr><td><b>Leaky bucket</b></td><td>Exact</td><td>Two fields</td><td>Protecting something with a hard concurrency limit</td></tr>
+<tr><td><b>Concurrency limit</b></td><td>Exact</td><td>A sorted set of in-flight</td><td>"At most N running", not "N per second"</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the practical details every limiter needs</span><button class="copy">Copy</button></div>
+<pre><code># TELL THE CLIENT. A 429 with no information means they retry immediately.
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1741946460
+Retry-After: 37
+# Return the remaining count and reset time FROM the same Lua call, so the
+# headers do not require a second round trip and cannot disagree.
+
+# LIMIT ON SEVERAL DIMENSIONS. One key per dimension, all checked:
+rl:ip:203.0.113.5        # crude, catches unauthenticated abuse
+rl:user:41               # the real quota
+rl:user:41:endpoint:search   # per-endpoint, for expensive operations
+rl:global:search         # a system-wide ceiling
+# Check the cheapest first and short-circuit. Check them all in ONE Lua
+# script if you need the decision to be atomic across dimensions.
+
+# FAIL OPEN OR CLOSED? If Redis is unreachable, do you allow or reject?
+#   fail open  — an outage removes your protection, and the site stays up
+#   fail closed — an outage rejects everything, turning a Redis problem into
+#                 a total outage
+# Usually fail open with a short client timeout, plus a much cruder local
+# in-process limiter as a backstop. Decide deliberately and write it down.
+
+# DO NOT COUNT THE CHECK ITSELF. A limiter that increments before deciding
+# charges the user for requests you rejected, so a client in a retry loop can
+# never recover — every retry extends the block. Increment only on allow, or
+# make the reset time absolute rather than sliding.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Counting things</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">HyperLogLog — cardinality in 12 KB</span><button class="copy">Copy</button></div>
+<pre><code># "How many DISTINCT users visited today" over hundreds of millions of
+# events. A set is exact and costs memory proportional to the answer.
+PFADD   visitors:2026-03-14 "u41" "u9" "u41"
+PFCOUNT visitors:2026-03-14        # 2
+
+# Fixed 12 KB per key, regardless of whether you added ten items or ten
+# billion. Standard error around 0.81%.
+PFMERGE visitors:week visitors:2026-03-08 ... visitors:2026-03-14
+PFCOUNT visitors:week              # unique across the week — the union is
+                                   # correct, not a sum of the days
+
+# WHAT IT CANNOT DO, and this catches people: it cannot tell you whether a
+# specific item is in it. There is no PFEXISTS. It counts and merges; that
+# is all. If you need membership, you need a set or a bitmap.
+#
+# It also cannot be decremented, and merging is one-way.
+
+# THE COMPARISON, for one million distinct user ids:
+#   SET       ~60 MB, exact, supports membership and enumeration
+#   BITMAP    ~125 KB, exact, needs dense integer ids (chapter 3)
+#   HLL       12 KB, ~0.81% error, no membership
+#
+# So: bitmap if the ids are dense integers, HLL if they are not and you only
+# need the count, set if you need to ask about individual members.
+
+# TOP-K AND FREQUENCY. A sorted set is exact and unbounded in members:
+ZINCRBY trending:2026-03-14 1 "redis"
+ZREVRANGE trending:2026-03-14 0 9 WITHSCORES
+# For a very large key space where approximate is fine, the RedisBloom
+# module adds Count-Min Sketch and Top-K in bounded memory. Without the
+# module, cap the sorted set periodically:
+ZREMRANGEBYRANK trending:2026-03-14 0 -10001</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">A rate limiter is a hot key, and a hot key does not shard</span>
+  <p>Per-user limits distribute naturally — a million users are a million keys spread across the keyspace. A <em>global</em> limit is one key that every request touches, and in cluster mode that key lives on exactly one node, so your entire request rate serialises through one thread (chapters 1 and 16). At a few thousand requests per second that is fine. At a hundred thousand it is the bottleneck. The fixes are to shard the counter across N keys and check a random one with a limit of <code>total/N</code>, or to do the global limiting locally in each application instance with a share of the budget — both approximate, both far cheaper than the exact version.</p>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Rate limiting is a product decision wearing an engineering costume</span>
+  <p>The algorithm is the easy part; all four above are twenty lines of Lua. The hard questions are what the limit should be, what happens when someone hits it, whether it is per user or per IP or per key, whether paying customers get more, and whether a burst is abuse or a legitimate batch job. Those get decided by whoever implements it, at the moment of implementation, usually by picking a round number. <b>Instrument first</b> — count what would have been rejected without rejecting it — and set the limit from the distribution you observe rather than from a guess. A limit that fires for 3% of legitimate users is a support burden that outlasts whatever it was protecting against.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Fixed window is two commands and lets through 2× at a boundary.</b> Often that is fine — decide, do not default.</li>
+    <li><b>Sliding log is exact</b> and costs one sorted-set entry per request, which does not scale to many users.</li>
+    <li><b>The sliding window counter is the default</b> — log accuracy for fixed-window memory.</li>
+    <li><b>Token bucket shapes traffic</b>: a sustained rate plus a deliberate burst allowance, as separate parameters.</li>
+    <li><b>Return the remaining count and reset time from the same Lua call</b>, so headers cannot disagree with the decision.</li>
+    <li><b>Do not count rejected requests</b>, or a client in a retry loop can never recover.</li>
+    <li><b>HyperLogLog counts in 12 KB and cannot answer membership.</b> Bitmap for dense integer ids, set if you need members.</li>
+    <li><b>A global limit is one hot key</b> that does not shard. Split it, or limit locally with a budget share.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("10-rate-limiting.html");
+
+(function(){
+  const root = document.getElementById("rl");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const LIMIT = 10, WIN = 10;
+
+  const A = {
+    fixed: {mem:"1 integer", cost:"2",
+      code:'local n = redis.call(\'INCR\', KEYS[1])\nif n == 1 then\n  redis.call(\'EXPIRE\', KEYS[1], ARGV[1])\nend\nreturn n <= tonumber(ARGV[2])',
+      // burst at end of window 1 + same burst at start of window 2
+      allow: (b) => Math.min(b, LIMIT) + Math.min(b, LIMIT),
+      note:"One counter per user per window, expiring on its own. Two commands, constant memory, no cleanup — this is the cheapest correct-ish rate limiter there is.\n\nThe boundary artefact is visible in the chart: requests just before the window rolls fill one counter, and requests just after fill a fresh one. Both are within the configured limit and the combined burst is up to twice the intended rate over a very short span.\n\nWhether that matters is a real question rather than a rhetorical one. For an API quota where the intent is fairness over an hour, a brief 2× burst is irrelevant. For protecting a downstream service that falls over above a hard concurrency ceiling, it is the difference between working and not."},
+    slidelog: {mem:"~80 B per request", cost:"4",
+      code:'redis.call(\'ZREMRANGEBYSCORE\', KEYS[1], \'-inf\', now - window)\nlocal used = redis.call(\'ZCARD\', KEYS[1])\nif used >= limit then return 0 end\nredis.call(\'ZADD\', KEYS[1], now, unique_id)\nredis.call(\'PEXPIRE\', KEYS[1], window)\nreturn 1',
+      allow: () => LIMIT,
+      note:"Exactly correct. Every request is recorded in a sorted set scored by its timestamp, old entries are removed on each call, and the count is whatever remains in the rolling window.\n\nNo boundary artefact exists because there is no boundary — the window slides continuously with each request.\n\nThe cost is one sorted-set entry per request currently in the window, at roughly 70-100 bytes each. A limit of 1,000 per hour across a million active users is a hundred million entries and several gigabytes, spent entirely on a rate limiter.\n\nOne implementation detail that is easy to get wrong: the member must be unique per request. Two requests in the same millisecond with the same member collapse into one sorted-set entry, and one of them goes uncounted."},
+    slidecount: {mem:"2 integers", cost:"4",
+      code:'local cur  = GET key:current_window\nlocal prev = GET key:previous_window\nlocal est  = cur + prev * (1 - elapsed_fraction)\nif est >= limit then return 0 end\nINCR key:current_window',
+      allow: (b) => {
+        // previous window had b requests (capped at limit), 20% elapsed into new window
+        const prev = Math.min(b, LIMIT);
+        const budget = Math.max(0, LIMIT - prev * 0.8);
+        return prev + Math.min(b, Math.floor(budget));
+      },
+      note:"Two fixed-window counters, with the previous one weighted by how much of it still overlaps the rolling window. Two seconds into a ten-second window, 80% of the previous window is still inside it, so 80% of its count is charged against the limit.\n\nThat single weighting removes almost all of the boundary artefact — the chart shows the second burst being cut off much earlier, because the previous window's requests are still being counted.\n\nThe estimate assumes requests were spread evenly through the previous window, which is an approximation. Cloudflare published measurements at scale showing under 0.003% of requests wrongly allowed, which is small enough that it does not show up in practice.\n\nTwo small integers per user instead of one entry per request. This is what most production rate limiters use, and for good reason."},
+    bucket: {mem:"2 hash fields", cost:"3",
+      code:'tokens = min(capacity, tokens + elapsed * rate)\nif tokens < 1 then return 0 end\nHSET key tokens (tokens - 1) ts now\nreturn 1',
+      allow: (b) => {
+        // capacity 10, rate 1/s; 2 seconds elapsed = 2 tokens refilled
+        const first = Math.min(b, LIMIT);
+        const refilled = Math.min(LIMIT - first + 2, 2 + Math.max(0, LIMIT - first));
+        return first + Math.min(b, Math.max(0, refilled));
+      },
+      note:"Tokens accumulate at a fixed rate up to a capacity, and each request spends one. Nothing runs on a timer — the token count is computed from the elapsed time whenever the bucket is read, so an idle bucket costs nothing.\n\nThe behaviour here is different in kind from the others. After the first burst drains the bucket, only the two seconds' worth of refill is available, so the second burst is throttled to the refill rate rather than to a window count.\n\nThat is the point: a token bucket encodes a SUSTAINED RATE and an ALLOWED BURST as two separate parameters. Capacity 100 with a refill of 10/s means \"10 per second sustained, and you may spend up to 100 at once if you have been quiet\". The window algorithms cannot express that distinction at all — they only know how many arrived recently.\n\nSet capacity to 1 and you have a leaky bucket: perfectly smooth output with no bursts, which is what you want when protecting something with a hard concurrency ceiling."}
+  };
+
+  function render(){
+    const k = $("q-alg").value, a = A[k];
+    const b = parseInt($("q-burst").value, 10);
+    $("q-burstv").textContent = b;
+
+    const allowed = a.allow(b);
+    const over = allowed / LIMIT;
+
+    $("q-allowed").textContent = allowed;
+    $("q-over").textContent    = over > 1.05 ? over.toFixed(1) + "× over" : "within";
+    $("q-mem").textContent     = a.mem;
+    $("q-cost").textContent    = a.cost;
+
+    // timeline: 2 windows, burst at end of first and start of second
+    const cells = [];
+    const firstAllowed = Math.min(b, LIMIT);
+    const secondAllowed = allowed - firstAllowed;
+    for(let i = 0; i < b; i++) cells.push({w:1, ok: i < firstAllowed});
+    for(let i = 0; i < b; i++) cells.push({w:2, ok: i < secondAllowed});
+
+    $("q-chart").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:16px 0 8px">' +
+      'Burst of ' + b + ' at t=9.9s, then ' + b + ' at t=10.1s · limit ' + LIMIT + ' per ' + WIN + 's</div>' +
+      '<div style="background:#fff;border:1px solid #E1E7EC;border-radius:5px;padding:12px">' +
+      '<div style="display:flex;gap:14px;align-items:flex-start">' +
+      [1,2].map(w =>
+        '<div style="flex:1">' +
+        '<div style="font-family:var(--mono);font-size:10.5px;color:#8FA0AF;margin-bottom:5px">' +
+        (w === 1 ? 'window 1 · t=9.9s' : 'window 2 · t=10.1s') + '</div>' +
+        '<div style="display:flex;gap:3px;flex-wrap:wrap">' +
+        cells.filter(c => c.w === w).map(c =>
+          '<div style="width:15px;height:22px;border-radius:2px;background:' +
+          (c.ok ? "#3FB984" : "#E2574C") + '"></div>').join("") +
+        '</div>' +
+        '<div style="font-family:var(--mono);font-size:10.5px;color:#54677A;margin-top:5px">' +
+        (w === 1 ? firstAllowed : secondAllowed) + ' allowed, ' +
+        (b - (w === 1 ? firstAllowed : secondAllowed)) + ' rejected</div>' +
+        '</div>').join("") +
+      '</div>' +
+      '<div style="display:flex;gap:14px;margin-top:10px;font-size:11.5px;color:#54677A">' +
+      '<span style="display:flex;align-items:center;gap:5px"><span style="width:11px;height:11px;' +
+      'background:#3FB984;border-radius:2px;display:inline-block"></span>allowed</span>' +
+      '<span style="display:flex;align-items:center;gap:5px"><span style="width:11px;height:11px;' +
+      'background:#E2574C;border-radius:2px;display:inline-block"></span>rejected</span></div></div>';
+
+    $("q-code").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid ' +
+      (over > 1.5 ? "#E2574C" : over > 1.05 ? "#F2A03D" : "#3FB984") +
+      ';border-radius:5px;padding:11px 13px;margin:14px 0 12px;font-family:var(--mono);' +
+      'font-size:12px;line-height:1.65;overflow-x:auto">' +
+      a.code.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>';
+
+    const notes = [a.note];
+
+    if(over > 1.5)
+      notes.push("Across the two-second span " + allowed + " requests got through against an intended rate of " +
+                 LIMIT + " per " + WIN + " seconds — " + over.toFixed(1) +
+                 "× the configured limit. Switch algorithms in the dropdown and watch the second window's rejections start much earlier.");
+    else if(over <= 1.05 && k !== "fixed")
+      notes.push("The boundary burst is contained: " + allowed + " allowed against a limit of " + LIMIT +
+                 ". Compare with the fixed window, which permits " + (Math.min(b,LIMIT)*2) + " for the same traffic.");
+
+    notes.push("Whichever you choose: return the remaining count and reset time from the SAME Lua call that makes the decision, so your rate-limit headers cannot disagree with what actually happened. And do not increment on rejected requests — a client in a retry loop would then never recover, because every retry extends its own block.");
+    $("q-note").textContent = notes.join("\n\n");
+  }
+
+  ["q-alg","q-burst"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

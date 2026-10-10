@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Subqueries and CTEs — SQL</title>
+<meta name="description" content="Scalar, IN, EXISTS and correlated subqueries, common table expressions for readability, and recursive CTEs for hierarchies.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 07 · Combining data</div>
+    <h1>Subqueries and CTEs</h1>
+    <p class="standfirst">Chapter 1 said every operation returns a relation, so a query can go anywhere a table can. This chapter is that closure property cashed in — and the one place where a readability tool can quietly cost you a hundredfold in performance.</p>
+    <div class="chap-meta">
+      <span class="tagpill">scalar and correlated</span>
+      <span class="tagpill">exists</span>
+      <span class="tagpill">cte</span>
+      <span class="tagpill">recursive</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Where a subquery can go</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Position</th><th>Must return</th><th>Example use</th></tr></thead>
+<tbody>
+<tr><td><b>SELECT list</b> — scalar</td><td>One row, one column</td><td>A per-row lookup or count</td></tr>
+<tr><td><b>FROM</b> — derived table</td><td>Any relation</td><td>Pre-aggregating before a join (chapter 6)</td></tr>
+<tr><td><b>WHERE … IN</b></td><td>One column, any rows</td><td>Membership</td></tr>
+<tr><td><b>WHERE EXISTS</b></td><td>Anything; only existence matters</td><td>Semi-join and anti-join</td></tr>
+<tr><td><b>WHERE … = (…)</b></td><td>Exactly one row, one column</td><td>Comparison against a computed value</td></tr>
+<tr><td><b>JOIN … LATERAL</b></td><td>Any relation, per left row</td><td>Top-N per group (chapter 5)</td></tr>
+<tr><td><b>HAVING</b></td><td>Scalar</td><td>Comparing a group against a global figure</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the same question, four ways</span><button class="copy">Copy</button></div>
+<pre><code>-- "Customers who have placed a paid order."
+
+-- IN — fine, and reads well for a short list of values.
+SELECT * FROM customers
+WHERE id IN (SELECT customer_id FROM orders WHERE status = 'paid');
+
+-- EXISTS — the reflex to build. NULL-safe, stops at the first match,
+-- and cannot fan out.
+SELECT * FROM customers c
+WHERE EXISTS (SELECT 1 FROM orders o
+              WHERE o.customer_id = c.id AND o.status = 'paid');
+
+-- JOIN — WRONG here: one row per matching order, not per customer.
+SELECT c.* FROM customers c
+JOIN orders o ON o.customer_id = c.id AND o.status = 'paid';   -- duplicates
+
+-- JOIN with DISTINCT — works, and does more work than EXISTS: it materialises
+-- every match and then deduplicates, instead of stopping at the first.
+SELECT DISTINCT c.* FROM customers c
+JOIN orders o ON o.customer_id = c.id AND o.status = 'paid';</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">EXISTS says what you mean</span>
+  <p><code>SELECT 1</code> inside an <code>EXISTS</code> is idiomatic and the column list is genuinely ignored — the engine only checks whether a row was produced. The reason to prefer it over a join is not usually performance (planners often produce the same semi-join either way) but <b>intent</b>: it states that you are testing for existence and not retrieving anything, which means it cannot accidentally multiply rows the way a join can.</p>
+</div>
+
+<h2><span class="h-rule"></span>Correlated subqueries</h2>
+
+<p>A subquery that references a column from the outer query is <b>correlated</b>: conceptually it re-runs for every outer row. That is the readable version and also the dangerous one.</p>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">readable, and potentially N executions</span><button class="copy">Copy</button></div>
+<pre><code>-- Correlated: `c.id` comes from the outer query.
+SELECT c.name,
+       (SELECT count(*) FROM orders o WHERE o.customer_id = c.id) AS n_orders,
+       (SELECT max(placed_at) FROM orders o WHERE o.customer_id = c.id) AS last_order
+FROM customers c;
+
+-- Two scalar subqueries, each conceptually running once per customer. With an
+-- index on orders(customer_id) and a few thousand customers this is fine —
+-- planners frequently rewrite it into a hash join anyway. Without the index,
+-- it is two full scans of orders per customer.
+
+-- The equivalent that groups once and joins once. Usually the better plan on
+-- large tables, and it computes both values in a single pass:
+SELECT c.name, coalesce(o.n, 0) AS n_orders, o.last_order
+FROM customers c
+LEFT JOIN (
+    SELECT customer_id, count(*) AS n, max(placed_at) AS last_order
+    FROM orders GROUP BY customer_id
+) o ON o.customer_id = c.id;</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Two or three scalar subqueries is fine; six is a rewrite</span>
+  <p>Correlated scalar subqueries are the clearest way to attach one or two derived values to each row, and modern planners handle them well when the inner table is indexed on the correlation column. Past about three, you are scanning the same table repeatedly to compute things that one <code>GROUP BY</code> could produce together — and the query becomes harder to read as well as slower. Check the plan (chapter 13); if you see the same table appearing several times, consolidate.</p>
+</div>
+
+<h2><span class="h-rule"></span>Common table expressions</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the same logic, nested and named</span><button class="copy">Copy</button></div>
+<pre><code>-- Nested derived tables. Read from the inside out, which nobody enjoys.
+SELECT region, avg(total) FROM (
+    SELECT c.region, o.customer_id, sum(o.amount) AS total
+    FROM orders o
+    JOIN customers c ON c.id = o.customer_id
+    WHERE o.status = 'paid'
+      AND o.placed_at >= date_trunc('year', current_date)
+    GROUP BY c.region, o.customer_id
+) t
+WHERE total > 500
+GROUP BY region;
+
+-- The same thing as named steps. Read top to bottom.
+WITH paid_this_year AS (
+    SELECT customer_id, amount
+    FROM orders
+    WHERE status = 'paid'
+      AND placed_at >= date_trunc('year', current_date)
+),
+by_customer AS (
+    SELECT c.region, p.customer_id, sum(p.amount) AS total
+    FROM paid_this_year p
+    JOIN customers c ON c.id = p.customer_id
+    GROUP BY c.region, p.customer_id
+)
+SELECT region, avg(total) AS avg_value
+FROM by_customer
+WHERE total > 500
+GROUP BY region;</code></pre>
+</div>
+
+<p>Same result, same plan on most engines, dramatically easier to review — each step has a name that says what it is, and you can run any prefix of the query to see intermediate output while debugging.</p>
+
+<div class="note warn">
+  <span class="note-t">The optimisation-fence trap</span>
+  <p>Historically PostgreSQL <b>materialised every CTE</b>: it computed the whole thing, stored it, and could not push a filter from the outer query down into it. A CTE producing ten million rows that the outer query filters to fifty would compute all ten million first. That changed in PostgreSQL 12 — CTEs referenced once are now inlined by default — but older versions, and other engines with the same behaviour, are still in service. If a CTE-based query is unexpectedly slow, rewrite one step as a derived table and compare; that is the fastest way to identify the fence.</p>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">controlling it explicitly</span><button class="copy">Copy</button></div>
+<pre><code>-- Postgres 12+: force the old behaviour when you want it.
+WITH expensive AS MATERIALIZED (
+    SELECT customer_id, sum(amount) AS total
+    FROM orders GROUP BY customer_id
+)
+SELECT * FROM expensive e1 JOIN expensive e2 ON …;
+-- Worth forcing when the CTE is referenced several times and is expensive to
+-- compute — otherwise it may be evaluated once per reference.
+
+WITH cheap AS NOT MATERIALIZED (…)
+-- Forces inlining, letting the planner push filters down. The default for a
+-- single-reference, side-effect-free CTE.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Recursive CTEs</h2>
+
+<div class="demo" id="rec">
+  <div class="demo-head">
+    <b>A recursive CTE, one iteration at a time</b>
+    <span>Walking an org chart. Step through and watch the working table feed itself.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="rc-start">Start from</label>
+        <select id="rc-start">
+          <option value="1" selected>Adeyemi (CEO) — whole tree</option>
+          <option value="3">Bianchi — a subtree</option>
+          <option value="up">Walk UP from Rossi to the root</option>
+        </select>
+      </div>
+      <div style="display:flex;gap:7px;align-items:flex-end;flex-wrap:wrap">
+        <button class="btn" id="rc-step">next iteration</button>
+        <button class="btn ghost" id="rc-all">run to completion</button>
+        <button class="btn ghost" id="rc-reset">reset</button>
+      </div>
+    </div>
+    <div id="rc-tree"></div>
+    <div id="rc-work"></div>
+    <div class="out" id="rc-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the shape of every recursive CTE</span><button class="copy">Copy</button></div>
+<pre><code>WITH RECURSIVE subordinates AS (
+    -- ANCHOR: the starting rows. Runs once.
+    SELECT id, name, manager_id, 1 AS depth, name::text AS path
+    FROM employees
+    WHERE id = 1
+
+    UNION ALL
+
+    -- RECURSIVE TERM: joins the previous iteration's output to the table.
+    -- Runs repeatedly until it produces no new rows.
+    SELECT e.id, e.name, e.manager_id, s.depth + 1, s.path || ' > ' || e.name
+    FROM employees e
+    JOIN subordinates s ON e.manager_id = s.id      -- s = the working table
+    WHERE s.depth < 20                              -- always bound the depth
+)
+SELECT repeat('  ', depth - 1) || name AS org, depth, path
+FROM subordinates
+ORDER BY path;
+
+-- How it actually runs:
+--   1. evaluate the anchor -> working table
+--   2. evaluate the recursive term against the working table
+--   3. append the results, and make them the new working table
+--   4. repeat until step 2 returns nothing
+--
+-- "subordinates" inside the recursive term does NOT mean everything found so
+-- far. It means only the rows the PREVIOUS iteration produced. That is the
+-- single most misunderstood part, and the demo above shows it directly.</code></pre>
+</div>
+
+<div class="note trap">
+  <span class="note-t">UNION ALL, and always bound the depth</span>
+  <p>Use <code>UNION ALL</code>, not <code>UNION</code>: the deduplication that <code>UNION</code> performs is usually unnecessary and always expensive. But that means a cycle in the data — an employee who is transitively their own manager, a category loop from a bad import — produces an infinite loop that consumes memory until something dies. Two defences: a <code>depth &lt; n</code> guard, which is cheap and catches everything, and a path array with <code>NOT (e.id = ANY(path))</code>, which detects genuine cycles precisely. Use the depth guard always; add the path check when cycles are plausible.</p>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">cycle-safe, and walking upward</span><button class="copy">Copy</button></div>
+<pre><code>-- Detecting cycles rather than merely surviving them.
+WITH RECURSIVE tree AS (
+    SELECT id, name, manager_id, ARRAY[id] AS path, false AS cycle
+    FROM employees WHERE manager_id IS NULL
+
+    UNION ALL
+
+    SELECT e.id, e.name, e.manager_id, t.path || e.id, e.id = ANY(t.path)
+    FROM employees e
+    JOIN tree t ON e.manager_id = t.id
+    WHERE NOT t.cycle                       -- stop expanding once one is found
+)
+SELECT * FROM tree WHERE cycle;             -- report the loops
+
+-- Walking UP instead of down: swap which side of the join is correlated.
+WITH RECURSIVE chain AS (
+    SELECT id, name, manager_id FROM employees WHERE id = 7
+    UNION ALL
+    SELECT e.id, e.name, e.manager_id
+    FROM employees e
+    JOIN chain c ON c.manager_id = e.id     -- note: reversed
+)
+SELECT * FROM chain;                        -- Rossi, their manager, and so on</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Other uses for recursion</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Problem</th><th>Shape</th></tr></thead>
+<tbody>
+<tr><td>Org charts, category trees, threaded comments</td><td>The canonical case</td></tr>
+<tr><td>Bill of materials — parts made of parts</td><td>A DAG rather than a tree; needs cycle protection</td></tr>
+<tr><td>Graph reachability — "who can this account reach"</td><td>Add a visited-set check</td></tr>
+<tr><td>Generating a date series</td><td>Where <code>generate_series</code> is unavailable, as in SQL Server</td></tr>
+<tr><td>Splitting a delimited string</td><td>Works; a built-in split function is better if you have one</td></tr>
+<tr><td>Gaps and islands</td><td>Usually a window function instead (chapter 8)</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note key">
+  <span class="note-t">Adjacency lists are not the only option</span>
+  <p><code>manager_id</code> pointing at the parent is simple and makes insertion trivial, but every ancestor or descendant query needs recursion. If your workload is read-heavy over deep hierarchies, consider a <b>materialised path</b> (a text or array column holding the full ancestry, indexed for prefix search) or a <b>closure table</b> (one row per ancestor-descendant pair). Both make subtree queries a simple indexed lookup and make writes more expensive. Recursion is the right default; these are what you reach for when the profile says so.</p>
+</div>
+
+<h2><span class="h-rule"></span>Data-modifying CTEs</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">multiple statements, one atomic pass</span><button class="copy">Copy</button></div>
+<pre><code>-- Postgres: move rows to an archive and delete them, in one statement.
+WITH moved AS (
+    DELETE FROM orders
+    WHERE placed_at < now() - interval '7 years'
+    RETURNING *
+)
+INSERT INTO orders_archive SELECT * FROM moved;
+
+-- Two things to know:
+--   * all sub-statements see the SAME snapshot of the database, so a later
+--     one does not observe an earlier one's changes
+--   * execution order between them is not guaranteed, so do not write two
+--     that modify the same rows and expect a particular sequence
+--
+-- Supported in PostgreSQL. SQL Server has OUTPUT clauses; MySQL has neither.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Choosing between them</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Want</th><th>Use</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Test whether related rows exist</td><td><code>EXISTS</code></td><td>Cannot fan out; NULL-safe; states the intent</td></tr>
+<tr><td>Test that they do not</td><td><code>NOT EXISTS</code></td><td>NULL-safe, unlike <code>NOT IN</code> (chapter 3)</td></tr>
+<tr><td>Attach one or two derived values</td><td>Correlated scalar subquery</td><td>Readable; needs an index on the correlation column</td></tr>
+<tr><td>Attach several</td><td>Pre-aggregated derived table or CTE</td><td>One pass instead of several</td></tr>
+<tr><td>Name a multi-step pipeline</td><td>CTE</td><td>Readability, and debuggable step by step</td></tr>
+<tr><td>Reuse an expensive result several times</td><td><code>CTE … AS MATERIALIZED</code></td><td>Computed once rather than per reference</td></tr>
+<tr><td>Top-N per group</td><td><code>LATERAL</code>, or a window function</td><td>Chapters 5 and 8</td></tr>
+<tr><td>Walk a hierarchy</td><td><code>WITH RECURSIVE</code></td><td>The only pure-SQL way</td></tr>
+<tr><td>Compare a row to its neighbours</td><td><b>A window function</b></td><td>Chapter 8 — this replaces most self-joins and correlated subqueries</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>A subquery can go anywhere a relation can — <code>SELECT</code>, <code>FROM</code>, <code>WHERE</code>, <code>JOIN LATERAL</code>, <code>HAVING</code>.</li>
+    <li><b><code>EXISTS</code> over a join</b> when you are only testing existence: it states the intent and cannot multiply rows.</li>
+    <li>A <b>correlated</b> subquery references the outer row and conceptually runs per row. Two or three is fine; six is a rewrite.</li>
+    <li><b>CTEs are for readability</b> — named steps, top-to-bottom, debuggable a step at a time.</li>
+    <li>Watch the <b>optimisation fence</b>: on older PostgreSQL and some engines a CTE is materialised and filters cannot be pushed into it.</li>
+    <li>A recursive CTE is <b>anchor <code>UNION ALL</code> recursive term</b>, and the recursive term sees only the <em>previous</em> iteration's rows.</li>
+    <li><b>Always bound the depth.</b> <code>UNION ALL</code> plus a cycle in the data is an infinite loop.</li>
+    <li>Adjacency lists need recursion; <b>materialised paths and closure tables</b> trade write cost for cheap subtree reads.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("07-subqueries-ctes.html");
+
+(function(){
+  const root = document.getElementById("rec");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const EMP = [
+    {id:1, name:"Adeyemi",  manager_id:null},
+    {id:2, name:"Kowalski", manager_id:1},
+    {id:3, name:"Bianchi",  manager_id:1},
+    {id:4, name:"Haddad",   manager_id:2},
+    {id:5, name:"Rossi",    manager_id:3},
+    {id:6, name:"Tan",      manager_id:3},
+    {id:7, name:"Mbeki",    manager_id:5},
+    {id:8, name:"Larsen",   manager_id:5}
+  ];
+  const byId = id => EMP.find(e => e.id === id);
+
+  let iters = [];      // iters[0] = anchor, then each recursive pass
+  let shown = 0;
+
+  function compute(){
+    const mode = $("rc-start").value;
+    iters = [];
+    if(mode === "up"){
+      let cur = [byId(7)];
+      iters.push(cur);
+      while(true){
+        const next = cur.map(e => e.manager_id ? byId(e.manager_id) : null).filter(Boolean);
+        if(!next.length) break;
+        iters.push(next);
+        cur = next;
+      }
+    } else {
+      const rootId = parseInt(mode, 10);
+      let cur = [byId(rootId)];
+      iters.push(cur);
+      while(true){
+        const ids = cur.map(e => e.id);
+        const next = EMP.filter(e => ids.indexOf(e.manager_id) >= 0);
+        if(!next.length) break;
+        iters.push(next);
+        cur = next;
+      }
+    }
+    iters.push([]);     // the terminating empty pass
+  }
+
+  function render(){
+    const mode = $("rc-start").value;
+    const found = [];
+    for(let i = 0; i < shown && i < iters.length; i++) iters[i].forEach(e => found.push(e.id));
+    const working = shown > 0 && shown <= iters.length ? iters[shown-1] : [];
+    const workingIds = working.map(e => e.id);
+
+    // tree layout
+    const POS = {1:[3,0], 2:[1,1], 3:[5,1], 4:[1,2], 5:[4,2], 6:[6,2], 7:[3,3], 8:[5,3]};
+    const cols = 8, W = 100/cols;
+    $("rc-tree").innerHTML =
+      '<div style="position:relative;height:200px;margin:16px 0 10px">' +
+      EMP.filter(e => e.manager_id).map(e => {
+        const [c1,r1] = POS[e.manager_id], [c2,r2] = POS[e.id];
+        const left = Math.min(c1,c2), w = Math.abs(c2-c1);
+        return '<div style="position:absolute;left:' + ((Math.min(c1,c2)+0.5)*W) + '%;top:' + (r1*50+24) +
+          'px;width:' + (w*W) + '%;height:50px;border-top:2px solid #CFD8E0;' +
+          (c2 < c1 ? 'border-left' : 'border-right') + ':2px solid #CFD8E0;border-radius:' +
+          (c2 < c1 ? '6px 0 0 0' : '0 6px 0 0') + '"></div>';
+      }).join("") +
+      EMP.map(e => {
+        const [c,r] = POS[e.id];
+        const isWork = workingIds.indexOf(e.id) >= 0;
+        const isFound = found.indexOf(e.id) >= 0 && !isWork;
+        const bg = isWork ? "#25B7C4" : isFound ? "#3FB984" : "#fff";
+        const fg = (isWork || isFound) ? "#fff" : "#54677A";
+        const bd = isWork ? "#0F7A85" : isFound ? "#2E9A6C" : "#CFD8E0";
+        return '<div style="position:absolute;left:' + (c*W) + '%;top:' + (r*50) +
+          'px;width:' + W + '%;display:flex;justify-content:center">' +
+          '<div style="padding:6px 9px;border-radius:5px;border:2px solid ' + bd + ';background:' + bg +
+          ';color:' + fg + ';font-size:12px;font-weight:600;white-space:nowrap;transition:all .18s">' +
+          e.name + '</div></div>';
+      }).join("") + '</div>';
+
+    // working table
+    const label = shown === 0 ? "Nothing yet"
+      : shown === 1 ? "Working table after the ANCHOR"
+      : working.length === 0 ? "Recursive term returned no rows — the CTE stops"
+      : "Working table after recursive pass " + (shown-1);
+    $("rc-work").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:0 0 6px">' +
+      label + '</div>' +
+      (working.length === 0
+        ? '<div class="out" style="margin:0">Empty. Total rows accumulated: ' + found.length + '.</div>'
+        : '<div style="display:flex;gap:6px;flex-wrap:wrap">' + working.map(e =>
+            '<span style="padding:5px 10px;border-radius:4px;background:#EEFAFB;border:1px solid #9EDDE4;' +
+            'font-family:var(--mono);font-size:12.5px;color:#0F7A85">' + e.name + '</span>').join("") +
+          '</div>');
+
+    const notes = [];
+    if(shown === 0)
+      notes.push("Press next iteration. The anchor runs first, then the recursive term runs repeatedly against whatever the previous pass produced.");
+    else if(shown === 1)
+      notes.push("The anchor ran once and produced " + iters[0].length + " row. That is now the working table — " +
+                 "and it is the ONLY thing the recursive term will see on the next pass.");
+    else if(working.length === 0)
+      notes.push("The recursive term found no rows matching the previous working table, so the CTE terminates. " +
+                 found.length + " rows in total, accumulated across " + (shown-2) + " recursive passes.");
+    else
+      notes.push("Pass " + (shown-1) + " joined employees to the previous working table and found " + working.length +
+                 " new row" + (working.length === 1 ? "" : "s") + ". Those " + working.length +
+                 " become the new working table; the earlier rows are kept in the result but are no longer visible to the recursion.");
+
+    if(shown >= 2 && working.length)
+      notes.push("This is the part people misread. Inside the recursive term, the CTE's name refers to the PREVIOUS iteration's output only — not to everything found so far. " +
+                 "That is exactly why it terminates: eventually a pass finds nothing new.");
+
+    if(mode === "up" && shown >= 2)
+      notes.push("Walking upward is the same query with the join reversed — `ON c.manager_id = e.id` instead of `ON e.manager_id = c.id`. " +
+                 "The direction of a hierarchy traversal is entirely a property of which side of the join is correlated.");
+
+    if(shown >= iters.length - 1 && iters[iters.length-2] && iters[iters.length-2].length)
+      notes.push("In production this loop needs a bound. With UNION ALL, a cycle in the data — someone transitively their own manager — never terminates and consumes memory until something dies. " +
+                 "A `WHERE depth < 20` guard costs nothing and catches every case.");
+
+    $("rc-note").textContent = notes.join("\n\n");
+    $("rc-step").disabled = shown >= iters.length;
+    $("rc-step").textContent = shown >= iters.length ? "complete" : "next iteration";
+  }
+
+  $("rc-step").addEventListener("click", () => { if(shown < iters.length) shown++; render(); });
+  $("rc-all").addEventListener("click", () => { shown = iters.length; render(); });
+  $("rc-reset").addEventListener("click", () => { shown = 0; render(); });
+  $("rc-start").addEventListener("change", () => { compute(); shown = 0; render(); });
+
+  compute(); render();
+})();
+</script>
+</body>
+</html>

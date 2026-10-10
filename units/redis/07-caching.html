@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Caching — Redis</title>
+<meta name="description" content="The dominant use case, done properly: cache-aside, invalidation, stampedes, negative caching, and what to do when the cache is wrong.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 07 · Patterns</div>
+    <h1>Caching</h1>
+    <p class="standfirst">The use everyone starts with. The basic pattern is four lines and correct; the interesting parts are what happens when a popular key expires, when the underlying data changes, and when the cache and the database disagree about reality.</p>
+    <div class="chap-meta">
+      <span class="tagpill">cache-aside</span>
+      <span class="tagpill">stampede</span>
+      <span class="tagpill">invalidation</span>
+      <span class="tagpill">ttl</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Cache-aside</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">the pattern, and the two lines people get wrong</span><button class="copy">Copy</button></div>
+<pre><code>def get_product(pid):
+    key = f"cache:product:{pid}:v3"
+    cached = r.get(key)
+    if cached is not None:
+        return decode(cached)
+
+    product = db.query("SELECT ... WHERE id = %s", pid)
+    r.set(key, encode(product), ex=300 + random.randint(0, 60))
+    return product
+
+# The two details that matter:
+#
+#   `is not None` — not a truthy check. A cached empty list, zero or empty
+#   string is a HIT, and treating it as a miss means the most-cached values
+#   are the ones that never cache.
+#
+#   The jitter on the TTL. Without it, everything cached during a deploy
+#   expires in the same second and the database takes the whole load at once
+#   (chapter 2). A few percent of random spread costs nothing and removes
+#   an entire class of incident.
+
+# WRITE PATH — delete rather than update:
+def update_product(pid, changes):
+    db.update(pid, changes)
+    r.delete(f"cache:product:{pid}:v3")
+
+# Deleting is safer than writing the new value, because two concurrent
+# updates can write their values to the cache in the opposite order to the
+# database — leaving the cache permanently holding the older one. Deleting
+# has no ordering to get wrong: the next read repopulates from the current
+# truth.
+
+# And delete AFTER the database write, never before. Before, and a concurrent
+# read can repopulate the cache with the old value in the window between.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Delete, do not update</span>
+  <p>"Write to the database, then write the new value to the cache" is the version people reach for and it has a race with no fix. Two writers, A then B: A writes to the database, B writes to the database, B writes to the cache, A writes to the cache. The database holds B's value and the cache holds A's, permanently, until the TTL expires — and if the TTL is long, that is hours of serving wrong data with nothing to indicate it. <b>Deleting has no such ordering</b>: whichever delete lands last, the next read fetches whatever the database currently holds. The cost is one extra database read after each write, which is almost always the right trade.</p>
+</div>
+
+<h2><span class="h-rule"></span>Stampedes</h2>
+
+<div class="demo" id="stam">
+  <div class="demo-head">
+    <b>What happens when a hot key expires</b>
+    <span>The naive pattern sends every concurrent request to the database at once. Four ways to stop it.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="s-strat">Strategy</label>
+        <select id="s-strat">
+          <option value="naive" selected>Plain cache-aside</option>
+          <option value="jitter">TTL with jitter</option>
+          <option value="lock">Lock while recomputing</option>
+          <option value="stale">Serve stale while revalidating</option>
+          <option value="early">Probabilistic early expiry</option>
+        </select>
+      </div>
+      <div>
+        <label for="s-rps">Requests/sec for this key — <span id="s-rpsv">2,000</span></label>
+        <input type="range" id="s-rps" min="1" max="6" step="1" value="4">
+      </div>
+      <div>
+        <label for="s-cost">Recompute takes — <span id="s-costv">400</span> ms</label>
+        <input type="range" id="s-cost" min="10" max="3000" step="10" value="400">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="s-hits">—</b><span>database hits per expiry</span></div>
+      <div><b id="s-wait">—</b><span>worst-case user wait</span></div>
+      <div><b id="s-stale">—</b><span>stale data served</span></div>
+      <div><b id="s-cx">—</b><span>complexity</span></div>
+    </div>
+    <div id="s-bar"></div>
+    <div class="out" id="s-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">serve stale while revalidating — usually the best answer</span><button class="copy">Copy</button></div>
+<pre><code># Store the value with a LOGICAL expiry inside it, and give the key a much
+# longer real TTL. The value is then never absent — only sometimes old.
+
+def get_with_swr(pid, fresh_for=300, keep_for=3600):
+    key = f"cache:product:{pid}:v3"
+    raw = r.get(key)
+
+    if raw is None:                              # genuine cold miss
+        return recompute_and_store(pid, fresh_for, keep_for)
+
+    entry = decode(raw)
+    if time.time() < entry["fresh_until"]:
+        return entry["value"]                    # fresh
+
+    # Stale but usable. ONE caller wins the right to refresh; everyone else
+    # gets the stale value immediately and nobody waits.
+    if r.set(f"lock:refresh:{pid}", "1", nx=True, ex=30):
+        background(recompute_and_store, pid, fresh_for, keep_for)
+
+    return entry["value"]
+
+# Properties worth naming:
+#   * no user ever waits for a recompute except on a genuine cold miss
+#   * exactly one recompute happens per staleness period
+#   * the database sees a trickle rather than a spike
+#   * the cost is serving data up to `fresh_for` old, which for most reads
+#     is invisible
+#
+# The failure mode to handle: if the recompute keeps failing, the value keeps
+# being served past keep_for and then vanishes. Log refresh failures loudly —
+# a cache that silently serves hour-old data because the refresh has been
+# broken since Tuesday is worse than one that fails.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Invalidation</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Strategy</th><th>Freshness</th><th>Cost</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><td><b>TTL only</b></td><td>Up to the TTL stale</td><td>Nothing</td><td>Staleness is acceptable. Most of the time</td></tr>
+<tr><td><b>Delete on write</b></td><td>Immediate</td><td>One delete per write</td><td>You control every write path</td></tr>
+<tr><td><b>Version in the key</b></td><td>Immediate, in bulk</td><td>Old entries linger until they expire</td><td>A deploy changes the value's shape</td></tr>
+<tr><td><b>Tag sets</b></td><td>Immediate, grouped</td><td>A set per tag to maintain</td><td>One change invalidates many keys</td></tr>
+<tr><td><b>Change stream / CDC</b></td><td>Near-immediate</td><td>A consumer to run</td><td>Writes happen outside your application</td></tr>
+<tr><td><b>Client-side tracking</b></td><td>Near-immediate</td><td>Redis 6 RESP3</td><td>A local in-process cache in front of Redis</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">versioning and tags, since they solve different problems</span><button class="copy">Copy</button></div>
+<pre><code># VERSION IN THE KEY — invalidate everything at once, with no deletion.
+cache:product:8842:v3
+# Deploy changes the serialisation? Bump to v4. Every v3 key is instantly
+# unreachable and expires on its own schedule. No SCAN, no mass delete, no
+# thundering herd of deletions. This costs one stale generation's memory for
+# one TTL and it is the cheapest bulk invalidation there is.
+
+# A global generation counter does the same thing dynamically:
+INCR cache:generation                     # -> 7
+# key = f"cache:gen{gen}:product:{pid}"
+
+# TAG SETS — when one change invalidates a set of keys you cannot enumerate.
+SADD tag:product:8842 "cache:page:home" "cache:page:category:5"
+SADD tag:product:8842 "cache:api:search:keyboards"
+
+# On change:
+SMEMBERS tag:product:8842 | xargs redis-cli UNLINK
+UNLINK tag:product:8842
+
+# Or atomically, in Lua (chapter 8):
+EVAL "
+  local keys = redis.call('SMEMBERS', KEYS[1])
+  if #keys > 0 then redis.call('UNLINK', unpack(keys)) end
+  redis.call('UNLINK', KEYS[1])
+  return #keys
+" 1 tag:product:8842
+
+# The obligation: every write that caches a derived value must also SADD the
+# key to every tag it depends on. Miss one and that entry never invalidates.
+# Give the tag sets a TTL longer than the cached entries so they clean
+# themselves up.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">A cache is a second copy, and second copies diverge</span>
+  <p>Every caching strategy is a bet about how long you can tolerate the copy being wrong, and there is no configuration that makes divergence impossible — a delete can fail, a write path can be missed, a network partition can strand an invalidation. So the design question is not "how do I keep it perfectly correct" but <b>"how wrong can it get, for how long, and what happens then"</b>. A TTL is the answer to the last part: it bounds every failure mode, including ones you have not thought of. That is why <b>every cache key should have a TTL even when you invalidate explicitly</b> — the TTL is the backstop for the invalidation you missed.</p>
+</div>
+
+<h2><span class="h-rule"></span>Negative caching</h2>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">cache the absence, or the misses go straight through</span><button class="copy">Copy</button></div>
+<pre><code># A key that does not exist in the database is never cached, so every
+# request for it hits the database. Point a scraper at /product/{random}
+# and every request is a database query — a cache with a 99% hit rate
+# providing zero protection against exactly the traffic you need protecting
+# from.
+
+MISSING = b"\x00__miss__"
+
+def get_product(pid):
+    key = f"cache:product:{pid}:v3"
+    cached = r.get(key)
+    if cached == MISSING:
+        return None                              # cached absence
+    if cached is not None:
+        return decode(cached)
+
+    product = db.query(...)
+    if product is None:
+        r.set(key, MISSING, ex=60)               # SHORT ttl
+    else:
+        r.set(key, encode(product), ex=300)
+    return product
+
+# Use a much shorter TTL for misses than for hits. A product that does not
+# exist yet may exist in a minute, and caching that absence for an hour makes
+# creation appear broken.
+
+# For very large key spaces where even the negative entries would be too
+# many, a Bloom filter in front is the standard answer — either the
+# RedisBloom module, or one you maintain with SETBIT (chapter 3):
+BF.EXISTS products:filter "8842"     # definitely absent, or maybe present</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>What to cache</h2>
+
+<div class="cols">
+  <div class="col good">
+    <h4>Good candidates</h4>
+    <ul>
+      <li><b>Expensive to compute</b> — an aggregation, a rendered page, an external API call</li>
+      <li><b>Read far more than written</b> — the ratio is the whole argument</li>
+      <li><b>Tolerant of being slightly stale</b></li>
+      <li><b>Small enough</b> to move without blocking the thread</li>
+      <li><b>Requested repeatedly</b> — a cache with no reuse is pure overhead</li>
+    </ul>
+  </div>
+  <div class="col bad">
+    <h4>Poor candidates</h4>
+    <ul>
+      <li><b>Cheap queries already served by an index</b> — you added a network hop</li>
+      <li><b>Written as often as read</b> — invalidation costs more than it saves</li>
+      <li><b>Anything that must be exactly current</b> — a balance, a stock level</li>
+      <li><b>Per-user data with no reuse</b> — one hit per entry</li>
+      <li><b>Large values</b> — a 50 MB blob blocks the thread (chapter 14)</li>
+    </ul>
+  </div>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Measure the hit rate per key pattern, not overall</span>
+  <p>An aggregate hit rate of 94% sounds healthy and can hide a pattern at 12% that accounts for most of the traffic — the overall figure is dominated by whichever pattern is most cacheable, which is not the one causing you problems. Track hits and misses per pattern, and be prepared to <b>remove</b> a cache that is not earning its place: a cache with a low hit rate costs a round trip on every request, memory for entries nobody reads, and an invalidation path to maintain, in exchange for nothing. <code>INFO stats</code> gives you <code>keyspace_hits</code> and <code>keyspace_misses</code> globally; per-pattern tracking has to come from your application.</p>
+</div>
+
+<h2><span class="h-rule"></span>Operating a cache</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the settings that make it a cache rather than a database</span><button class="copy">Copy</button></div>
+<pre><code># A dedicated cache instance should be configured to discard data freely.
+maxmemory 8gb
+maxmemory-policy allkeys-lru        # or allkeys-lfu. NOT volatile-* — those
+                                    # only evict keys with a TTL, and if none
+                                    # qualify Redis refuses writes (chapter 2)
+save ""                             # no RDB snapshots. It is a cache
+appendonly no                       # no AOF either
+
+# Persistence on a cache costs fork memory and disk I/O to protect data you
+# are willing to lose by definition. Turning it off is one of the few
+# genuinely free wins available (chapter 13).
+
+# Health:
+INFO stats
+#   keyspace_hits / keyspace_misses      -> the hit rate
+#   evicted_keys                         -> rising means undersized
+#   expired_keys
+INFO memory
+#   used_memory vs maxmemory
+#   mem_fragmentation_ratio
+
+# THE NUMBER TO WATCH IS evicted_keys. Steady eviction means the working set
+# does not fit and Redis is discarding things that would have been hits. It
+# is not an error and there is no alarm — the hit rate simply degrades.
+
+# And separate your instances. A cache and a session store on one instance
+# share one maxmemory and one eviction policy, so a cache surge evicts
+# sessions and logs everybody out. Different durability requirements mean
+# different instances (chapter 18).</code></pre>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Delete on write, do not update.</b> Writing the new value has an ordering race with no fix.</li>
+    <li><b>Delete after the database write</b>, never before.</li>
+    <li><b>Jitter every TTL.</b> Without it, everything cached together expires together.</li>
+    <li><b>Serve stale while revalidating</b> is usually the best stampede answer — nobody waits, one recompute happens.</li>
+    <li><b>Every key gets a TTL</b>, even with explicit invalidation. The TTL is the backstop for the invalidation you missed.</li>
+    <li><b>A version in the key</b> invalidates everything at once with no deletion at all.</li>
+    <li><b>Cache absences too</b>, with a short TTL — otherwise misses go straight through.</li>
+    <li><b>Measure the hit rate per pattern</b>, and remove caches that are not earning their place.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("07-caching.html");
+
+(function(){
+  const root = document.getElementById("stam");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const RPS = [50, 200, 500, 2000, 10000, 50000];
+
+  const S = {
+    naive: {cx:"none", stale:"none",
+      hits: (rps, ms) => Math.max(1, Math.round(rps * ms / 1000)),
+      wait: (rps, ms) => ms,
+      note:"Every request that arrives during the recompute finds an empty cache and starts its own recompute. There is nothing coordinating them.\n\nThis is the thundering herd, and the shape of the failure is worth understanding: the database gets slower under the load, which makes the recompute take longer, which means more requests pile in, which makes it slower still. It does not settle — it collapses.\n\nIt is also invisible until it happens. The cache works perfectly at a 99.9% hit rate, and then one popular key expires during a traffic peak and the database falls over."},
+    jitter: {cx:"trivial", stale:"none",
+      hits: (rps, ms) => Math.max(1, Math.round(rps * ms / 1000)),
+      wait: (rps, ms) => ms,
+      note:"Jitter does not help with THIS problem, and it is worth being clear about why.\n\nA random spread on the TTL stops many DIFFERENT keys expiring at the same instant — which is the failure after a deploy, when everything was cached in the same second and expires in the same second an hour later. That is a real and common incident, and jitter fixes it completely for the cost of one random number.\n\nWhat it does not fix is a single hot key. When that one key expires, every concurrent request for it still misses simultaneously, however randomly the expiry time was chosen.\n\nSo jitter is necessary and not sufficient. Always add it, and then pick one of the strategies below for the keys that are hot enough to matter."},
+    lock: {cx:"low", stale:"none",
+      hits: () => 1,
+      wait: (rps, ms) => ms,
+      note:"One caller wins SET lock:recompute:{key} NX EX 30 and recomputes. Everyone else waits — either polling briefly for the value to appear, or blocking on the lock.\n\nThe database sees exactly one query, which is the goal achieved.\n\nThe cost is that every waiting request still waits the full recompute time. At high concurrency that is a large number of requests holding connections and threads for hundreds of milliseconds, which can exhaust your application's connection pool even though the database is fine.\n\nAlso make sure the lock has a TTL. A recompute that crashes while holding a lock with no expiry blocks every future refresh permanently — chapter 9 covers this properly."},
+    stale: {cx:"moderate", stale:"up to the fresh window",
+      hits: () => 1,
+      wait: () => 0,
+      note:"The best general answer, and the one worth defaulting to for anything hot.\n\nStore a logical freshness timestamp inside the value and give the key a much longer real TTL. When the value is stale but present, one caller takes a lock and refreshes in the background while EVERY caller — including that one — gets the stale value immediately.\n\nNobody ever waits except on a genuine cold miss. The database sees exactly one query per staleness period. The only cost is serving data up to the fresh window old, which for most reads is completely invisible.\n\nThe failure mode to handle: if the background refresh keeps failing, the stale value keeps being served until the real TTL expires and then it vanishes. Log refresh failures loudly — a cache silently serving hour-old data because the refresh broke on Tuesday is worse than one that fails visibly."},
+    early: {cx:"low", stale:"none",
+      hits: () => 1,
+      wait: (rps, ms) => ms,
+      note:"Probabilistic early expiration, sometimes called XFetch. Each reader computes whether to refresh early, with a probability that rises as the expiry approaches and is weighted by how long the recompute takes.\n\n    if now - delta * beta * log(random()) >= expiry: recompute\n\nThe effect is that one unlucky reader refreshes shortly BEFORE expiry, while the cached value is still valid and being served — so the herd never forms, because there is never a moment when the key is absent.\n\nElegant, and it needs no lock and no coordination at all: each reader decides independently, and the maths makes simultaneous decisions unlikely.\n\nThe reader that draws the short straw still waits for the recompute. Combine it with serving stale and nobody waits at all, which is what a well-tuned cache layer usually ends up doing."}
+  };
+
+  function render(){
+    const k = $("s-strat").value, s = S[k];
+    const rps = RPS[parseInt($("s-rps").value,10)-1];
+    const ms  = parseInt($("s-cost").value,10);
+    $("s-rpsv").textContent  = rps.toLocaleString();
+    $("s-costv").textContent = ms;
+
+    const hits = s.hits(rps, ms);
+    const wait = s.wait(rps, ms);
+    $("s-hits").textContent  = hits.toLocaleString();
+    $("s-wait").textContent  = wait === 0 ? "none" : wait + " ms";
+    $("s-stale").textContent = s.stale;
+    $("s-cx").textContent    = s.cx;
+
+    const naiveHits = Math.max(1, Math.round(rps * ms / 1000));
+    const bars = [
+      ["This strategy", hits, hits > 10 ? "#E2574C" : "#3FB984"],
+      ["Plain cache-aside", naiveHits, "#CFD8E0"]
+    ];
+    const max = Math.max.apply(null, bars.map(b => b[1]));
+    $("s-bar").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      'Database queries when the key expires</div>' +
+      bars.map(([lab, v, col]) =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px">' +
+        '<span style="min-width:148px;font-size:13px">' + lab + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + Math.max(1, v/max*100).toFixed(1) +
+        '%;background:' + col + '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:56px;text-align:right">' +
+        v.toLocaleString() + '</span></div>').join("");
+
+    const notes = [s.note];
+
+    if(hits > 100)
+      notes.push("At " + rps.toLocaleString() + " requests/sec with a " + ms +
+                 " ms recompute, roughly " + hits.toLocaleString() +
+                 " queries hit the database in the window before the first one finishes. That is the whole point of the cache being undone in a fraction of a second — and the database, now overloaded, takes longer to answer, which lets more requests in. The curve is the wrong shape.");
+    else if(hits === 1 && k !== "naive" && k !== "jitter")
+      notes.push("One database query per expiry, down from " + naiveHits.toLocaleString() +
+                 ". Whichever strategy you choose, that is the number to aim for — the difference between the two bars is what a coordination mechanism buys.");
+
+    if(wait > 200 && hits === 1)
+      notes.push("The database is protected and users are not: every request arriving during the " + ms +
+                 " ms recompute waits for it. At " + rps.toLocaleString() + " requests/sec that is around " +
+                 Math.round(rps*ms/1000).toLocaleString() +
+                 " requests holding application threads and connections simultaneously, which can exhaust a connection pool while the database sits idle. Serving stale removes the wait entirely.");
+
+    notes.push("Whatever you pick, add jitter to every TTL as well. It solves a different problem — many keys expiring in the same second after a deploy — and it costs one random number.");
+    $("s-note").textContent = notes.join("\n\n");
+  }
+
+  ["s-strat","s-rps","s-cost"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

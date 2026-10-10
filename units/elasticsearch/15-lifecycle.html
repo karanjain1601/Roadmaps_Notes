@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Data lifecycle — Elasticsearch</title>
+<meta name="description" content="Time-series data needs a plan: data streams, rollover, ILM, tiers, and snapshots that you have actually restored.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 15 · Running it</div>
+    <h1>Data lifecycle</h1>
+    <p class="standfirst">Deleting old documents from a big index is one of the worst things you can ask Elasticsearch to do. The whole lifecycle apparatus — data streams, rollover, tiers, ILM — exists so that you can delete a whole index instead, which is nearly free.</p>
+    <div class="chap-meta">
+      <span class="tagpill">ilm</span>
+      <span class="tagpill">rollover</span>
+      <span class="tagpill">data streams</span>
+      <span class="tagpill">snapshots</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Why one big index is the wrong shape</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">the problem, stated plainly</span><button class="copy">Copy</button></div>
+<pre><code>You have a `logs` index. It grows. After a year you want to delete anything
+older than 90 days.
+
+    POST /logs/_delete_by_query
+    { "query": { "range": { "@timestamp": { "lt": "now-90d" } } } }
+
+WHAT THAT ACTUALLY DOES: marks several hundred million documents as deleted,
+one at a time, writing a tombstone for each. Nothing is freed. The disk
+space comes back only as background merges rewrite the affected segments
+without those documents — which is an enormous amount of I/O, competing with
+your live indexing and searching, for hours or days.
+
+And you get to do it again next week.
+
+ALSO WRONG WITH ONE BIG INDEX:
+  * the shard count was fixed when it was small, and cannot be changed
+  * every search touches all of it, including data nobody is querying
+  * yesterday's data and last year's data sit on the same expensive disks
+  * you cannot force-merge it, because it is still being written to
+  * a mapping change requires reindexing the whole thing
+
+THE ANSWER: write to a NEW INDEX periodically. Then "delete old data" is
+DELETE /logs-2025.11.01, which unlinks some files. Instant, no merge storm,
+no tombstones.
+
+Every capability in this chapter is built on that one idea.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Data streams</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the modern shape for append-only time-series data</span><button class="copy">Copy</button></div>
+<pre><code># A data stream is a name you write to, backed by hidden indices that roll
+# over automatically. You index into `logs-app-prod`; Elasticsearch writes
+# into .ds-logs-app-prod-2026.03.14-000042 and manages the rest.
+
+# 1. A component template for the mapping
+PUT /_component_template/logs-mappings
+{ "template": { "mappings": {
+    "properties": {
+      "@timestamp": { "type": "date" },
+      "message":    { "type": "text" },
+      "service":    { "type": "keyword" },
+      "level":      { "type": "keyword" }
+    }
+}}}
+
+# 2. A component template for the settings
+PUT /_component_template/logs-settings
+{ "template": { "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 1,
+    "refresh_interval": "30s",
+    "index.lifecycle.name": "logs-policy"
+}}}
+
+# 3. An index template that declares a data stream
+PUT /_index_template/logs-template
+{ "index_patterns": [ "logs-*" ],
+  "data_stream": { },
+  "composed_of": [ "logs-mappings", "logs-settings" ],
+  "priority": 200 }
+
+# 4. Just write. The stream and its first backing index appear.
+POST /logs-app-prod/_doc
+{ "@timestamp": "2026-03-14T09:12:44Z", "message": "...", "level": "ERROR" }
+
+GET /_data_stream/logs-app-prod
+POST /logs-app-prod/_rollover                    # force one manually
+
+# WHAT A DATA STREAM GIVES YOU OVER A PLAIN ALIAS:
+#   * @timestamp is required, and the stream knows its time range, so a
+#     query with a date filter can SKIP backing indices entirely
+#   * writes always go to the newest backing index automatically
+#   * append-only by default — updates and deletes by id are rejected,
+#     which is a feature for logs and a blocker for anything mutable
+#   * rollover, ILM and tier movement are wired in
+#
+# THE CONSTRAINT WORTH KNOWING: because it is append-only, you cannot use a
+# data stream for data you need to update in place. Use an alias with
+# rollover instead, which gives you most of the same benefits and permits
+# updates.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>ILM</h2>
+
+<div class="demo" id="il">
+  <div class="demo-head">
+    <b>A lifecycle policy, as it plays out</b>
+    <span>Move the clock and watch one index change phase, tier and cost.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="i-age">Index age — <span id="i-agev">0</span> days</label>
+        <input type="range" id="i-age" min="0" max="400" step="1" value="0">
+      </div>
+      <div>
+        <label for="i-policy">Policy</label>
+        <select id="i-policy">
+          <option value="std" selected>Standard — hot 7d, warm 30d, cold 90d, delete 365d</option>
+          <option value="short">Aggressive — hot 1d, delete 30d</option>
+          <option value="keep">Compliance — hot 7d, warm 30d, frozen 90d, keep forever</option>
+        </select>
+      </div>
+      <div>
+        <label for="i-size">Data per day — <span id="i-sizev">20</span> GB</label>
+        <input type="range" id="i-size" min="1" max="100" step="1" value="20">
+      </div>
+    </div>
+    <div id="i-track"></div>
+    <div class="stat">
+      <div><b id="i-phase">—</b><span>phase</span></div>
+      <div><b id="i-tier">—</b><span>tier</span></div>
+      <div><b id="i-cost">—</b><span>relative storage cost</span></div>
+      <div><b id="i-total">—</b><span>total retained</span></div>
+    </div>
+    <div class="out" id="i-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the policy itself</span><button class="copy">Copy</button></div>
+<pre><code>PUT /_ilm/policy/logs-policy
+{ "policy": { "phases": {
+
+  "hot": {
+    "actions": {
+      "rollover": {
+        "max_primary_shard_size": "40gb",     # THE ONE TO USE
+        "max_age": "1d",
+        "max_docs": 200000000
+      },
+      "set_priority": { "priority": 100 }     # recovery order after restart
+    }
+  },
+
+  "warm": {
+    "min_age": "7d",
+    "actions": {
+      "allocate": { "number_of_replicas": 1,
+                    "require": { "data": "warm" } },
+      "forcemerge": { "max_num_segments": 1 },   # safe — no longer written to
+      "shrink": { "number_of_shards": 1 },       # fewer, larger shards
+      "readonly": { },
+      "set_priority": { "priority": 50 }
+    }
+  },
+
+  "cold": {
+    "min_age": "30d",
+    "actions": {
+      "searchable_snapshot": { "snapshot_repository": "s3-backups" },
+      "set_priority": { "priority": 0 }
+    }
+  },
+
+  "frozen": {
+    "min_age": "90d",
+    "actions": { "searchable_snapshot": { "snapshot_repository": "s3-backups" } }
+  },
+
+  "delete": {
+    "min_age": "365d",
+    "actions": { "delete": { } }
+  }
+}}}
+
+GET /logs-app-prod/_ilm/explain          # WHERE IS EACH INDEX, AND WHY
+POST /_ilm/stop  |  POST /_ilm/start
+POST /logs-000042/_ilm/retry             # after fixing whatever failed
+
+# min_age IS MEASURED FROM ROLLOVER, not from index creation and not from
+# the age of the documents inside. An index that stayed hot for three days
+# before rolling over enters the warm phase three days later than you might
+# expect. This is the commonest source of "why is this index still hot".
+
+# ROLL OVER BY max_primary_shard_size, not max_size or max_docs. It targets
+# the thing that actually matters — shard size (chapter 14) — and it adapts
+# automatically when your volume changes. Combine it with max_age so that a
+# quiet period does not leave one index open for months.
+
+# ILM RUNS ON A POLL INTERVAL, ten minutes by default. Nothing is instant,
+# and an index sitting one step behind is usually just waiting for the poll.
+indices.lifecycle.poll_interval: 10m</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">The tiers are a cost decision, and searchable snapshots are the interesting one</span>
+  <p><b>Hot</b> takes the writes and wants fast SSDs. <b>Warm</b> is read-only, force-merged and shrunk, on cheaper disks. <b>Cold</b> and <b>frozen</b> use <em>searchable snapshots</em> — the data lives in object storage and the node holds only a cache, so you are paying S3 prices for storage while the index remains queryable. Frozen goes further, keeping almost nothing locally and fetching on demand, which makes queries much slower and storage nearly free. <b>That is the shape of the trade: each tier down is roughly an order of magnitude cheaper and correspondingly slower</b>, and for log data where 95% of queries touch the last three days, moving the other 97% of the bytes to cold storage is one of the largest cost reductions available in the whole product.</p>
+</div>
+
+<h2><span class="h-rule"></span>Snapshots</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the only actual backup Elasticsearch has</span><button class="copy">Copy</button></div>
+<pre><code># 1. Register a repository
+PUT /_snapshot/s3-backups
+{ "type": "s3",
+  "settings": { "bucket": "my-es-backups", "region": "eu-west-1",
+                "base_path": "prod", "compress": true } }
+# types: s3, gcs, azure, fs (a shared filesystem), hdfs, url (read-only)
+
+# 2. Take one
+PUT /_snapshot/s3-backups/snapshot-2026-03-14?wait_for_completion=false
+{ "indices": "logs-*,products", "include_global_state": true }
+#   include_global_state captures templates, ILM policies, pipelines and
+#   cluster settings. Without it you restore data into a cluster that does
+#   not know how to handle it — a genuinely unpleasant discovery
+
+# 3. Automate with SLM, which is the part people skip
+PUT /_slm/policy/nightly
+{ "schedule": "0 30 2 * * ?",
+  "name": "<nightly-{now/d}>",
+  "repository": "s3-backups",
+  "config": { "indices": [ "*" ], "include_global_state": true },
+  "retention": { "expire_after": "60d", "min_count": 10, "max_count": 100 } }
+
+POST /_slm/policy/nightly/_execute          # test it now
+GET /_slm/policy/nightly                    # last success AND last failure
+GET /_slm/stats
+
+# 4. Restore
+POST /_snapshot/s3-backups/snapshot-2026-03-14/_restore
+{ "indices": "products",
+  "rename_pattern": "(.+)",
+  "rename_replacement": "restored-$1",       # do not clobber the live index
+  "index_settings": { "index.number_of_replicas": 0 } }
+
+GET /_snapshot/s3-backups/_all
+GET /_cat/recovery?v&active_only=true
+
+# SNAPSHOTS ARE INCREMENTAL AT THE SEGMENT LEVEL. A second snapshot only
+# uploads segments that did not exist before, so nightly full snapshots are
+# far cheaper than they sound. Deleting a snapshot only removes segments no
+# other snapshot references.
+#
+# YOU CANNOT RESTORE INTO AN OLDER CLUSTER, and there are version-skew
+# limits going forward — generally one major version. Snapshots are not an
+# archive format you can sit on indefinitely and read in five years.
+#
+# AND A REPLICA IS NOT A BACKUP. It faithfully applies your DELETE within
+# milliseconds. Same argument as every other unit.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Restore-test on a schedule, and time it</span>
+  <p>A backup nobody has restored is a hope. The specific failure modes here are worth knowing because they are all silent until the day you need them: <b>a snapshot taken without <code>include_global_state</code></b>, so the templates and ILM policies are missing and restored indices behave nothing like the originals; <b>a repository whose credentials expired</b> months ago, with the SLM failure buried in a stats endpoint nobody reads; <b>a restore that works and takes eleven hours</b>, which nobody knew until it mattered. Restore into a scratch cluster quarterly, check a document count and a sample query, and <b>record how long it took</b> — that duration is your actual recovery time objective, and it grows with your data.</p>
+</div>
+
+<h2><span class="h-rule"></span>Two conveniences worth knowing</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">shrink, split, and DSL</span><button class="copy">Copy</button></div>
+<pre><code># SHRINK — fewer shards, for an index that is no longer written to. The
+# original shard count must be a multiple of the new one.
+POST /logs-000042/_shrink/logs-000042-shrunk
+{ "settings": { "index.number_of_shards": 1,
+                "index.number_of_replicas": 1,
+                "index.codec": "best_compression" } }
+# Requires the source index to be read-only and all its shards on one node.
+# ILM's shrink action handles both prerequisites for you, which is a good
+# reason to let ILM do it.
+
+# SPLIT — more shards. Also requires read-only, and the target must be a
+# multiple of the source.
+POST /products/_split/products-bigger
+{ "settings": { "index.number_of_shards": 6 } }
+# This is the closest thing to changing the shard count without a full
+# reindex, and the multiple-of constraint means planning ahead: an index
+# created with 1 shard can be split to any number, one created with 5 can
+# only go to 10, 15, 20.
+
+# index.codec: best_compression uses DEFLATE instead of LZ4 for _source.
+# Roughly 15-25% smaller, slightly slower to fetch. For warm and cold data
+# that is an easy win, and ILM's forcemerge is the natural place to apply
+# it since the index is being rewritten anyway.
+
+# DATA STREAM LIFECYCLE (DSL) — the simpler alternative to ILM, for data
+# streams only:
+PUT /_data_stream/logs-app-prod/_lifecycle
+{ "data_retention": "90d" }
+# One setting: how long to keep it. Elasticsearch handles rollover and
+# deletion, and manages downsampling and merging itself.
+#
+# No tiers, no phases, no actions. If your requirement genuinely is "keep
+# 90 days of logs and then delete them", this is the whole configuration
+# and ILM is more machinery than the problem needs. Reach for ILM when you
+# actually want tier movement or per-phase actions.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Downsampling, for metrics you keep for years</span>
+  <p>Time-series metrics have an awkward property: you want per-second resolution for the last day and nobody needs it for data from eighteen months ago — but the storage cost is dominated by the old data precisely because there is so much of it. <b>Downsampling</b> replaces an index with a smaller one holding statistical aggregates over a coarser interval: <code>POST /metrics-000012/_downsample/metrics-000012-1h</code> with <code>{"fixed_interval": "1h"}</code> turns per-second samples into hourly min, max, sum, value count and average. The reduction is often 20–50×, the data stays queryable through the same data stream, and it can be an ILM action so it happens on schedule. For a metrics cluster this is frequently a larger saving than tier movement, and it is much less known.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b><code>delete_by_query</code> on a large index is a merge storm.</b> Write to periodic indices so deletion means dropping an index.</li>
+    <li><b>Data streams are the modern shape</b> for append-only time-series data — and they reject updates, which is a feature or a blocker.</li>
+    <li><b>Roll over by <code>max_primary_shard_size</code></b>, with <code>max_age</code> as a backstop.</li>
+    <li><b>ILM's <code>min_age</code> is measured from rollover</b>, not from index creation. This is the usual "why is it still hot".</li>
+    <li><b>Each tier down is ~10× cheaper and slower.</b> Searchable snapshots put cold data in object storage while keeping it queryable.</li>
+    <li><b>Snapshots are the only real backup</b>, incremental at the segment level, and useless without <code>include_global_state</code>.</li>
+    <li><b>Restore-test quarterly and record the duration.</b> That number is your actual recovery time.</li>
+    <li><b>Data stream lifecycle is one setting</b> where ILM is five phases. Use ILM only when you need tiers or per-phase actions.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("15-lifecycle.html");
+
+(function(){
+  const root = document.getElementById("il");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const POLICIES = {
+    std: {name:"Standard", phases:[
+      {p:"hot",    at:0,   tier:"hot",    cost:1.0},
+      {p:"warm",   at:7,   tier:"warm",   cost:0.45},
+      {p:"cold",   at:30,  tier:"cold",   cost:0.12},
+      {p:"delete", at:365, tier:"—",      cost:0}
+    ]},
+    short: {name:"Aggressive", phases:[
+      {p:"hot",    at:0,  tier:"hot", cost:1.0},
+      {p:"delete", at:30, tier:"—",   cost:0}
+    ]},
+    keep: {name:"Compliance", phases:[
+      {p:"hot",    at:0,  tier:"hot",    cost:1.0},
+      {p:"warm",   at:7,  tier:"warm",   cost:0.45},
+      {p:"frozen", at:90, tier:"frozen", cost:0.04}
+    ]}
+  };
+
+  function render(){
+    const age = parseInt($("i-age").value, 10);
+    const pk  = $("i-policy").value;
+    const gb  = parseInt($("i-size").value, 10);
+    const P   = POLICIES[pk];
+    $("i-agev").textContent  = age;
+    $("i-sizev").textContent = gb;
+
+    let cur = P.phases[0];
+    P.phases.forEach(f => { if(age >= f.at) cur = f; });
+
+    const deleted = cur.p === "delete";
+    const retainDays = pk === "keep" ? 3650 : P.phases[P.phases.length - 1].at;
+
+    // total retained cost: sum over each day of retention at that day's tier cost
+    let totalGb = 0, weighted = 0;
+    for(let d = 0; d < retainDays; d++){
+      let f = P.phases[0];
+      P.phases.forEach(x => { if(d >= x.at) f = x; });
+      if(f.p === "delete") break;
+      totalGb += gb;
+      weighted += gb * f.cost;
+    }
+
+    $("i-phase").textContent = cur.p;
+    $("i-tier").textContent  = cur.tier;
+    $("i-cost").textContent  = deleted ? "0" : cur.cost.toFixed(2) + "×";
+    $("i-total").textContent = (totalGb/1000).toFixed(1) + " TB";
+    $("i-phase").style.color = deleted ? "#E2574C" : cur.p === "hot" ? "#E2574C" :
+                               cur.p === "warm" ? "#F2A03D" : "#25B7C4";
+
+    const TCOL = {hot:"#E2574C", warm:"#F2A03D", cold:"#25B7C4", frozen:"#7C8CF8", "—":"#94A3B8"};
+
+    $("i-track").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin:16px 0 8px">' + P.name + ' policy · day ' + age + '</div>' +
+      '<div style="display:grid;grid-template-columns:repeat(' + P.phases.length +
+      ',1fr);gap:6px">' +
+      P.phases.map((f, i) => {
+        const active = f === cur;
+        const past = age >= f.at && !active;
+        return '<div style="background:' + (active ? "#fff" : past ? "#F7F9FA" : "#F4F7F9") +
+          ';border:2px solid ' + (active ? TCOL[f.tier] : "#E9EDF0") +
+          ';border-radius:6px;padding:10px 8px;text-align:center;' +
+          (past ? "opacity:.6" : active ? "" : "opacity:.8") + '">' +
+          '<div style="font-family:var(--mono);font-size:11.5px;font-weight:700;color:' +
+          (active ? TCOL[f.tier] : "#8FA0AF") + '">' + f.p + '</div>' +
+          '<div style="font-size:10.5px;color:#8FA0AF;margin-top:4px">day ' + f.at + '</div>' +
+          '<div style="font-size:10.5px;color:#54677A;margin-top:3px">' +
+          (f.cost ? f.cost.toFixed(2) + "× cost" : "gone") + '</div></div>';
+      }).join("") + '</div>' +
+      '<div style="margin-top:12px"><div style="font-family:var(--mono);font-size:10.5px;' +
+      'color:#8FA0AF;margin-bottom:5px">retained data by tier, at ' + gb + ' GB/day</div>' +
+      '<div style="display:flex;height:22px;border-radius:4px;overflow:hidden;background:#EDF1F4">' +
+      P.phases.filter(f => f.p !== "delete").map((f, i) => {
+        const next = P.phases[P.phases.findIndex(x => x === f) + 1];
+        const until = next ? next.at : retainDays;
+        const days = Math.max(0, until - f.at);
+        return '<div style="width:' + (days/retainDays*100).toFixed(1) + '%;background:' +
+          TCOL[f.tier] + ';height:100%" title="' + f.p + '"></div>';
+      }).join("") + '</div>' +
+      '<div style="display:flex;gap:14px;margin-top:7px;font-size:11px;color:#54677A;flex-wrap:wrap">' +
+      P.phases.filter(f => f.p !== "delete").map(f =>
+        '<span style="display:flex;align-items:center;gap:5px">' +
+        '<span style="width:10px;height:10px;background:' + TCOL[f.tier] +
+        ';border-radius:2px;display:inline-block"></span>' + f.p + '</span>').join("") +
+      '</div></div>';
+
+    const notes = [];
+
+    if(deleted){
+      notes.push("At day " + age + " this index has passed the delete phase and is gone.\n\nDeletion of a whole index is nearly free — it unlinks files. That is the entire reason for this chapter's machinery: a delete_by_query removing the same data from one large index would write hundreds of millions of tombstones and then generate hours of merge I/O to reclaim the space, competing with live indexing the whole time.");
+    } else {
+      notes.push("At day " + age + " this index is in the " + cur.p + " phase on the " + cur.tier +
+        " tier, at roughly " + cur.cost.toFixed(2) + "× the storage cost of hot.\n\n" +
+        (cur.p === "hot"
+          ? "It is taking writes and wants fast local SSDs. Rollover is what ends this phase — by max_primary_shard_size ideally, so the shard size stays in the 10-50 GB range from chapter 14, with max_age as a backstop so a quiet period does not leave one index open for months."
+          : cur.p === "warm"
+          ? "It is read-only now, which unlocks two actions that cannot be applied to a live index: force-merge down to one segment, and shrink to fewer shards. Both reduce per-segment and per-shard overhead permanently, and best_compression on the codec is an easy 15-25% on top since the index is being rewritten anyway."
+          : cur.p === "cold"
+          ? "Cold uses a SEARCHABLE SNAPSHOT: the data lives in object storage and the node keeps only a local cache. You are paying S3 prices for the bytes while the index stays queryable through the same data stream — slower, and roughly an order of magnitude cheaper."
+          : "Frozen keeps almost nothing locally and fetches from object storage on demand. Queries are much slower — seconds rather than milliseconds — and storage is nearly free. For compliance data that must be searchable and is almost never searched, this is exactly the right trade."));
+    }
+
+    if(pk === "std")
+      notes.push("Over the full 365-day retention this holds " + (totalGb/1000).toFixed(1) +
+        " TB, and the cost-weighted equivalent is about " + (weighted/1000).toFixed(1) +
+        " TB of hot storage — a reduction of roughly " + Math.round((1 - weighted/totalGb) * 100) +
+        "%.\n\nThat saving comes from a simple observation about log data: 95% of queries touch the last few days, and 97% of the bytes are older than that. Moving the old bytes to cheap storage while keeping them queryable is one of the largest cost reductions available in the whole product, and it requires no application changes at all.");
+
+    if(pk === "short")
+      notes.push("Thirty days, hot the whole way, then deleted. No tier movement and no phases beyond the minimum.\n\nFor this requirement ILM is more machinery than the problem needs. DATA STREAM LIFECYCLE does the same job in one setting:\n\n    PUT /_data_stream/logs-app-prod/_lifecycle\n    { \"data_retention\": \"30d\" }\n\nElasticsearch handles rollover, merging and deletion itself. Reach for ILM when you actually want tiers or per-phase actions; use DSL when the requirement genuinely is \"keep N days and then delete\".");
+
+    if(pk === "keep")
+      notes.push("No delete phase, so this grows without bound — at " + gb + " GB/day that is " +
+        (gb * 365 / 1000).toFixed(1) + " TB per year, forever.\n\nFrozen makes it affordable rather than free. The other lever for indefinite retention, and often the larger one, is DOWNSAMPLING: replace a fine-grained metrics index with one holding hourly aggregates, which typically reduces size by 20-50× while keeping the data queryable through the same data stream.\n\nNobody needs per-second resolution for data from eighteen months ago, and the storage cost is dominated by exactly that old data because there is so much of it.");
+
+    notes.push("One detail that causes more confusion than anything else here: min_age is measured FROM ROLLOVER, not from index creation and not from the age of the documents inside.\n\nAn index that stayed hot for three days before rolling over enters the warm phase three days later than the policy's number suggests. When an index seems stuck in the wrong phase, GET /index/_ilm/explain states which step it is on, when it entered, and what it is waiting for — and often the answer is just the ten-minute ILM poll interval.");
+
+    $("i-note").textContent = notes.join("\n\n");
+  }
+
+  ["i-age","i-policy","i-size"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

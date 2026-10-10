@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Index types in depth — PostgreSQL</title>
+<meta name="description" content="B-tree, GIN, GiST, BRIN, SP-GiST and hash — what each is actually for, and the ones people reach for too late.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 06 · Storage and access</div>
+    <h1>Index types in depth</h1>
+    <p class="standfirst">The SQL unit covered what indexes do in general. Postgres has six built-in access methods and an extension mechanism for more, and reaching for the right one is frequently the difference between a query that is impossible and one that is instant.</p>
+    <div class="chap-meta">
+      <span class="tagpill">gin</span>
+      <span class="tagpill">gist</span>
+      <span class="tagpill">brin</span>
+      <span class="tagpill">operator classes</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The six</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Type</th><th>Answers</th><th>Size</th><th>Write cost</th></tr></thead>
+<tbody>
+<tr><td><b>B-tree</b></td><td>Equality, ranges, ordering, prefix</td><td>Moderate</td><td>Low</td></tr>
+<tr><td><b>GIN</b></td><td>"Which rows contain this element" — arrays, jsonb, full text, trigrams</td><td>Large</td><td><b>High</b></td></tr>
+<tr><td><b>GiST</b></td><td>Overlap, containment, nearest-neighbour — geometry, ranges, full text</td><td>Moderate</td><td>Moderate</td></tr>
+<tr><td><b>BRIN</b></td><td>Ranges over physically correlated data</td><td><b>Tiny</b></td><td>Negligible</td></tr>
+<tr><td><b>SP-GiST</b></td><td>Non-balanced partitioned structures — quadtrees, radix trees, IP prefixes</td><td>Small</td><td>Moderate</td></tr>
+<tr><td><b>Hash</b></td><td>Equality only</td><td>Small</td><td>Low</td></tr>
+</tbody>
+</table>
+<caption>B-tree is right about 90% of the time and is the default. The interesting question is recognising the other 10% — and most teams reach for GIN and BRIN years later than they should.</caption>
+</div>
+
+<div class="demo" id="ix">
+  <div class="demo-head">
+    <b>Which access method</b>
+    <span>Describe the query and the data. The recommendation comes with the reasoning, because the reasoning is the transferable part.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="i-query">The query does</label>
+        <select id="i-query">
+          <option value="eq" selected>Equality on a scalar column</option>
+          <option value="range">A range on a scalar column</option>
+          <option value="sort">Equality plus ORDER BY</option>
+          <option value="contains">Array or jsonb containment (@&gt;)</option>
+          <option value="fts">Full-text search</option>
+          <option value="substr">Substring match — LIKE '%x%'</option>
+          <option value="fuzzy">Fuzzy or similarity match</option>
+          <option value="overlap">Range or geometry overlap (&amp;&amp;)</option>
+          <option value="nn">Nearest neighbour — ORDER BY distance</option>
+          <option value="ip">IP address containment</option>
+          <option value="vector">Vector similarity search</option>
+        </select>
+      </div>
+      <div>
+        <label for="i-corr">Column values physically correlated with row order?</label>
+        <select id="i-corr">
+          <option value="no" selected>No — arbitrary order</option>
+          <option value="yes">Yes — append-only, e.g. a timestamp</option>
+        </select>
+      </div>
+      <div>
+        <label for="i-writes">Write rate</label>
+        <select id="i-writes">
+          <option value="low" selected>Low — mostly reads</option>
+          <option value="high">High — constant inserts and updates</option>
+        </select>
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="i-pick">—</b><span>recommended</span></div>
+      <div><b id="i-size">—</b><span>relative size</span></div>
+      <div><b id="i-write">—</b><span>write impact</span></div>
+    </div>
+    <div id="i-ddl"></div>
+    <div class="out" id="i-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>GIN</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the inverted index — one entry per element, not per row</span><button class="copy">Copy</button></div>
+<pre><code>-- A B-tree indexes the whole value. GIN indexes each ELEMENT inside a value
+-- and stores the list of rows containing it — an inverted index. That is what
+-- makes "which rows contain this tag" a lookup rather than a scan.
+
+CREATE INDEX ON articles USING gin (tags);                    -- text[]
+CREATE INDEX ON events   USING gin (payload jsonb_path_ops);  -- jsonb
+CREATE INDEX ON docs     USING gin (to_tsvector('english', body));
+CREATE INDEX ON users    USING gin (name gin_trgm_ops);       -- pg_trgm
+
+SELECT * FROM articles WHERE tags @> ARRAY['postgres'];
+SELECT * FROM events   WHERE payload @> '{"type":"signup"}';
+SELECT * FROM users    WHERE name ILIKE '%okaf%';   -- trigram index applies
+
+-- jsonb_ops (the default) vs jsonb_path_ops:
+--   jsonb_ops       indexes keys AND values; supports ?, ?|, ?& as well as @>
+--   jsonb_path_ops  indexes only key/value PATHS; ~3x smaller and faster,
+--                   supports only @>
+-- If you only ever use @>, use jsonb_path_ops. Most people only use @>.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">GIN writes are slow, and the pending list is the reason it seems fine</span>
+  <p>Inserting one row with ten tags means ten index entries, each needing its posting list updated. To hide this, GIN batches new entries into a <b>pending list</b> and merges them in bulk later — during vacuum, or when the list exceeds <code>gin_pending_list_limit</code>. The consequences: inserts look cheap until a merge, which is a latency spike; and <b>queries must scan the pending list linearly</b>, so a large one makes reads slow too. On a write-heavy GIN index, keep <code>gin_pending_list_limit</code> modest and let autovacuum run often. Setting <code>fastupdate = off</code> makes writes uniformly slower and removes the spikes, which is sometimes the better trade.</p>
+</div>
+
+<h2><span class="h-rule"></span>BRIN</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the tiny index for enormous tables</span><button class="copy">Copy</button></div>
+<pre><code>-- BRIN stores, for each BLOCK RANGE (128 pages by default), the minimum and
+-- maximum value found there. A query for a value outside a range skips those
+-- 128 pages entirely without reading them.
+--
+-- An index on a billion-row table can be a few megabytes.
+
+CREATE INDEX ON events USING brin (occurred_at);
+CREATE INDEX ON events USING brin (occurred_at) WITH (pages_per_range = 32);
+
+-- It works ONLY when values correlate with physical order. On an append-only
+-- table with a timestamp, correlation is near 1 and BRIN is superb. On a
+-- randomly-ordered column it is worthless — every block range covers the
+-- whole value space and nothing can be skipped.
+
+SELECT attname, correlation
+FROM pg_stats
+WHERE tablename = 'events' AND attname = 'occurred_at';
+-- correlation near 1.0 or -1.0: BRIN is a good fit
+-- correlation near 0:            use a B-tree
+
+-- Rough comparison on a billion-row time-series table:
+--   B-tree on occurred_at    ~21 GB, meaningful write cost
+--   BRIN   on occurred_at    ~3 MB, negligible write cost
+-- BRIN returns more false positives, so it reads more heap pages than a
+-- B-tree would — but on a table where the B-tree does not fit in memory,
+-- BRIN wins by a wide margin.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">BRIN is the most under-used index type in Postgres</span>
+  <p>Every append-only table with a timestamp — events, logs, metrics, audit trails, orders — is a candidate, and these are exactly the tables that grow to hundreds of gigabytes and where a B-tree becomes a problem. The index is so small it stays in memory permanently and the write cost is close to zero. Check <code>correlation</code> in <code>pg_stats</code> first; if it is above about 0.9, try BRIN before adding another B-tree. Note that a <code>CLUSTER</code> or a bulk reorganisation resets correlation, and updates that move rows degrade it over time.</p>
+</div>
+
+<h2><span class="h-rule"></span>GiST and SP-GiST</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">GiST — a framework, not one structure</span><button class="copy">Copy</button></div>
+<pre><code>-- GiST is a generalised search tree: a template that an operator class fills
+-- in. That is why it supports such different things.
+
+-- Range overlap — the exclusion constraint from the SQL unit
+CREATE EXTENSION btree_gist;
+CREATE INDEX ON bookings USING gist (room_id, during);
+ALTER TABLE bookings ADD EXCLUDE USING gist (room_id WITH =, during WITH &&);
+
+-- Geometry, via PostGIS
+CREATE INDEX ON places USING gist (geom);
+SELECT * FROM places WHERE ST_DWithin(geom, :point, 1000);
+
+-- Nearest-neighbour: GiST can return rows in distance order, so ORDER BY
+-- distance LIMIT 10 becomes an index scan rather than sorting everything.
+SELECT * FROM places ORDER BY geom <-> :point LIMIT 10;
+-- This "KNN-GiST" capability is unique among the access methods and is
+-- the reason GiST is the answer for anything spatial.
+
+-- SP-GiST: space-partitioned, for structures that are naturally unbalanced
+CREATE INDEX ON networks USING spgist (addr inet_ops);
+SELECT * FROM networks WHERE addr >>= '192.168.1.42';   -- containment
+-- Radix trees over text prefixes and quadtrees over points are the other
+-- classic uses. Rarely the first thing to reach for; excellent when it fits.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Hash</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">finally usable, still rarely the answer</span><button class="copy">Copy</button></div>
+<pre><code>CREATE INDEX ON sessions USING hash (token);
+
+-- Before PostgreSQL 10, hash indexes were not WAL-logged: they did not
+-- survive a crash and could not be replicated, so the advice was simply
+-- "never use them". That was fixed in 10, and a great deal of writing online
+-- still repeats the old advice.
+--
+-- Even so, a B-tree does equality nearly as fast AND supports ranges,
+-- ordering, multi-column keys and uniqueness. The narrow case for hash is a
+-- very wide key — a long token or URL — where the hash index is materially
+-- smaller than the B-tree because it stores a 4-byte hash rather than the
+-- value.
+--
+-- If you are considering it, measure both. Usually the B-tree wins on
+-- flexibility for a size difference that does not matter.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Operator classes</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the same index type, taught a different comparison</span><button class="copy">Copy</button></div>
+<pre><code>-- An operator class tells an access method how to handle a particular type.
+-- Choosing the right one is often the difference between an index that is
+-- used and one that is not.
+
+-- text_pattern_ops: makes LIKE 'prefix%' indexable in non-C locales.
+-- The default operator class uses locale collation, and LIKE does not.
+CREATE INDEX ON files (path text_pattern_ops);
+SELECT * FROM files WHERE path LIKE '/var/log/%';    -- now uses the index
+
+-- gin_trgm_ops / gist_trgm_ops: substring and similarity search
+CREATE EXTENSION pg_trgm;
+CREATE INDEX ON users USING gin (name gin_trgm_ops);
+SELECT * FROM users WHERE name ILIKE '%okaf%';
+SELECT * FROM users WHERE name % 'Okafor' ORDER BY similarity(name, 'Okafor') DESC;
+
+-- jsonb_path_ops: smaller jsonb GIN, @> only
+CREATE INDEX ON events USING gin (payload jsonb_path_ops);
+
+-- What is available for a type:
+SELECT am.amname, opc.opcname, opc.opcdefault
+FROM pg_opclass opc JOIN pg_am am ON am.oid = opc.opcmethod
+WHERE opc.opcintype = 'text'::regtype;</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">text_pattern_ops is the fix people spend hours not finding</span>
+  <p><code>LIKE 'prefix%'</code> should be indexable, and on a database created with a non-C locale it is not — because the default B-tree operator class orders by locale collation rules while <code>LIKE</code> compares byte by byte. The plan shows a sequential scan on a column that obviously has an index, and nothing in the query looks wrong. Adding a second index with <code>text_pattern_ops</code> fixes it. (If the database was created with <code>C</code> collation the default index already works, which is why the problem appears inconsistent across environments.)</p>
+</div>
+
+<h2><span class="h-rule"></span>Extension index types</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Extension</th><th>Provides</th><th>For</th></tr></thead>
+<tbody>
+<tr><td><b>pg_trgm</b></td><td>Trigram operator classes for GIN and GiST</td><td>Substring, fuzzy and similarity search</td></tr>
+<tr><td><b>btree_gin</b>, <b>btree_gist</b></td><td>Scalar types inside GIN and GiST indexes</td><td>Mixing a scalar with a range in one index or exclusion constraint</td></tr>
+<tr><td><b>pgvector</b></td><td>HNSW and IVFFlat index methods</td><td>Embedding similarity search</td></tr>
+<tr><td><b>PostGIS</b></td><td>Spatial operator classes for GiST and SP-GiST</td><td>Anything geographic</td></tr>
+<tr><td><b>bloom</b></td><td>A bloom-filter index method</td><td>Many columns, arbitrary combinations of equality predicates</td></tr>
+<tr><td><b>rum</b></td><td>A GIN variant storing extra information in the posting list</td><td>Full-text search with ranking by position or timestamp</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">pgvector, since it is why many people arrive here</span><button class="copy">Copy</button></div>
+<pre><code>CREATE EXTENSION vector;
+ALTER TABLE documents ADD COLUMN embedding vector(1536);
+
+-- HNSW: better recall and query speed, slower to build, more memory
+CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- IVFFlat: faster to build, smaller, needs the data present before building
+CREATE INDEX ON documents USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 1000);      -- roughly rows/1000 for under 1M rows
+
+SET hnsw.ef_search = 100;     -- raise for better recall, at query cost
+SELECT id, embedding <=> :query AS distance
+FROM documents ORDER BY embedding <=> :query LIMIT 10;
+
+-- Both are APPROXIMATE: they trade recall for speed, and the operator class
+-- must match the distance function you query with (cosine, L2 or inner
+-- product). A mismatch silently returns wrong neighbours with no error —
+-- the query works, the results are just not the nearest ones.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Choosing</h2>
+
+<div class="flow stack">
+  <div class="step"><b>Scalar equality, ranges or ordering?</b><span>B-tree. Stop here — this is most cases</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Huge table, values correlated with physical order?</b><span>BRIN. Check <code>correlation</code> in pg_stats first</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>"Contains" over arrays, jsonb or text?</b><span>GIN. Pick the narrower operator class if you can</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Overlap, containment or nearest-neighbour?</b><span>GiST</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Hierarchical keys — IP prefixes, quadtrees?</b><span>SP-GiST</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Vectors?</b><span>pgvector, HNSW by default</span></div>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Check the plan actually uses it</span>
+  <p>Creating an index is not evidence that it is used. The operator in your query has to be one the operator class supports — <code>@&gt;</code> works with <code>jsonb_path_ops</code> and <code>?</code> does not; <code>LIKE</code> needs <code>text_pattern_ops</code> in a non-C locale; a cast on the column disables everything. After creating any index other than a plain B-tree, run <code>EXPLAIN</code> on the query you built it for and confirm the node type. A GIN index that is never used is one of the more expensive mistakes available, because it taxes every write for nothing.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Six access methods. <b>B-tree is right about 90% of the time</b>; the skill is recognising the rest.</li>
+    <li><b>GIN indexes elements, not values</b> — arrays, jsonb, full text, trigrams. Writes are expensive.</li>
+    <li>GIN's <b>pending list</b> hides write cost until a merge, and a large one slows reads too.</li>
+    <li><b>BRIN is the most under-used type in Postgres.</b> Tiny, nearly free to maintain, and perfect for append-only timestamped tables — check <code>correlation</code> first.</li>
+    <li><b>GiST does overlap, containment and nearest-neighbour</b>, which no other method offers.</li>
+    <li>Hash indexes have been crash-safe since PostgreSQL 10, and are <b>still rarely better than a B-tree</b>.</li>
+    <li><b><code>text_pattern_ops</code></b> is what makes <code>LIKE 'prefix%'</code> indexable in a non-C locale.</li>
+    <li>After creating any non-B-tree index, <b>run <code>EXPLAIN</code> and confirm it is used</b>. An unused GIN index is pure write cost.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("06-indexes.html");
+
+(function(){
+  const root = document.getElementById("ix");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const REC = {
+    eq:      {t:"B-tree", size:"moderate", write:"low",
+      ddl:"CREATE INDEX ON t (col);",
+      why:"Equality on a scalar is the B-tree's home ground. It also gives you ranges, ordering, multi-column keys and uniqueness for free, none of which a hash index offers.\n\nA hash index would be marginally smaller for a very wide key — a long token or URL — because it stores a 4-byte hash rather than the value. Measure before choosing it; the flexibility usually wins."},
+    range:   {t:"B-tree", size:"moderate", write:"low",
+      ddl:"CREATE INDEX ON t (col);",
+      why:"Ranges need sorted order, which is exactly what a B-tree provides. A hash index cannot answer this at all.\n\nIf the table is very large and the column correlates with physical row order, BRIN is worth comparing — it will be thousands of times smaller for the same range queries."},
+    sort:    {t:"B-tree, composite", size:"moderate", write:"low",
+      ddl:"CREATE INDEX ON t (filter_col, sort_col DESC);",
+      why:"Put the equality column first and the sort column second, so the index supplies both the seek and the ordering. The sort node then disappears from the plan entirely, and a LIMIT can stop early rather than sorting everything.\n\nMatch the direction: if you query ORDER BY x DESC, declare the index DESC — although Postgres can also scan a B-tree backwards, so this matters less than it does in some other engines."},
+    contains:{t:"GIN", size:"large", write:"high",
+      ddl:"-- arrays\nCREATE INDEX ON t USING gin (tags);\n\n-- jsonb, if you only use @>\nCREATE INDEX ON t USING gin (payload jsonb_path_ops);",
+      why:"Containment asks \"which rows have this element inside them\", which is an inverted-index question. GIN stores one entry per element with the list of rows containing it.\n\nFor jsonb specifically, choose the operator class deliberately: jsonb_ops indexes keys and values and supports ?, ?| and ?& as well as @>; jsonb_path_ops indexes only paths, is about three times smaller and faster, and supports only @>. Most applications only ever use @>."},
+    fts:     {t:"GIN", size:"large", write:"high",
+      ddl:"ALTER TABLE t ADD COLUMN tsv tsvector\n    GENERATED ALWAYS AS (to_tsvector('english', body)) STORED;\nCREATE INDEX ON t USING gin (tsv);",
+      why:"GIN is the standard choice for full-text search — faster to query than GiST, at the cost of size and write speed.\n\nUse a generated column rather than an expression index: it is visible in the plan, it can be selected directly for debugging, and every query uses the same text search configuration, which removes a whole category of \"why does this document not match\" confusion.\n\nIf you need ranking by position or recency, look at the rum extension, which stores that information in the posting list and avoids a re-sort."},
+    substr:  {t:"GIN with pg_trgm", size:"large", write:"high",
+      ddl:"CREATE EXTENSION pg_trgm;\nCREATE INDEX ON t USING gin (col gin_trgm_ops);",
+      why:"A B-tree cannot help with a leading wildcard — sorted order tells you nothing about what is in the middle of a string. Trigrams break each value into overlapping three-character sequences and index those, so '%okaf%' becomes a lookup for the trigrams it contains.\n\nThis handles both LIKE '%x%' and ILIKE. It is a large index and slow to write, which is the price for making an otherwise impossible query fast."},
+    fuzzy:   {t:"GIN or GiST with pg_trgm", size:"large", write:"high",
+      ddl:"CREATE EXTENSION pg_trgm;\nCREATE INDEX ON t USING gist (col gist_trgm_ops);\n\nSELECT * FROM t\nORDER BY col <-> 'Okafor' LIMIT 10;",
+      why:"GiST rather than GIN here, because GiST supports the distance operator and can return rows in similarity order — so ORDER BY <-> LIMIT 10 becomes an index scan instead of computing similarity for every row.\n\nUse GIN if you only need the % containment operator and not ranked results; it is faster for that case."},
+    overlap: {t:"GiST", size:"moderate", write:"moderate",
+      ddl:"CREATE EXTENSION btree_gist;\nCREATE INDEX ON t USING gist (scalar_col, range_col);\n\nALTER TABLE t ADD EXCLUDE USING gist\n    (scalar_col WITH =, range_col WITH &&);",
+      why:"Overlap is not equality and not ordering, so a B-tree cannot express it. GiST's generalised tree handles containment and intersection natively.\n\nThe btree_gist extension is what lets you mix a plain scalar column into a GiST index alongside the range — which is exactly what an exclusion constraint like \"no two bookings for the same room may overlap\" needs."},
+    nn:      {t:"GiST", size:"moderate", write:"moderate",
+      ddl:"CREATE INDEX ON t USING gist (geom);\n\nSELECT * FROM t ORDER BY geom <-> :point LIMIT 10;",
+      why:"KNN-GiST returns rows in distance order directly from the index, so the ten nearest are found without computing distance to every row and sorting.\n\nThis capability is unique to GiST among the built-in methods, and it is the reason anything spatial ends up there. Note the requirement: the ORDER BY must use the distance operator on the indexed column, with no other sort key ahead of it."},
+    ip:      {t:"SP-GiST", size:"small", write:"moderate",
+      ddl:"CREATE INDEX ON t USING spgist (addr inet_ops);\n\nSELECT * FROM t WHERE addr >>= '192.168.1.42';",
+      why:"IP prefixes form a naturally unbalanced radix tree — some prefixes are densely populated and others empty. SP-GiST is built for exactly that shape, where a balanced structure like a B-tree wastes space and comparisons.\n\nThe same reasoning applies to text prefix trees and to quadtrees over points. It is rarely the first method to consider and it is clearly right when the data is hierarchical."},
+    vector:  {t:"HNSW (pgvector)", size:"large", write:"high",
+      ddl:"CREATE EXTENSION vector;\nCREATE INDEX ON t USING hnsw (embedding vector_cosine_ops)\n    WITH (m = 16, ef_construction = 64);",
+      why:"HNSW gives better recall and faster queries than IVFFlat, at the cost of a slower build and more memory. IVFFlat is worth considering when build time matters or memory is tight — but it needs representative data present before you build it, since it clusters what it sees.\n\nBoth are approximate. The operator class must match the distance function in your query: vector_cosine_ops with <=>, vector_l2_ops with <->, vector_ip_ops with <#>. A mismatch returns wrong neighbours silently — the query succeeds and the answers are simply not the nearest ones."}
+  };
+
+  function render(){
+    const q = $("i-query").value;
+    const corr = $("i-corr").value === "yes";
+    const heavy = $("i-writes").value === "high";
+    let r = Object.assign({}, REC[q]);
+
+    // BRIN override for correlated scalar range work
+    if(corr && (q === "range" || q === "eq")){
+      r = {t:"BRIN", size:"tiny", write:"negligible",
+        ddl:"-- Check first:\nSELECT correlation FROM pg_stats\nWHERE tablename='t' AND attname='col';\n\nCREATE INDEX ON t USING brin (col);\n-- tune with WITH (pages_per_range = 32) for finer granularity",
+        why:"The column correlates with physical row order, which is BRIN's precondition. It stores only a min and max per 128-page range, so the index is a few megabytes where a B-tree would be tens of gigabytes — small enough to stay in memory permanently, with essentially no write cost.\n\nBRIN returns false positives and therefore reads more heap pages than a B-tree would. On a table large enough that the B-tree does not fit in cache, that trade is overwhelmingly favourable.\n\nWatch two things: correlation degrades as updates move rows around, and a bulk reorganisation resets it. Re-check pg_stats periodically."};
+    }
+
+    $("i-pick").textContent  = r.t;
+    $("i-size").textContent  = r.size;
+    $("i-write").textContent = r.write;
+
+    const col = r.write === "high" ? "#E2574C" : r.write === "moderate" ? "#F2A03D" : "#3FB984";
+    $("i-ddl").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid ' + col +
+      ';border-radius:5px;padding:11px 13px;margin:14px 0 12px;font-family:var(--mono);' +
+      'font-size:12px;line-height:1.6;overflow-x:auto">' +
+      r.ddl.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>';
+
+    const notes = [r.why];
+
+    if(heavy && r.write === "high")
+      notes.push("With a high write rate this is an expensive index. For GIN specifically, the pending list batches new entries and merges them later — so inserts look cheap until a merge causes a latency spike, and a large pending list slows queries because they must scan it linearly. Keep gin_pending_list_limit modest and let autovacuum run frequently, or set fastupdate = off to trade uniform slowness for predictability.");
+    if(heavy && r.t === "BRIN")
+      notes.push("BRIN is unusually well suited to a high write rate: there is almost nothing to maintain on insert. The risk is the opposite one — updates that relocate rows degrade correlation over time, and once correlation falls the index quietly stops helping. Track it.");
+    if(!corr && (q === "range" || q === "eq"))
+      notes.push("If this table is very large and append-ordered, switch the correlation control above and compare. BRIN on a timestamped append-only table is routinely thousands of times smaller than the equivalent B-tree, and it is the single most under-used index type in Postgres.");
+
+    notes.push("After creating this, run EXPLAIN on the query it was built for and confirm the plan uses it. Operator-class mismatches, casts on the column and unsupported operators all produce an index that exists, taxes every write, and is never chosen.");
+    $("i-note").textContent = notes.join("\n\n");
+  }
+
+  ["i-query","i-corr","i-writes"].forEach(id => $(id).addEventListener("change", render));
+  render();
+})();
+</script>
+</body>
+</html>

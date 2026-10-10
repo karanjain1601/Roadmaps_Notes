@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Asynchronism: queues, streams, jobs — System Design Notes</title>
+<meta name="description" content="Queues versus logs, delivery semantics, ordering, consumer groups, dead letters, backpressure, the outbox pattern, sagas and background jobs.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/notes.css">
+</head>
+<body>
+<div class="readbar"></div>
+
+<header class="top">
+  <div class="top-inner">
+    <a class="home" href="../../index.html"><span class="mark"></span>All roadmaps</a>
+    <span class="top-sep">/</span>
+    <a class="home" href="index.html" style="color:var(--band-text)">System Design</a>
+    <span class="top-spacer"></span>
+    <button class="rail-toggle" aria-expanded="false">Contents</button>
+    <nav class="top-nav" aria-label="Chapter navigation"></nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail" id="rail" aria-label="Chapter and section navigation"></aside>
+
+  <article>
+    <p class="crumb">Part 5 · Moving the data &nbsp;·&nbsp; <b>Chapter 17</b></p>
+    <h1>Asynchronism: queues, streams, jobs</h1>
+    <p class="standfirst">Moving work off the request path is the single most effective architectural move available: it makes responses fast, failures retryable, and load absorbable. It also introduces duplicates, reordering, backlogs and a second system to operate. This chapter is what queues actually guarantee, what they do not, and the patterns that make the difference survivable.</p>
+    <div class="meta">
+      <span>~45 min read</span>
+      <span>Queues vs logs · delivery · DLQ · outbox · sagas</span>
+      <span>2 interactive panels</span>
+      <span>Prerequisite: chapters 3, 6, 16</span>
+    </div>
+
+    <div class="body">
+
+      <h2><span class="h2n">17.1</span>What going asynchronous buys</h2>
+
+      <ol>
+        <li><b>Latency.</b> The user waits for the durable write, not for the six things that follow it. A 900 ms checkout becomes 80 ms plus a queue append.</li>
+        <li><b>Load levelling.</b> A queue absorbs a spike that would otherwise have to be provisioned for. Ten times the traffic for two minutes becomes a backlog that drains in twenty, instead of an outage.</li>
+        <li><b>Retryability.</b> A failed synchronous call is an error the user sees. A failed message is retried, with backoff, until it succeeds or is quarantined.</li>
+        <li><b>Decoupling.</b> The producer does not know who consumes. Adding a fourth consumer of "order placed" requires no change to the order service — which is the property that lets teams move independently.</li>
+        <li><b>Fan-out.</b> One event, many independent reactions, each failing and retrying on its own.</li>
+      </ol>
+
+      <p>And what it costs: eventual consistency everywhere downstream, duplicate deliveries you must tolerate, ordering you must not assume, a backlog that can grow without anyone noticing, and a whole second system with its own failure modes, capacity limits and on-call burden.</p>
+
+      <div class="note key">
+        <span class="lab">The test for what goes behind a queue</span>
+        <p>Does the user need the result of this work to consider their action complete? Publishing a post: the post must be durable before you return success. Generating thumbnails, notifying followers, updating the search index, recomputing trending, sending the confirmation email: none of these. If the answer is "they need to know it will happen, not that it has happened", it belongs in a queue.</p>
+      </div>
+
+      <h2><span class="h2n">17.2</span>Queues and logs are different things</h2>
+
+      <p>Both are called "message brokers" and they have genuinely different semantics. Choosing the wrong one produces a system that fights its infrastructure.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Queue versus log</caption>
+          <thead><tr><th></th><th>Queue (RabbitMQ, SQS, Redis lists)</th><th>Log (Kafka, Kinesis, Pulsar, Redpanda)</th></tr></thead>
+          <tbody>
+            <tr><td>Model</td><td>Messages are handed out and removed</td><td>An append-only, immutable, ordered sequence per partition</td></tr>
+            <tr><td>After consumption</td><td class="mid">Deleted on acknowledgement</td><td class="yes">Still there — consumers hold an offset</td></tr>
+            <tr><td>Multiple consumer groups</td><td class="no">Needs fan-out to separate queues</td><td class="yes">Native — each group reads independently at its own pace</td></tr>
+            <tr><td>Replay</td><td class="no">Gone</td><td class="yes">Reset the offset and reprocess history</td></tr>
+            <tr><td>Ordering</td><td class="mid">Per queue, lost with competing consumers</td><td class="yes">Strict per partition</td></tr>
+            <tr><td>Parallelism</td><td class="yes">Add consumers freely; work is distributed per message</td><td class="mid">Bounded by partition count — more consumers than partitions sit idle</td></tr>
+            <tr><td>Per-message operations</td><td class="yes">Delay, priority, per-message TTL, selective acknowledgement</td><td class="no">Not really — the log is a sequence, not a set</td></tr>
+            <tr><td>Retention</td><td>Until consumed</td><td>Time or size based, independent of consumption</td></tr>
+            <tr><td>Natural fit</td><td>Task distribution: send email, resize image, run job</td><td>Event streams: things that happened, consumed by many, possibly replayed</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <figure class="diagram">
+        <div class="mermaid">
+flowchart LR
+  subgraph Q["Queue — work distribution"]
+    P1["Producer"] --> QQ[["order-emails"]]
+    QQ --> W1["Worker 1"]
+    QQ --> W2["Worker 2"]
+    QQ --> W3["Worker 3"]
+  end
+  subgraph L["Log — event stream"]
+    P2["Producer"] --> T[["topic: orders<br/>partition 0..N"]]
+    T --> G1["Group: email<br/>offset 8 412"]
+    T --> G2["Group: search index<br/>offset 8 410"]
+    T --> G3["Group: warehouse<br/>offset 7 990"]
+    T --> G4["Group: analytics<br/>offset 3 100 — replaying"]
+  end
+        </div>
+        <figcaption>In a queue, three workers share one stream of work and each message goes to exactly one of them. In a log, four independent groups each read <em>every</em> message at their own position — including one deliberately reprocessing history.</figcaption>
+      </figure>
+
+      <p>A useful heuristic: if the message is a <b>command</b> ("resize this image") it wants a queue; if it is an <b>event</b> ("an order was placed") it wants a log, because you cannot know today who will want to react to it tomorrow.</p>
+
+      <h2><span class="h2n">17.3</span>Delivery semantics</h2>
+
+      <div class="tw">
+        <table>
+          <caption>What a broker can promise</caption>
+          <thead><tr><th>Semantic</th><th>Mechanism</th><th>Failure mode</th><th>Use when</th></tr></thead>
+          <tbody>
+            <tr><td><b>At most once</b></td><td>Acknowledge before processing</td><td>A crash loses the message silently</td><td>Metrics, telemetry, anything where a gap is cheaper than a duplicate</td></tr>
+            <tr><td><b>At least once</b></td><td>Acknowledge after processing; redeliver if no ack</td><td>Duplicates on retry, crash, or a slow consumer exceeding its timeout</td><td>Almost everything — combined with idempotent consumers</td></tr>
+            <tr><td><b>Exactly once</b></td><td>Broker transactions plus deduplication</td><td>Only holds inside the broker's own boundary</td><td>Stream processing wholly within one system</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <span class="lab">"Exactly once" is a scoped claim, not a general one</span>
+        <p>Kafka's exactly-once semantics are real and useful: within Kafka, a consume-transform-produce cycle can be made atomic, so reprocessing after a crash does not duplicate the output. What it cannot do is make a side effect in <em>another</em> system exactly once — sending an email, charging a card, calling a third-party API. The moment a message causes an effect outside the broker's transaction, you are back to at-least-once delivery plus an idempotent handler. In a design discussion the correct phrasing is <b>"at-least-once delivery with effectively-once processing"</b>, and the mechanism is a deduplication key, not a broker setting.</p>
+      </div>
+
+      <div class="codewrap">
+        <span class="lang">An idempotent consumer</span>
+        <pre><code>def handle(msg):
+    # The dedup key must come from the MESSAGE, not be generated here.
+    # Prefer a business identity over a message id: two different
+    # messages describing the same event should collapse.
+    key = msg.headers.get("event_id") or f"{msg.type}:{msg.payload['order_id']}"
+
+    with db.transaction():
+        claimed = db.execute(
+            "INSERT INTO processed_events (key, at) VALUES (?, now()) "
+            "ON CONFLICT DO NOTHING", key)
+        if claimed.rowcount == 0:
+            return ACK                    # already handled; drop silently
+
+        do_the_work(msg)                  # side effect and the claim commit
+                                          # together, or neither happens
+    return ACK
+
+# Retain processed_events for longer than the maximum possible redelivery
+# window — typically days — then prune. An unbounded dedup table is a
+# slow-motion outage of its own.</code></pre>
+      </div>
+
+      <h2><span class="h2n">17.4</span>Ordering</h2>
+
+      <p>Global ordering across a distributed system is expensive and almost never required. What is usually required is <b>ordering per entity</b>: this user's events in order, this conversation's messages in order, this account's transactions in order. That is cheap, and it is what partitioning gives you.</p>
+
+      <ul class="tight">
+        <li><b>Partition by the entity key.</b> All events for <code>order_42</code> go to the same partition and are therefore consumed in order by one consumer. Different orders proceed in parallel.</li>
+        <li><b>Ordering dies with competing consumers.</b> Two workers pulling from one queue will finish out of order regardless of the order they received messages in. If you need order, you need one consumer per key — which is what partitioning enforces.</li>
+        <li><b>A retry breaks order too.</b> Message 5 fails, goes back on the queue, and is redelivered after message 6 has already been processed. If order matters, the consumer must either block the partition on failure or the messages must be commutative.</li>
+        <li><b>Prefer designing for out-of-order.</b> Carry a version or timestamp and ignore anything older than what you have applied. Ordering-independent handlers are far more robust than ordering-dependent ones, and they let you parallelise freely.</li>
+      </ul>
+
+      <h2><span class="h2n">17.5</span>Consumers, scaling and rebalancing</h2>
+
+      <p>In a queue, adding consumers adds throughput linearly until the broker or the downstream becomes the bottleneck. In a log, parallelism is capped by the <b>partition count</b>: with 12 partitions, the 13th consumer in a group gets nothing. Partition count is therefore a capacity decision made in advance, and increasing it later changes which keys map where — breaking the per-key ordering guarantee across the change.</p>
+
+      <div class="note trap">
+        <span class="lab">Rebalance storms</span>
+        <p>When a consumer joins, leaves or is presumed dead, the group rebalances and — in the naive protocol — <em>every</em> consumer stops, gives up its partitions and is reassigned. A consumer that takes too long between polls (because one message is slow) is evicted, which triggers a rebalance, which stalls everyone, which makes more consumers look slow. Defences: keep per-message processing well under the poll interval, or hand long work to a separate thread and keep polling; use cooperative/incremental rebalancing so only the affected partitions move; and set the session timeout deliberately rather than leaving the default.</p>
+      </div>
+
+      <h2><span class="h2n">17.6</span>Failure: retries, poison messages, dead letters</h2>
+
+      <figure class="diagram">
+        <div class="mermaid">
+flowchart LR
+  Q[["main queue"]] --> C["Consumer"]
+  C -->|"ack"| DONE(["done"])
+  C -->|"transient failure"| R{"attempts &lt; max?"}
+  R -->|"yes"| D[["retry queue<br/>delay = backoff"]]
+  D --> Q
+  R -->|"no"| DLQ[["dead-letter queue"]]
+  DLQ --> H["Human or automated triage"]
+  H -->|"fixed: redrive"| Q
+  H -->|"unfixable: archive"| A[("archive")]
+        </div>
+        <figcaption>The retry loop must be bounded and the failure destination must be somewhere a person will look. An unbounded retry loop on a permanently-failing message is an infinite CPU burner that also blocks its partition.</figcaption>
+      </figure>
+
+      <ul>
+        <li><b>Distinguish transient from permanent.</b> A timeout is worth retrying; a validation error never will be. Retrying permanent failures wastes capacity and delays the messages behind them — fail those straight to the dead-letter queue.</li>
+        <li><b>Exponential backoff with jitter,</b> and a cap. Without jitter, everything that failed together retries together, forever.</li>
+        <li><b>Bound the attempts</b>, then dead-letter. The count belongs in the message headers, not in the consumer's memory.</li>
+        <li><b>Alert on the DLQ.</b> A dead-letter queue nobody monitors is a data-loss mechanism with extra steps. Alert on depth greater than zero, and on its age.</li>
+        <li><b>Make redrive routine.</b> Fix the bug, replay the DLQ back into the main queue. This only works if consumers are idempotent — which is the same requirement as everything else in this chapter.</li>
+        <li><b>Visibility timeouts must exceed processing time.</b> If a consumer takes 90 seconds and the timeout is 30, the message is redelivered to a second consumer while the first is still working — and now you are running it three times concurrently. This is one of the most common causes of mysterious duplicate work.</li>
+      </ul>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Retries, duplicates and the dead-letter queue</h4>
+          <p>Ten thousand messages through a consumer with a given failure rate. See where they end up and how much extra work retries generate.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="r-tr">Transient failure rate <b><span id="r-trv">3</span>%</b></label>
+              <input type="range" id="r-tr" min="0" max="40" step="0.5" value="3">
+            </div>
+            <div class="ctrl">
+              <label for="r-perm">Permanent failure rate <b><span id="r-permv">0.2</span>%</b></label>
+              <input type="range" id="r-perm" min="0" max="10" step="0.1" value="0.2">
+            </div>
+            <div class="ctrl">
+              <label for="r-max">Max attempts <b><span id="r-maxv">5</span></b></label>
+              <input type="range" id="r-max" min="1" max="15" step="1" value="5">
+            </div>
+            <div class="ctrl">
+              <label for="r-vis">Visibility timeout <b><span id="r-visv">30</span> s</b></label>
+              <input type="range" id="r-vis" min="5" max="300" step="5" value="30">
+            </div>
+            <div class="ctrl">
+              <label for="r-proc">Processing time p99 <b><span id="r-procv">8</span> s</b></label>
+              <input type="range" id="r-proc" min="1" max="300" step="1" value="8">
+            </div>
+            <div class="ctrl">
+              <label for="r-idem">Consumer is idempotent</label>
+              <select id="r-idem">
+                <option value="1" selected>Yes — dedup key on write</option>
+                <option value="0">No</option>
+              </select>
+            </div>
+          </div>
+          <div class="bars" id="r-bars"></div>
+          <div class="out">
+            <div class="stats" id="r-stats"></div>
+            <p id="r-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">17.7</span>Backlogs and backpressure</h2>
+
+      <p>A queue's job is to absorb bursts. Its danger is that it absorbs them silently — nobody notices until a backlog is hours deep and the business has been shipping stale results all afternoon.</p>
+
+      <div class="codewrap">
+        <span class="lang">The only two numbers that matter</span>
+        <pre><code>depth  = messages waiting
+age    = how old is the OLDEST unprocessed message
+
+Little's Law:   drain time = depth / (consumer rate − producer rate)
+
+  depth 500 000, consumers 2 000/s, producers 1 800/s
+    → net drain 200/s → 2 500 s ≈ 42 minutes, IF producers stay flat
+
+  If producers ≥ consumers, drain time is infinite and the queue
+  is not a buffer, it is a leak.
+
+ALERT ON AGE, NOT DEPTH. Depth of 100 000 is fine at a million
+messages a second and catastrophic at ten. Age is expressed in the
+same units as your SLO, which makes it directly actionable.</code></pre>
+      </div>
+
+      <p><b>Backpressure</b> is telling the producer to slow down. Systems that lack it fail in the worst possible way: the queue grows until the broker runs out of disk, and then everything stops at once. Options, in order of preference: bound the queue and reject or block producers when it is full; rate-limit at the entry point so excess is refused cheaply at the edge with a <code>429</code>; shed low-priority messages while the backlog is deep; or, at minimum, autoscale consumers on <em>age</em> and alert loudly when the backlog cannot drain.</p>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Backlog dynamics</h4>
+          <p>Two hours with a traffic spike and a consumer outage. Watch depth, and watch age — which is the one your users feel.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="b-prod">Baseline producer rate <b><span id="b-prodv">1200</span>/s</b></label>
+              <input type="range" id="b-prod" min="100" max="10000" step="100" value="1200">
+            </div>
+            <div class="ctrl">
+              <label for="b-cons">Consumers <b><span id="b-consv">10</span></b> × 200/s</label>
+              <input type="range" id="b-cons" min="1" max="60" step="1" value="10">
+            </div>
+            <div class="ctrl">
+              <label for="b-spike">Spike multiplier <b><span id="b-spikev">4</span>×</b></label>
+              <input type="range" id="b-spike" min="1" max="12" step="0.5" value="4">
+            </div>
+            <div class="ctrl">
+              <label for="b-out">Consumer outage <b><span id="b-outv">10</span> min</b></label>
+              <input type="range" id="b-out" min="0" max="60" step="1" value="10">
+            </div>
+            <div class="ctrl">
+              <label for="b-auto">Autoscale consumers on backlog age</label>
+              <select id="b-auto">
+                <option value="0">No — fixed fleet</option>
+                <option value="1" selected>Yes — up to 4× the fleet</option>
+              </select>
+            </div>
+          </div>
+          <canvas id="b-chart" width="900" height="300" aria-label="Queue depth and backlog age over time"></canvas>
+          <div class="legend">
+            <span><i style="background:var(--line)"></i>Queue depth</span>
+            <span><i style="background:#4BA3E3"></i>Backlog age</span>
+            <span><i style="background:var(--ok)"></i>Consumer capacity</span>
+          </div>
+          <div class="out">
+            <div class="stats" id="b-stats"></div>
+            <p id="b-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">17.8</span>The dual-write problem and the outbox</h2>
+
+      <p>The most common correctness bug in event-driven systems, and it looks entirely innocent:</p>
+
+      <div class="codewrap">
+        <span class="lang">The bug</span>
+        <pre><code>db.save(order)              # succeeds
+broker.publish(OrderPlaced) # ... process dies here
+
+Result: the order exists and nobody downstream knows.
+No warehouse pick, no confirmation email, no analytics row.
+Nothing retries, because nothing recorded that it needed to.
+
+Reversing the order is no better:
+broker.publish(OrderPlaced) # succeeds
+db.save(order)              # fails
+
+Now the warehouse is picking an order that does not exist.</code></pre>
+      </div>
+
+      <p>There is no way to make two independent systems commit atomically without a distributed transaction, and distributed transactions across a database and a broker are unavailable in practice. The <b>transactional outbox</b> resolves it by making the publication part of the database transaction:</p>
+
+      <figure class="diagram">
+        <div class="mermaid">
+flowchart LR
+  A["Service"] -->|"one transaction"| DB[("orders table<br/>+ outbox table")]
+  DB -->|"replication log / poller"| REL["Relay"]
+  REL -->|"publish"| B[["Broker"]]
+  B --> C1["Consumer A"]
+  B --> C2["Consumer B"]
+  REL -.->|"marks row sent<br/>or advances offset"| DB
+        </div>
+        <figcaption>The order row and the outbox row commit together, so the intent to publish is as durable as the data. A separate relay reads the outbox and publishes — at least once, since it may crash after publishing and before marking, which is precisely why consumers must be idempotent.</figcaption>
+      </figure>
+
+      <p>Two ways to run the relay. A <b>poller</b> reads unsent outbox rows on an interval — simple, works on any database, adds latency and load. <b>Change data capture</b> tails the database's own replication log and publishes from it — lower latency, no polling load, and it captures every change including those made by migrations and manual fixes. CDC is the more robust option and is what Debezium and similar tools exist to do.</p>
+
+      <p>The mirror-image pattern is the <b>inbox</b>: a consumer records the message id it has processed in the same transaction as the effect, which is exactly the idempotent consumer from §17.3. Outbox on the way out, inbox on the way in, and the seam between systems becomes safe.</p>
+
+      <h2><span class="h2n">17.9</span>Sagas</h2>
+
+      <p>A business operation spanning several services cannot be one transaction. A saga makes it a sequence of local transactions, each with a <b>compensating action</b> that semantically undoes it.</p>
+
+      <div class="codewrap">
+        <span class="lang">Booking a trip</span>
+        <pre><code>  step                     compensation
+  ─────────────────────    ────────────────────────
+  1  reserve seat          release seat
+  2  reserve hotel room    cancel room
+  3  charge card           refund card
+  4  issue tickets         void tickets
+
+If step 3 fails: run compensations for 2 and 1, in reverse order.
+
+Properties you must accept:
+  · NOT isolated — another user can observe the seat reserved
+    and then released. Use a "pending" status so the intermediate
+    state is legible rather than confusing.
+  · Compensations are semantic, not rollbacks. A refund is not the
+    absence of a charge; both appear on the statement.
+  · Compensations can fail too. They must be retried and idempotent,
+    and some need human escalation.
+  · Some steps are irreversible (an email was sent). Order the saga
+    so irreversible steps come last.</code></pre>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Two ways to run one</caption>
+          <thead><tr><th></th><th>Choreography</th><th>Orchestration</th></tr></thead>
+          <tbody>
+            <tr><td>How</td><td>Each service reacts to events and emits its own</td><td>A coordinator holds the state machine and issues commands</td></tr>
+            <tr><td>Coupling</td><td class="yes">Low — no central component</td><td class="mid">Services depend on the orchestrator</td></tr>
+            <tr><td>Understanding the flow</td><td class="no">Requires reading every service</td><td class="yes">One place shows the whole process</td></tr>
+            <tr><td>Debugging a stuck saga</td><td class="no">Hard — no single state</td><td class="yes">Query the coordinator</td></tr>
+            <tr><td>Suits</td><td>Two or three steps, simple flows</td><td>Four or more steps, real business processes, anything auditable</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Beyond roughly three steps, orchestration wins in practice, because the ability to answer "where is order 8817 stuck and why" is worth more than the coupling you avoid. The orchestrator's state must itself be durable — this is what workflow engines such as Temporal, Step Functions and Camunda provide.</p>
+
+      <h2><span class="h2n">17.10</span>Background jobs</h2>
+
+      <div class="tw">
+        <table>
+          <caption>Kinds of background work and their specific hazards</caption>
+          <thead><tr><th>Kind</th><th>Trigger</th><th>Hazard</th><th>Handling</th></tr></thead>
+          <tbody>
+            <tr><td><b>Event-driven</b></td><td>A message arrives</td><td>Duplicates, ordering</td><td>Idempotent handlers, partition by key</td></tr>
+            <tr><td><b>Scheduled (cron)</b></td><td>A clock</td><td>Every instance runs it, so it runs N times</td><td>Leader election, a distributed lock, or a scheduler service that enqueues one message</td></tr>
+            <tr><td><b>Delayed</b></td><td>A timer per item</td><td>Millions of timers do not fit in memory</td><td>Broker-native delayed delivery, or a sorted set keyed by due time and a small poller</td></tr>
+            <tr><td><b>Long-running</b></td><td>Anything</td><td>Exceeds visibility timeouts; a deploy kills it halfway</td><td>Checkpoint progress, break into steps, extend the lease while working</td></tr>
+            <tr><td><b>Batch / recurring sweep</b></td><td>Schedule</td><td>Full table scans, lock contention, cache pollution</td><td>Run against a replica, batch with pauses, bypass the cache</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Two design details that come up repeatedly. <b>Missed schedules:</b> decide explicitly whether a job that did not run at 02:00 because the fleet was down should run late, skip, or run twice for the two windows — the right answer differs for "send daily digest" and "charge subscriptions". And <b>returning results to a user</b> when the work is asynchronous: return <code>202 Accepted</code> with a job id and a status URL for polling; use a webhook when the caller is another system; push over SSE or WebSocket when a person is watching a progress bar. Polling with a sensible interval is underrated — it is simple, stateless and survives disconnects.</p>
+
+      <h2><span class="h2n">17.11</span>Operating the async layer</h2>
+
+      <ul>
+        <li><b>Alert on backlog age, DLQ depth and consumer error rate.</b> These three catch nearly everything.</li>
+        <li><b>Track end-to-end latency,</b> from the moment the event was produced to the moment its effect is visible — not just consumer processing time, which hides queue wait entirely.</li>
+        <li><b>Use a schema registry</b> for event payloads, with compatibility checking on publish. An event with no schema is a contract that everyone has independently guessed at.</li>
+        <li><b>Include a correlation id and a producer timestamp in every message,</b> so a trace can cross the async boundary — otherwise every distributed trace stops dead at the queue.</li>
+        <li><b>Version events additively,</b> exactly as in <a href="16-communication.html">Chapter 16</a>. Old consumers must tolerate new fields and unknown enum values.</li>
+        <li><b>Rehearse replay.</b> If you rely on being able to reprocess a topic, do it in staging on real volume, and know how long it takes and what it does to downstream systems.</li>
+      </ul>
+
+      <details class="check">
+        <summary>Your consumers are idempotent, so why does the visibility timeout still matter?</summary>
+        <div class="ans">
+          <p>Because idempotency prevents duplicate <em>effects</em>, not duplicate <em>work</em>. If processing takes 90 seconds and the timeout is 30, the message is redelivered twice while the first attempt is still running — so three consumers are doing the same expensive job simultaneously, and only the first to commit accomplishes anything. That is a threefold waste of capacity, which under load is the difference between draining a backlog and never catching up. Worse, if the work involves an external call, that system may see three requests regardless of your dedup logic. Set the timeout above your p99.9 processing time, or better, extend the lease periodically while working so slow items do not get redelivered at all.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>The order service writes to the database and publishes an event. Why is that wrong, and what is the smallest fix?</summary>
+        <div class="ans">
+          <p>It is a dual write: two independent systems, no atomicity, so a crash between them leaves the order saved and unpublished (silent loss downstream) or published and unsaved (downstream acting on nothing). The smallest fix is a transactional outbox — insert a row into an <code>outbox</code> table in the same transaction as the order, and have a separate relay read that table and publish. Publication becomes as durable as the order itself. The relay is at-least-once, since it can crash after publishing and before marking the row sent, so consumers must dedupe — which they should be doing anyway. If you want lower latency and no polling load, drive the relay from the database's replication log with change data capture instead.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Your Kafka topic has 12 partitions and you need more consumer throughput. You add a 20th consumer. What happens?</summary>
+        <div class="ans">
+          <p>Eight consumers sit idle. Within a consumer group each partition is assigned to exactly one consumer, so parallelism is capped by partition count. You have also just triggered a rebalance, which briefly stops all consumption. The real options: increase partitions (which changes the key-to-partition mapping, so per-key ordering is not preserved across the change, and existing consumers must handle the reassignment); make each consumer faster by batching, increasing concurrency inside the consumer, or removing whatever downstream call dominates; or, if ordering is not needed, decouple fetching from processing — one poller feeding a local worker pool, with careful offset management so you only commit what has actually been processed. The lesson for design is that partition count is a capacity decision you make in advance, and it is worth over-provisioning it at the start.</p>
+        </div>
+      </details>
+
+      <div class="recap">
+        <h2>Recap</h2>
+        <ol>
+          <li><b>Move work off the request path when the user does not need its result</b> — it buys latency, load levelling, retryability, decoupling and fan-out.</li>
+          <li><b>Queues distribute commands; logs record events</b> and let many groups read independently and replay.</li>
+          <li><b>Assume at-least-once.</b> "Exactly once" holds only inside a broker's boundary; effectively-once comes from an idempotent consumer with a dedup key.</li>
+          <li><b>Order per entity, not globally,</b> by partitioning on the entity key — and prefer handlers that do not care about order.</li>
+          <li><b>Log parallelism is capped by partition count.</b> Choose it generously up front.</li>
+          <li><b>Bound retries, use jittered backoff, dead-letter permanent failures, and alert on the DLQ.</b></li>
+          <li><b>Visibility timeout must exceed p99.9 processing time,</b> or you triple your own work.</li>
+          <li><b>Alert on backlog age, not depth.</b> Age is in the same units as your SLO.</li>
+          <li><b>Never dual-write.</b> Use a transactional outbox, relayed by a poller or CDC.</li>
+          <li><b>Sagas trade isolation for progress;</b> orchestrate rather than choreograph once there are more than about three steps.</li>
+        </ol>
+      </div>
+
+      <nav class="pn" aria-label="Previous and next chapter"></nav>
+    </div>
+  </article>
+</div>
+
+<script src="assets/notes.js"></script>
+<script>
+function st17(k, v, tone) {
+  var d = document.createElement("div"); d.className = "stat";
+  var a = document.createElement("div"); a.className = "k"; a.textContent = k;
+  var b = document.createElement("div"); b.className = "v"; b.textContent = v;
+  if (tone) b.style.color = tone;
+  d.append(a, b); return d;
+}
+function bar17(label, pct, value, colour) {
+  var row = document.createElement("div"); row.className = "bar";
+  var k = document.createElement("span"); k.textContent = label;
+  var t = document.createElement("span"); t.className = "track";
+  var f = document.createElement("span"); f.className = "fill";
+  f.style.width = Math.max(0.5, Math.min(100, pct)) + "%";
+  if (colour) f.style.background = colour;
+  t.appendChild(f);
+  var v = document.createElement("span"); v.className = "val"; v.textContent = value;
+  row.append(k, t, v); return row;
+}
+function fmtN17(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "k";
+  return Math.round(n).toString();
+}
+
+/* ---------- retries and DLQ ---------- */
+(function () {
+  var tr = document.getElementById("r-tr"), perm = document.getElementById("r-perm"),
+      max = document.getElementById("r-max"), vis = document.getElementById("r-vis"),
+      proc = document.getElementById("r-proc"), idem = document.getElementById("r-idem"),
+      bars = document.getElementById("r-bars"), stats = document.getElementById("r-stats"),
+      note = document.getElementById("r-note");
+  var N = 10000;
+
+  function draw() {
+    var t = +tr.value / 100, p = +perm.value / 100, M = +max.value,
+        V = +vis.value, P = +proc.value, I = idem.value === "1";
+    document.getElementById("r-trv").textContent = (+tr.value).toFixed(1);
+    document.getElementById("r-permv").textContent = (+perm.value).toFixed(1);
+    document.getElementById("r-maxv").textContent = M;
+    document.getElementById("r-visv").textContent = V;
+    document.getElementById("r-procv").textContent = P;
+
+    /* premature redelivery when processing outruns the visibility timeout */
+    var overrun = P > V ? Math.min(4, Math.floor(P / V)) : 0;
+
+    var remaining = N, attempts = 0, dlq = 0, done = 0;
+    for (var a = 1; a <= M && remaining > 0; a++) {
+      attempts += remaining;
+      var permFail = remaining * p;
+      var transFail = (remaining - permFail) * t;
+      done += remaining - permFail - transFail;
+      dlq += permFail;                     /* permanent failures dead-letter immediately */
+      remaining = transFail;
+    }
+    dlq += remaining;                      /* exhausted retries */
+    var totalWork = attempts + (P > V ? N * overrun : 0);
+    var dupEffects = I ? 0 : (attempts - N) + (P > V ? N * overrun : 0);
+
+    var worst = Math.max(totalWork, N);
+    bars.innerHTML = "";
+    bars.appendChild(bar17("Messages", N / worst * 100, fmtN17(N), "var(--text-3)"));
+    bars.appendChild(bar17("Consumer executions", totalWork / worst * 100, fmtN17(totalWork),
+      totalWork > N * 1.5 ? "var(--line)" : "var(--ok)"));
+    bars.appendChild(bar17("Dead-lettered", Math.sqrt(dlq / worst) * 100, fmtN17(Math.round(dlq)),
+      dlq > N * 0.01 ? "var(--line)" : "var(--ok)"));
+    bars.appendChild(bar17("Duplicate side effects", Math.sqrt(Math.max(0, dupEffects) / worst) * 100,
+      fmtN17(Math.round(Math.max(0, dupEffects))), dupEffects > 0 ? "var(--line)" : "var(--ok)"));
+
+    stats.innerHTML = "";
+    stats.appendChild(st17("Delivered successfully", fmtN17(Math.round(done))));
+    stats.appendChild(st17("Extra work from retries", ((totalWork / N - 1) * 100).toFixed(0) + "%",
+      totalWork / N > 1.5 ? "var(--line)" : ""));
+    stats.appendChild(st17("Dead-letter rate", (dlq / N * 100).toFixed(2) + "%", dlq / N > 0.01 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st17("Premature redeliveries", overrun ? overrun + "× per message" : "none",
+      overrun ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st17("Duplicate effects", I ? "0 — deduped" : fmtN17(Math.round(Math.max(0, dupEffects))),
+      I ? "var(--ok)" : "var(--line)"));
+
+    note.textContent = overrun
+      ? "Processing takes " + P + " s but the visibility timeout is " + V + " s, so every message is handed to another consumer while the first is still working — " + overrun + " extra concurrent executions each. Idempotency stops the duplicate effects; it does not stop the wasted capacity, which is what turns a slow consumer into an un-drainable backlog."
+      : !I && (totalWork - N) > N * 0.02
+      ? "Without a dedup key, every retry is a second real side effect: " + fmtN17(Math.round(dupEffects)) + " duplicate emails, charges or writes. At-least-once delivery is the default, so a non-idempotent consumer is not a risk, it is a scheduled bug."
+      : t > 0.15
+      ? "A high transient failure rate multiplies your load: " + ((totalWork / N - 1) * 100).toFixed(0) + "% extra executions. At this level the retries themselves are a meaningful share of the traffic hitting whatever is failing — add a circuit breaker so you stop hammering a struggling dependency."
+      : "Healthy. The number to watch in production is the dead-letter rate: anything above a fraction of a percent means messages your consumer genuinely cannot handle, and they need triage rather than a bigger retry count.";
+  }
+  [tr, perm, max, vis, proc, idem].forEach(function (x) { x.addEventListener("input", draw); x.addEventListener("change", draw); });
+  draw();
+})();
+
+/* ---------- backlog dynamics ---------- */
+(function () {
+  var prod = document.getElementById("b-prod"), cons = document.getElementById("b-cons"),
+      spike = document.getElementById("b-spike"), out = document.getElementById("b-out"),
+      auto = document.getElementById("b-auto"), cvs = document.getElementById("b-chart"),
+      stats = document.getElementById("b-stats"), note = document.getElementById("b-note");
+  var MIN = 120, PER = 200;
+
+  function sim() {
+    var P = +prod.value, C = +cons.value, S = +spike.value, O = +out.value, A = auto.value === "1";
+    var depth = 0, maxDepth = 0, maxAge = 0, over = 0, series = [];
+    var fleet = C;
+    for (var t = 0; t < MIN; t++) {
+      var rate = P * (t >= 30 && t < 45 ? S : 1);
+      var outage = (t >= 60 && t < 60 + O);
+      var cap = outage ? 0 : fleet * PER;
+      depth = Math.max(0, depth + (rate - cap) * 60);
+      maxDepth = Math.max(maxDepth, depth);
+      var age = cap > 0 ? depth / cap : (depth > 0 ? 9999 : 0);
+      maxAge = Math.max(maxAge, Math.min(age, 9999));
+      if (age > 60) over++;
+      series.push({ t: t, depth: depth, age: Math.min(age, 3600), cap: cap });
+      if (A && !outage) {
+        if (age > 60 && fleet < C * 4) fleet = Math.min(C * 4, fleet + Math.max(1, Math.round(C * 0.25)));
+        else if (age < 5 && fleet > C) fleet = Math.max(C, fleet - 1);
+      }
+    }
+    return { series: series, maxDepth: maxDepth, maxAge: maxAge, over: over, fleet: fleet, P: P, C: C, O: O };
+  }
+
+  function draw() {
+    document.getElementById("b-prodv").textContent = +prod.value;
+    document.getElementById("b-consv").textContent = +cons.value;
+    document.getElementById("b-spikev").textContent = (+spike.value).toFixed(1);
+    document.getElementById("b-outv").textContent = +out.value;
+
+    var r = sim(), d = r.series;
+    var dpr = window.devicePixelRatio || 1, w = cvs.clientWidth || 900, h = 300;
+    cvs.width = w * dpr; cvs.height = h * dpr; cvs.style.height = h + "px";
+    var c = cvs.getContext("2d"); c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, w, h);
+    var css = getComputedStyle(document.body), cs = function (n) { return css.getPropertyValue(n).trim(); };
+    var pad = { l: 62, r: 54, t: 12, b: 30 };
+    var maxD = Math.max.apply(null, d.map(function (x) { return x.depth; })) || 1;
+    var maxA = Math.max.apply(null, d.map(function (x) { return x.age; })) || 1;
+    var maxC = Math.max.apply(null, d.map(function (x) { return x.cap; })) || 1;
+    var X = function (t) { return pad.l + (t / MIN) * (w - pad.l - pad.r); };
+    var YD = function (v) { return h - pad.b - (v / maxD) * (h - pad.t - pad.b); };
+    var YA = function (v) { return h - pad.b - (v / maxA) * (h - pad.t - pad.b); };
+    var YC = function (v) { return h - pad.b - (v / (maxC * 1.6)) * (h - pad.t - pad.b); };
+
+    c.strokeStyle = cs("--rule"); c.lineWidth = 1;
+    c.beginPath(); c.moveTo(pad.l, pad.t); c.lineTo(pad.l, h - pad.b); c.lineTo(w - pad.r, h - pad.b); c.stroke();
+    c.fillStyle = cs("--text-3"); c.font = "11px Archivo, sans-serif"; c.textAlign = "center";
+    for (var g = 0; g <= 4; g++) {
+      var tt = MIN * g / 4;
+      c.fillText(Math.round(tt) + "m", X(tt), h - pad.b + 15);
+      c.strokeStyle = cs("--rule-2"); c.beginPath(); c.moveTo(X(tt), pad.t); c.lineTo(X(tt), h - pad.b); c.stroke();
+    }
+    c.textAlign = "right";
+    for (var g2 = 0; g2 <= 4; g2++) {
+      c.fillStyle = cs("--line");
+      c.fillText(fmtN17(maxD * g2 / 4), pad.l - 7, YD(maxD * g2 / 4) + 4);
+      c.fillStyle = "#4BA3E3"; c.textAlign = "left";
+      c.fillText((maxA * g2 / 4 / 60).toFixed(1) + "m", w - pad.r + 7, YA(maxA * g2 / 4) + 4);
+      c.textAlign = "right";
+    }
+
+    var line = function (key, Y, colour, width) {
+      c.strokeStyle = colour; c.lineWidth = width; c.beginPath();
+      d.forEach(function (x, i) { i ? c.lineTo(X(x.t), Y(x[key])) : c.moveTo(X(x.t), Y(x[key])); });
+      c.stroke();
+    };
+    line("cap", YC, cs("--ok"), 1.6);
+    line("age", YA, "#4BA3E3", 2);
+    line("depth", YD, cs("--line"), 2.4);
+
+    stats.innerHTML = "";
+    stats.appendChild(st17("Peak depth", fmtN17(r.maxDepth), r.maxDepth > 1e6 ? "var(--line)" : ""));
+    stats.appendChild(st17("Peak backlog age", r.maxAge >= 3600 ? "unbounded" : (r.maxAge / 60).toFixed(1) + " min",
+      r.maxAge > 600 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st17("Minutes over 1 min stale", r.over, r.over > 20 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st17("Final depth", fmtN17(d[MIN - 1].depth), d[MIN - 1].depth > 1000 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(st17("Consumers at end", r.fleet));
+    stats.appendChild(st17("Steady-state headroom", ((r.C * PER) / r.P).toFixed(2) + "×",
+      (r.C * PER) / r.P < 1.2 ? "var(--line)" : "var(--ok)"));
+
+    note.textContent = (r.C * PER) <= r.P
+      ? "Consumer capacity is at or below the producer rate, so the queue never drains — it is not a buffer, it is a leak with a dashboard. No amount of retention or autoscaling on depth fixes this; you need more consumers or fewer messages."
+      : r.maxAge > 900
+      ? "The backlog reached " + (r.maxAge / 60).toFixed(0) + " minutes of staleness. Note that depth and age tell different stories: depth looks alarming during the spike and recovers, while age is what your users actually experience — which is why age is the number to alert on and to autoscale on."
+      : auto.value === "1" && r.fleet > r.C
+      ? "Autoscaling on backlog age added consumers during the incident and released them afterwards, keeping staleness bounded. Scaling on depth instead would have reacted late during the spike and over-provisioned afterwards."
+      : "Comfortable: the queue absorbs the spike and the outage, then drains. That absorption is precisely what you bought by going asynchronous — the same load hitting a synchronous path would have been an outage.";
+  }
+  [prod, cons, spike, out, auto].forEach(function (x) { x.addEventListener("input", draw); x.addEventListener("change", draw); });
+  addEventListener("resize", draw);
+  draw();
+})();
+</script>
+</body>
+</html>

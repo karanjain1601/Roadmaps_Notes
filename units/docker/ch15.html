@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Registries and distribution — Docker</title>
+<meta name="description" content="The registry protocol, image reference parsing, authentication and credential storage, tagging strategy and promotion by digest, pull limits, retention and signing.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Crect x='6' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='19' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='10' width='5' height='5' fill='%23fff'/%3E%3Cpath d='M4 22h22a5 5 0 004-4' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch15">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Docker
+    </a>
+    <div class="chno"><b>Chapter 15</b><span>Composition and workflow</span></div>
+    <h1>Registries and distribution</h1>
+    <p class="lede">A registry is a content-addressed blob store with an HTTP API and a mutable name index bolted on the front. <b>Everything difficult about distribution comes from that last part</b> — tags move, so the thing you deployed is not necessarily the thing you can go back to, and the fix is to treat digests as the real identifiers and tags as labels for humans.</p>
+    <div class="meta"><span>26 min</span><span>2 demos</span><span>8 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="protocol">
+      <h2 data-nav="The protocol">The protocol</h2>
+      <p class="sub">Two endpoints, and chapter 3's objects moving over HTTP.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">what a pull is, in requests</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># 1. resolve the tag to a manifest (or an index, for multi-arch)
+GET /v2/library/nginx/manifests/1.27-alpine
+    Accept: application/vnd.oci.image.index.v1+json, …
+→   Docker-Content-Digest: sha256:41523187cf…
+
+# 2. fetch the config blob named in that manifest
+GET /v2/library/nginx/blobs/sha256:2b8b1b3a5c…
+
+# 3. fetch each layer blob it does not already have
+GET /v2/library/nginx/blobs/sha256:63ca1fbb43…      # "Already exists" if cached</pre>
+      </div>
+      <p>That is the whole distribution specification: <code>/v2/&lt;name&gt;/manifests/&lt;reference&gt;</code> and <code>/v2/&lt;name&gt;/blobs/&lt;digest&gt;</code>, plus an upload flow for pushing. Because blobs are named by digest, a registry deduplicates across every image and a push only uploads layers it does not have — which is why pushing a rebuilt application image transfers a few megabytes rather than the whole base (chapter 3).</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">poking at it directly</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run -d -p 5000:5000 --name reg registry:2      # a real registry, locally
+$ docker tag nginx:alpine localhost:5000/nginx:alpine
+$ docker push localhost:5000/nginx:alpine
+$ curl -s localhost:5000/v2/_catalog
+{"repositories":["nginx"]}
+$ curl -s localhost:5000/v2/nginx/tags/list
+{"name":"nginx","tags":["alpine"]}
+
+# and the useful one: inspect a remote image without pulling it
+$ docker buildx imagetools inspect nginx:1.27-alpine --raw | head -20</pre>
+      </div>
+      <div class="tip">
+        <span class="lbl">Retag without pulling anything</span>
+        <p><code>docker buildx imagetools create -t ghcr.io/acme/api:prod ghcr.io/acme/api@sha256:4152…</code> creates a new tag pointing at an existing manifest <strong>entirely server-side</strong> — no layers move, and it works on multi-arch indexes without flattening them. That is the correct mechanism for promotion, and it is much faster and safer than <code>docker pull</code> + <code>docker tag</code> + <code>docker push</code>, which round-trips gigabytes and can accidentally promote a single platform.</p>
+      </div>
+    </section>
+
+    <section id="naming">
+      <h2 data-nav="References">Image references</h2>
+      <p class="sub">There is a precise parsing rule, and it produces one genuine surprise.</p>
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Reference resolver</h3>
+          <span class="hint">What Docker actually resolves your image name to</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight" id="r-presets"></div>
+          <div class="ctrl">
+            <label for="r-in" style="min-width:52px">image</label>
+            <input type="text" id="r-in" spellcheck="false" style="flex:1 1 300px;font-family:var(--mono);font-size:12.5px" value="myregistry/api:2.4">
+          </div>
+          <div class="term" id="r-term"></div>
+          <div class="rgrid" id="r-out"></div>
+          <p class="readout" id="r-note"></p>
+        </div>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Rule</th><th>Effect</th></tr></thead>
+          <tbody>
+            <tr><td>The first component is a <b>registry</b> if it contains a <code>.</code> or a <code>:</code>, or is exactly <code>localhost</code></td><td>Otherwise it is part of the repository name</td></tr>
+            <tr><td>No registry</td><td>Defaults to <code>docker.io</code></td></tr>
+            <tr><td>No namespace on Docker Hub</td><td><code>library/</code> is inserted — <code>nginx</code> is <code>docker.io/library/nginx</code></td></tr>
+            <tr><td>No tag and no digest</td><td><code>:latest</code> is assumed</td></tr>
+            <tr><td>Both a tag and a digest</td><td><b>The digest wins;</b> the tag is documentation</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="trap">
+        <span class="lbl">A registry hostname without a dot is not a registry</span>
+        <p>Name an internal registry <code>registry</code> or <code>myregistry</code> and <code>docker pull myregistry/api</code> does not talk to it — the first component has no dot and no colon, so Docker reads it as a <em>Docker Hub namespace</em> and tries <code>docker.io/myregistry/api</code>. The error is a confusing "repository does not exist" or "unauthorized" from Docker Hub about an image you have never heard of. Use a fully-qualified name (<code>registry.internal.acme.com/api</code>) or a port (<code>registry:5000/api</code>), both of which contain a disambiguating character.</p>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Registry</th><th>Reference looks like</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>Docker Hub</td><td><code>acme/api</code>, <code>nginx</code></td><td>The default; pull limits apply (below)</td></tr>
+            <tr><td>GitHub</td><td><code>ghcr.io/acme/api</code></td><td>Permissions follow the repository; good CI integration</td></tr>
+            <tr><td>AWS</td><td><code>123456789012.dkr.ecr.eu-west-1.amazonaws.com/api</code></td><td>IAM auth via a credential helper</td></tr>
+            <tr><td>Google</td><td><code>europe-docker.pkg.dev/proj/repo/api</code></td><td>Artifact Registry; <code>gcr.io</code> is the older form</td></tr>
+            <tr><td>Azure</td><td><code>acme.azurecr.io/api</code></td><td></td></tr>
+            <tr><td>Self-hosted</td><td><code>registry.acme.com/api</code></td><td><code>registry:2</code>, Harbor, or Zot</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="auth">
+      <h2 data-nav="Authentication">Authentication</h2>
+      <p class="sub">And where your credentials are actually stored.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">logging in</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ echo "$TOKEN" | docker login ghcr.io -u acme --password-stdin   # never as an argument
+$ cat ~/.docker/config.json
+{
+  "auths": { "ghcr.io": { "auth": "YWNtZTpnaHBfeDdLZOKApg==" } }
+}
+$ echo 'YWNtZTpnaHBfeDdLZOKApg==' | base64 -d
+acme:ghp_x7Kd…                       # base64, not encryption</pre>
+      </div>
+      <div class="warn">
+        <span class="lbl"><code>config.json</code> stores credentials in plain text</span>
+        <p>The <code>auth</code> field is base64-encoded, which is an encoding rather than a protection — anyone who can read the file has your registry token. Configure a credential store so it goes to the OS keychain instead: <code>"credsStore": "osxkeychain"</code> on macOS, <code>"wincred"</code> on Windows, <code>"pass"</code> or <code>"secretservice"</code> on Linux. And on a server, prefer a short-lived token minted per job (chapter 8's OIDC) over a long-lived one on disk at all.</p>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">~/.docker/config.json — the shape you want</span><button class="copy">Copy</button></div>
+<pre data-lang="text">{
+  "credsStore": "osxkeychain",
+  "credHelpers": {
+    "123456789012.dkr.ecr.eu-west-1.amazonaws.com": "ecr-login",
+    "europe-docker.pkg.dev": "gcloud"
+  }
+}</pre>
+      </div>
+      <p>A credential <em>helper</em> mints a token on demand from cloud credentials you already have, so nothing registry-specific is stored at all — <code>docker-credential-ecr-login</code> uses your IAM identity, <code>gcloud</code> uses your Google session. This is the right answer for cloud registries and removes an entire class of expired-token incident.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">in CI, with no stored secret at all</span><button class="copy">Copy</button></div>
+<pre data-lang="yaml">      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}     # scoped, and expires with the job</pre>
+      </div>
+    </section>
+
+    <section id="tagging">
+      <h2 data-nav="Tagging strategy">Tagging and promotion</h2>
+      <p class="sub">The section that decides whether you can roll back.</p>
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Tag strategy simulator</h3>
+          <span class="hint">Three releases, one bad deploy, and whether there is a way back</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:74px">strategy</span>
+            <span id="t-strat" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl">
+            <label for="t-step" style="min-width:120px">timeline step <b id="t-stepv">3</b></label>
+            <input type="range" id="t-step" min="0" max="4" value="3" style="width:130px">
+            <span class="sep"></span>
+            <span id="t-label" style="font-size:12.5px;color:var(--text-2)"></span>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(248px,1fr));gap:11px">
+            <div>
+              <div style="font-size:12px;color:var(--text-2);margin-bottom:5px">what each reference resolves to</div>
+              <div class="term" id="t-refs" style="min-height:auto;font-size:11.3px"></div>
+            </div>
+            <div>
+              <div style="font-size:12px;color:var(--text-2);margin-bottom:5px">rolling back from step 3</div>
+              <div class="term" id="t-roll" style="min-height:auto;font-size:11.3px"></div>
+            </div>
+          </div>
+          <div class="rgrid" id="t-out"></div>
+          <p class="readout" id="t-note"></p>
+        </div>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Tag</th><th>Mutability</th><th>Use for</th></tr></thead>
+          <tbody>
+            <tr><td><code>latest</code></td><td>Moves on every push</td><td>Local convenience. <b>Never a deployment target</b></td></tr>
+            <tr><td><code>2</code>, <code>2.4</code></td><td>Move within their range</td><td>Consumers who want patches automatically</td></tr>
+            <tr><td><code>2.4.1</code></td><td>Should never move</td><td>Humans reading a changelog</td></tr>
+            <tr><td><code>sha-a1b2c3d</code></td><td>Never moves — one per commit</td><td>Traceability from image back to source</td></tr>
+            <tr><td><code>@sha256:…</code></td><td><b>Cannot</b> move, by construction</td><td>What production should actually reference</td></tr>
+            <tr><td><code>prod</code>, <code>staging</code></td><td>Moved deliberately, as a promotion</td><td>A pointer to "what is deployed"</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">the pattern: build once, tag by commit, promote by digest</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># build once, and record what came out
+$ docker buildx build -t ghcr.io/acme/api:sha-$GIT_SHA --push .
+$ DIGEST=$(docker buildx imagetools inspect ghcr.io/acme/api:sha-$GIT_SHA \
+             --format '{{json .Manifest.Digest}}' | tr -d '"')
+
+# promote by pointing a tag at that exact digest — nothing is rebuilt
+$ docker buildx imagetools create -t ghcr.io/acme/api:staging ghcr.io/acme/api@$DIGEST
+$ docker buildx imagetools create -t ghcr.io/acme/api:prod    ghcr.io/acme/api@$DIGEST
+
+# deploy the digest, not the tag
+$ echo "image: ghcr.io/acme/api@$DIGEST" &gt;&gt; deploy.yaml</pre>
+      </div>
+      <div class="key">
+        <span class="lbl">Build once, promote many</span>
+        <p>If staging and production are separate <em>builds</em> of the same commit, they are separate images — different digests, possibly different base layers, and the thing you tested is not the thing you shipped (chapter 8's reproducibility problem). Building once and moving a pointer removes that gap entirely, and makes a rollback a matter of pointing at the previous digest rather than rebuilding an old commit and hoping.</p>
+      </div>
+    </section>
+
+    <section id="limits">
+      <h2 data-nav="Pull limits">Pull limits</h2>
+      <p class="sub">The 429 that appears the week your CI gets busy.</p>
+      <p>Docker Hub throttles pulls — by IP for anonymous clients and by account for authenticated ones. The specific figures have been revised several times, so check the current policy rather than a number in a tutorial; what matters is the shape: <strong>anonymous pulls from a shared CI IP exhaust an allowance quickly</strong>, and the failure is <code>toomanyrequests: You have reached your pull rate limit</code> partway through a build.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Mitigation</th><th>Effect</th><th>Effort</th></tr></thead>
+          <tbody>
+            <tr><td>Authenticate in CI</td><td>Limits count against your account rather than a shared IP</td><td>One step in the workflow</td></tr>
+            <tr><td>A pull-through cache</td><td>One upstream pull per image, then local hits</td><td>A registry to run</td></tr>
+            <tr><td>Mirror base images into your own registry</td><td>No Hub dependency in the build path at all</td><td>A sync job, and you own the updates</td></tr>
+            <tr><td>Cache layers in CI</td><td>Fewer builds pull anything (chapter 6)</td><td>Already worth doing</td></tr>
+            <tr><td>Pin by digest</td><td>Does not reduce pulls, but removes surprise base changes</td><td>Free</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">a pull-through cache</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run -d -p 5000:5000 --name mirror \
+    -e REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io \
+    registry:2
+
+# point the daemon at it: /etc/docker/daemon.json
+{ "registry-mirrors": ["http://mirror.internal:5000"] }
+$ sudo systemctl restart docker</pre>
+      </div>
+      <p>Note the mirror is transparent: image references stay unchanged and the daemon consults the mirror first. That makes it the least invasive of the mitigations, and the one that also speeds up cold CI runners on a shared network.</p>
+    </section>
+
+    <section id="retention">
+      <h2 data-nav="Retention">Storage and retention</h2>
+      <p class="sub">Deleting a tag frees nothing.</p>
+      <p>Because blobs are content-addressed and shared, removing a tag only removes a <em>name</em>. The manifest becomes untagged, its blobs become unreferenced if nothing else needs them, and the space is reclaimed when garbage collection runs — which on a self-hosted registry is a command you must schedule yourself.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">reclaiming space</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># self-hosted registry:2 — deletion must be enabled first
+$ docker exec mirror registry garbage-collect /etc/docker/registry/config.yml --dry-run
+
+# ECR: a lifecycle policy, evaluated automatically
+{
+  "rules": [{
+    "rulePriority": 1,
+    "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed",
+                   "countUnit": "days", "countNumber": 14 },
+    "action": { "type": "expire" }
+  }]
+}</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Keep</th><th>Expire</th></tr></thead>
+          <tbody>
+            <tr><td>Anything a running deployment references by digest</td><td>Untagged manifests older than a fortnight</td></tr>
+            <tr><td>Every release tag, indefinitely — they are cheap</td><td>Per-commit tags from merged pull requests</td></tr>
+            <tr><td>The last several images per branch, for rollback</td><td>Branch builds for deleted branches</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="warn">
+        <span class="lbl">An expiry policy can delete what production is running</span>
+        <p>If you deploy by digest and the tag has since been expired by a retention rule, the manifest may be garbage-collected — and then a node that needs to pull it during a scale-up or a restart cannot. Retention rules must exclude anything currently deployed, which in practice means keeping a durable tag on every promoted digest rather than relying on the digest alone to protect it.</p>
+      </div>
+    </section>
+
+    <section id="signing">
+      <h2 data-nav="Signing">Signing</h2>
+      <p class="sub">Provenance says how it was built; a signature says nobody swapped it since.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">cosign, keyless</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># sign the DIGEST — signing a tag is meaningless, because tags move
+$ cosign sign --yes ghcr.io/acme/api@sha256:41523187cf…
+
+# verify, pinning who was allowed to sign it and which issuer vouched for them
+$ cosign verify ghcr.io/acme/api@sha256:41523187cf… \
+    --certificate-identity-regexp '^https://github\.com/acme/api/\.github/workflows/.+$' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+$ cosign tree ghcr.io/acme/api@sha256:41523187cf…      # signatures and attestations</pre>
+      </div>
+      <p>Keyless signing uses the CI job's OIDC identity, so there is no key to store or rotate: the signature records <em>which workflow in which repository</em> produced the image, and verification asserts that. Combined with chapter 8's provenance attestation, you can require that a deployed image was built from your source by your pipeline — and that requirement is only meaningful if it is <strong>enforced at deploy time</strong> by an admission policy rather than checked by hand (chapters 17 and 22).</p>
+      <div class="note">
+        <span class="lbl">Docker Content Trust is the older answer</span>
+        <p><code>DOCKER_CONTENT_TRUST=1</code> uses Notary v1 and a key you manage, and it predates the Sigstore ecosystem. It still works, and new work should use cosign: keyless identities remove the key-management problem that stopped most teams adopting signing at all.</p>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 15 in eight lines</h2>
+        <ul>
+          <li>A registry is <code>/v2/&lt;name&gt;/manifests/&lt;ref&gt;</code> plus <code>/v2/&lt;name&gt;/blobs/&lt;digest&gt;</code>. Content addressing is why pushes and pulls transfer so little.</li>
+          <li>The first component of a reference is a registry only if it contains a <b><code>.</code> or <code>:</code></b>, or is <code>localhost</code> — otherwise it is a Docker Hub namespace.</li>
+          <li>A reference with both a tag and a digest resolves by <b>digest</b>; the tag is documentation.</li>
+          <li><code>~/.docker/config.json</code> holds credentials <b>base64-encoded, not encrypted</b>. Use a credential store or helper.</li>
+          <li><code>docker buildx imagetools create</code> retags <b>server-side</b> — no layers move, and multi-arch indexes survive.</li>
+          <li><b>Build once, tag by commit, promote by digest.</b> Rebuilding per environment means the thing you tested is not the thing you shipped.</li>
+          <li>Deleting a tag frees no space until garbage collection; retention rules must exclude anything deployed.</li>
+          <li>Sign the <b>digest</b>, keylessly, and enforce verification at deploy time or it proves nothing.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary><code>docker pull registry/api:2.4</code> against your internal registry called <code>registry</code> fails with "unauthorized". Why?</summary>
+        <div class="ans"><p>It never contacted your registry. The first component has no dot and no colon and is not <code>localhost</code>, so Docker parsed <code>registry</code> as a <b>Docker Hub namespace</b> and asked <code>docker.io/registry/api:2.4</code> — hence an authorization error about an image you do not own. Give the host a fully-qualified name (<code>registry.internal.acme.com/api:2.4</code>) or include the port (<code>registry:5000/api:2.4</code>); either adds the character the parser needs. The resolver above shows the fully-qualified form for any reference you type.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Production deploys <code>api:latest</code>. A release breaks things at 2am. Walk through the rollback.</summary>
+        <div class="ans"><p>There is nothing to roll back to. <code>latest</code> now points at the broken image, and the previous one may have no tag at all — so the only route is to find the old digest in a deploy log or a node's local image cache, if either still exists. With per-commit tags you would name the previous one directly; with promotion by digest you would repoint <code>prod</code> at the previous digest, which is exact and takes one command. The simulator above makes the difference concrete: the same three releases are recoverable under one strategy and not the other.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Why promote by moving a tag to an existing digest rather than rebuilding from the same commit?</summary>
+        <div class="ans"><p>Because rebuilding produces a <em>different image</em>. The base image may have been republished under its tag, dependency resolution may pick newer patch versions, and timestamps differ — so the staging artefact you tested and the production artefact you shipped have different digests and possibly different contents (chapter 8). Promotion by digest guarantees they are byte-identical, is instant because <code>imagetools create</code> is server-side, and gives a rollback target that is exactly what previously worked.</p></div>
+      </details>
+      <details class="chk">
+        <summary>CI starts failing with <code>toomanyrequests</code> halfway through builds. Two fixes, and which you would do first.</summary>
+        <div class="ans"><p>Authenticate to Docker Hub in the workflow, so the allowance counts against your account rather than the runner's shared IP — that is one step and usually resolves it immediately. Then, if base-image pulls are still on the critical path, run a pull-through cache and add it to <code>registry-mirrors</code>, which is transparent to every image reference and also speeds up cold runners. The heavier option is mirroring base images into your own registry, which removes the dependency entirely at the cost of owning the update cadence. Layer caching (chapter 6) helps too, by reducing how often anything is pulled at all.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Chapter 16 closes Part 4 with containers in CI: build once and promote, cache backends that actually help, multi-arch matrices, and integration tests against real services.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li><code>docker run -d -p 5000:5000 registry:2</code> and push something to it.</li>
+        <li><code>cat ~/.docker/config.json</code> — is <code>credsStore</code> set?</li>
+        <li><code>docker buildx imagetools inspect nginx:alpine --raw | head</code>.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>The OCI distribution specification, Docker's registry and credential-store documentation, the <code>buildx imagetools</code> reference, and the Sigstore cosign documentation.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — image reference resolver
+   ============================================================ */
+(function () {
+  var input = document.getElementById("r-in");
+  var term = document.getElementById("r-term");
+  var out = document.getElementById("r-out");
+  var note = document.getElementById("r-note");
+
+  [
+    "nginx", "nginx:1.27-alpine", "acme/api:2.4", "myregistry/api:2.4",
+    "ghcr.io/acme/api:2.4", "localhost:5000/api", "localhost/api",
+    "registry:5000/api", "192.168.1.5:5000/api",
+    "acme/api:2.4@sha256:41523187cf0f8e2a", "europe-docker.pkg.dev/proj/repo/api"
+  ].forEach(function (p) {
+    var b = document.createElement("button");
+    b.className = "btn mono";
+    b.textContent = p.length > 26 ? p.slice(0, 25) + "…" : p;
+    b.title = p;
+    b.addEventListener("click", function () { input.value = p; render(); });
+    document.getElementById("r-presets").appendChild(b);
+  });
+
+  /* the documented rule: the first path component is a registry if it
+     contains a '.' or ':', or is exactly "localhost" */
+  function isRegistry(part) {
+    return part === "localhost" || part.indexOf(".") !== -1 || part.indexOf(":") !== -1;
+  }
+
+  function parse(ref) {
+    ref = ref.trim();
+    if (!ref) return { err: "empty reference" };
+
+    var digest = null, tag = null, rest = ref;
+    var at = rest.indexOf("@");
+    if (at !== -1) { digest = rest.slice(at + 1); rest = rest.slice(0, at); }
+
+    /* a colon is a tag separator only in the LAST path component */
+    var lastSlash = rest.lastIndexOf("/");
+    var lastColon = rest.lastIndexOf(":");
+    if (lastColon > lastSlash) { tag = rest.slice(lastColon + 1); rest = rest.slice(0, lastColon); }
+
+    var parts = rest.split("/");
+    var registry = null;
+    if (parts.length > 1 && isRegistry(parts[0])) registry = parts.shift();
+
+    var repo = parts.join("/");
+    if (!repo) return { err: "no repository name" };
+
+    var defaulted = [];
+    if (!registry) { registry = "docker.io"; defaulted.push("registry"); }
+    var fullRepo = repo;
+    if (registry === "docker.io" && repo.indexOf("/") === -1) {
+      fullRepo = "library/" + repo;
+      defaulted.push("library namespace");
+    }
+    if (!tag && !digest) { tag = "latest"; defaulted.push("tag :latest"); }
+
+    return { registry: registry, repo: fullRepo, rawRepo: repo, tag: tag, digest: digest, defaulted: defaulted };
+  }
+
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+
+  function render() {
+    var p = parse(input.value);
+    if (p.err) {
+      term.innerHTML = '<span class="r">' + esc(p.err) + "</span>";
+      out.innerHTML = ""; note.innerHTML = "";
+      return;
+    }
+    var immutable = !!p.digest;
+    var full = p.registry + "/" + p.repo + (p.digest ? "@" + p.digest : ":" + p.tag);
+    var host = p.registry === "docker.io" ? "registry-1.docker.io" : p.registry;
+
+    var lines = [];
+    lines.push('<span class="p">$</span> docker pull ' + esc(input.value.trim()));
+    lines.push("");
+    lines.push('<span class="d">resolves to</span>');
+    lines.push("  " + '<span class="g">' + esc(full) + "</span>");
+    lines.push("");
+    lines.push('<span class="d">registry    </span>' + esc(p.registry) +
+      (p.registry === "docker.io" ? '<span class="d">   (the default)</span>' : ""));
+    lines.push('<span class="d">repository  </span>' + esc(p.repo) +
+      (p.repo !== p.rawRepo ? '<span class="y">   (library/ inserted)</span>' : ""));
+    lines.push('<span class="d">reference   </span>' +
+      (p.digest ? '<span class="g">' + esc(p.digest) + "  (immutable)</span>"
+                : '<span class="y">:' + esc(p.tag) + "  (mutable — can be repointed)</span>"));
+    if (p.digest && p.tag) {
+      lines.push('<span class="y">note: both a tag and a digest were given — the digest wins</span>');
+    }
+    lines.push("");
+    lines.push('<span class="p">GET</span> https://' + esc(host) + "/v2/" + esc(p.repo) +
+      "/manifests/" + esc(p.digest || p.tag));
+    term.innerHTML = lines.join("\n");
+
+    var surprise = p.registry === "docker.io" && input.value.indexOf("/") !== -1 &&
+      !isRegistry(input.value.trim().split("/")[0]) &&
+      input.value.trim().split("/")[0] !== "" &&
+      p.rawRepo.indexOf("/") !== -1;
+
+    out.innerHTML = "";
+    tile("Registry", p.registry === "docker.io" ? "docker.io" : p.registry.split(":")[0], p.registry === "docker.io" ? "default" : "explicit", p.registry !== "docker.io");
+    tile("Mutable", immutable ? "no" : "yes", immutable ? "pinned by digest" : "tag can move", immutable);
+    tile("Defaults applied", String(p.defaulted.length), p.defaulted.join(", ") || "none");
+    tile("Hits Docker Hub", p.registry === "docker.io" ? "yes" : "no", p.registry === "docker.io" ? "rate limits apply" : "", p.registry !== "docker.io");
+
+    var msgs = [];
+    if (surprise) {
+      msgs.push("<b>This is the trap.</b> <code>" + esc(input.value.trim().split("/")[0]) +
+        "</code> has no dot and no colon, so it is <b>not</b> read as a registry hostname — Docker treats it as a Docker Hub namespace and requests <code>docker.io/" +
+        esc(p.rawRepo) + "</code>. If that was meant to be your internal registry, add a domain or a port.");
+    } else if (immutable) {
+      msgs.push("Pinned by digest, so this reference <b>cannot</b> resolve to different bytes later — the property production wants. Note the request goes straight to the manifest by digest, with no tag lookup in between.");
+    } else if (p.registry === "docker.io" && p.repo !== p.rawRepo) {
+      msgs.push("An unqualified official image: Docker inserted the <code>library/</code> namespace, so <code>" +
+        esc(p.rawRepo) + "</code> is really <code>library/" + esc(p.rawRepo) +
+        "</code>. This is also a Docker Hub pull, so it counts against the rate limits below.");
+    } else if (p.registry === "localhost" || /^localhost:/.test(p.registry)) {
+      msgs.push("<code>localhost</code> is the one hostname the parser special-cases without needing a dot or a colon — which is why a local <code>registry:2</code> on port 5000 works with either <code>localhost:5000/…</code> or <code>localhost/…</code>.");
+    } else {
+      msgs.push("Fully qualified, so there is no ambiguity about which registry is contacted. The tag is still mutable: whoever can push to this repository can repoint it at different bytes, which is what the digest column above is about.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 9 ? "12px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  input.addEventListener("input", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — tag strategy and promotion
+   ============================================================ */
+(function () {
+  var STRATS = [
+    { id: "latest", label: "latest only" },
+    { id: "semver", label: "moving semver tags" },
+    { id: "promote", label: "sha tags + promote by digest" }
+  ];
+  var STEPS = [
+    "build 2.4.0  (digest A)",
+    "deploy 2.4.0",
+    "build 2.4.1  (digest B)",
+    "deploy 2.4.1 — and it is broken",
+    "attempt a rollback"
+  ];
+  var strat = "latest";
+
+  var stratHost = document.getElementById("t-strat");
+  var refsEl = document.getElementById("t-refs");
+  var rollEl = document.getElementById("t-roll");
+  var out = document.getElementById("t-out");
+  var note = document.getElementById("t-note");
+
+  STRATS.forEach(function (s) {
+    var b = document.createElement("button");
+    b.className = "btn mono" + (s.id === strat ? " on" : "");
+    b.textContent = s.label;
+    b.addEventListener("click", function () {
+      strat = s.id;
+      Array.prototype.forEach.call(stratHost.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      render();
+    });
+    stratHost.appendChild(b);
+  });
+
+  var A = "sha256:a1b2c3d4e5f6", B = "sha256:9f8e7d6c5b4a";
+
+  function state(step) {
+    var refs = {}, deployed = null;
+    function set(t, d) { refs[t] = d; }
+
+    if (step >= 0) {
+      if (strat === "latest") set("latest", A);
+      if (strat === "semver") { set("latest", A); set("2", A); set("2.4", A); set("2.4.0", A); }
+      if (strat === "promote") set("sha-a1b2c3d", A);
+    }
+    if (step >= 1) {
+      deployed = strat === "promote" ? { ref: "@" + A, digest: A } : { ref: strat === "latest" ? "latest" : "2.4", digest: A };
+      if (strat === "promote") set("prod", A);
+    }
+    if (step >= 2) {
+      if (strat === "latest") set("latest", B);
+      if (strat === "semver") { set("latest", B); set("2", B); set("2.4", B); set("2.4.1", B); }
+      if (strat === "promote") set("sha-9f8e7d6", B);
+    }
+    if (step >= 3) {
+      deployed = strat === "promote" ? { ref: "@" + B, digest: B } : { ref: strat === "latest" ? "latest" : "2.4", digest: B };
+      if (strat === "promote") set("prod", B);
+    }
+    return { refs: refs, deployed: deployed };
+  }
+
+  function rollback() {
+    if (strat === "latest") {
+      return { possible: false,
+        how: ["no reference resolves to digest A any more:", "  latest → B", "", "the only routes are a node's local cache", "or a digest recorded in a deploy log"],
+        precision: "none" };
+    }
+    if (strat === "semver") {
+      return { possible: true,
+        how: ["2.4.0 still points at A, so:", "  docker pull acme/api:2.4.0", "", "but the deployment referenced 2.4,", "which now resolves to B — so the", "manifest must be edited, not just re-applied"],
+        precision: "by tag" };
+    }
+    return { possible: true,
+      how: ["repoint the promotion tag at the previous digest:", "", "  docker buildx imagetools create \\", "    -t acme/api:prod acme/api@" + A.slice(0, 19) + "…", "", "and redeploy that digest. Exact, server-side,", "no rebuild, no ambiguity."],
+      precision: "by digest" };
+  }
+
+  function esc(s) { return String(s).replace(/[&<>]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]; }); }
+
+  function render() {
+    var step = parseInt(document.getElementById("t-step").value, 10);
+    document.getElementById("t-stepv").textContent = step;
+    document.getElementById("t-label").textContent = STEPS[step];
+    var st = state(step);
+    var rb = rollback();
+
+    var keys = Object.keys(st.refs);
+    refsEl.innerHTML = (keys.length
+      ? keys.map(function (t) {
+          var d = st.refs[t];
+          var isA = d === A;
+          return (t.indexOf("sha-") === 0 || t === "prod" ? '<span class="g">' : '<span class="y">') +
+            t.padEnd(14, "\u00a0") + "</span>→ " + (isA ? '<span class="d">' : '<span class="r">') +
+            d.slice(0, 19) + "…" + (isA ? "  (good)" : "  (broken)") + "</span>";
+        }).join("\n")
+      : '<span class="d">nothing built yet</span>') +
+      "\n\n" + (st.deployed
+        ? '<span class="p">deployed</span> ' + esc(st.deployed.ref) + " → " +
+          (st.deployed.digest === A ? '<span class="g">A (good)</span>' : '<span class="r">B (broken)</span>')
+        : '<span class="d">not deployed yet</span>') +
+      "\n" + (strat === "promote" ? '<span class="d">the deployment names a digest, not a tag</span>' : '<span class="d">the deployment names a mutable tag</span>');
+
+    rollEl.innerHTML = (rb.possible ? '<span class="g">possible</span>' : '<span class="r">not possible</span>') +
+      "\n\n" + rb.how.map(esc).join("\n");
+
+    var immutableRefs = keys.filter(function (t) { return t.indexOf("sha-") === 0 || /^\d+\.\d+\.\d+$/.test(t); }).length;
+
+    out.innerHTML = "";
+    tile("References", String(keys.length), "tags in the registry");
+    tile("Immutable ones", String(immutableRefs), "never move", immutableRefs > 0);
+    tile("Rollback", rb.possible ? "possible" : "impossible", rb.precision, rb.possible);
+    tile("Deployed", st.deployed ? (st.deployed.digest === A ? "good" : "broken") : "—",
+      st.deployed ? st.deployed.ref : "", st.deployed && st.deployed.digest === A);
+
+    var msgs = [];
+    if (strat === "latest") {
+      msgs.push("<b>Every build overwrites the only reference there is.</b> After step 2, nothing in the registry resolves to digest A — so at step 4 there is no rollback target at all, only archaeology through deploy logs and node caches. This is the strategy most projects start with and the reason 2am incidents last hours.");
+    } else if (strat === "semver") {
+      msgs.push("<b>Better: <code>2.4.0</code> still points at the good digest</b>, so the old image is retrievable. The catch is that the <em>deployment</em> referenced <code>2.4</code>, which has moved — so re-applying the same manifest redeploys the broken image, and the rollback means editing the reference. Moving tags are useful for consumers who want patches and a poor thing to deploy.");
+    } else {
+      msgs.push("<b>Each build gets a permanent per-commit tag, and <code>prod</code> is a pointer moved deliberately.</b> The deployment names a digest, so it cannot drift; rolling back is one server-side <code>imagetools create</code> plus a redeploy, landing on exactly the bytes that previously worked. Nothing is rebuilt, so nothing can differ from what was tested.");
+    }
+    if (step === 4) {
+      msgs.push(rb.possible
+        ? "Rollback precision here is <b>" + rb.precision + "</b> — which matters, because \"the tag that used to be right\" is not the same guarantee as \"this exact digest\"."
+        : "There is no way back from inside the registry, which is the whole point of the comparison.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 9 ? "12.5px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  document.getElementById("t-step").addEventListener("input", render);
+  render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Getting the model to reason — Prompt Engineering</title>
+<meta name="description" content="Chain of thought, step-back, self-consistency, tree of thoughts and ReAct — with the cost of each and when it pays.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 07 · Core techniques</div>
+    <h1>Getting the model to reason</h1>
+    <p class="standfirst">Asking a model to work through a problem before answering measurably improves hard tasks and measurably wastes money on easy ones. The techniques differ mainly in how many extra tokens they buy and what they buy them for.</p>
+    <div class="chap-meta">
+      <span class="tagpill">chain of thought</span>
+      <span class="tagpill">step-back</span>
+      <span class="tagpill">self-consistency</span>
+      <span class="tagpill">tree of thoughts</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Why thinking out loud works</h2>
+
+<p>Two mechanisms, both consequences of chapter 1.</p>
+
+<div class="terms">
+  <div><dt>More computation per answer</dt><dd>The model does a fixed amount of work per token. A question answered in one token gets one token's worth of computation; the same question answered after 200 tokens of working gets 200 times more. Reasoning tokens are compute you are buying.</dd></div>
+  <div><dt>Intermediate results enter the context</dt><dd>Each token attends to everything before it. Writing "the sale window is 14 days" puts that fact in the context where the final answer can attend to it — rather than requiring it to be recomputed implicitly inside a single forward pass.</dd></div>
+</div>
+
+<p>Both explain the observed pattern: reasoning helps most on problems with multiple dependent steps, and helps least on lookup, classification and formatting, where there is nothing to decompose.</p>
+
+<div class="note key">
+  <span class="note-t">Reasoning models have not made this obsolete</span>
+  <p>Models trained to reason before answering do this internally, and for those you should generally <em>stop</em> adding chain-of-thought instructions — you get worse results and pay twice. But the technique still matters for three reasons: most production traffic still runs on standard models because they are cheaper and faster; you often want the reasoning <em>visible</em> for auditability; and the decision of when reasoning is worth its cost is the same decision either way. Chapter 14 covers adapting prompts for reasoning models specifically.</p>
+</div>
+
+<h2><span class="h-rule"></span>Chain of thought</h2>
+
+<div class="code" data-lang="markdown">
+<div class="code-head"><span class="lang">three strengths of the same idea</span><button class="copy">Copy</button></div>
+<pre><code># 1. Zero-shot CoT — the classic one-liner. Cheap, and often enough.
+Think step by step before answering.
+
+# 2. Structured — separates working from answer, so you can strip one.
+Work through this in <scratch> tags, then give the final answer in <answer> tags.
+Nothing outside <answer> will be shown to the user.
+
+# 3. Guided — name the steps. Strongest, because it specifies the decomposition
+#    rather than hoping the model finds a good one.
+Work through this in <scratch>:
+1. What did the customer buy, and when?
+2. Was it a sale item, and is it marked final sale?
+3. Is it faulty, or a change of mind?
+4. Which policy section applies, given 2 and 3?
+5. What is the return window, and who pays postage?
+Then give the answer in <answer>, quoting the window and postage rule exactly.</code></pre>
+</div>
+
+<p>Guided decomposition is underrated. "Think step by step" leaves the model to invent the steps, and on a domain task it often invents the wrong ones. Naming the five questions that actually determine the answer is more reliable, more auditable, and makes the reasoning comparable across runs — which matters for evaluation.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">extracting the answer, safely</span><button class="copy">Copy</button></div>
+<pre><code>import re
+
+ANSWER = re.compile(r"<answer>(.*?)</answer>", re.S)
+
+def extract(text: str) -> str:
+    m = ANSWER.search(text)
+    if not m:
+        # No tags: the model ignored the format, or was truncated mid-scratch.
+        # Do NOT fall back to returning the whole string — that shows the user
+        # the working, which often contains discarded wrong turns.
+        raise MalformedOutput("no <answer> block")
+    return m.group(1).strip()
+
+# Log the scratch content. Never render it. It routinely contains sentences like
+# "Actually that's wrong, the window is 14 not 30" — useful for debugging,
+# damaging for user trust.</code></pre>
+</div>
+
+<div class="demo" id="cot">
+  <div class="demo-head">
+    <b>What reasoning costs and buys</b>
+    <span>Illustrative accuracy by task type; real arithmetic on tokens, latency and price.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="c-task">Task</label>
+        <select id="c-task">
+          <option value="classify">Classification — one label from eight</option>
+          <option value="extract">Extraction — pull four fields</option>
+          <option value="policy" selected>Policy question — three dependent conditions</option>
+          <option value="math">Multi-step calculation</option>
+          <option value="plan">Open-ended planning</option>
+        </select>
+      </div>
+      <div>
+        <label for="c-tech">Technique</label>
+        <select id="c-tech">
+          <option value="none">Direct answer</option>
+          <option value="zero" selected>"Think step by step"</option>
+          <option value="guided">Guided decomposition</option>
+          <option value="stepback">Step-back, then answer</option>
+          <option value="sc3">Self-consistency, 3 samples</option>
+          <option value="sc5">Self-consistency, 5 samples</option>
+          <option value="tot">Tree of thoughts</option>
+        </select>
+      </div>
+      <div>
+        <label for="c-req">Requests per day — <span id="c-reqv">20,000</span></label>
+        <input type="range" id="c-req" min="0" max="6" step="1" value="3">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="c-acc">—</b><span>accuracy</span></div>
+      <div><b id="c-lat">—</b><span>latency</span></div>
+      <div><b id="c-cost">—</b><span>cost / month</span></div>
+      <div><b id="c-marg">—</b><span>$ per point gained</span></div>
+    </div>
+    <div id="c-bars"></div>
+    <div class="out" id="c-note"></div>
+  </div>
+</div>
+
+<h2><span class="h-rule"></span>Step-back prompting</h2>
+
+<p>Before answering the specific question, ask the model to state the general principle that governs it. Cheap — one extra paragraph — and disproportionately effective on questions where the specifics invite pattern-matching to the wrong rule.</p>
+
+<div class="code" data-lang="markdown">
+<div class="code-head"><span class="lang">step-back, in one prompt</span><button class="copy">Copy</button></div>
+<pre><code>First, state the general policy that governs this situation, in one sentence,
+without reference to the specific case. Then apply it to the case below.
+
+Case: A customer bought a discounted pan on 20 February. The handle snapped on
+1 March. They want a refund and are asking who pays return postage.
+
+# The step-back forces "faults are governed by the faulty-items rule regardless
+# of whether the item was discounted" to be stated BEFORE the specifics are
+# processed. Without it, "discounted" and "20 February" pull toward the sale
+# window, and the model reasons its way into the wrong section of the policy.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Self-consistency</h2>
+
+<p>Sample the same prompt several times at non-zero temperature, then take the majority answer. It works because errors from sampling tend to be scattered while correct answers agree — so a vote filters noise that a single sample cannot.</p>
+
+<div class="code" data-lang="python">
+<div class="code-head"><span class="lang">self_consistency.py — vote, and use the margin</span><button class="copy">Copy</button></div>
+<pre><code>from collections import Counter
+
+async def self_consistent(prompt: str, n: int = 5, temp: float = 0.7):
+    outs = await asyncio.gather(*[call(prompt, temperature=temp) for _ in range(n)])
+    answers = [normalise(extract(o)) for o in outs]     # normalise before counting
+
+    counts = Counter(answers)
+    winner, votes = counts.most_common(1)[0]
+
+    # The margin is a genuine confidence signal, and it is free.
+    return {
+        "answer": winner,
+        "agreement": votes / n,
+        "dissent": [a for a in answers if a != winner],
+        "escalate": votes / n < 0.6,        # 3-2 is not a decision
+    }
+
+# Requirements, all of them:
+#   - the answer must be comparable. Normalise, or vote on an extracted field
+#     rather than on free prose, where every sample differs trivially.
+#   - temperature must be > 0. At 0 you get five identical samples and pay 5x
+#     for no information. This is a real and common misconfiguration.
+#   - use the margin. A 5-0 result and a 3-2 result are different situations;
+#     treating them the same throws away the most useful thing the method gives you.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Self-consistency multiplies cost linearly and helps sub-linearly</span>
+  <p>Five samples cost five times one. The accuracy gain is real on multi-step reasoning but flattens quickly — most of the benefit is in the first three samples, and going from five to nine rarely justifies itself. It also cannot help where the model is <em>consistently</em> wrong: if it misreads the policy the same way every time, five votes for the wrong answer look exactly like confidence. Reserve it for high-value decisions where you will use the agreement margin, not as a general accuracy setting.</p>
+</div>
+
+<h2><span class="h-rule"></span>Tree of thoughts</h2>
+
+<p>Generate several candidate approaches, evaluate them, expand the promising ones, backtrack from dead ends. Powerful for genuine search problems, and heavy — expect 5–10× the cost.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Requirement</th><th>Why it is non-negotiable</th></tr></thead>
+<tbody>
+<tr><td><b>A real evaluator</b></td><td>Without something objective to score branches — tests passing, a constraint satisfied, a numeric objective — "evaluate the branches" is another model call with no ground truth, and the search wanders expensively</td></tr>
+<tr><td><b>A large branching factor that matters</b></td><td>If there are two plausible approaches, just try one. Search pays when there are many and most are wrong</td></tr>
+<tr><td><b>Steps you can abandon</b></td><td>Exploration only makes sense if a branch costs nothing to discard</td></tr>
+<tr><td><b>Budget for the multiplier</b></td><td>Decide whether the problem is worth 5–10× before building it, not after</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>In practice, most application teams do not need tree search. If you find yourself reaching for it, check first whether the problem is really "the model needs to explore" or actually "the model needs a tool" — the latter is far more common and far cheaper (chapter 7 of the AI Agents unit).</p>
+
+<h2><span class="h-rule"></span>Choosing</h2>
+
+<div class="flow stack">
+  <div class="step"><b>Is the task a lookup, classification or reformat?</b><span>Yes → answer directly. Reasoning is cost with no return</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Does it have 2–5 dependent steps?</b><span>Yes → guided decomposition, naming the steps. The best value in this chapter</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Do the specifics invite the wrong rule?</b><span>Yes → step-back. One extra paragraph, large effect</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Is it high-value, and would you use a confidence margin?</b><span>Yes → self-consistency at 3, and act on disagreement</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Many candidates and a real verifier?</b><span>Yes → tree search, budgeting 5–10×</span></div>
+  <div class="arr">↓</div>
+  <div class="step"><b>Does it need facts or computation it does not have?</b><span>Yes → not a reasoning problem. Retrieval or a tool</span></div>
+</div>
+
+<h2><span class="h-rule"></span>Where reasoning misleads</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Failure</th><th>What is happening</th></tr></thead>
+<tbody>
+<tr><td><b>Plausible working, wrong answer</b></td><td>The reasoning was generated to be coherent, not to be correct. A confident chain of thought is not evidence</td></tr>
+<tr><td><b>Post-hoc rationalisation</b></td><td>The model settled on an answer early and the "working" justifies it. Guided decomposition helps because it fixes the order of questions</td></tr>
+<tr><td><b>Reasoning leaks into output</b></td><td>Users see "wait, that's wrong" mid-answer. Use tags and strip them</td></tr>
+<tr><td><b>Truncation mid-scratch</b></td><td>Token limit hit before the answer block. Always check <code>finish_reason</code> (chapter 2)</td></tr>
+<tr><td><b>Latency doubles unnoticed</b></td><td>Reasoning tokens are generated at normal speed. 300 extra tokens is several seconds</td></tr>
+<tr><td><b>Applied to easy tasks by default</b></td><td>Someone put "think step by step" in the shared system prompt. Every classification now costs triple</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Do not evaluate reasoning by reading it</span>
+  <p>A chain of thought that reads well is persuasive and proves nothing — models produce fluent justifications for wrong answers as readily as for right ones. Evaluate the <em>answers</em> against ground truth (chapter 12), and use the reasoning only for diagnosis once you already know a case failed. Teams that grade the working rather than the outcome consistently overestimate how well their reasoning prompt is doing.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Reasoning buys <b>more computation per answer</b> and <b>puts intermediate results in the context</b>. Both explain where it helps.</li>
+    <li>It helps on <b>multi-step dependent problems</b> and wastes money on lookup, classification and formatting.</li>
+    <li><b>Guided decomposition beats "think step by step"</b> — name the steps rather than hoping the model finds good ones.</li>
+    <li>Separate working from answer with tags, <b>log the working and never render it</b>.</li>
+    <li><b>Step-back</b> is one extra paragraph and disproportionately effective when specifics invite the wrong rule.</li>
+    <li>Self-consistency needs <b>temperature above 0 and comparable answers</b>, and its real product is the <b>agreement margin</b>.</li>
+    <li>Tree search needs a <b>real evaluator and reversible steps</b>, costs 5–10×, and is usually a tool problem in disguise.</li>
+    <li><b>Never grade the reasoning.</b> Grade the answers; read the reasoning only to diagnose.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("07-reasoning.html");
+
+(function(){
+  const root = document.getElementById("cot");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const REQS = [500, 2000, 5000, 20000, 100000, 500000, 2000000];
+
+  // base accuracy, and how much reasoning can add, per task type
+  const TASKS = {
+    classify: {base:0.93, head:0.02, in:900,  out:12,  label:"Classification"},
+    extract:  {base:0.89, head:0.04, in:1100, out:80,  label:"Extraction"},
+    policy:   {base:0.68, head:0.22, in:1400, out:140, label:"Policy question"},
+    math:     {base:0.52, head:0.38, in:700,  out:60,  label:"Multi-step calculation"},
+    plan:     {base:0.58, head:0.26, in:1000, out:320, label:"Open-ended planning"}
+  };
+
+  // fraction of available headroom captured, extra output tokens, call multiplier
+  const TECH = {
+    none:     {cap:0.00, extra:0,   calls:1, label:"Direct answer"},
+    zero:     {cap:0.55, extra:180, calls:1, label:"Think step by step"},
+    guided:   {cap:0.78, extra:260, calls:1, label:"Guided decomposition"},
+    stepback: {cap:0.68, extra:120, calls:1, label:"Step-back"},
+    sc3:      {cap:0.82, extra:180, calls:3, label:"Self-consistency ×3"},
+    sc5:      {cap:0.88, extra:180, calls:5, label:"Self-consistency ×5"},
+    tot:      {cap:0.93, extra:240, calls:7, label:"Tree of thoughts"}
+  };
+
+  function compute(taskKey, techKey){
+    const t = TASKS[taskKey], k = TECH[techKey];
+    const acc = t.base + t.head * k.cap;
+    const inTok = t.in * k.calls;
+    const outTok = (t.out + k.extra) * k.calls;
+    const cost = inTok / 1e6 * 3 + outTok / 1e6 * 15;
+    const lat = 0.5 + (t.out + k.extra) / 90;    // parallel samples: latency ≈ one call
+    return {acc, cost, lat, outTok};
+  }
+
+  function render(){
+    const taskKey = $("c-task").value;
+    const techKey = $("c-tech").value;
+    const ri = parseInt($("c-req").value, 10);
+    const reqs = REQS[ri];
+    $("c-reqv").textContent = reqs.toLocaleString();
+
+    const cur  = compute(taskKey, techKey);
+    const base = compute(taskKey, "none");
+    const gain = (cur.acc - base.acc) * 100;
+    const extraCost = (cur.cost - base.cost) * reqs * 30;
+
+    $("c-acc").textContent  = (cur.acc * 100).toFixed(1) + "%";
+    $("c-lat").textContent  = cur.lat.toFixed(1) + "s";
+    $("c-cost").textContent = "$" + Math.round(cur.cost * reqs * 30).toLocaleString();
+    $("c-marg").textContent = gain > 0.05 ? "$" + Math.round(extraCost / gain).toLocaleString() : "—";
+
+    const rows = Object.keys(TECH).map(k => ({k, ...compute(taskKey, k)}));
+    const maxCost = Math.max.apply(null, rows.map(r => r.cost));
+
+    $("c-bars").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      TASKS[taskKey].label + ' — all techniques</div>' +
+      rows.map(r =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px' +
+        (r.k === techKey ? ';font-weight:600' : '') + '">' +
+        '<span style="min-width:172px;font-size:13px">' + TECH[r.k].label + (r.k === techKey ? ' ◄' : '') + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + (r.cost/maxCost*100).toFixed(0) +
+        '%' + (r.k === techKey ? ';background:#3FB984' : '') + '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:106px;text-align:right">' +
+        (r.acc*100).toFixed(0) + '% · $' + (r.cost * reqs * 30 / 1000).toFixed(1) + 'k</span></div>').join("");
+
+    const notes = [];
+    if(TASKS[taskKey].head < 0.06)
+      notes.push("This task has almost no headroom for reasoning to capture — a direct answer is already at " +
+                 (TASKS[taskKey].base*100).toFixed(0) + "%. Every technique below costs more and returns essentially nothing. " +
+                 "This is the case where a shared \"think step by step\" in the system prompt quietly triples the bill of every classification call in the product.");
+    else if(gain > 8)
+      notes.push("Reasoning captures " + gain.toFixed(1) + " points here, which is a real improvement — this task has genuinely dependent steps and the working carries intermediate results the final answer can attend to.");
+
+    if(techKey === "guided")
+      notes.push("Guided decomposition captures more headroom than \"think step by step\" for a similar cost, because naming the steps stops the model inventing a decomposition that misses a condition. It also makes the reasoning comparable across runs, which matters when you come to evaluate it.");
+    if(techKey === "zero" && TASKS[taskKey].head > 0.1)
+      notes.push("\"Think step by step\" gets you most of the way. Compare it against guided decomposition above — naming the specific questions is usually worth the extra prompt tokens on a domain task.");
+    if(techKey === "stepback")
+      notes.push("Step-back is the cheapest technique on the list after a direct answer, because it adds one paragraph rather than a full working. On questions where the surface details point at the wrong rule, it punches well above that cost.");
+    if(techKey.startsWith("sc"))
+      notes.push("Self-consistency costs " + TECH[techKey].calls + "× because it is " + TECH[techKey].calls +
+                 " full calls. Latency stays low if you run them in parallel. Note that going from 3 to 5 samples buys " +
+                 ((compute(taskKey,"sc5").acc - compute(taskKey,"sc3").acc)*100).toFixed(1) +
+                 " points for another 2× — the curve flattens fast. Its real product is the agreement margin, so use it, or you are paying 5× for one number.");
+    if(techKey === "tot")
+      notes.push("Tree of thoughts at 7× cost. It reaches the highest accuracy here, but only because this model assumes a working evaluator exists. Without something objective to score branches against, the search wanders and you pay the multiplier for nothing.");
+
+    if(gain > 0.05)
+      notes.push("Marginal cost: $" + Math.round(extraCost / gain).toLocaleString() +
+                 " per month per accuracy point gained, at " + reqs.toLocaleString() +
+                 " requests/day. That is the number to take to whoever owns the budget — and to compare against what an error actually costs you.");
+
+    notes.push("Accuracy figures are illustrative and directional. Token, latency and cost arithmetic is real. Run this comparison on your own eval set before committing to a technique.");
+    $("c-note").textContent = notes.join("\n\n");
+  }
+
+  ["c-task","c-tech","c-req"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

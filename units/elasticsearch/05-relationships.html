@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Objects, nested and relationships — Elasticsearch</title>
+<meta name="description" content="There are no joins. Four ways to model related data, the array-flattening trap that silently returns wrong results, and how to choose.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 05 · Modelling</div>
+    <h1>Objects, nested and relationships</h1>
+    <p class="standfirst">Elasticsearch has no joins, which everyone knows. What catches people is subtler: an array of objects is silently flattened at index time, so a query that looks obviously correct returns documents that do not match it — with no error, ever.</p>
+    <div class="chap-meta">
+      <span class="tagpill">nested</span>
+      <span class="tagpill">object</span>
+      <span class="tagpill">join</span>
+      <span class="tagpill">denormalisation</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The flattening trap</h2>
+
+<p>Lucene has no concept of an object. A document is a flat set of field-to-terms mappings, so when Elasticsearch indexes nested JSON it flattens the structure into dotted paths. For a single object that is harmless. For an <em>array</em> of objects it destroys the association between fields.</p>
+
+<div class="demo" id="nst">
+  <div class="demo-head">
+    <b>Why this query is wrong</b>
+    <span>One document, two ways of mapping it, and a query that should not match.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="n-type">Field mapping</label>
+        <select id="n-type">
+          <option value="object" selected>object (the default)</option>
+          <option value="nested">nested</option>
+        </select>
+      </div>
+      <div>
+        <label for="n-q">Search for</label>
+        <select id="n-q">
+          <option value="alice-admin" selected>name: Alice AND role: admin</option>
+          <option value="alice-viewer">name: Alice AND role: viewer</option>
+          <option value="bob-admin">name: Bob AND role: admin</option>
+          <option value="carol-admin">name: Carol AND role: admin</option>
+        </select>
+      </div>
+    </div>
+    <div id="n-view"></div>
+    <div class="stat">
+      <div><b id="n-result">—</b><span>query result</span></div>
+      <div><b id="n-truth">—</b><span>correct answer</span></div>
+      <div><b id="n-ok">—</b><span></span></div>
+    </div>
+    <div class="out" id="n-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">There is no error. That is the whole problem.</span>
+  <p>Every other modelling mistake in this unit announces itself — a rejected document, a mapping conflict, an empty result set that makes you look. This one returns <em>plausible extra results</em>, forever, silently. A permissions check written this way grants access to people who should not have it; a product filter shows items that do not match; a compliance report includes records it should exclude. <b>If your document contains an array of objects and you query two of their fields together, you need <code>nested</code></b> — and the time to discover that is now rather than during an audit.</p>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">what nested actually does</span><button class="copy">Copy</button></div>
+<pre><code>PUT /projects
+{ "mappings": { "properties": {
+    "name":    { "type": "text" },
+    "members": {
+      "type": "nested",                 # <- the whole fix
+      "properties": {
+        "name": { "type": "keyword" },
+        "role": { "type": "keyword" }
+      }
+    }
+}}}
+
+# Nested objects are indexed as SEPARATE HIDDEN LUCENE DOCUMENTS, stored
+# adjacent to their parent in the same segment and joined at query time.
+# Each one keeps its own field associations intact.
+
+GET /projects/_search
+{ "query": {
+    "nested": {
+      "path": "members",
+      "query": {
+        "bool": { "must": [
+          { "term": { "members.name": "Alice" } },
+          { "term": { "members.role": "admin"  } }
+        ]}
+      },
+      "inner_hits": {}                  # WHICH member matched — very useful
+    }
+}}
+
+# THE COSTS, and they are real:
+#
+#  * A document with 50 members is 51 Lucene documents. Your doc count in
+#    _cat/indices is the visible one; the internal count is much higher and
+#    it is what actually consumes resources
+#  * Updating ANY field of the parent reindexes the parent and every nested
+#    child. A document with a large nested array is expensive to touch
+#  * Queries are slower — a join, even a cheap one
+#  * index.mapping.nested_objects.limit defaults to 10,000 per document and
+#    index.mapping.nested_fields.limit to 50 per index. Both exist because
+#    unbounded nesting is a reliable way to exhaust heap
+#
+# So: use nested where you must, and notice when the array is unbounded and
+# growing. An array of a few sizes or a handful of variants is fine; an
+# array of every event that ever happened to an order is a different index.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>The four options</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Approach</th><th>Query cost</th><th>Update cost</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><td><b>Denormalise</b> — copy the related data in</td><td>Lowest</td><td>Highest — update every copy</td><td>The related data changes rarely. <b>The default answer</b></td></tr>
+<tr><td><b><code>object</code></b> — plain nesting</td><td>Lowest</td><td>Low</td><td>Single objects, or arrays whose fields you never query together</td></tr>
+<tr><td><b><code>nested</code></b></td><td>Moderate</td><td>Moderate — reindexes the whole document</td><td>Arrays of objects where the pairing matters</td></tr>
+<tr><td><b><code>join</code></b> — parent/child</td><td>High</td><td>Lowest — children update independently</td><td>Many children per parent, changing far more often than the parent</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">parent/child, and why it is a last resort</span><button class="copy">Copy</button></div>
+<pre><code>PUT /blog
+{ "mappings": { "properties": {
+    "relation": {
+      "type": "join",
+      "relations": { "post": "comment" }
+    },
+    "title": { "type": "text" },
+    "body":  { "type": "text" }
+}}}
+
+PUT /blog/_doc/1?refresh
+{ "title": "Consensus", "relation": { "name": "post" } }
+
+PUT /blog/_doc/c1?routing=1&refresh          # routing is MANDATORY
+{ "body": "Great post", "relation": { "name": "comment", "parent": "1" } }
+
+GET /blog/_search
+{ "query": { "has_child": { "type": "comment",
+    "query": { "match": { "body": "great" } } } } }
+
+GET /blog/_search
+{ "query": { "has_parent": { "parent_type": "post",
+    "query": { "match": { "title": "consensus" } } } } }
+
+# THE CONSTRAINTS:
+#   * parent and children MUST live on the same shard, which is what the
+#     routing parameter enforces. Forget it and the relationship breaks
+#   * one join field per index, one level of hierarchy in practice
+#   * has_child and has_parent queries are SLOW — Elastic's own guidance is
+#     roughly 5-10× slower than the equivalent nested query
+#   * scoring across the join is limited and awkward
+#
+# WHEN IT IS NEVERTHELESS RIGHT: a parent with thousands of children that
+# change constantly. Nested would reindex the entire parent document on
+# every child change; join lets a child be written on its own.
+#
+# WHEN IT IS NOT: almost everything else. If you are reaching for join
+# because the data is relational, the honest answer is that the data is
+# relational and Elasticsearch is holding a derived copy of it (chapter 1) —
+# so denormalise the copy and let the database own the relationships.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Denormalisation is the intended answer, and it is a real commitment</span>
+  <p>The Elasticsearch-shaped solution to "I need data from two places" is to write it into one document at index time. A product document carries its category name, its brand name and its supplier name as fields, not as ids. Searches are then a single-shard-local operation with no join at any level, which is exactly the performance the design exists to deliver. <b>The commitment is that when a brand is renamed, you must find and rewrite every document that mentions it</b> — an <code>update_by_query</code>, or more often a reindex from the source database. That is fine when it happens monthly and unworkable when it happens hourly. The question to ask before denormalising is not "does this fit" but "how often does the copied field change, and what rewrites it when it does".</p>
+</div>
+
+<h2><span class="h-rule"></span>Choosing</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">a decision procedure</span><button class="copy">Copy</button></div>
+<pre><code>1. IS IT A SINGLE OBJECT, not an array?
+      { "customer": { "id": ..., "email": ... } }
+   -> object. There is no trap. Nothing to think about.
+
+2. IS IT AN ARRAY OF OBJECTS?
+   -> Will you ever query TWO of their fields together and require both to
+      match the SAME element?
+
+      NO   -> object. Cheaper, simpler, and correct for this usage.
+              e.g. an array of tags with a count you only ever display
+      YES  -> nested. This is the flattening trap and there is no other fix.
+
+3. DOES THE RELATED DATA CHANGE MUCH MORE OFTEN THAN ITS PARENT,
+   AND ARE THERE MANY OF THEM?
+   -> join, reluctantly, and measure the query cost before committing.
+
+4. OTHERWISE
+   -> denormalise, and write down what rebuilds the copies.
+
+A FIFTH OPTION PEOPLE FORGET: two indices and two queries. Search the child
+index, collect the parent ids, fetch the parents by id. Two round trips,
+no join machinery, no nested overhead, and it scales predictably. For a
+lot of "I need a join" situations this is both faster and simpler than
+making Elasticsearch do it, and it keeps each index simple enough to
+reason about.
+
+AND A SIXTH, WHICH IS OFTEN CORRECT: do the join in the database that owns
+the data, and index the result. If the relational shape matters to your
+queries, the relational store should be answering them — Elasticsearch is
+holding a derived copy, and a derived copy can be pre-joined.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Nested aggregations, briefly</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the same trap, in the analytics half</span><button class="copy">Copy</button></div>
+<pre><code># Aggregating a nested field requires the nested aggregation, and forgetting
+# it produces numbers that are wrong in the same silent way as the query.
+
+GET /projects/_search
+{ "size": 0,
+  "aggs": {
+    "members": {
+      "nested": { "path": "members" },
+      "aggs": {
+        "by_role": { "terms": { "field": "members.role" } }
+      }
+    }
+}}
+
+# And to get back to the parent's fields from inside a nested aggregation:
+{ "aggs": { "members": {
+    "nested": { "path": "members" },
+    "aggs": { "admins": {
+      "filter": { "term": { "members.role": "admin" } },
+      "aggs": { "back_to_parent": {
+        "reverse_nested": {},
+        "aggs": { "projects": { "terms": { "field": "name.keyword" } } }
+      }}
+    }}
+}}}
+
+# reverse_nested is the escape hatch: "having found the matching members,
+# now group by something on their PARENT documents". It is the answer to
+# "which projects have an admin", asked as an aggregation.
+
+# NOTE THE COUNTS MEAN SOMETHING DIFFERENT. Inside a nested aggregation,
+# doc_count counts NESTED DOCUMENTS, not parents. A count of 500 admins
+# across 200 projects is 500 member-records, not 500 projects — and people
+# report the wrong number to stakeholders on the strength of that confusion
+# more often than they discover it.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Check whether you have the bug already</span>
+  <p>The flattening trap is worth actively auditing for, because nothing will tell you. Look for indices whose mapping contains an <code>object</code> field — meaning no explicit <code>"type"</code>, which is how objects appear — that receives arrays, and then grep your query code for <code>bool</code> queries combining two of that object's sub-fields. <code>GET /index/_mapping</code> shows the structure; the array-ness only shows in the data, since Elasticsearch does not record whether a field held one value or many. A quick empirical test: index a document you know should <em>not</em> match, run the query, and see whether it comes back. <b>That five-minute check has found real bugs in permission filters and pricing rules</b>, and it is cheaper than finding them the other way.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>Lucene has no objects.</b> Nested JSON is flattened into dotted paths at index time.</li>
+    <li><b>An array of objects loses the association between fields</b>, so a two-field query matches documents that should not match.</li>
+    <li><b>There is no error and no warning.</b> The results are plausible and wrong.</li>
+    <li><b><code>nested</code> fixes it</b> by indexing each element as a separate hidden document, at the cost of size, update expense and query speed.</li>
+    <li><b>Denormalisation is the intended answer</b> — and the commitment is knowing what rewrites the copies when the source changes.</li>
+    <li><b><code>join</code> is a last resort</b>: same-shard routing, one level, and 5–10× slower than nested.</li>
+    <li><b>Two indices and two queries</b> is often better than making Elasticsearch join at all.</li>
+    <li><b>Nested aggregations count nested documents</b>, not parents. Use <code>reverse_nested</code> to get back.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("05-relationships.html");
+
+(function(){
+  const root = document.getElementById("nst");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const MEMBERS = [
+    {name:"Alice", role:"viewer"},
+    {name:"Bob",   role:"admin"},
+    {name:"Carol", role:"editor"}
+  ];
+
+  const Q = {
+    "alice-admin":  {name:"Alice", role:"admin"},
+    "alice-viewer": {name:"Alice", role:"viewer"},
+    "bob-admin":    {name:"Bob",   role:"admin"},
+    "carol-admin":  {name:"Carol", role:"admin"}
+  };
+
+  function render(){
+    const type = $("n-type").value;
+    const q    = Q[$("n-q").value];
+
+    // object: fields flattened into two independent lists
+    const names = MEMBERS.map(m => m.name);
+    const roles = MEMBERS.map(m => m.role);
+    const objMatch    = names.includes(q.name) && roles.includes(q.role);
+    const nestedMatch = MEMBERS.some(m => m.name === q.name && m.role === q.role);
+
+    const got     = type === "object" ? objMatch : nestedMatch;
+    const correct = nestedMatch;
+    const right   = got === correct;
+
+    $("n-result").textContent = got ? "1 hit" : "0 hits";
+    $("n-truth").textContent  = correct ? "1 hit" : "0 hits";
+    $("n-ok").textContent     = right ? "correct" : "WRONG";
+    $("n-ok").style.color     = right ? "#3FB984" : "#E2574C";
+
+    const chip = (v, hit) =>
+      '<span style="font-family:var(--mono);font-size:11.5px;padding:3px 8px;border-radius:3px;' +
+      'background:' + (hit ? "#D6EFF3" : "#F1F4F6") + ';color:' + (hit ? "#0F7A85" : "#54677A") +
+      ';border:1px solid ' + (hit ? "#25B7C4" : "#E1E7EC") + '">' + v + '</span>';
+
+    let indexView;
+    if(type === "object"){
+      indexView =
+        '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid #E2574C;' +
+        'border-radius:5px;padding:12px 14px">' +
+        '<div style="font-family:var(--mono);font-size:11px;color:#8FA0AF;margin-bottom:7px">' +
+        'ONE Lucene document · field associations destroyed</div>' +
+        '<div style="margin-bottom:7px"><div style="font-family:var(--mono);font-size:11.5px;' +
+        'font-weight:700;color:#16232F;margin-bottom:4px">members.name</div>' +
+        '<div style="display:flex;gap:5px;flex-wrap:wrap">' +
+        names.map(n => chip(n, n === q.name)).join("") + '</div></div>' +
+        '<div><div style="font-family:var(--mono);font-size:11.5px;font-weight:700;color:#16232F;' +
+        'margin-bottom:4px">members.role</div>' +
+        '<div style="display:flex;gap:5px;flex-wrap:wrap">' +
+        roles.map(r => chip(r, r === q.role)).join("") + '</div></div></div>';
+    } else {
+      indexView =
+        '<div style="background:#fff;border:1px solid #E1E7EC;border-left:3px solid #3FB984;' +
+        'border-radius:5px;padding:12px 14px">' +
+        '<div style="font-family:var(--mono);font-size:11px;color:#8FA0AF;margin-bottom:7px">' +
+        MEMBERS.length + ' hidden Lucene documents + 1 parent · associations preserved</div>' +
+        MEMBERS.map(m => {
+          const hit = m.name === q.name && m.role === q.role;
+          return '<div style="display:flex;gap:6px;align-items:center;padding:6px 9px;border-radius:4px;' +
+            'background:' + (hit ? "#E6F6F8" : "#FAFBFC") + ';border:1px solid ' +
+            (hit ? "#25B7C4" : "#EDF1F4") + ';margin-bottom:4px">' +
+            chip(m.name, m.name === q.name) + chip(m.role, m.role === q.role) +
+            (hit ? '<span style="font-size:11px;color:#0F7A85;font-weight:600;margin-left:auto">match</span>' : "") +
+            '</div>';
+        }).join("") + '</div>';
+    }
+
+    $("n-view").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin:16px 0 8px">The document</div>' +
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-radius:5px;padding:11px 13px;' +
+      'margin:0 0 14px;font-family:var(--mono);font-size:11.5px;line-height:1.6;overflow-x:auto">' +
+      '{ "name": "Redesign",\n  "members": [\n' +
+      MEMBERS.map(m => '    { "name": "' + m.name + '", "role": "' + m.role + '" }').join(",\n") +
+      '\n  ] }</pre>' +
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin:0 0 8px">How it is indexed as <code>' + type + '</code></div>' +
+      indexView;
+
+    const notes = [];
+
+    if(type === "object" && !right){
+      notes.push("The query asks for a member who is BOTH named " + q.name + " AND has the role " + q.role +
+        ". No such member exists — " + q.name + " is a " +
+        (MEMBERS.find(m => m.name === q.name) || {role:"non-member"}).role +
+        " — and the document matches anyway.\n\nHere is why. Lucene has no concept of an object, so the array is flattened into two independent term lists: members.name holds [" +
+        names.join(", ") + "] and members.role holds [" + roles.join(", ") +
+        "]. Which name went with which role is simply not recorded anywhere.\n\nThe bool query then checks each clause against the whole document. Is \"" + q.name +
+        "\" in the names? Yes. Is \"" + q.role + "\" in the roles? Yes. Both clauses satisfied, document matches.");
+      notes.push("There is no error. There will never be an error. The query is syntactically valid, the mapping is valid, and the result is plausible — which is what makes this the most dangerous default in Elasticsearch.\n\nConsider what this does to a permissions filter: \"show me projects where this user is an admin\" returns projects where the user is a viewer and somebody else is an admin. The same shape of bug appears in product filters that show non-matching variants, and in compliance reports that include records they should exclude.\n\nSwitch the mapping to nested above.");
+    }
+    else if(type === "object" && right){
+      notes.push("This particular query happens to give the right answer, because " + q.name +
+        " really is a " + q.role + " — so the two clauses match the same element by coincidence rather than by construction.\n\nThat is worth sitting with. The mapping is broken in exactly the same way it was a moment ago; this query just does not expose it. Try \"name: Alice AND role: admin\" and watch the same mapping return a document that does not match.\n\nA bug that only appears for some inputs is harder to find than one that always fires, and this is why the flattening trap survives in production systems for years.");
+    }
+    else if(type === "nested"){
+      notes.push("With the nested type, each array element is indexed as its own hidden Lucene document, stored adjacent to the parent in the same segment. The field associations survive, so the bool query is evaluated against one member at a time.\n\n" +
+        (nestedMatch
+          ? "There is a member who is both " + q.name + " and " + q.role + ", so the document matches — correctly this time."
+          : "No single member is both " + q.name + " and " + q.role + ", so the document does not match. Correct.") +
+        "\n\nNote that the query itself must change too: the clauses have to be wrapped in a nested query naming the path. Changing the mapping without changing the queries gets you zero results everywhere, which at least fails loudly.");
+      notes.push("The costs are real and worth stating. This document is now 4 Lucene documents rather than 1, so your internal document count is several times the number in _cat/indices. Updating the project's name reindexes the parent and all three members. Queries do a join, which is cheap but not free.\n\nThe limits exist for a reason: 10,000 nested objects per document and 50 nested fields per index by default. An array of a few members or variants is fine. An array of every event that ever touched an order is a different index.\n\nAdd \"inner_hits\": {} to the nested query and Elasticsearch tells you WHICH element matched, which is usually what the interface needs to display.");
+    }
+
+    $("n-note").textContent = notes.join("\n\n");
+  }
+
+  ["n-type","n-q"].forEach(id => $(id).addEventListener("change", render));
+  render();
+})();
+</script>
+</body>
+</html>

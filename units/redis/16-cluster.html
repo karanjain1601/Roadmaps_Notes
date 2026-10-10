@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Cluster — Redis</title>
+<meta name="description" content="Hash slots, resharding, multi-key operations and hash tags, and the constraints cluster mode places on everything in this unit.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 16 · Running it</div>
+    <h1>Cluster</h1>
+    <p class="standfirst">Sixteen thousand three hundred and eighty-four hash slots, distributed across nodes. The mechanism is simple and the consequences are not — cluster mode quietly invalidates several patterns from earlier chapters, and it is easier to design for than to migrate to.</p>
+    <div class="chap-meta">
+      <span class="tagpill">slots</span>
+      <span class="tagpill">hash tags</span>
+      <span class="tagpill">resharding</span>
+      <span class="tagpill">constraints</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>Do you need it</h2>
+
+<div class="note key">
+  <span class="note-t">Cluster solves two problems, and neither is "we have a lot of keys"</span>
+  <p>The reasons to shard are <b>memory beyond one machine</b> and <b>write throughput beyond one thread</b>. Read throughput is not one of them — replicas do that (chapter 15). Key count is not one of them; ten million keys on one instance is unremarkable. Before clustering, exhaust the cheaper answers: a bigger machine, a smaller working set (chapter 12), TTLs on everything, better encodings, replicas for reads, and <b>separate instances by purpose</b> — which gets you multiple cores and is dramatically simpler than a cluster. Most deployments that adopt cluster mode did not need to, and pay its constraints indefinitely.</p>
+</div>
+
+<h2><span class="h-rule"></span>Hash slots</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">a fixed number of buckets, assigned to nodes</span><button class="copy">Copy</button></div>
+<pre><code># Every key belongs to exactly one of 16,384 slots:
+#     slot = CRC16(key) mod 16384
+#
+# Each node owns a contiguous-ish range of slots. Three nodes typically:
+#     node A: 0-5460     node B: 5461-10922     node C: 10923-16383
+
+CLUSTER KEYSLOT user:41            # (integer) 8106
+CLUSTER COUNTKEYSINSLOT 8106
+CLUSTER GETKEYSINSLOT 8106 10
+CLUSTER SHARDS                     # 7.0+. Slot ranges per shard
+CLUSTER NODES
+CLUSTER INFO
+
+# Why 16,384 rather than a hash of the node count? Because slots are the
+# unit of MIGRATION. Adding a node moves slots, not keys — the mapping from
+# key to slot never changes, so a resharding operation reassigns ranges and
+# transfers their contents rather than rehashing the whole keyspace.
+
+# CLIENTS DO THE ROUTING. A cluster-aware client fetches the slot map,
+# caches it, and sends each command to the right node. When it is wrong:
+GET user:41
+# (error) MOVED 8106 10.0.1.11:6379      -> the slot lives there. Update the
+#                                           cached map and retry
+# (error) ASK 8106 10.0.1.12:6379        -> the slot is MIGRATING right now.
+#                                           Retry there with ASKING, but do
+#                                           NOT update the map
+#
+# Every decent client library handles both. A non-cluster client pointed at
+# a cluster works for keys that happen to land on the node it connected to
+# and fails for the rest, which is a confusing way to discover the problem.
+
+redis-cli -c                       # follow redirections in the CLI</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>What stops working</h2>
+
+<div class="demo" id="cl">
+  <div class="demo-head">
+    <b>Does this work in cluster mode?</b>
+    <span>Several patterns from earlier chapters need rewriting. Check yours before migrating.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="x-op">Operation</label>
+        <select id="x-op">
+          <option value="get" selected>GET user:41</option>
+          <option value="mget">MGET user:41 user:9 user:12</option>
+          <option value="mgettag">MGET {u41}:name {u41}:tier</option>
+          <option value="lua">A Lua script over two keys</option>
+          <option value="pipeline">A pipeline of 500 mixed keys</option>
+          <option value="multi">MULTI over two keys</option>
+          <option value="sinter">SINTER tag:redis tag:database</option>
+          <option value="scan">SCAN over the keyspace</option>
+          <option value="pubsub">PUBLISH to a channel</option>
+          <option value="select">SELECT 3</option>
+        </select>
+      </div>
+    </div>
+    <div id="x-slots"></div>
+    <div class="stat">
+      <div><b id="x-works">—</b><span>works?</span></div>
+      <div><b id="x-why">—</b><span>because</span></div>
+      <div><b id="x-fix">—</b><span>fix</span></div>
+    </div>
+    <div id="x-code"></div>
+    <div class="out" id="x-note"></div>
+  </div>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Every multi-key operation must stay within one slot</span>
+  <p>This is the constraint that reaches back into every earlier chapter. <code>MGET</code>, <code>MSET</code>, <code>SINTER</code>, <code>ZINTERSTORE</code>, <code>SMOVE</code>, <code>RENAME</code>, <code>BLMOVE</code>, Lua scripts, <code>MULTI</code> blocks — all of them require every key involved to hash to the same slot, and <b>same node is not sufficient</b>. Two keys can share a node today and be separated by a resharding tomorrow, so Redis enforces the stricter rule and returns <code>CROSSSLOT Keys in request don't hash to the same slot</code>. The workaround is hash tags, and using them well is the whole of cluster schema design.</p>
+</div>
+
+<h2><span class="h-rule"></span>Hash tags</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">forcing keys into the same slot</span><button class="copy">Copy</button></div>
+<pre><code># If a key contains {...}, only the text inside the FIRST pair of braces is
+# hashed. Everything else is ignored for routing.
+
+CLUSTER KEYSLOT "{user:41}:profile"     # 8106
+CLUSTER KEYSLOT "{user:41}:sessions"    # 8106  — same slot
+CLUSTER KEYSLOT "{user:41}:cart"        # 8106
+
+# Now multi-key operations across a user's keys are legal:
+MGET {user:41}:profile {user:41}:cart
+EVAL "..." 2 {user:41}:cart {user:41}:total
+
+# THE DESIGN RULE: tag by the entity that operations are scoped to. If your
+# transactions and scripts always touch one user's data, tag by user. If they
+# touch one order's data, tag by order.
+#
+# THE HAZARD: a tag that is too coarse destroys distribution.
+#     {tenant:acme}:...        one tenant's entire dataset on one node
+#     {global}:...             everything on one node. You have unsharded
+#
+# In a multi-tenant system with one enormous tenant, tagging by tenant means
+# one node holds most of your data and takes most of your traffic, while the
+# others idle. The balancer cannot help — you configured it.
+
+# CHECK THE DISTRIBUTION before committing to a tagging scheme:
+redis-cli --cluster check 10.0.1.10:6379
+redis-cli --cluster info  10.0.1.10:6379
+# and per node:
+CLUSTER COUNTKEYSINSLOT <slot>
+
+# Note also that hash tags interact with expiry and eviction: all of a
+# tenant's keys expiring at once now hit one node's expiry cycle rather than
+# being spread (chapter 2).</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Setting one up</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">and resharding it</span><button class="copy">Copy</button></div>
+<pre><code># redis.conf on every node
+cluster-enabled yes
+cluster-config-file nodes.conf        # maintained by Redis, not by you
+cluster-node-timeout 15000
+cluster-require-full-coverage yes     # see below
+
+# Create it — six nodes, three primaries each with one replica:
+redis-cli --cluster create \
+  10.0.1.10:6379 10.0.1.11:6379 10.0.1.12:6379 \
+  10.0.1.13:6379 10.0.1.14:6379 10.0.1.15:6379 \
+  --cluster-replicas 1
+
+# ADD A NODE, then give it slots:
+redis-cli --cluster add-node 10.0.1.16:6379 10.0.1.10:6379
+redis-cli --cluster reshard 10.0.1.10:6379 \
+  --cluster-from all --cluster-to <new-node-id> --cluster-slots 4096
+
+# REMOVE A NODE — move its slots away first, then delete it:
+redis-cli --cluster reshard ... --cluster-from <id> --cluster-to <other>
+redis-cli --cluster del-node 10.0.1.10:6379 <id>
+
+# REBALANCE after changes:
+redis-cli --cluster rebalance 10.0.1.10:6379 --cluster-use-empty-masters
+
+# RESHARDING IS ONLINE. Slots move key by key while the cluster serves
+# traffic, and clients follow ASK redirections for the slot in flight. It is
+# genuinely non-disruptive — and it is slow on large datasets and it adds
+# load, so schedule it rather than doing it during a peak.
+
+# cluster-require-full-coverage:
+#   yes  the WHOLE cluster refuses writes if any slot is unavailable.
+#        Consistent, and one node's failure is a total outage
+#   no   the rest keeps serving; requests for missing slots fail
+#        Available, and your application must handle partial failure
+# The default is yes. For a cache, no is usually the better trade.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Failover</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">built in — no Sentinel</span><button class="copy">Copy</button></div>
+<pre><code># Cluster nodes gossip over a separate bus port (the client port + 10000).
+# When a majority of PRIMARIES agree a node is unreachable for longer than
+# cluster-node-timeout, one of its replicas is promoted.
+#
+# So cluster mode replaces Sentinel entirely. Running both is a mistake —
+# they are alternative answers to the same question (chapter 15).
+
+CLUSTER FAILOVER              # on a replica: planned, coordinated handover
+CLUSTER FAILOVER FORCE        # without the primary's agreement
+CLUSTER FAILOVER TAKEOVER     # without majority agreement. Dangerous
+
+cluster-replica-validity-factor 10    # a replica too far behind will not
+                                      # be promoted. 0 disables the check
+cluster-migration-barrier 1           # keep at least this many replicas on a
+                                      # primary before migrating one elsewhere
+cluster-allow-replica-migration yes   # spare replicas move to primaries with
+                                      # none — genuinely useful
+
+# THE SAME DATA LOSS AS CHAPTER 15. Replication is still asynchronous, so a
+# promoted replica is missing whatever its primary acknowledged and had not
+# yet sent. Cluster mode does not change this — it automates the failover,
+# not the durability.
+
+# YOU NEED A MAJORITY OF PRIMARIES. Three primaries tolerate one failure.
+# Two primaries tolerate none, because one remaining node is not a majority
+# — so a two-shard cluster is strictly worse than a single instance with a
+# replica. Three primaries is the practical minimum.
+
+# Note that primaries vote, not replicas. A cluster with three primaries and
+# nine replicas still tolerates exactly one primary failure at a time.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>The full list of constraints</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Constraint</th><th>Detail</th></tr></thead>
+<tbody>
+<tr><td><b>Multi-key ops need one slot</b></td><td><code>MGET</code>, <code>SINTER</code>, Lua, <code>MULTI</code> — all of them. Use hash tags</td></tr>
+<tr><td><b>Only database 0</b></td><td><code>SELECT</code> is unavailable. Prefix your keys (chapter 2)</td></tr>
+<tr><td><b><code>SCAN</code> is per node</b></td><td>Iterate every primary yourself, or use <code>redis-cli --scan</code></td></tr>
+<tr><td><b><code>PUBLISH</code> broadcasts to every node</b></td><td>Use <code>SPUBLISH</code>, which is sharded (chapter 11)</td></tr>
+<tr><td><b><code>KEYS</code>, <code>DBSIZE</code>, <code>FLUSHALL</code> are per node</b></td><td>Every "whole keyspace" command is now per shard</td></tr>
+<tr><td><b>Clients must be cluster-aware</b></td><td>They cache the slot map and follow <code>MOVED</code>/<code>ASK</code></td></tr>
+<tr><td><b>Three primaries minimum</b></td><td>Majority voting. Two shards tolerate no failures</td></tr>
+<tr><td><b>Lua must declare every key</b></td><td>Keys built from <code>ARGV</code> break here (chapter 8)</td></tr>
+<tr><td><b>Hot keys do not shard</b></td><td>One key is one slot is one node is one thread</td></tr>
+<tr><td><b>More operational surface</b></td><td>Six or more processes, a gossip bus, resharding, slot coverage</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">A hot key defeats the whole thing</span>
+  <p>Sharding distributes the <em>keyspace</em>, not the traffic. A single key that every request touches — a global counter, a shared rate limit, a leaderboard everyone reads — lives in one slot on one node and is served by one thread, exactly as it was before you clustered. Adding nodes gives that key no more capacity at all. The fixes are the same as chapter 10's: split the key into N shards and aggregate, or handle it locally in each application instance with a share of the budget. Identify your hot keys with <code>redis-cli --hotkeys</code> <b>before</b> designing the cluster, because a hot key is one of the few problems clustering genuinely cannot solve.</p>
+</div>
+
+<h2><span class="h-rule"></span>The alternative</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">client-side sharding, which is often enough</span><button class="copy">Copy</button></div>
+<pre><code>Run several independent Redis instances and choose one in your application:
+
+    instance = instances[hash(key) % len(instances)]
+
+WHAT YOU GET that cluster gives you:
+  * memory and throughput across machines
+  * full use of your cores
+  * complete freedom from CROSSSLOT — because you accept that cross-instance
+    operations simply do not exist, rather than fighting the constraint
+
+WHAT YOU GIVE UP:
+  * automatic failover — you need Sentinel per instance, or manual promotion
+  * online resharding — adding an instance rehashes everything, so you need
+    consistent hashing, or a migration, or a maintenance window
+  * a single logical endpoint
+
+WHEN IT IS BETTER:
+  * the data partitions cleanly by tenant, region or service, so you were
+    going to separate it anyway
+  * different partitions want different configuration — a cache with
+    allkeys-lru next to a queue with noeviction, which one cluster cannot do
+  * the instance count is stable, so resharding is rare
+
+Separating instances BY PURPOSE — cache, sessions, queues, rate limits — is
+the version of this almost every deployment should do regardless (chapter 12).
+It uses more cores, isolates failures, and lets each instance have the
+eviction and persistence settings its workload actually wants. Do that first
+and see whether you still need to shard.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Design for cluster before you need it, or accept you may never migrate</span>
+  <p>Retrofitting cluster mode means auditing every multi-key operation, every Lua script, every <code>MULTI</code>, every <code>SCAN</code> loop and every use of <code>SELECT</code> — then adding hash tags to key names, which changes where every key lives and therefore requires a data migration. That is a project, and it is the reason plenty of teams stay on one large instance long past the point where sharding would help. <b>If there is any chance you will need it, adopt the constraints now</b>: prefix instead of <code>SELECT</code>, tag keys by their natural entity, declare Lua keys properly, and keep multi-key operations within one entity. All of it is free on a single instance and removes the migration entirely.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>16,384 slots</b>, <code>CRC16(key) mod 16384</code>, assigned to nodes. Slots migrate, not keys.</li>
+    <li><b>Shard for memory or write throughput.</b> Not for read throughput, and not for key count.</li>
+    <li><b>Every multi-key operation needs one slot</b> — same node is not sufficient.</li>
+    <li><b>Hash tags force keys together</b>, and a tag that is too coarse unshards your cluster.</li>
+    <li><b>Cluster replaces Sentinel.</b> Failover is built in, with the same asynchronous data loss.</li>
+    <li><b>Three primaries minimum.</b> Two tolerate no failures, which is worse than one instance with a replica.</li>
+    <li><b>A hot key does not shard</b> — one slot, one node, one thread. Find them before designing.</li>
+    <li><b>Separate instances by purpose first.</b> It uses your cores, isolates failures, and is far simpler.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("16-cluster.html");
+
+(function(){
+  const root = document.getElementById("cl");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const O = {
+    get: {works:"yes", why:"one key, one slot", fix:"—", slots:[["user:41", 8106, "B"]],
+      code:'GET user:41\n# routed to the node owning slot 8106',
+      note:"Single-key commands are the case cluster mode handles transparently. The client computes CRC16(key) mod 16384, looks up the owning node in its cached slot map, and sends the command there.\n\nIf the map is stale it gets a MOVED redirection, updates the map and retries — one extra round trip, once, until the map is refreshed.\n\nThis is most of your traffic, and it works with no changes at all."},
+    mget: {works:"NO", why:"three different slots", fix:"hash tags, or a pipeline",
+      slots:[["user:41", 8106, "B"],["user:9", 2412, "A"],["user:12", 14733, "C"]],
+      code:'MGET user:41 user:9 user:12\n# (error) CROSSSLOT Keys in request don\'t hash\n#         to the same slot',
+      note:"Three keys, three slots, three nodes. Redis rejects the command rather than fanning it out.\n\nNote that it rejects it even when the keys happen to be on the same node — the rule is same SLOT, not same node, because slots move during resharding and a command that worked yesterday would silently break tomorrow.\n\nTwo fixes. Hash tags force the keys into one slot, which works when the keys belong to one entity. Or use a pipeline: the client splits the commands by node and sends each batch to the right place, giving you the round-trip saving without the atomicity — which is usually what you wanted from MGET anyway (chapter 14)."},
+    mgettag: {works:"yes", why:"the hash tag forces one slot", fix:"—",
+      slots:[["{u41}:name", 4823, "A"],["{u41}:tier", 4823, "A"]],
+      code:'MGET {u41}:name {u41}:tier\n\nCLUSTER KEYSLOT "{u41}:name"   # 4823\nCLUSTER KEYSLOT "{u41}:tier"   # 4823',
+      note:"Only the text inside the first pair of braces is hashed, so every key tagged {u41} lands in the same slot and multi-key operations across them are legal.\n\nThis is the whole of cluster schema design: tag by the entity that your multi-key operations are scoped to. If scripts and transactions always touch one user's data, tag by user.\n\nThe hazard is a tag that is too coarse. Tag by tenant in a multi-tenant system with one enormous tenant, and that tenant's entire dataset sits on one node taking most of the traffic while the others idle — you have configured the imbalance, so no rebalancing can fix it.\n\nCheck the distribution with redis-cli --cluster check before committing to a scheme."},
+    lua: {works:"only within a slot", why:"scripts are routed by their keys", fix:"tag the keys",
+      slots:[["cart:41", 9210, "B"],["total:41", 1877, "A"]],
+      code:'EVAL "..." 2 cart:41 total:41\n# (error) CROSSSLOT\n\n# Works:\nEVAL "..." 2 {u41}:cart {u41}:total',
+      note:"A script is routed to the node owning its keys, so every key it touches must be in one slot.\n\nThis is why chapter 8 insisted on declaring keys in KEYS rather than constructing them from ARGV. A script that builds a key name internally works perfectly on a single instance and, in cluster mode, is routed based on keys the client declared while touching keys on a different node entirely — which is undefined behaviour rather than a clean error.\n\nRedis 7 tightened this: scripts accessing undeclared keys in cluster mode are rejected. On older versions they may silently read the wrong node's data, which is considerably worse.\n\nDeclare every key. It costs nothing on a single instance and it is the difference between a script that migrates and one that has to be rewritten."},
+    pipeline: {works:"yes", why:"the client splits it by node", fix:"—",
+      slots:[["500 mixed keys", null, "A, B, C"]],
+      code:'pipe = r.pipeline(transaction=False)\nfor k in keys: pipe.get(k)\npipe.execute()\n\n# The cluster client groups commands by node\n# and sends one batch to each.',
+      note:"A pipeline has no atomicity requirement, so a cluster-aware client can split it: group the commands by which node owns their keys, send one batch to each node in parallel, and reassemble the replies in order.\n\nYou get the round-trip saving across an arbitrary key distribution, which is exactly what MGET cannot do.\n\nThis is a strong argument for preferring pipelines over multi-key commands in code that might one day run on a cluster. The pipeline version works everywhere; the MGET version works on one instance and fails with CROSSSLOT on a cluster.\n\nNote that transaction=True wraps it in MULTI, which reintroduces the single-slot requirement. Turn it off explicitly (chapter 14)."},
+    multi: {works:"only within a slot", why:"transactions are single-node", fix:"tag, or restructure",
+      slots:[["orders:41", 3391, "A"],["stock:TSH", 11204, "C"]],
+      code:'MULTI\n  INCR orders:41\n  DECR stock:TSH\nEXEC\n# (error) CROSSSLOT',
+      note:"MULTI executes on one node, so every key in the transaction must be in one slot.\n\nThis one is often harder to work around than the others, because the keys involved frequently belong to different entities by design — an order and a stock level, a user and a global counter. Hash-tagging them together forces unrelated data onto one node, which is exactly the distribution problem you were trying to avoid.\n\nThat tension is worth noticing before you migrate. If your correctness depends on multi-key atomicity across genuinely unrelated entities, cluster mode is asking you to either co-locate them or give up the atomicity — and chapter 8's argument applies: often the right answer is to restructure so the invariant lives in one key."},
+    sinter: {works:"only within a slot", why:"set algebra is single-node", fix:"tag the sets",
+      slots:[["tag:redis", 5581, "B"],["tag:database", 15029, "C"]],
+      code:'SINTER tag:redis tag:database\n# (error) CROSSSLOT\n\n# Works:\nSINTER {tags}:redis {tags}:database',
+      note:"Every server-side set and sorted-set combination — SINTER, SUNION, SDIFF, ZINTERSTORE, ZUNIONSTORE, ZRANGESTORE — requires all inputs in one slot.\n\nTagging all your tag-sets into one slot works and puts them all on one node, which for a tagging index is often acceptable since the sets are small. For anything large it recreates the imbalance.\n\nThe alternative is fetching both sets and intersecting client-side, which transfers far more data and loses the server-side efficiency that made chapter 4's set algebra worth using in the first place.\n\nThere is no good general answer here. It is one of the clearer costs of cluster mode, and worth weighing before adopting it."},
+    scan: {works:"per node only", why:"each node has its own keyspace", fix:"iterate every primary",
+      slots:[["the keyspace", null, "A, B, C"]],
+      code:'# SCAN on one node returns only ITS keys.\n# Iterate every primary:\nfor node in CLUSTER SHARDS primaries:\n    SCAN cursor on that node\n\n# Or let the CLI do it:\nredis-cli --cluster call ... \nredis-cli --scan --pattern "user:*"',
+      note:"Each node holds its own slice of the keyspace and SCAN only walks the node it is sent to. A full iteration means running the cursor loop against every primary and combining the results.\n\nThe same applies to every whole-keyspace command: DBSIZE, KEYS, FLUSHALL, RANDOMKEY. All of them are per node now, so any maintenance script written against a single instance needs rewriting.\n\nIf you have a background job that iterates keys — a cleanup, a migration, an audit — check it before migrating. This is one of the constraints that is easy to forget because it does not produce an error, just an incomplete result."},
+    pubsub: {works:"yes, inefficiently", why:"PUBLISH broadcasts to every node", fix:"SPUBLISH",
+      slots:[["a channel", null, "all nodes"]],
+      code:'PUBLISH room:general "hi"\n# broadcast to EVERY node, since any of\n# them might have a subscriber\n\nSPUBLISH room:general "hi"    # 7.0+\n# hashed to one slot, one node',
+      note:"Plain PUBLISH works and scales the wrong way. Because any node might have a subscriber for a channel, the message is broadcast across the cluster bus to every node — so publishing gets MORE expensive as you add nodes, which is the opposite of what sharding is for.\n\nSharded pub/sub with SPUBLISH and SSUBSCRIBE hashes the channel to a slot like a key, so the message goes to one node and its subscribers only.\n\nThe cost is that subscribers must connect to the node owning that channel's slot and handle MOVED redirection, and patterns are not supported — you cannot route a glob pattern to a single node.\n\nIf you use pub/sub in a cluster at all, use the sharded form (chapter 11)."},
+    select: {works:"NO", why:"cluster mode has only database 0", fix:"prefix your keys",
+      slots:[["—", null, "—"]],
+      code:'SELECT 3\n# (error) ERR SELECT is not allowed in cluster mode\n\n# Use prefixes instead:\nsessions:a3f9\ncache:product:8842',
+      note:"Numbered databases do not exist in cluster mode. Only database 0 is available.\n\nThis is mostly a non-issue because numbered databases were never a good namespacing tool — they share one process, one thread and one memory limit, so they provide separation in name only (chapter 2). Most client libraries handle them poorly too.\n\nIt does break code that uses them, which tends to be older code where different logical datasets were separated by database number. Migrating means prefixing every key and rewriting every access, which is exactly the kind of retrofit that makes cluster migrations expensive.\n\nUse key prefixes from the start, even on a single instance."}
+  };
+
+  function render(){
+    const k = $("x-op").value, o = O[k];
+    const ok = o.works === "yes";
+
+    $("x-slots").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:16px 0 8px">' +
+      'Slot routing</div>' +
+      o.slots.map(([key, slot, node]) =>
+        '<div style="display:flex;align-items:center;gap:14px;background:#fff;border:1px solid #E1E7EC;' +
+        'border-left:3px solid ' + (ok || o.works.startsWith("only") ? "#25B7C4" : "#E2574C") +
+        ';border-radius:4px;padding:8px 12px;margin-bottom:4px;font-family:var(--mono);font-size:12px">' +
+        '<span style="font-weight:700;color:#0F7A85;min-width:150px">' + key + '</span>' +
+        '<span style="color:#54677A;min-width:100px">' + (slot === null ? "—" : "slot " + slot) + '</span>' +
+        '<span style="color:#8FA0AF">node ' + node + '</span></div>').join("");
+
+    $("x-works").textContent = o.works;
+    $("x-why").textContent   = o.why;
+    $("x-fix").textContent   = o.fix;
+
+    $("x-code").innerHTML =
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-left:3px solid ' +
+      (ok ? "#3FB984" : o.works === "NO" ? "#E2574C" : "#F2A03D") +
+      ';border-radius:5px;padding:11px 13px;margin:14px 0 12px;font-family:var(--mono);' +
+      'font-size:12px;line-height:1.65;overflow-x:auto">' +
+      o.code.replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"}[c])) + '</pre>';
+
+    let note = o.note;
+    if(!ok)
+      note += "\n\nThis is the kind of thing to audit BEFORE migrating rather than after. Retrofitting cluster mode means finding every instance of these patterns, and where the fix is a hash tag it also means changing key names — which changes where every key lives and therefore requires a data migration on top of the code change.";
+    $("x-note").textContent = note;
+  }
+
+  $("x-op").addEventListener("change", render);
+  render();
+})();
+</script>
+</body>
+</html>

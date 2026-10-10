@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Physical storage — PostgreSQL</title>
+<meta name="description" content="Pages and tuples, TOAST for oversized values, fillfactor, and why HOT updates decide how much work an UPDATE really does.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 05 · Storage and access</div>
+    <h1>Physical storage</h1>
+    <p class="standfirst">Everything is 8 KB pages. Knowing what fits in one, what happens when a value does not, and when an update can stay inside one explains a surprising amount of performance behaviour — including why some tables bloat far faster than others.</p>
+    <div class="chap-meta">
+      <span class="tagpill">pages</span>
+      <span class="tagpill">toast</span>
+      <span class="tagpill">fillfactor</span>
+      <span class="tagpill">hot updates</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The page</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">8192 bytes, laid out from both ends</span><button class="copy">Copy</button></div>
+<pre><code>┌─────────────────────────────────────────────┐  offset 0
+│ PageHeader (24 bytes)                       │  LSN, checksum, free space
+├─────────────────────────────────────────────┤  pointers
+│ ItemId array →→→→→                          │  4 bytes each, one per tuple
+│                                             │
+│              free space                     │  ← this is what fillfactor
+│                                             │     reserves
+│                          ←←←←← Tuples       │  grow backwards from the end
+│ tuple 3 │ tuple 2 │ tuple 1                 │
+└─────────────────────────────────────────────┘  offset 8191
+
+-- Pointers grow forward from the header; tuple data grows backward from the
+-- end. They meet in the middle, and the gap is the page's free space.
+--
+-- The ItemId indirection is why a tuple can move within its page without
+-- invalidating anything: a ctid of (4, 2) means page 4, item 2, and item 2
+-- points at wherever the tuple currently sits. That is what makes in-page
+-- compaction possible during vacuum.
+
+CREATE EXTENSION pageinspect;
+SELECT * FROM page_header(get_raw_page('orders', 0));
+SELECT lp, lp_off, lp_len, t_xmin, t_xmax, t_ctid
+FROM heap_page_items(get_raw_page('orders', 0));</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">A tuple cannot span pages</span>
+  <p>The largest tuple that fits in an 8 KB page is roughly 8 KB minus the header, and Postgres will not split one across pages. That constraint is the entire reason TOAST exists, and it is also why a row with many wide columns can fail to insert with "row is too big" even though each individual value looks reasonable. The per-tuple overhead is about 23 bytes of header plus alignment padding, which matters when rows are small — a table of two integers is mostly header.</p>
+</div>
+
+<h2><span class="h-rule"></span>Column order affects table size</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">alignment padding, and the free win</span><button class="copy">Copy</button></div>
+<pre><code>-- Fixed-width types must start at an aligned offset, so Postgres inserts
+-- padding bytes. Declaration order therefore changes the size on disk.
+
+CREATE TABLE bad (              -- 24 bytes of data per row
+    a boolean,                  --  1 byte  + 7 padding
+    b bigint,                   --  8 bytes
+    c boolean,                  --  1 byte  + 3 padding
+    d integer                   --  4 bytes
+);                              -- 24 bytes
+
+CREATE TABLE good (             -- 16 bytes for the same data
+    b bigint,                   --  8 bytes
+    d integer,                  --  4 bytes
+    a boolean,                  --  1 byte
+    c boolean                   --  1 byte  + 2 padding at the end
+);                              -- 16 bytes
+
+-- One third smaller, for free. The rule: declare widest fixed-width first
+-- (bigint, timestamptz, double), then narrower (integer, date), then
+-- single-byte (boolean, char), then all variable-length (text, jsonb, numeric).
+--
+-- On a hundred-million-row table this is gigabytes and a materially better
+-- cache hit ratio. On a small table it does not matter at all — so apply it
+-- to your largest tables and ignore it elsewhere.
+
+-- What it costs you now:
+SELECT pg_column_size(ROW(true, 1::bigint, true, 1::integer));</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>TOAST</h2>
+
+<p>The Oversized-Attribute Storage Technique. When a row will not fit in a page, Postgres compresses wide values and, if still too large, moves them to a side table in chunks.</p>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">what happens to a large value</span><button class="copy">Copy</button></div>
+<pre><code>-- The sequence, when a row exceeds ~2 KB (TOAST_TUPLE_THRESHOLD):
+--   1. compress the widest eligible column
+--   2. if the row still does not fit, move that column out of line into the
+--      TOAST table, leaving an 18-byte pointer in its place
+--   3. repeat with the next widest until the row fits
+
+-- Every table with a toastable column gets a hidden companion:
+SELECT c.relname, t.relname AS toast_table,
+       pg_size_pretty(pg_relation_size(c.oid))  AS main,
+       pg_size_pretty(pg_relation_size(t.oid))  AS toast
+FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid
+WHERE c.relname = 'documents';
+
+-- Per-column storage strategy:
+ALTER TABLE documents ALTER COLUMN body SET STORAGE EXTERNAL;
+--   PLAIN     never compressed or moved (only for non-toastable types)
+--   EXTENDED  compress, then move out of line   (default for text, jsonb)
+--   EXTERNAL  move out of line, do NOT compress
+--   MAIN      compress, avoid moving out if possible
+
+-- EXTERNAL is worth knowing: it makes substring() and jsonb field access on
+-- large values much faster, because those can read a slice of an uncompressed
+-- out-of-line value without decompressing the whole thing. The cost is disk.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">TOAST is why a "small" table can be enormous</span>
+  <p><code>pg_relation_size</code> reports only the main table and excludes TOAST, so a table showing 40 MB can occupy 12 GB once its TOAST table is counted. Always use <code>pg_total_relation_size</code>, which includes TOAST and indexes. Related: a <code>SELECT *</code> on a table with a large <code>jsonb</code> column pays to fetch and decompress every TOASTed value, even for columns you never read — which is one of the more expensive versions of the SQL unit's argument against <code>SELECT *</code>.</p>
+</div>
+
+<h2><span class="h-rule"></span>HOT updates</h2>
+
+<div class="demo" id="hot">
+  <div class="demo-head">
+    <b>Heap-only tuple updates</b>
+    <span>Whether an update can stay inside its page decides how much work it really does. Two conditions, and both are under your control.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="h-indexed">Does the update change an indexed column?</label>
+        <select id="h-indexed">
+          <option value="no" selected>No — only non-indexed columns</option>
+          <option value="yes">Yes — an indexed column changes</option>
+        </select>
+      </div>
+      <div>
+        <label for="h-fill">fillfactor — <span id="h-fillv">100</span></label>
+        <input type="range" id="h-fill" min="50" max="100" step="5" value="100">
+      </div>
+      <div>
+        <label for="h-idx">Indexes on the table — <span id="h-idxv">4</span></label>
+        <input type="range" id="h-idx" min="0" max="10" step="1" value="4">
+      </div>
+      <div>
+        <label for="h-rate">Updates per second — <span id="h-ratev">1,000</span></label>
+        <input type="range" id="h-rate" min="1" max="6" step="1" value="4">
+      </div>
+    </div>
+    <div class="stat">
+      <div><b id="h-can">—</b><span>HOT possible?</span></div>
+      <div><b id="h-writes">—</b><span>writes per update</span></div>
+      <div><b id="h-wal">—</b><span>WAL per second</span></div>
+      <div><b id="h-idxbloat">—</b><span>index entries / sec</span></div>
+    </div>
+    <div id="h-diag"></div>
+    <div class="out" id="h-note"></div>
+  </div>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the two conditions, and why it matters so much</span><button class="copy">Copy</button></div>
+<pre><code>-- An update is HOT — heap-only tuple — when BOTH hold:
+--   1. no INDEXED column changed
+--   2. the new tuple fits on the SAME PAGE as the old one
+--
+-- When it is HOT:
+--   * the old tuple gets a pointer to the new one, forming a HOT chain
+--   * NO index entries are written — indexes still point at the old ctid and
+--     the chain is followed to reach the current version
+--   * dead tuples in the chain can be cleaned up by a cheap "page prune"
+--     during any read, without waiting for vacuum
+--
+-- When it is not:
+--   * every index on the table gains an entry
+--   * cleanup requires a full vacuum pass over the table AND every index
+--
+-- On a table with six indexes, that is the difference between one write and
+-- seven, and between cheap opportunistic cleanup and an expensive vacuum.
+
+-- Measure it:
+SELECT relname, n_tup_upd, n_tup_hot_upd,
+       round(100.0 * n_tup_hot_upd / nullif(n_tup_upd, 0), 1) AS hot_pct
+FROM pg_stat_user_tables
+WHERE n_tup_upd > 10000
+ORDER BY n_tup_upd DESC;
+
+-- hot_pct below ~50% on an update-heavy table is worth investigating. The
+-- usual causes are an index on a frequently-changing column, or fillfactor
+-- 100 leaving no room on the page for the new version.</code></pre>
+</div>
+
+<div class="note key">
+  <span class="note-t">Two changes that raise the HOT rate</span>
+  <p><b>Drop the index on the column you keep updating.</b> An index on <code>updated_at</code> or <code>last_seen_at</code> on a hot table is unusually expensive — it disqualifies every update from HOT, on a column whose value changes constantly. Check whether anything actually queries by it. <b>Lower <code>fillfactor</code> on update-heavy tables</b> to 70–90, so each page keeps room for new versions. It costs disk and reduces how many rows fit per page for scans; on a queue or session table it is nearly always worth it. Both are one line, and together they routinely take a table from 20% HOT to 90%.</p>
+</div>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">fillfactor</span><button class="copy">Copy</button></div>
+<pre><code>-- The percentage of a page that INSERTs may fill. The rest is reserved for
+-- future updates to rows already on that page.
+ALTER TABLE sessions SET (fillfactor = 80);
+VACUUM FULL sessions;    -- or pg_repack; existing pages are not rewritten
+                         -- by the ALTER alone
+
+-- Guidance:
+--   100  the default. Right for append-only and read-mostly tables
+--   90   mild update traffic
+--   70-85 heavily updated tables: queues, sessions, counters, state machines
+--   below 70 rarely pays — you are trading a lot of scan efficiency
+--
+-- Index fillfactor exists too and defaults to 90 for B-trees. Leave it unless
+-- you have a specific reason; the default already accounts for page splits.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>The free space map and the visibility map</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th>Fork</th><th>File</th><th>Holds</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><td><b>Main</b></td><td><code>16401</code></td><td>The pages themselves</td><td>Everything</td></tr>
+<tr><td><b>Free space map</b></td><td><code>16401_fsm</code></td><td>Approximate free space per page</td><td>Finding a page for an insert without scanning</td></tr>
+<tr><td><b>Visibility map</b></td><td><code>16401_vm</code></td><td>Two bits per page: all-visible, all-frozen</td><td>Index-only scans; skipping pages during vacuum (chapter 3)</td></tr>
+<tr><td><b>Init</b></td><td><code>16401_init</code></td><td>An empty template</td><td>Unlogged tables, reset after a crash</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note trap">
+  <span class="note-t">The free space map is why deleted space is reused, not returned</span>
+  <p>Chapter 3's point, from the storage side. Vacuum records reclaimed space in the FSM, so the next insert finds a page with room and fills the gap. The file never shrinks — which is correct for a table with ongoing inserts, and unhelpful after a one-off deletion of 90% of the rows. That is the case where <code>VACUUM FULL</code> or <code>pg_repack</code> earns its lock. Note also that the FSM is only updated by vacuum, so a table where autovacuum is starved will keep extending the file even though free space exists inside it.</p>
+</div>
+
+<h2><span class="h-rule"></span>Measuring what a table costs</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">the size query worth saving</span><button class="copy">Copy</button></div>
+<pre><code>SELECT
+    c.relname,
+    pg_size_pretty(pg_total_relation_size(c.oid))                   AS total,
+    pg_size_pretty(pg_relation_size(c.oid))                         AS heap,
+    pg_size_pretty(pg_indexes_size(c.oid))                          AS indexes,
+    pg_size_pretty(coalesce(pg_total_relation_size(c.reltoastrelid), 0)) AS toast,
+    round(100.0 * pg_indexes_size(c.oid) /
+          nullif(pg_total_relation_size(c.oid), 0), 1)              AS pct_indexes,
+    c.reltuples::bigint                                             AS est_rows,
+    pg_size_pretty((pg_relation_size(c.oid) /
+                    nullif(c.reltuples, 0))::bigint)                AS bytes_per_row
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'r' AND n.nspname = 'public'
+ORDER BY pg_total_relation_size(c.oid) DESC
+LIMIT 20;
+
+-- What the columns tell you:
+--   pct_indexes above ~50%   more index than data. Audit them (SQL ch 12)
+--   toast much larger than heap   wide values dominate; check SELECT * usage
+--   bytes_per_row far above the sum of column widths   bloat, or padding</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Checksums and corruption</h2>
+
+<div class="code" data-lang="sql">
+<div class="code-head"><span class="lang">turn them on, and know how to check</span><button class="copy">Copy</button></div>
+<pre><code>SHOW data_checksums;         -- on / off
+
+-- Checksums detect silent corruption from failing storage — a bit flip that
+-- would otherwise be read back as plausible data and propagate into backups
+-- and replicas before anyone notices.
+--
+-- They cost a few percent of CPU and they are OFF by default when a cluster is
+-- created with initdb without --data-checksums. Most managed services enable
+-- them; many self-managed clusters do not, because nobody chose either way.
+--
+-- Enabling on an existing cluster requires downtime:
+--   pg_checksums --enable -D $PGDATA        (cluster must be stopped)
+--
+-- Verify an offline cluster or a restored backup:
+--   pg_checksums --check -D $PGDATA
+--
+-- Corruption in the log looks like:
+--   WARNING:  page verification failed, calculated checksum 21023 but expected 15118
+--   ERROR:  invalid page in block 8213 of relation base/16384/16401
+-- Do not "fix" this by setting ignore_checksum_failure. Take a copy, work out
+-- which relation and which rows, and restore from backup.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">Check whether checksums are on before you need them</span>
+  <p>Without them, a failing disk corrupts a page, Postgres reads it back happily, and the bad data flows into your replicas and your backups. By the time a query returns something impossible, every copy you have is contaminated and you cannot tell when it started. With them, the read fails loudly at the moment of corruption and your backups from before that point are known good. It is one flag at cluster creation and a painful migration afterwards — so check <code>SHOW data_checksums</code> on every cluster you own, today.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li>Everything is <b>8 KB pages</b>, with pointers growing forward and tuples backward. A tuple cannot span pages.</li>
+    <li><b>Column order changes table size</b> through alignment padding — widest fixed-width first. Free, and worth doing on large tables.</li>
+    <li><b>TOAST</b> compresses and relocates wide values. Use <code>pg_total_relation_size</code>, or you will not see it.</li>
+    <li>A <b>HOT update</b> writes no index entries — but only if no indexed column changed <em>and</em> the new tuple fits on the same page.</li>
+    <li><b>An index on a constantly-updated column disqualifies every update from HOT.</b> Check whether anything queries by it.</li>
+    <li><b>Lower <code>fillfactor</code> to 70–90 on update-heavy tables</b> so there is room on the page for new versions.</li>
+    <li>Track <code>n_tup_hot_upd</code> as a percentage. <b>Below 50% on a hot table is worth investigating.</b></li>
+    <li><b>Check <code>data_checksums</code> today.</b> Without them, corruption propagates silently into replicas and backups.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("05-storage.html");
+
+(function(){
+  const root = document.getElementById("hot");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+  const RATE = [10, 100, 500, 1000, 5000, 20000];
+
+  function render(){
+    const indexed = $("h-indexed").value === "yes";
+    const fill = parseInt($("h-fill").value, 10);
+    const idx  = parseInt($("h-idx").value, 10);
+    const rate = RATE[parseInt($("h-rate").value, 10) - 1];
+    $("h-fillv").textContent = fill;
+    $("h-idxv").textContent  = idx;
+    $("h-ratev").textContent = rate.toLocaleString();
+
+    // room on the page: fillfactor 100 leaves nothing reserved, so HOT depends
+    // on incidental free space; lower fillfactor reserves it deliberately.
+    const roomProb = fill >= 100 ? 0.35 : Math.min(0.98, 0.35 + (100 - fill) * 0.032);
+    const hotRate = indexed ? 0 : roomProb;
+
+    const canHot = !indexed && roomProb > 0.5;
+    $("h-can").textContent = indexed ? "no — indexed col" : roomProb > 0.5 ? "mostly" : "sometimes";
+
+    const writesPerUpdate = 1 + (1 - hotRate) * idx;
+    const walPerUpdate = 0.35 + (1 - hotRate) * idx * 0.09;   // KB
+    const idxEntries = rate * (1 - hotRate) * idx;
+
+    $("h-writes").textContent   = writesPerUpdate.toFixed(1);
+    $("h-wal").textContent      = (rate * walPerUpdate / 1024).toFixed(1) + " MB/s";
+    $("h-idxbloat").textContent = Math.round(idxEntries).toLocaleString();
+
+    const rows = [
+      ["HOT updates (no index writes)", hotRate * 100, "#3FB984"],
+      ["Non-HOT (writes " + idx + " index entries)", (1 - hotRate) * 100, "#E2574C"]
+    ];
+    $("h-diag").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#54677A;margin:14px 0 8px">' +
+      'Share of updates</div>' +
+      rows.map(([lab, v, col]) =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px">' +
+        '<span style="min-width:230px;font-size:13px">' + lab + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' + Math.max(0.5, v).toFixed(0) +
+        '%;background:' + col + '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:48px;text-align:right">' +
+        v.toFixed(0) + '%</span></div>').join("");
+
+    const notes = [];
+    if(indexed){
+      notes.push("No update can be HOT, because an indexed column changed. Every one of the " + rate.toLocaleString() +
+                 " updates per second writes a new tuple AND " + idx + " index entries — " + Math.round(idxEntries).toLocaleString() +
+                 " index writes per second that could have been zero.");
+      notes.push("This is the highest-leverage thing to check on an update-heavy table. If the column being updated is something like updated_at or last_seen_at, " +
+                 "ask whether anything actually queries by it. Dropping that one index frequently takes a table from near-0% HOT to 80%+, " +
+                 "which cuts write volume, WAL volume, index bloat and vacuum cost all at once.");
+    } else if(fill >= 100){
+      notes.push("No indexed column changes, so HOT is possible — but fillfactor 100 means pages are packed at insert time and there is often no room for the new version. " +
+                 "About " + Math.round(roomProb*100) + "% of updates find incidental space; the rest must go to another page, which breaks the chain and writes " + idx + " index entries.");
+      notes.push("Setting fillfactor to 80 on this table reserves room on each page deliberately. It costs disk and fits fewer rows per page for scans — " +
+                 "on a table with this much update traffic that is nearly always the right trade.");
+    } else {
+      notes.push("Both conditions are largely satisfied: no indexed column changes, and fillfactor " + fill + " reserves room on the page. " +
+                 "About " + Math.round(hotRate*100) + "% of updates stay heap-only, writing no index entries at all.");
+      notes.push("HOT chains also get cleaned up opportunistically during ordinary page reads, without waiting for a vacuum pass — " +
+                 "so a high HOT rate reduces vacuum pressure as well as write volume. The two problems in chapter 3 shrink together.");
+    }
+
+    if(idx >= 7)
+      notes.push(idx + " indexes is a lot for a table taking " + rate.toLocaleString() + " updates per second. Each one is a write per non-HOT update, " +
+                 "an entry to clean up during vacuum, and pages competing for cache. Audit them with idx_scan (SQL chapter 12) — a third are usually unused.");
+
+    if(rate >= 5000 && !canHot)
+      notes.push("At " + rate.toLocaleString() + " updates per second with HOT largely unavailable, this table will bloat quickly and vacuum will struggle to keep up. " +
+                 "Chapter 3's per-table autovacuum settings are a mitigation; fixing the HOT rate is the actual fix.");
+
+    notes.push("The room-on-page probability is modelled, not measured. Get your real figure from n_tup_hot_upd / n_tup_upd in pg_stat_user_tables — that number is exact and it is the one to track.");
+    $("h-note").textContent = notes.join("\n\n");
+  }
+
+  ["h-indexed","h-fill","h-idx","h-rate"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

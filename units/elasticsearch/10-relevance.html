@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Relevance and BM25 — Elasticsearch</title>
+<meta name="description" content="Where the score comes from, how to read an explain output, and the levers: boosting, function score, and knowing precision from recall.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%2325B7C4' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div class="scrim"></div>
+<div class="shell">
+<nav class="rail" aria-label="Chapters"></nav>
+<div class="page">
+  <div class="topbar"><div class="topbar-in">
+    <div class="crumb"></div>
+    <div class="topbar-right"><span class="readpct">0%</span></div>
+    <span class="scrollbar"></span>
+  </div></div>
+
+  <article>
+    <div class="chap-eyebrow"><span class="tick"></span>Chapter 10 · Searching</div>
+    <h1>Relevance and BM25</h1>
+    <p class="standfirst">The number in <code>_score</code> is not arbitrary and it is not comparable between queries. It comes from three quantities — how often the term appears, how rare the term is, and how long the field is — combined by a formula worth understanding, because tuning relevance without it is guesswork.</p>
+    <div class="chap-meta">
+      <span class="tagpill">bm25</span>
+      <span class="tagpill">scoring</span>
+      <span class="tagpill">boosting</span>
+      <span class="tagpill">explain</span>
+    </div>
+
+    <div class="body">
+
+<h2><span class="h-rule"></span>The formula</h2>
+
+<div class="code" data-lang="text">
+<div class="code-head"><span class="lang">BM25, for one term in one field</span><button class="copy">Copy</button></div>
+<pre><code>                            tf × (k1 + 1)
+  score = IDF  ×  ───────────────────────────────────
+                  tf + k1 × (1 − b + b × dl / avgdl)
+
+  where
+
+    tf     term frequency — occurrences of the term IN THIS FIELD
+    dl     the length of this field, in terms
+    avgdl  the average field length across the index
+    IDF    inverse document frequency = ln(1 + (N − n + 0.5) / (n + 0.5))
+             N = documents in the index
+             n = documents containing the term
+    k1     1.2  — how fast term frequency saturates
+    b      0.75 — how much field length matters
+
+  A multi-term query sums the per-term scores. A multi-field query combines
+  them with dis_max or a sum depending on type (chapter 7).
+
+THREE INTUITIONS, and they are the whole thing:
+
+  MORE OCCURRENCES IS BETTER, WITH DIMINISHING RETURNS. The tf term
+  saturates: going from 1 to 2 occurrences helps a lot, 20 to 21 barely at
+  all. That is the "25" refinement over classic TF-IDF, where frequency
+  contributed linearly and a page repeating a word 400 times won.
+
+  RARE TERMS MATTER MORE. IDF rises as fewer documents contain the term. A
+  match on "quixotic" says far more than a match on "the", and this is
+  computed from your actual corpus rather than a stopword list.
+
+  SHORTER FIELDS MATCHING IS STRONGER. A term in a 4-word title is a bigger
+  fraction of that field than the same term in a 4,000-word body. The b
+  parameter controls how hard this applies.</code></pre>
+</div>
+
+<div class="demo" id="bm">
+  <div class="demo-head">
+    <b>Compute a real BM25 score</b>
+    <span>The actual formula, with Elasticsearch's default parameters. Move the inputs and watch which factor dominates.</span>
+  </div>
+  <div class="demo-body">
+    <div class="row">
+      <div>
+        <label for="b-tf">Occurrences in this field — <span id="b-tfv">2</span></label>
+        <input type="range" id="b-tf" min="1" max="30" step="1" value="2">
+      </div>
+      <div>
+        <label for="b-dl">Field length — <span id="b-dlv">40</span> terms</label>
+        <input type="range" id="b-dl" min="3" max="400" step="1" value="40">
+      </div>
+      <div>
+        <label for="b-n">Documents containing the term — <span id="b-nv">1,000</span></label>
+        <input type="range" id="b-n" min="0" max="6" step="1" value="3">
+      </div>
+      <div>
+        <label for="b-k1">k1 — <span id="b-k1v">1.2</span></label>
+        <input type="range" id="b-k1" min="0" max="30" step="1" value="12">
+      </div>
+      <div>
+        <label for="b-b">b — <span id="b-bv">0.75</span></label>
+        <input type="range" id="b-b" min="0" max="10" step="1" value="8">
+      </div>
+    </div>
+    <div id="b-calc"></div>
+    <div class="stat">
+      <div><b id="b-score">—</b><span>_score</span></div>
+      <div><b id="b-idf">—</b><span>IDF</span></div>
+      <div><b id="b-tfnorm">—</b><span>tf component</span></div>
+      <div><b id="b-driver">—</b><span>dominant factor</span></div>
+    </div>
+    <div class="out" id="b-note"></div>
+  </div>
+</div>
+
+<div class="note key">
+  <span class="note-t">Scores are not comparable across queries, and not a percentage</span>
+  <p><code>_score</code> is meaningful only as an ordering within one result set. It has no upper bound, no unit and no absolute interpretation — a score of 8.4 for one query and 8.4 for another say nothing about each other, because IDF depends on the corpus and the number of clauses affects the sum. That has two practical consequences. <b>Never threshold on a raw score</b> (<code>min_score: 5</code>) and expect it to mean the same thing next month, because as the index grows the IDF values shift. And never show it to users as a relevance percentage — dividing by <code>max_score</code> gives you a number where the top hit is always 100%, whether it was a perfect match or the least-bad of a bad set.</p>
+</div>
+
+<h2><span class="h-rule"></span>Reading an explain</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">the API that answers "why is this ranked here"</span><button class="copy">Copy</button></div>
+<pre><code>GET /products/_explain/8842
+{ "query": { "match": { "name": "wireless headphones" } } }
+
+{
+  "matched": true,
+  "explanation": {
+    "value": 3.412,
+    "description": "sum of:",
+    "details": [
+      { "value": 1.981,
+        "description": "weight(name:wireless in 41) [PerFieldSimilarity]",
+        "details": [
+          { "value": 2.114, "description": "idf, computed as log(1 + (N - n + 0.5) / (n + 0.5))",
+            "details": [ { "value": 1204, "description": "n, number of documents containing term" },
+                         { "value": 10000, "description": "N, total number of documents" } ] },
+          { "value": 0.937, "description": "tf, computed as freq / (freq + k1 * (1 - b + b * dl / avgdl))",
+            "details": [ { "value": 2.0,  "description": "freq, occurrences of term within document" },
+                         { "value": 1.2,  "description": "k1, term saturation parameter" },
+                         { "value": 0.75, "description": "b, length normalization parameter" },
+                         { "value": 6.0,  "description": "dl, length of field" },
+                         { "value": 12.4, "description": "avgdl, average length of field" } ] } ] },
+      { "value": 1.431, "description": "weight(name:headphones in 41) ..." }
+    ]
+  }
+}
+
+# READ IT INSIDE OUT. Every leaf is one of N, n, freq, dl, avgdl, k1, b.
+# Every branch is a sum, a product, or a max — the description says which.
+#
+# WHAT IT ANSWERS:
+#   * did this document match at all ("matched": false is the answer to
+#     half of all relevance questions)
+#   * which term contributed most
+#   * whether the ranking is being driven by IDF (a rare term) or by tf
+#     (repetition) or by length normalisation (a short field)
+
+# ON A WHOLE RESULT SET instead of one document:
+GET /products/_search
+{ "explain": true, "query": { ... } }
+# Verbose. Use it on size: 2 while debugging, never in production.
+
+# COMPARING TWO DOCUMENTS is the usual real question: why does B outrank A?
+# Run _explain for both, put the two trees side by side, and the differing
+# leaf is your answer. It is almost always dl or n.</code></pre>
+</div>
+
+<div class="note warn">
+  <span class="note-t">IDF is computed per shard, so scores differ across shards</span>
+  <p>Each shard computes <code>N</code> and <code>n</code> from <em>its own</em> documents, because gathering global statistics before scoring would mean an extra round trip on every search. With a large, evenly distributed index the per-shard values approximate the global ones closely enough that nobody notices. With a small index, or unevenly distributed data — a shard where a term is rare and another where it is common — <b>the same document can score differently depending on which shard it landed on</b>, and near-identical documents can rank in a surprising order. Two remedies: <code>?search_type=dfs_query_then_fetch</code> gathers global term statistics first at the cost of a round trip, and using fewer shards makes the problem smaller. It is also the reason relevance testing on a three-document index produces nonsense.</p>
+</div>
+
+<h2><span class="h-rule"></span>The levers, weakest to strongest</h2>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">field boosts, then query boosts, then functions</span><button class="copy">Copy</button></div>
+<pre><code># 1. FIELD BOOSTS — a multiplier on that field's contribution
+{ "multi_match": { "query": "sony", "fields": [ "name^3", "brand^2", "body" ] } }
+
+# 2. CLAUSE BOOSTS — the same idea on a whole clause
+{ "bool": { "should": [
+    { "match": { "name":  { "query": "sony", "boost": 3 } } },
+    { "match": { "body":  { "query": "sony", "boost": 1 } } } ]}}
+
+# Both are just numbers multiplied into the score, which means their effect
+# depends on what the scores already are. A boost of 3 on a field whose
+# scores are around 0.5 is worth less than a boost of 1.2 on a field whose
+# scores are around 8. This is why boost tuning feels unscientific — it is
+# arithmetic on quantities you have not looked at. Look at them first with
+# _explain.
+
+# 3. FUNCTION_SCORE — modify the score with a function of field values
+{ "function_score": {
+    "query": { "match": { "name": "headphones" } },
+    "functions": [
+      { "field_value_factor": {
+          "field": "sales_rank_inverse",
+          "modifier": "log1p",              # tame the distribution
+          "factor": 1.2,
+          "missing": 1 } },
+      { "gauss": {                          # decay by recency
+          "released": { "origin": "now", "scale": "180d", "decay": 0.5 } } },
+      { "filter": { "term": { "featured": true } }, "weight": 1.5 }
+    ],
+    "score_mode": "sum",                    # combine the functions
+    "boost_mode": "multiply",               # combine with the query score
+    "max_boost": 5
+}}
+
+#   score_mode  multiply | sum | avg | first | max | min
+#   boost_mode  multiply | replace | sum | avg | max | min
+#
+#   DECAY FUNCTIONS: gauss, exp, linear. Each takes origin, scale, offset,
+#   decay — and they work on dates, numbers and geo_points, which makes them
+#   the right tool for "nearer is better" and "newer is better".
+
+# 4. DISTANCE FEATURE — cheaper than function_score for the common cases,
+#    and it can be used as a should clause so it only boosts:
+{ "bool": { "should": [
+    { "distance_feature": {
+        "field": "released", "pivot": "180d", "origin": "now" } } ]}}
+# Designed to be efficient enough to use on every query, unlike
+# function_score which scores every matching document.
+
+# 5. RESCORE — re-rank only the top N with an expensive query
+{ "query": { "match": { "name": "wireless headphones" } },
+  "rescore": {
+    "window_size": 100,
+    "query": {
+      "rescore_query": { "match_phrase": { "name": { "query": "wireless headphones", "slop": 2 } } },
+      "query_weight": 0.7, "rescore_query_weight": 1.3 }
+}}
+# THE MOST UNDERUSED FEATURE HERE. A phrase query over the whole index is
+# expensive; over the top 100 candidates it is free. This is how you get
+# "documents where the terms are adjacent rank higher" without paying for
+# positional matching across millions of documents.</code></pre>
+</div>
+
+<h2><span class="h-rule"></span>Precision and recall</h2>
+
+<div class="cols">
+  <div class="col">
+    <h4>Recall too low — results are missing</h4>
+    <ul>
+      <li>Loosen <code>minimum_should_match</code>, or drop <code>"operator": "and"</code></li>
+      <li>Add <code>fuzziness: "AUTO"</code> for typos</li>
+      <li>Add a stemming analyzer, or the right language one (chapter 3)</li>
+      <li>Add synonyms for vocabulary the corpus does not use</li>
+      <li>Search more fields with <code>multi_match</code></li>
+      <li>Check for the <code>term</code>-on-<code>text</code> bug first (chapter 8)</li>
+    </ul>
+  </div>
+  <div class="col">
+    <h4>Precision too low — results are junk</h4>
+    <ul>
+      <li>Tighten <code>minimum_should_match</code> to <code>"75%"</code> or higher</li>
+      <li>Move exact conditions into <code>filter</code> (chapter 7)</li>
+      <li>Use <code>match_phrase</code>, or <code>rescore</code> with one</li>
+      <li>Reduce over-aggressive stemming or synonyms</li>
+      <li>Boost the fields that indicate real relevance</li>
+      <li>Check that <code>should</code> clauses are not letting junk qualify</li>
+    </ul>
+  </div>
+</div>
+
+<div class="note trap">
+  <span class="note-t">Tune against a judgement list, not against your own intuition</span>
+  <p>Relevance tuning by trying a query, looking at the results and adjusting a boost is a process that converges on the queries you happen to try. It very reliably makes some other query worse without telling you. <b>The alternative is a ranking evaluation set</b>: a list of queries with the documents that <em>should</em> be in their top results, from analytics, from support tickets, or from asking colleagues. Elasticsearch has an API for exactly this — <code>POST /products/_rank_eval</code> with your queries and their expected hits, returning precision, recall, mean reciprocal rank or NDCG. Run it before and after every change. It turns "this feels better" into a number, and it is the difference between tuning relevance and fiddling with it.</p>
+</div>
+
+<div class="code" data-lang="bash">
+<div class="code-head"><span class="lang">rank_eval, concretely</span><button class="copy">Copy</button></div>
+<pre><code>POST /products/_rank_eval
+{
+  "requests": [
+    { "id": "wireless-headphones",
+      "request": { "query": { "multi_match": {
+          "query": "wireless headphones",
+          "fields": [ "name^3", "description" ] } } },
+      "ratings": [
+        { "_index": "products", "_id": "8842", "rating": 3 },
+        { "_index": "products", "_id": "1204", "rating": 2 },
+        { "_index": "products", "_id": "9911", "rating": 0 }
+      ] },
+    { "id": "noise-cancelling", "request": { ... }, "ratings": [ ... ] }
+  ],
+  "metric": { "dcg": { "k": 10, "normalize": true } }
+}
+
+# -> { "metric_score": 0.812, "details": { per-query breakdown } }
+
+#   precision_at_k         fraction of the top k that are relevant
+#   recall_at_k            fraction of relevant documents in the top k
+#   mean_reciprocal_rank   how high the FIRST relevant result appears
+#   dcg (normalize: true)  NDCG — graded relevance, position-discounted.
+#                          The right default when your ratings have degrees
+#   expected_reciprocal_rank
+#
+# THIRTY QUERIES WITH RATINGS is enough to catch most regressions and is a
+# couple of hours of work. It is the highest-value hour anyone spends on
+# search quality, and it is skipped almost universally.</code></pre>
+</div>
+
+<div class="note tip">
+  <span class="note-t">Tuning BM25 itself is almost never the answer</span>
+  <p><code>k1</code> and <code>b</code> are configurable per field via a custom similarity, and the defaults of 1.2 and 0.75 are the product of a great deal of information-retrieval research on general text. The honest guidance is to leave them alone. <b>Two exceptions worth knowing</b>: for a field where length carries no information — a tag list, a set of identifiers, a product code — <code>b: 0</code> disables length normalisation and is a genuine improvement, since a document with four tags is not more relevant than one with eight. And for short, uniform fields where repetition is meaningless, <code>k1: 0</code> makes term frequency irrelevant so any occurrence counts once. Both are narrow, structural cases. If your ranking problem is "the wrong documents are winning", the answer is in the query, the mapping or the analysis — not in these two constants.</p>
+</div>
+
+<div class="recap">
+  <h2>The short version</h2>
+  <ol>
+    <li><b>BM25 combines term frequency, inverse document frequency and field length</b> with two constants, <code>k1</code> and <code>b</code>.</li>
+    <li><b>Term frequency saturates</b> — that is the improvement over TF-IDF, where a page repeating a word 400 times won.</li>
+    <li><b>Scores are not comparable across queries</b> and are not percentages. Do not threshold on them; do not show them.</li>
+    <li><b>IDF is per shard</b>, so small or skewed indices score oddly. That is why testing relevance on three documents is meaningless.</li>
+    <li><b><code>_explain</code> answers "why"</b>, and the differing leaf between two documents is almost always <code>dl</code> or <code>n</code>.</li>
+    <li><b>Boosts are multipliers on numbers you have not looked at.</b> Look at them with <code>_explain</code> before tuning.</li>
+    <li><b><code>rescore</code> is the most underused feature here</b> — an expensive phrase query over 100 candidates instead of millions.</li>
+    <li><b>Tune against a <code>rank_eval</code> judgement list.</b> Thirty rated queries catches most regressions.</li>
+  </ol>
+</div>
+
+    </div>
+    <nav class="pager"></nav>
+  </article>
+</div>
+</div>
+
+<script src="assets/unit.js"></script>
+<script>
+initChapter("10-relevance.html");
+
+(function(){
+  const root = document.getElementById("bm");
+  if(!root) return;
+  const $ = id => document.getElementById(id);
+
+  const N = 10000;
+  const NVALS = [1, 10, 100, 1000, 3000, 6000, 9500];
+  const AVGDL = 40;
+
+  function render(){
+    const tf = parseInt($("b-tf").value, 10);
+    const dl = parseInt($("b-dl").value, 10);
+    const ni = parseInt($("b-n").value, 10);
+    const n  = NVALS[ni];
+    const k1 = parseInt($("b-k1").value, 10) / 10;
+    const b  = parseInt($("b-b").value, 10) / 10;
+
+    $("b-tfv").textContent = tf;
+    $("b-dlv").textContent = dl;
+    $("b-nv").textContent  = n.toLocaleString();
+    $("b-k1v").textContent = k1.toFixed(1);
+    $("b-bv").textContent  = b.toFixed(2);
+
+    const idf = Math.log(1 + (N - n + 0.5) / (n + 0.5));
+    const norm = k1 * (1 - b + b * dl / AVGDL);
+    const tfComp = (tf * (k1 + 1)) / (tf + norm);
+    const score = idf * tfComp;
+
+    $("b-score").textContent  = score.toFixed(3);
+    $("b-idf").textContent    = idf.toFixed(3);
+    $("b-tfnorm").textContent = tfComp.toFixed(3);
+
+    // which factor is doing the work: compare against baselines
+    const idfBase = Math.log(1 + (N - 1000 + 0.5) / (1000.5));
+    const tfBase  = (2 * (k1 + 1)) / (2 + k1 * (1 - b + b * 1));
+    const idfDelta = Math.abs(idf - idfBase) / idfBase;
+    const tfDelta  = Math.abs(tfComp - tfBase) / tfBase;
+    const lenDelta = Math.abs(dl - AVGDL) / AVGDL;
+
+    let driver;
+    if(idfDelta > tfDelta && idfDelta > 0.25) driver = n < 100 ? "term rarity" : "term commonness";
+    else if(lenDelta > 0.8) driver = dl < AVGDL ? "short field" : "long field";
+    else if(tf > 8) driver = "saturated tf";
+    else driver = "balanced";
+    $("b-driver").textContent = driver;
+
+    const bars = [
+      ["IDF — term rarity", idf, 10, "#E0699F"],
+      ["tf component", tfComp, k1 + 1, "#25B7C4"],
+      ["field length penalty", norm, k1 * (1 - b + b * 400/AVGDL), "#F2A03D"],
+      ["final _score", score, 20, "#3FB984"]
+    ];
+
+    $("b-calc").innerHTML =
+      '<div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;' +
+      'color:#54677A;margin:16px 0 8px">The calculation</div>' +
+      '<pre style="background:#F4F7F9;border:1px solid #E1E7EC;border-radius:5px;padding:11px 13px;' +
+      'margin:0 0 12px;font-family:var(--mono);font-size:11.5px;line-height:1.75;overflow-x:auto">' +
+      'IDF = ln(1 + (' + N.toLocaleString() + ' − ' + n.toLocaleString() + ' + 0.5) / (' +
+      n.toLocaleString() + ' + 0.5))\n    = ' + idf.toFixed(4) + '\n\n' +
+      'norm = ' + k1.toFixed(1) + ' × (1 − ' + b.toFixed(2) + ' + ' + b.toFixed(2) +
+      ' × ' + dl + '/' + AVGDL + ')\n     = ' + norm.toFixed(4) + '\n\n' +
+      'tf   = (' + tf + ' × ' + (k1 + 1).toFixed(1) + ') / (' + tf + ' + ' + norm.toFixed(4) +
+      ')\n     = ' + tfComp.toFixed(4) + '\n\n' +
+      'score = ' + idf.toFixed(4) + ' × ' + tfComp.toFixed(4) + ' = ' + score.toFixed(4) +
+      '</pre>' +
+      bars.map(([lab, v, max, col]) =>
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:5px">' +
+        '<span style="min-width:158px;font-size:12.5px">' + lab + '</span>' +
+        '<span class="bar" style="flex:1"><i style="width:' +
+        Math.max(1, Math.min(100, v/max*100)).toFixed(1) + '%;background:' + col + '"></i></span>' +
+        '<span style="font-family:var(--mono);font-size:11.5px;color:#54677A;min-width:48px;text-align:right">' +
+        v.toFixed(3) + '</span></div>').join("");
+
+    const notes = [];
+
+    if(n <= 10)
+      notes.push("The term appears in only " + n.toLocaleString() + " of " + N.toLocaleString() +
+        " documents, so IDF is " + idf.toFixed(2) +
+        " — very high. A match on something this rare is a strong signal and BM25 weights it accordingly.\n\nThis is computed from your actual corpus, not from a stopword list, which is why it adapts. In a corpus of medical papers \"patient\" is nearly a stopword and IDF handles that automatically.");
+    else if(n >= 6000)
+      notes.push("The term appears in " + n.toLocaleString() + " of " + N.toLocaleString() +
+        " documents — most of them — so IDF collapses to " + idf.toFixed(3) +
+        " and matching it contributes almost nothing.\n\nThat is the correct behaviour and it is why explicit stopword removal is less important than it used to be: IDF already discounts common words to near-zero. Removing them from the index saves space and breaks phrase queries; leaving them in costs space and lets BM25 ignore them.");
+    else
+      notes.push("IDF is " + idf.toFixed(2) + " for a term in " + n.toLocaleString() + " of " +
+        N.toLocaleString() + " documents. Middling rarity, middling contribution.\n\nNote that this quantity is computed PER SHARD, from that shard's own document counts. On a large evenly-distributed index the per-shard values approximate the global ones closely. On a small or skewed index they do not, and the same document can score differently depending on where it landed.");
+
+    if(tf >= 12)
+      notes.push("At " + tf + " occurrences the tf component is " + tfComp.toFixed(3) +
+        ", against a ceiling of " + (k1 + 1).toFixed(1) +
+        ". Drag it higher and watch how little changes — the curve has flattened.\n\nThis saturation is the \"25\" in BM25 and the main improvement over classic TF-IDF, where term frequency contributed linearly. Under TF-IDF a page repeating a keyword four hundred times outranked everything, which is exactly what early search-engine spam exploited.\n\nk1 controls how quickly it saturates. Lower k1 flattens the curve sooner.");
+    else if(tf === 1)
+      notes.push("A single occurrence. The tf component is " + tfComp.toFixed(3) +
+        ", and moving to 2 occurrences is the largest single jump available in the whole curve — the first repetition is worth much more than the tenth.");
+
+    if(dl <= 10)
+      notes.push("At " + dl + " terms against an average of " + AVGDL +
+        ", this field is much shorter than typical, so the length normalisation term is small and the tf component is boosted.\n\nThis is the mechanism behind title matches outranking body matches without any explicit boost: a term in a five-word title is a large fraction of that field, while the same term in a two-thousand-word body is noise. The effect is often mistaken for a configured field weight.");
+    else if(dl >= 250)
+      notes.push("At " + dl + " terms — over six times the average — the length penalty is heavy. The normalisation term is " +
+        norm.toFixed(2) + ", which pushes the tf component down substantially.\n\nBM25's assumption is that a long document mentioning your term is less about your term than a short one that mentions it. That is usually right and occasionally wrong: a long, comprehensive reference page may genuinely be the best result, and this is the factor working against it. Field boosts or function_score on a quality signal are the counterweight.");
+
+    if(b <= 0.1)
+      notes.push("With b at " + b.toFixed(2) + " length normalisation is effectively off — field length no longer affects the score at all.\n\nThat is a legitimate configuration for a specific case: a field where length carries no information, such as a tag list, a set of identifiers or a product code. A document with four tags is not more relevant than one with eight, and the default b of 0.75 penalises the second one for no reason.\n\nFor prose, leave b alone. The default is the product of a lot of information-retrieval research.");
+
+    if(k1 <= 0.1)
+      notes.push("With k1 at " + k1.toFixed(1) +
+        " term frequency barely matters — any occurrence counts about the same as many.\n\nThis is occasionally right for short uniform fields where repetition is meaningless. For general text it discards a real signal.");
+
+    if(driver === "balanced" && b > 0.5 && k1 > 0.9)
+      notes.push("With defaults and typical inputs, no single factor dominates — which is the point of the formula. Each of the three quantities contributes and none can run away with the ranking.\n\nMove any slider to an extreme to see which lever you would be pulling if you changed the corresponding thing about your data or configuration.");
+
+    $("b-note").textContent = notes.join("\n\n");
+  }
+
+  ["b-tf","b-dl","b-n","b-k1","b-b"].forEach(id => $(id).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

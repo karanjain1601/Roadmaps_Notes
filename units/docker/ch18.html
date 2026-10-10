@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · Hardening — Docker</title>
+<meta name="description" content="The root problem, capabilities and what to drop, seccomp and AppArmor, what the Docker socket really grants, escalation paths, rootless Docker and a hardened configuration.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Crect x='6' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='19' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='10' width='5' height='5' fill='%23fff'/%3E%3Cpath d='M4 22h22a5 5 0 004-4' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch18">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Docker
+    </a>
+    <div class="chno"><b>Chapter 18</b><span>Security and operations</span></div>
+    <h1>Hardening</h1>
+    <p class="lede">Chapter 17 was about knowing which packages have known problems. This chapter is about making it not matter very much. <b>A container is a process with restrictions, and the restrictions are all optional</b> — which means the interesting question is not "is my container secure" but "what exactly can this process do, and what would it take to get out".</p>
+    <div class="meta"><span>30 min</span><span>2 demos</span><span>8 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="root">
+      <h2 data-nav="The root problem">The root problem</h2>
+      <p class="sub">There is no user namespace by default, so container root is host root.</p>
+      <p>Chapters 2 and 11 established the mechanism; here is the consequence. A container running as UID 0 is running as <em>the host's</em> UID 0, restricted only by the capability set, seccomp profile and namespaces it happens to have. Remove any of those restrictions and root in the container is root on the machine.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">what root in a container still cannot do — by default</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run --rm -it alpine sh
+/ # id
+uid=0(root) gid=0(root)
+/ # mount -t tmpfs none /mnt
+mount: permission denied                      # no CAP_SYS_ADMIN, and seccomp blocks mount
+/ # sysctl -w kernel.hostname=x
+sysctl: error setting key: Read-only file system
+/ # touch /proc/sysrq-trigger
+touch: /proc/sysrq-trigger: Read-only file system
+
+$ docker run --rm -it --privileged alpine sh
+/ # mount -t tmpfs none /mnt                  # works. And so does everything else
+/ # fdisk -l                                   # the host's disks</pre>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">running as a non-root user, properly</span><button class="copy">Copy</button></div>
+<pre data-lang="dockerfile"># create the user at build time, own what it needs, then switch
+RUN addgroup -g 10001 app &amp;&amp; adduser -u 10001 -G app -S -H app
+COPY --from=build --chown=10001:10001 /out/app /app/
+USER 10001:10001                    # numeric, so it works on scratch too (ch. 7)</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Why non-root matters even with capabilities dropped</th></tr></thead>
+          <tbody>
+            <tr><td>A kernel vulnerability reachable only by UID 0 becomes unreachable</td></tr>
+            <tr><td>Files written to bind mounts belong to a real user, not host root (chapter 11)</td></tr>
+            <tr><td>Container-internal escalation via setuid binaries needs somewhere to escalate <em>from</em></td></tr>
+            <tr><td>Most platform policies (Kubernetes <code>runAsNonRoot</code>) simply require it</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="caps">
+      <h2 data-nav="Capabilities">Capabilities</h2>
+      <p class="sub">Docker grants fourteen by default. Most workloads need none of them.</p>
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Capability audit</h3>
+          <span class="hint">What your workload actually needs, and the flags that follow</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl" id="c-profile"></div>
+          <div id="c-table" style="overflow-x:auto"></div>
+          <div class="term" id="c-term"></div>
+          <div class="rgrid" id="c-out"></div>
+          <p class="readout" id="c-note"></p>
+        </div>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">inspecting and restricting</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run --rm alpine sh -c 'apk add -q libcap; capsh --print | head -3'
+$ docker run --rm --cap-drop ALL alpine sh -c 'apk add -q libcap; capsh --print | head -3'
+
+# drop everything, then add back only what is proven necessary
+$ docker run --cap-drop ALL --cap-add NET_BIND_SERVICE nginx
+$ docker inspect -f '{{.HostConfig.CapDrop}} {{.HostConfig.CapAdd}}' web</pre>
+      </div>
+      <div class="key">
+        <span class="lbl"><code>NET_BIND_SERVICE</code> is usually avoidable</span>
+        <p>It exists to bind ports below 1024, and there is rarely a reason for a container to do so: listen on 8080 inside and publish it as 80 outside (<code>-p 80:8080</code>), and the capability becomes unnecessary. Official images increasingly ship unprivileged variants that do exactly this. The general principle: a capability you need because of a <em>configuration choice</em> is a capability you can remove by changing the configuration.</p>
+      </div>
+      <div class="warn">
+        <span class="lbl"><code>--privileged</code> is not "a few more capabilities"</span>
+        <p>It grants <strong>every</strong> capability, exposes all host devices under <code>/dev</code>, and <strong>disables the seccomp and AppArmor profiles entirely</strong>. A privileged container is a root shell on the host with extra steps. The legitimate uses are narrow — Docker-in-Docker, some storage and networking tooling — and each has a narrower alternative: specific <code>--cap-add</code> flags, a single <code>--device</code>, or rootless DinD.</p>
+      </div>
+    </section>
+
+    <section id="seccomp">
+      <h2 data-nav="seccomp">seccomp</h2>
+      <p class="sub">A syscall filter, on by default, that quietly does a lot of work.</p>
+      <p>Docker's default seccomp profile blocks roughly forty of the several hundred available syscalls — the ones with no legitimate use inside a container and a history of vulnerabilities. It is applied unless you turn it off, and it is a large part of why root in a container is less dangerous than root on the host.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Blocked by default</th><th>Because</th></tr></thead>
+          <tbody>
+            <tr><td><code>mount</code>, <code>umount2</code>, <code>pivot_root</code></td><td>Filesystem manipulation is the classic escape primitive</td></tr>
+            <tr><td><code>keyctl</code>, <code>add_key</code></td><td>The kernel keyring is not namespaced</td></tr>
+            <tr><td><code>bpf</code></td><td>Loading kernel programs</td></tr>
+            <tr><td><code>kexec_load</code>, <code>reboot</code></td><td>Replacing or restarting the running kernel</td></tr>
+            <tr><td><code>init_module</code>, <code>delete_module</code></td><td>Loading kernel modules</td></tr>
+            <tr><td><code>ptrace</code> (historically)</td><td>Now permitted, since it is namespaced and needed by debuggers</td></tr>
+            <tr><td><code>userfaultfd</code>, <code>perf_event_open</code></td><td>Repeated exploitation primitives</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">a custom profile, and turning it off (do not)</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run --security-opt seccomp=./profile.json app
+$ docker run --security-opt seccomp=unconfined app         # only to diagnose
+$ docker info --format '{{.SecurityOptions}}'               # is it even on?</pre>
+      </div>
+      <p>Custom profiles are rarely worth writing by hand — the default is well-tuned, and a bespoke allow-list breaks on the next runtime upgrade. The exception is a narrow, long-lived workload where you can enumerate its syscalls; tools exist to record a profile from a running process, and the result needs re-recording whenever the application changes.</p>
+      <div class="trap">
+        <span class="lbl">Debuggers are why people disable seccomp, and they should not</span>
+        <p>Delve and gdb need <code>CAP_SYS_PTRACE</code>, and the common advice is <code>--security-opt seccomp=unconfined --privileged</code>, which removes every syscall restriction to solve a capability problem. <code>--cap-add SYS_PTRACE</code> alone is usually sufficient (chapter 14), and it belongs in a development override rather than the production compose file.</p>
+      </div>
+    </section>
+
+    <section id="mac">
+      <h2 data-nav="AppArmor, SELinux">AppArmor and SELinux</h2>
+      <p class="sub">A second, path-based layer that most people never touch.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th></th><th>AppArmor</th><th>SELinux</th></tr></thead>
+          <tbody>
+            <tr><td>Where</td><td>Debian, Ubuntu, SUSE</td><td>Fedora, RHEL, CentOS</td></tr>
+            <tr><td>Model</td><td>Path-based profiles</td><td>Label-based, mandatory access control</td></tr>
+            <tr><td>Docker default</td><td><code>docker-default</code>, applied automatically</td><td>Enabled per-daemon; labels containers separately</td></tr>
+            <tr><td>You notice it when</td><td>Something is denied and the logs say <code>apparmor="DENIED"</code></td><td>A bind mount is unreadable until <code>:z</code> or <code>:Z</code> (chapter 11)</td></tr>
+            <tr><td>Custom</td><td><code>--security-opt apparmor=my-profile</code></td><td><code>--security-opt label=type:my_t</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Both are disabled by <code>--privileged</code>, which is worth restating because it is the least visible thing that flag does. If you are on a distribution where one of these is active, leave it active and fix the denial rather than switching it off — the SELinux bind-mount case in particular has a one-character fix that people replace with <code>--privileged</code>.</p>
+    </section>
+
+    <section id="socket">
+      <h2 data-nav="The Docker socket">The Docker socket</h2>
+      <p class="sub">The single most dangerous thing you can mount.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">what "just for monitoring" actually grants</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run -it -v /var/run/docker.sock:/var/run/docker.sock alpine sh
+/ # apk add -q docker-cli
+/ # docker run -v /:/host --privileged -it alpine chroot /host sh
+# whoami
+root                     # on the host. Game over.</pre>
+      </div>
+      <p>Access to the socket is access to the daemon's API, and the daemon runs as root and can start any container with any configuration. There is no read-only mode, no scope, and no capability set you can drop inside the mounting container that changes this — the escalation happens in a <em>new</em> container the daemon creates on your behalf.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Instead of mounting the socket</th><th>Use</th></tr></thead>
+          <tbody>
+            <tr><td>A container that needs container metadata</td><td>A socket proxy allow-listing specific read-only endpoints</td></tr>
+            <tr><td>CI that needs to build images</td><td>A remote BuildKit endpoint, or rootless DinD (chapter 16)</td></tr>
+            <tr><td>Testcontainers in CI</td><td>Rootless DinD, or Compose-managed services</td></tr>
+            <tr><td>A reverse proxy discovering containers</td><td>A proxy with the socket, on its own network, nothing else on it</td></tr>
+            <tr><td>Monitoring</td><td>The metrics endpoint, or a read-only socket proxy</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Escalation path tracer</h3>
+          <span class="hint">Which paths out of the container are open, and what each yields</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight" id="e-set1"></div>
+          <div class="ctrl tight" id="e-set2"></div>
+          <div class="ctrl" id="e-set3"></div>
+          <div id="e-paths"></div>
+          <div class="rgrid" id="e-out"></div>
+          <p class="readout" id="e-note"></p>
+        </div>
+      </div>
+    </section>
+
+    <section id="rootless">
+      <h2 data-nav="Rootless">Rootless Docker</h2>
+      <p class="sub">The structural fix for the root problem, with real costs.</p>
+      <p>Rootless mode runs the daemon and containers inside a user namespace as your unprivileged user, so container UID 0 maps to a high, harmless host UID. An escape lands you as a normal user, not as root — which changes the severity of every path in the demo above.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">setting it up</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ dockerd-rootless-setuptool.sh install
+$ export DOCKER_HOST=unix:///run/user/$(id -u)/docker.sock
+$ docker info -f '{{.SecurityOptions}}'
+[name=rootless name=seccomp,profile=builtin ...]
+
+# the middle ground: keep the root daemon, remap container UIDs
+# /etc/docker/daemon.json
+{ "userns-remap": "default" }</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Rootless costs</th><th>Detail</th></tr></thead>
+          <tbody>
+            <tr><td>Privileged ports</td><td>Cannot bind below 1024 without extra configuration</td></tr>
+            <tr><td>Networking</td><td>Userspace networking (slirp4netns or pasta) is slower; source IPs may be rewritten</td></tr>
+            <tr><td>Storage drivers</td><td>Fewer options; overlay2 needs a recent kernel</td></tr>
+            <tr><td>Some resource limits</td><td>cgroup delegation must be configured for memory and CPU limits to apply</td></tr>
+            <tr><td><code>--privileged</code></td><td>Still exists, but is now privileged only within your user namespace</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><code>userns-remap</code> is the compromise: the daemon stays root, but containers get a UID mapping, so container root is an unprivileged host UID. It breaks fewer things than rootless and gives most of the benefit. Podman takes the rootless approach as its default, which is the main structural difference between the two tools (chapter 21).</p>
+    </section>
+
+    <section id="hardened">
+      <h2 data-nav="A hardened config">A hardened configuration</h2>
+      <p class="sub">Assembled, in descending order of value.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">compose.yaml — the security block</span><button class="copy">Copy</button></div>
+<pre data-lang="yaml">services:
+  api:
+    image: ghcr.io/acme/api@sha256:41523187cf…
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.5
+    networks: [backend]
+    ports: ["127.0.0.1:3000:3000"]
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 30s
+
+networks:
+  backend:
+    internal: true</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>#</th><th>Control</th><th>Prevents</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>Do not mount the Docker socket</td><td>Immediate, unconditional host takeover</td></tr>
+            <tr><td>2</td><td>No <code>--privileged</code></td><td>All capabilities, all devices, no seccomp, no AppArmor</td></tr>
+            <tr><td>3</td><td><code>user:</code> non-root</td><td>UID 0 kernel attack surface; root-owned files on mounts</td></tr>
+            <tr><td>4</td><td><code>cap_drop: [ALL]</code></td><td>Every capability-gated escape primitive</td></tr>
+            <tr><td>5</td><td><code>no-new-privileges</code></td><td>setuid binaries escalating inside the container</td></tr>
+            <tr><td>6</td><td><code>read_only</code> + tmpfs</td><td>Persistence and tampering at runtime (chapter 11)</td></tr>
+            <tr><td>7</td><td>No host namespaces</td><td>Access to host processes and host-only services</td></tr>
+            <tr><td>8</td><td>Resource limits</td><td>One container taking down the host (chapter 10)</td></tr>
+            <tr><td>9</td><td>Egress restriction</td><td>Exfiltration and calling home (chapter 12)</td></tr>
+            <tr><td>10</td><td>Keep the base current</td><td>The known vulnerabilities (chapter 17)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">checking a host</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run --rm --net host --pid host --userns host --cap-add audit_control \
+    -v /etc:/etc:ro -v /var/lib:/var/lib:ro -v /var/run/docker.sock:/var/run/docker.sock:ro \
+    --label docker_bench_security docker/docker-bench-security
+
+# or just audit what is running now
+$ docker ps -q | xargs docker inspect \
+    -f '{{.Name}} priv={{.HostConfig.Privileged}} user={{.Config.User}} ro={{.HostConfig.ReadonlyRootfs}}'</pre>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 18 in eight lines</h2>
+        <ul>
+          <li>Container root <b>is</b> host root, restricted only by capabilities, seccomp and namespaces — all of which are optional.</li>
+          <li>Docker grants 14 capabilities by default and most workloads need <b>none</b>. Drop all, add back what breaks.</li>
+          <li><code>NET_BIND_SERVICE</code> is usually avoidable: listen on 8080 and publish it as 80.</li>
+          <li><code>--privileged</code> grants every capability, exposes all devices, and <b>disables seccomp and AppArmor</b>.</li>
+          <li>The default seccomp profile blocks about forty syscalls and does much of the real work. Do not disable it to fix a capability problem.</li>
+          <li><b>Mounting the Docker socket is unconditional host root.</b> No capability set inside the container changes that.</li>
+          <li>Rootless mode or <code>userns-remap</code> makes container root an unprivileged host UID — the structural fix.</li>
+          <li>Order of value: no socket, no privileged, non-root, drop caps, no-new-privileges, read-only.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary>A monitoring agent needs the Docker socket "read only" — <code>-v /var/run/docker.sock:/var/run/docker.sock:ro</code>. Is that safe?</summary>
+        <div class="ans"><p>No. The <code>:ro</code> applies to the socket <em>file</em>, not to the API reachable through it — writes to a socket are how you send requests, so every endpoint remains available. Anything that can talk to the daemon can create a privileged container mounting the host filesystem, which is root on the machine. The mitigation is a socket <b>proxy</b> that allow-lists specific read-only endpoints and refuses container creation, placed on its own network with only the agent attached. Better still, use whatever metrics endpoint the thing actually needs.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A colleague fixes "operation not permitted" from Delve by adding <code>--privileged --security-opt seccomp=unconfined</code>. What is wrong, and what is right?</summary>
+        <div class="ans"><p>They removed every syscall restriction and every capability limit, plus AppArmor, to solve a single missing capability. Delve needs <code>CAP_SYS_PTRACE</code>; <code>--cap-add SYS_PTRACE</code> is almost always sufficient, and <code>ptrace</code> is permitted by the default seccomp profile precisely so debuggers work. The wider problem is where the flags live: this belongs in a development override (chapter 14), not in the file that also describes production — because <code>--privileged</code> added "temporarily" is how it reaches a server.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Your container runs as non-root with <code>cap_drop: [ALL]</code> and a read-only filesystem. It also has <code>pid: host</code>. What did you lose?</summary>
+        <div class="ans"><p>Visibility isolation, and possibly more. With the host PID namespace the container sees every process on the machine, so it can read command lines and environment from <code>/proc</code> — which is where secrets passed as environment variables end up (chapter 9). It also makes host processes targetable if the container ever gains <code>CAP_SYS_PTRACE</code> or runs as root. The other controls are still worth having and they do not compensate: a namespace you share is a boundary you removed, and no capability set restores it. The tracer above shows which paths open when you toggle it.</p></div>
+      </details>
+      <details class="chk">
+        <summary>You have limited time. Rank: drop all capabilities, run rootless, switch to distroless, enable a custom seccomp profile.</summary>
+        <div class="ans"><p><b>Drop all capabilities</b> first — one line, no behaviour change for most workloads, and it closes every capability-gated primitive. <b>Rootless (or <code>userns-remap</code>)</b> second: it is structural, making container root harmless, and worth the configuration cost. <b>Distroless</b> third — it removes the shell and package manager an attacker would use, and reduces the scan surface (chapters 7 and 17), but it changes your debugging story. A <b>custom seccomp profile</b> last: the default already blocks the dangerous syscalls, and a bespoke allow-list is high-effort, brittle across upgrades, and adds little over the first three.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Chapter 19 is observability and debugging: logs that survive the container, metrics, and getting a shell into an image that does not have one.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li><code>docker run --rm --cap-drop ALL your-image</code> — does it still work?</li>
+        <li><code>docker ps -q | xargs docker inspect -f '{{.Name}} {{.HostConfig.Privileged}}'</code>.</li>
+        <li><code>docker info -f '{{.SecurityOptions}}'</code>.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>Docker's runtime privilege and capabilities reference, the default seccomp profile, the AppArmor and SELinux notes, and the rootless mode documentation.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — capability audit
+   ============================================================ */
+(function () {
+  /* Docker's default capability set */
+  var DEFAULT = [
+    { id: "CHOWN", what: "change file ownership" },
+    { id: "DAC_OVERRIDE", what: "bypass file permission checks" },
+    { id: "FSETID", what: "keep setuid bits on modification" },
+    { id: "FOWNER", what: "bypass ownership checks on operations" },
+    { id: "MKNOD", what: "create special files" },
+    { id: "NET_RAW", what: "raw and packet sockets — ping, tcpdump" },
+    { id: "SETGID", what: "manipulate group IDs" },
+    { id: "SETUID", what: "manipulate user IDs" },
+    { id: "SETFCAP", what: "set file capabilities" },
+    { id: "SETPCAP", what: "modify the process capability set" },
+    { id: "NET_BIND_SERVICE", what: "bind ports below 1024" },
+    { id: "SYS_CHROOT", what: "call chroot" },
+    { id: "KILL", what: "signal processes owned by others" },
+    { id: "AUDIT_WRITE", what: "write to the audit log" }
+  ];
+  /* capabilities NOT in the default set, requiring an explicit --cap-add */
+  var EXTRA = {
+    NET_ADMIN: "configure interfaces and routes",
+    SYS_PTRACE: "attach a debugger to another process",
+    SYS_ADMIN: "a very large grab-bag, including mount",
+    SYS_TIME: "set the system clock"
+  };
+
+  var PROFILES = [
+    { id: "app8080", label: "app on :8080, non-root", needs: [], note: "the common case" },
+    { id: "nginx80", label: "nginx on :80 as root", needs: ["NET_BIND_SERVICE", "SETGID", "SETUID", "CHOWN"] },
+    { id: "nginx8080", label: "nginx unprivileged on :8080", needs: [] },
+    { id: "ping", label: "diagnostics — ping", needs: ["NET_RAW"] },
+    { id: "aptruntime", label: "apt-get install at runtime", needs: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID", "FSETID"] },
+    { id: "tcpdump", label: "tcpdump sidecar", needs: ["NET_RAW", "NET_ADMIN"] },
+    { id: "debugger", label: "delve / gdb", needs: ["SYS_PTRACE"] }
+  ];
+  var profile = "app8080";
+
+  var host = document.getElementById("c-profile");
+  var table = document.getElementById("c-table");
+  var term = document.getElementById("c-term");
+  var out = document.getElementById("c-out");
+  var note = document.getElementById("c-note");
+
+  PROFILES.forEach(function (p) {
+    var b = document.createElement("button");
+    b.className = "btn mono" + (p.id === profile ? " on" : "");
+    b.textContent = p.label;
+    b.addEventListener("click", function () {
+      profile = p.id;
+      Array.prototype.forEach.call(host.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      render();
+    });
+    host.appendChild(b);
+  });
+
+  function render() {
+    var P = PROFILES.filter(function (x) { return x.id === profile; })[0];
+    var needs = P.needs;
+    var droppable = DEFAULT.filter(function (c) { return needs.indexOf(c.id) === -1; });
+    var extras = needs.filter(function (n) { return EXTRA[n] !== undefined; });
+    var fromDefault = needs.filter(function (n) { return EXTRA[n] === undefined; });
+
+    table.innerHTML = '<table class="tbl"><thead><tr><th>capability</th><th>grants</th><th>this workload</th></tr></thead><tbody>' +
+      DEFAULT.map(function (c) {
+        var need = needs.indexOf(c.id) !== -1;
+        return "<tr" + (need ? ' style="background:var(--acc-wash)"' : "") + "><td><code>" + c.id +
+          "</code></td><td style='color:var(--text-2)'>" + c.what + "</td><td>" +
+          (need ? '<b style="color:var(--warn)">needs it</b>' : '<span style="color:var(--good)">droppable</span>') +
+          "</td></tr>";
+      }).join("") +
+      extras.map(function (e) {
+        return '<tr style="background:var(--acc-wash)"><td><code>' + e +
+          "</code><br><span style='font-size:11px;color:var(--text-3)'>not in the default set</span></td><td style='color:var(--text-2)'>" +
+          EXTRA[e] + '</td><td><b style="color:var(--bad)">must be added</b></td></tr>';
+      }).join("") + "</tbody></table>";
+
+    var flags = "--cap-drop ALL" + needs.map(function (n) { return " --cap-add " + n; }).join("");
+    term.innerHTML = '<span class="p">$</span> docker run ' + flags + " app\n\n" +
+      (needs.length === 0
+        ? '<span class="g">works with no capabilities at all</span>'
+        : '<span class="y">' + needs.length + " capabilit" + (needs.length === 1 ? "y" : "ies") + " retained: " + needs.join(", ") + "</span>") +
+      "\n" + '<span class="d">' + droppable.length + " of Docker's 14 defaults dropped" +
+      (extras.length ? "; " + extras.length + " added beyond the default set" : "") + "</span>";
+
+    var pct = Math.round((droppable.length / DEFAULT.length) * 100);
+    out.innerHTML = "";
+    tile("Needs", String(needs.length), "capabilities", needs.length === 0);
+    tile("Droppable", String(droppable.length) + "/14", pct + "% of defaults", pct > 70);
+    tile("Beyond default", String(extras.length), extras.length ? extras.join(", ") : "none", extras.length === 0);
+    tile("cap-drop ALL", needs.length === 0 ? "works" : "needs adds", "", needs.length === 0);
+
+    var msgs = [];
+    if (needs.length === 0) {
+      msgs.push("<b>Nothing is needed.</b> A plain application listening above 1024 as a non-root user runs perfectly with <code>--cap-drop ALL</code> — which is the single highest-value line in this chapter, because it closes every capability-gated escape at once and changes no behaviour.");
+    }
+    if (profile === "nginx80") {
+      msgs.push("<b>All four requirements come from a configuration choice, not from nginx.</b> Binding :80 needs <code>NET_BIND_SERVICE</code>; starting as root to drop to a worker user needs <code>SETUID</code> and <code>SETGID</code>; owning cache directories needs <code>CHOWN</code>. Switch to the unprivileged variant on :8080 and publish it as <code>-p 80:8080</code> — compare with the next profile, which needs nothing.");
+    }
+    if (profile === "nginx8080") {
+      msgs.push("The same server, one configuration change, <b>zero capabilities</b>. This is what the previous profile costs you and the argument for preferring unprivileged image variants.");
+    }
+    if (profile === "aptruntime") {
+      msgs.push("Installing packages at runtime needs six of the fourteen, which is a good reason to question the requirement rather than grant them. Anything installable at start-up is installable at <b>build</b> time (chapter 5), where the capabilities are the builder's problem and the result is part of the tested artefact.");
+    }
+    if (extras.length) {
+      msgs.push("<b>" + extras.join(" and ") + " " + (extras.length > 1 ? "are" : "is") +
+        " not in Docker's default set</b>, so " + (extras.length > 1 ? "they" : "it") +
+        " must be added explicitly — which is the system working as intended. It is also the moment to check whether a sidecar sharing the network namespace (chapter 12) can hold the capability instead of your application container.");
+    }
+    if (profile === "debugger") {
+      msgs.push("Note what is <em>not</em> needed: seccomp stays on and no other capability is required. This is the whole of the fix that people replace with <code>--privileged</code>.");
+    }
+    if (profile === "ping") {
+      msgs.push("<code>NET_RAW</code> is in the default set, so ping works out of the box — and it is also what lets a compromised container craft arbitrary packets and spoof addresses. Dropping it is free unless you are actually running diagnostics.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 7 ? "13px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — escalation path tracer
+   ============================================================ */
+(function () {
+  var S = {
+    root: true, privileged: false, socket: false,
+    sysadmin: false, ptrace: false, dacread: false,
+    hostpid: false, hostnet: false, hostetc: false,
+    seccomp: true, nnp: false, userns: false, readonly: false
+  };
+
+  var GROUPS = [
+    ["e-set1", [
+      ["root", "runs as root"], ["privileged", "--privileged"], ["socket", "docker.sock mounted"]
+    ]],
+    ["e-set2", [
+      ["sysadmin", "cap SYS_ADMIN"], ["ptrace", "cap SYS_PTRACE"], ["dacread", "cap DAC_READ_SEARCH"],
+      ["hostpid", "--pid host"], ["hostnet", "--network host"], ["hostetc", "-v /etc:/etc"]
+    ]],
+    ["e-set3", [
+      ["seccomp", "seccomp on"], ["nnp", "no-new-privileges"], ["userns", "rootless / userns-remap"], ["readonly", "--read-only"]
+    ]]
+  ];
+
+  GROUPS.forEach(function (g) {
+    var host = document.getElementById(g[0]);
+    g[1].forEach(function (k) {
+      var b = document.createElement("button");
+      b.className = "btn mono" + (S[k[0]] ? " on" : "");
+      b.textContent = k[1];
+      b.addEventListener("click", function () { S[k[0]] = !S[k[0]]; b.classList.toggle("on", S[k[0]]); render(); });
+      host.appendChild(b);
+    });
+  });
+
+  var pathsEl = document.getElementById("e-paths");
+  var out = document.getElementById("e-out");
+  var note = document.getElementById("e-note");
+
+  /* each path: prerequisites, what it yields, and what closes it */
+  var PATHS = [
+    { name: "Docker API via the mounted socket",
+      open: function () { return S.socket; },
+      yield: "host root", sev: 3,
+      how: "start a privileged container mounting / and chroot into it",
+      close: "do not mount the socket; a read-only bind does not help",
+      unaffected: "capabilities, read-only rootfs and non-root user change nothing" },
+    { name: "Host devices via --privileged",
+      open: function () { return S.privileged && !S.userns; },
+      yield: "host root", sev: 3,
+      how: "mount the host disk from /dev and write to it",
+      close: "drop --privileged; use specific --device or --cap-add" },
+    { name: "cgroup release_agent escape",
+      open: function () { return (S.privileged || (S.sysadmin && !S.seccomp)) && !S.userns; },
+      yield: "host root", sev: 3,
+      how: "mount cgroupfs and register a release_agent that the kernel runs on the host",
+      close: "keep seccomp on (it blocks mount) and do not grant SYS_ADMIN" },
+    { name: "Arbitrary host file read via open_by_handle_at",
+      open: function () { return (S.dacread || S.privileged) && !S.userns; },
+      yield: "host file read", sev: 2,
+      how: "brute-force inode handles outside the container's mount namespace",
+      close: "do not grant DAC_READ_SEARCH" },
+    { name: "Host process memory via /proc",
+      open: function () { return S.hostpid && (S.root || S.ptrace); },
+      yield: "host secrets", sev: 2,
+      how: "read /proc/<pid>/environ and cmdline of host processes, or attach with ptrace",
+      close: "do not share the host PID namespace" },
+    { name: "Host-only services on loopback",
+      open: function () { return S.hostnet; },
+      yield: "lateral movement", sev: 2,
+      how: "reach services bound to 127.0.0.1 that assume only the host can talk to them",
+      close: "use a bridge network; publish only what is needed (chapter 12)" },
+    { name: "Host credentials via a writable /etc",
+      open: function () { return S.hostetc && (S.root || S.privileged) && !S.userns; },
+      yield: "host root", sev: 3,
+      how: "add a user to /etc/passwd and /etc/shadow, or drop a file in /etc/cron.d",
+      close: "do not mount host system directories; mount :ro at minimum" },
+    { name: "setuid escalation inside the container",
+      open: function () { return !S.root && !S.nnp; },
+      yield: "container root", sev: 1,
+      how: "exploit a setuid binary present in the image",
+      close: "no-new-privileges, and remove setuid bits at build time" },
+    { name: "Runtime tampering and persistence",
+      open: function () { return !S.readonly; },
+      yield: "persistence", sev: 1,
+      how: "write a modified binary or a start-up hook into the container filesystem",
+      close: "--read-only with tmpfs for the paths that need writing (chapter 11)" }
+  ];
+
+  function render() {
+    var openPaths = PATHS.filter(function (p) { return p.open(); });
+    var hostRoot = openPaths.filter(function (p) { return p.sev === 3; });
+
+    pathsEl.innerHTML = PATHS.map(function (p) {
+      var isOpen = p.open();
+      var col = p.sev === 3 ? "var(--bad)" : p.sev === 2 ? "var(--warn)" : "var(--text-2)";
+      return '<div style="border-left:3px solid ' + (isOpen ? col : "var(--rule)") +
+        ';background:' + (isOpen ? "var(--acc-wash)" : "transparent") +
+        ';padding:7px 10px;margin:6px 0;border-radius:0 4px 4px 0;opacity:' + (isOpen ? 1 : 0.45) + '">' +
+        '<div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline">' +
+        '<b style="font-size:13px">' + p.name + "</b>" +
+        '<span style="font-family:var(--mono);font-size:11px;color:' + (isOpen ? col : "var(--text-3)") + '">' +
+        (isOpen ? "OPEN → " + p.yield : "closed") + "</span></div>" +
+        (isOpen
+          ? '<div style="font-size:12px;color:var(--text-2);margin-top:3px">' + p.how + "</div>" +
+            '<div style="font-size:12px;color:var(--text-2);margin-top:2px"><b>Close it:</b> ' + p.close + "</div>" +
+            (p.unaffected ? '<div style="font-size:12px;color:var(--bad);margin-top:2px">' + p.unaffected + "</div>" : "")
+          : "") + "</div>";
+    }).join("");
+
+    out.innerHTML = "";
+    tile("Paths open", String(openPaths.length) + "/" + PATHS.length, "", openPaths.length === 0);
+    tile("To host root", String(hostRoot.length), hostRoot.length ? "immediate" : "none", hostRoot.length === 0);
+    tile("Blast radius", hostRoot.length ? "the host" : openPaths.length ? "this container +" : "this container", "", !hostRoot.length);
+    tile("userns", S.userns ? "on" : "off", S.userns ? "root is harmless" : "container root = host root", S.userns);
+
+    var msgs = [];
+    if (S.socket) {
+      msgs.push("<b>The socket alone ends the discussion.</b> Every other control on this page is irrelevant while it is mounted, because the escalation happens in a <em>new</em> container the daemon creates — one that can be privileged and mount the host filesystem regardless of how locked down this container is. Note it stays open even with rootless toggled on if the socket belongs to a root daemon.");
+    }
+    if (S.privileged) {
+      msgs.push("<code>--privileged</code> opens several paths simultaneously and, less visibly, turns off seccomp and AppArmor — so the seccomp toggle above stops mattering.");
+    }
+    if (S.userns && !S.socket) {
+      msgs.push("<b>With a user namespace, container root maps to an unprivileged host UID</b>, so the paths that depended on being genuinely root collapse. This is why rootless mode is a structural fix rather than another hardening flag: it changes what the same exploit yields.");
+    }
+    if (S.sysadmin && S.seccomp && !S.privileged) {
+      msgs.push("Interesting case: <code>SYS_ADMIN</code> is granted, and the cgroup escape is still closed because <b>the default seccomp profile blocks <code>mount</code></b>. Two independent layers, and you need to lose both. Turn seccomp off and watch it open.");
+    }
+    if (!S.root && !S.nnp) {
+      msgs.push("<b>A coupling worth noticing:</b> switching to a non-root user <em>opens</em> the setuid escalation path, which did not exist while the process was already root. That is not a reason to run as root — the paths it closes are far worse — but it is why <code>no-new-privileges</code> belongs alongside <code>user:</code> rather than as a separate nice-to-have. The two are a pair.");
+    }
+    if (openPaths.length === 0) {
+      msgs.push("<b>No paths open.</b> Non-root, no privileged, no socket, no host namespaces, no extra capabilities, seccomp on, no-new-privileges, read-only. What remains is a kernel vulnerability reachable from the syscalls seccomp still permits — a real risk, and a far smaller one than anything above.");
+    } else if (!hostRoot.length) {
+      msgs.push("Nothing reaches host root from here. " + openPaths.length + " path" +
+        (openPaths.length > 1 ? "s remain" : " remains") + ", bounded to this container or to information disclosure — worth closing, and not an emergency.");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 9 ? "12px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

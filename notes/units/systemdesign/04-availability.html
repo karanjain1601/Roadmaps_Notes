@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Availability, reliability and failure — System Design Notes</title>
+<meta name="description" content="Nines and what they cost, series and parallel availability, SLIs and error budgets, failover modes, split brain and blast radius.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/notes.css">
+</head>
+<body>
+<div class="readbar"></div>
+
+<header class="top">
+  <div class="top-inner">
+    <a class="home" href="../../index.html"><span class="mark"></span>All roadmaps</a>
+    <span class="top-sep">/</span>
+    <a class="home" href="index.html" style="color:var(--band-text)">System Design</a>
+    <span class="top-spacer"></span>
+    <button class="rail-toggle" aria-expanded="false">Contents</button>
+    <nav class="top-nav" aria-label="Chapter navigation"></nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail" id="rail" aria-label="Chapter and section navigation"></aside>
+
+  <article>
+    <p class="crumb">Part 1 · Groundwork &nbsp;·&nbsp; <b>Chapter 04</b></p>
+    <h1>Availability, reliability and failure</h1>
+    <p class="standfirst">Availability is a number you can compute, budget and trade against other things — not a virtue you either have or lack. This chapter covers the arithmetic of nines, why adding components lowers availability while adding copies raises it, how error budgets turn reliability into a negotiable resource, and the specific ways redundancy fails.</p>
+    <div class="meta">
+      <span>~35 min read</span>
+      <span>Nines · SLOs · failover · blast radius</span>
+      <span>2 interactive panels</span>
+      <span>Prerequisite: chapter 2</span>
+    </div>
+
+    <div class="body">
+
+      <h2><span class="h2n">4.1</span>Three words that get confused</h2>
+
+      <dl>
+        <dt>Availability</dt>
+        <dd>The fraction of time the system is usable. A property of the <em>service</em>, measured over a window, and the thing users notice.</dd>
+        <dt>Reliability</dt>
+        <dd>The probability the system performs correctly for a given duration. A property of <em>behaviour</em>: a system that is up but returns wrong answers is available and unreliable.</dd>
+        <dt>Durability</dt>
+        <dd>The probability that stored data survives. A property of <em>data</em>. A system can be unavailable for a day and lose nothing, or be perfectly available while quietly corrupting records. Durability failures are the only ones you cannot apologise your way out of.</dd>
+      </dl>
+
+      <p>They are engineered separately. Availability comes from redundancy and fast recovery. Reliability comes from correctness work: testing, invariants, idempotency, validation. Durability comes from replication across independent failure domains plus backups you have actually restored from.</p>
+
+      <h2><span class="h2n">4.2</span>The arithmetic of nines</h2>
+
+      <div class="codewrap">
+        <span class="lang">Definitions</span>
+        <pre><code>Availability  A = uptime / (uptime + downtime)
+
+Equivalently  A = MTBF / (MTBF + MTTR)
+
+  MTBF = mean time between failures   (how often it breaks)
+  MTTR = mean time to recovery        (how long it stays broken)</code></pre>
+      </div>
+
+      <p>The second form is the useful one, because it exposes the two independent levers. You can make failures rarer, or you can make recovery faster. In practice <strong>reducing MTTR is far easier and cheaper than increasing MTBF</strong>. Going from a 60-minute recovery to a 5-minute recovery multiplies availability by twelve, and it is achieved with automation, good runbooks, fast rollbacks and health-checked failover — engineering you control. Making hardware, networks and dependencies fail less often is mostly out of your hands.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Nines, and the downtime they permit</caption>
+          <thead><tr><th>Availability</th><th>Per day</th><th>Per month</th><th>Per year</th><th>What it implies</th></tr></thead>
+          <tbody>
+            <tr><td><b>90%</b> — one nine</td><td class="num">2.4 h</td><td class="num">3 d</td><td class="num">36.5 d</td><td>A hobby project</td></tr>
+            <tr><td><b>99%</b> — two nines</td><td class="num">14.4 min</td><td class="num">7.2 h</td><td class="num">3.65 d</td><td>Single machine, restore from backup</td></tr>
+            <tr><td><b>99.9%</b> — three nines</td><td class="num">1.44 min</td><td class="num">43.8 min</td><td class="num">8.76 h</td><td>Redundant instances, automated restart, on-call</td></tr>
+            <tr><td><b>99.95%</b></td><td class="num">43 s</td><td class="num">21.9 min</td><td class="num">4.38 h</td><td>Multi-AZ, health-checked failover</td></tr>
+            <tr><td><b>99.99%</b> — four nines</td><td class="num">8.6 s</td><td class="num">4.4 min</td><td class="num">52.6 min</td><td>No manual step fits in the budget. Everything automated</td></tr>
+            <tr><td><b>99.999%</b> — five nines</td><td class="num">0.86 s</td><td class="num">26 s</td><td class="num">5.26 min</td><td>Multi-region active-active, progressive delivery, no maintenance windows</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <span class="lab">The line that changes the architecture</span>
+        <p>Between 99.9% and 99.99% something qualitative happens: the monthly budget drops below the time it takes a human to wake up, read a page, open a laptop and understand the problem. At three nines you can have a person in the loop. At four nines you cannot — <b>detection and recovery must be automatic</b>, deploys must be progressive with automatic rollback, and every routine operation must be doable without downtime. That is a different engineering organisation, not a bigger one.</p>
+      </div>
+
+      <p>Two practical caveats about the numbers. First, decide what "available" means before you promise a percentage: is a request that takes 30 seconds available? Is a page that loads but cannot show the user's own data available? Most useful definitions are request-based — <em>the fraction of valid requests served correctly within the latency target</em> — rather than time-based, because they capture partial and slow failures that a ping check would call "up". Second, dependencies count. If your service is perfect but sits on a cloud database with a 99.99% SLA, you cannot promise more than 99.99% without designing around that dependency.</p>
+
+      <h2><span class="h2n">4.3</span>Series and parallel</h2>
+
+      <p>Components arranged so that <em>all</em> must work are in <b>series</b>, and their availabilities multiply. Components arranged so that <em>any</em> may work are in <b>parallel</b>, and their unavailabilities multiply.</p>
+
+      <div class="codewrap">
+        <span class="lang">The two formulas</span>
+        <pre><code>Series (a chain of dependencies)
+  A_total = A₁ × A₂ × … × Aₙ
+
+  Three components at 99.9% each:  0.999³ = 0.997  →  99.7%
+  Ten components at 99.9% each:    0.999¹⁰ = 0.990  →  99.0%
+  (8.76 hours of downtime a year has become 87 hours)
+
+Parallel (redundant copies of one thing)
+  A_total = 1 − (1 − A₁)(1 − A₂) … (1 − Aₙ)
+
+  Two components at 99% each:   1 − 0.01²  = 99.99%
+  Three components at 99% each: 1 − 0.01³  = 99.9999%</code></pre>
+      </div>
+
+      <p>These two facts fight each other, and the tension is the central structural problem of availability engineering. Every service you add to the request path is another multiplication downwards. Every redundant copy is a multiplication upwards. A microservice architecture with a fifteen-service call chain has, by construction, a serial availability problem that no individual team can see in their own dashboards.</p>
+
+      <div class="note trap">
+        <span class="lab">Where the parallel formula lies to you</span>
+        <p>Multiplying unavailabilities assumes failures are <b>independent</b>. Real failures are correlated, and the correlation is usually the actual cause of outages:</p>
+        <ul class="tight">
+          <li>Both replicas run the same software version, so the same bad deploy kills both.</li>
+          <li>Both sit in the same rack, on the same power feed, behind the same switch.</li>
+          <li>Both depend on the same DNS zone, certificate authority or config service.</li>
+          <li>When one dies the other receives double load and dies too — the correlation <em>is</em> the failover.</li>
+        </ul>
+        <p>So the practical goal is not "N copies" but "N copies in independent failure domains, each able to carry the load of the others." Three replicas in one availability zone give you protection from machine failure only.</p>
+      </div>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Availability of a topology</h4>
+          <p>A chain of tiers, each optionally replicated. Watch the chain fight the copies.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="a-tiers">Tiers in the request path <b><span id="a-tiersv">5</span></b></label>
+              <input type="range" id="a-tiers" min="1" max="15" step="1" value="5">
+            </div>
+            <div class="ctrl">
+              <label for="a-comp">Availability of one instance</label>
+              <select id="a-comp">
+                <option value="0.99">99% — commodity, unmanaged</option>
+                <option value="0.999" selected>99.9% — well-run single instance</option>
+                <option value="0.9999">99.99% — managed cloud service</option>
+              </select>
+            </div>
+            <div class="ctrl">
+              <label for="a-rep">Redundant instances per tier <b><span id="a-repv">2</span></b></label>
+              <input type="range" id="a-rep" min="1" max="5" step="1" value="2">
+            </div>
+            <div class="ctrl">
+              <label for="a-corr">Correlated failure share <b><span id="a-corrv">10</span>%</b></label>
+              <input type="range" id="a-corr" min="0" max="100" step="5" value="10">
+            </div>
+          </div>
+          <div class="out">
+            <div class="stats" id="a-stats"></div>
+            <div class="bars" id="a-bars" style="margin-top:14px"></div>
+            <p id="a-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h3>Reducing the length of the chain</h3>
+
+      <p>Since serial dependencies multiply downwards, availability engineering is largely about shortening chains or making links optional:</p>
+
+      <ul>
+        <li><b>Make a dependency optional.</b> If the recommendations service is down, render the page without recommendations. That link leaves the series chain entirely.</li>
+        <li><b>Cache across the dependency.</b> A stale-but-serveable cached value converts an outage into degraded freshness.</li>
+        <li><b>Move it off the request path.</b> Anything asynchronous can fail for minutes without a user noticing.</li>
+        <li><b>Use a default.</b> Feature flags service unreachable? Use the last known values baked into the binary.</li>
+        <li><b>Fail open where it is safe, closed where it is not.</b> A rate limiter that cannot reach its store should usually allow traffic; an authorisation service that cannot reach its store must not.</li>
+      </ul>
+
+      <h2><span class="h2n">4.4</span>SLIs, SLOs, SLAs and error budgets</h2>
+
+      <div class="tw">
+        <table>
+          <caption>The vocabulary, from measurement to contract</caption>
+          <thead><tr><th>Term</th><th>What it is</th><th>Example</th></tr></thead>
+          <tbody>
+            <tr><td><b>SLI</b> — indicator</td><td>A measured number describing service quality</td><td>Proportion of HTTP requests returning non-5xx within 300 ms</td></tr>
+            <tr><td><b>SLO</b> — objective</td><td>The internal target for an SLI over a window</td><td>99.9% of such requests over 28 rolling days</td></tr>
+            <tr><td><b>SLA</b> — agreement</td><td>The external promise, with consequences</td><td>99.5% monthly, or the customer gets 10% credit</td></tr>
+            <tr><td><b>Error budget</b></td><td>1 − SLO: the failure you are allowed to spend</td><td>0.1% of 28 days = 40 minutes, or 0.1% of requests</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Set the SLA looser than the SLO — always. If you promise customers 99.9% and target 99.9% internally, you breach the contract half the time by definition. A common structure is SLA 99.5%, SLO 99.9%, with alerting that fires well before the SLO is at risk.</p>
+
+      <h3>Choosing SLIs that mean something</h3>
+
+      <p>A good SLI is measured as close to the user as possible, is a ratio of good events to valid events, and moves when users are unhappy. Four families cover most services:</p>
+
+      <ul class="tight">
+        <li><b>Availability</b> — successful requests ÷ valid requests. Exclude client errors (4xx) that are the client's fault; do not exclude your own 429s.</li>
+        <li><b>Latency</b> — requests faster than a threshold ÷ valid requests. A threshold ratio behaves better as an SLI than a raw percentile.</li>
+        <li><b>Freshness</b> — for pipelines and derived views: fraction of data updated within the target window.</li>
+        <li><b>Correctness</b> — fraction of records passing a validation check. The hardest to measure and often the one that matters most.</li>
+      </ul>
+
+      <h3>The error budget as a decision-making tool</h3>
+
+      <p>The budget converts reliability from an argument into a resource. If the SLO is 99.9% over 28 days, you may be unavailable for 40 minutes; that is not a failure, it is the allowance. The value is in the policy attached to it:</p>
+
+      <ul class="tight">
+        <li><b>Budget remaining:</b> ship features, take risks, run experiments, do the risky migration.</li>
+        <li><b>Budget nearly gone:</b> slow down. Freeze risky changes, spend the sprint on reliability work.</li>
+        <li><b>Budget exhausted:</b> feature freeze until the window rolls forward and the budget refills.</li>
+      </ul>
+
+      <p>It also resolves the perennial argument sensibly. If a team has consistently spent none of its budget for six months, it is <em>over</em>-invested in reliability and should be shipping faster or reducing cost — a conclusion that is impossible to reach without a number.</p>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Error budget burn</h4>
+          <p>How much of the month a given failure rate consumes, and how long you have.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="e-slo">SLO</label>
+              <select id="e-slo">
+                <option value="99">99%</option>
+                <option value="99.9" selected>99.9%</option>
+                <option value="99.95">99.95%</option>
+                <option value="99.99">99.99%</option>
+                <option value="99.999">99.999%</option>
+              </select>
+            </div>
+            <div class="ctrl">
+              <label for="e-days">Days into the 28-day window <b><span id="e-daysv">14</span></b></label>
+              <input type="range" id="e-days" min="1" max="28" step="1" value="14">
+            </div>
+            <div class="ctrl">
+              <label for="e-used">Downtime already spent <b><span id="e-usedv">12</span> min</b></label>
+              <input type="range" id="e-used" min="0" max="120" step="1" value="12">
+            </div>
+            <div class="ctrl">
+              <label for="e-rate">Current failure rate <b><span id="e-ratev">0.05</span>%</b></label>
+              <input type="range" id="e-rate" min="0" max="2" step="0.01" value="0.05">
+            </div>
+          </div>
+          <div class="out">
+            <div class="stats" id="e-stats"></div>
+            <div class="bars" id="e-bars" style="margin-top:14px"></div>
+            <p id="e-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">4.5</span>How things actually fail</h2>
+
+      <p>Designing redundancy is easy if you assume the only failure mode is a clean stop. It is not.</p>
+
+      <div class="tw">
+        <table>
+          <caption>A taxonomy of failure, roughly in order of how hard each is to handle</caption>
+          <thead><tr><th>Mode</th><th>Behaviour</th><th>Why it is hard</th></tr></thead>
+          <tbody>
+            <tr><td><b>Fail-stop</b></td><td>The process dies; connections refuse</td><td>Easy. Health checks catch it in seconds</td></tr>
+            <tr><td><b>Fail-slow / grey failure</b></td><td>It responds, but at 30× normal latency, or to 60% of requests</td><td>Health checks pass. It stays in the load balancer pool, absorbing and ruining traffic. This causes more real outages than fail-stop</td></tr>
+            <tr><td><b>Partial failure</b></td><td>Writes work, reads fail; one shard is unreachable</td><td>The service is neither up nor down, and callers cannot tell</td></tr>
+            <tr><td><b>Network partition</b></td><td>Both sides alive, cannot see each other</td><td>Each side may believe the other is dead. See <a href="05-cap.html">chapter 5</a></td></tr>
+            <tr><td><b>Correlated failure</b></td><td>All replicas fail together</td><td>Redundancy provides no protection at all</td></tr>
+            <tr><td><b>Cascading failure</b></td><td>One failure shifts load, which causes the next</td><td>Redundancy <em>causes</em> it. See <a href="20-resilience.html">chapter 20</a></td></tr>
+            <tr><td><b>Byzantine</b></td><td>A node returns wrong or contradictory answers</td><td>Requires voting protocols. Rare outside adversarial settings, but corruption and bad deploys look like it</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <span class="lab">Grey failure deserves its own paragraph</span>
+        <p>A node that is 95% dead is worse than a node that is 100% dead, because your infrastructure keeps sending it work. A shallow health check — "does this port accept a connection, does <code>/health</code> return 200?" — will happily keep a node in rotation while it fails every real request. The mitigations are outlier detection (eject instances whose error rate or latency is a statistical outlier versus their peers), client-side load balancing weighted by observed latency, and health checks that exercise a real dependency. But see the warning in §4.8 before you make health checks too deep.</p>
+      </div>
+
+      <h2><span class="h2n">4.6</span>Redundancy patterns and their failure modes</h2>
+
+      <figure class="diagram">
+        <div class="mermaid">
+flowchart TB
+  subgraph AP["Active-passive"]
+    direction LR
+    C1["Clients"] --> P1["Primary<br/>serving"]
+    P1 -. "replication" .-> S1["Standby<br/>idle"]
+    S1 -. "promoted on failure" .-> P1
+  end
+  subgraph AA["Active-active"]
+    direction LR
+    C2["Clients"] --> LB2["Load balancer"]
+    LB2 --> N1["Node A<br/>serving"]
+    LB2 --> N2["Node B<br/>serving"]
+    N1 <-. "bidirectional sync" .-> N2
+  end
+        </div>
+        <figcaption>Active-passive is simpler and wastes capacity; active-active uses everything but must resolve concurrent conflicting writes. The choice is usually decided by whether the workload can tolerate write conflicts.</figcaption>
+      </figure>
+
+      <div class="tw">
+        <table>
+          <caption>Standby types and their trade-offs</caption>
+          <thead><tr><th>Type</th><th>State</th><th>Recovery time</th><th>Cost</th><th>Risk</th></tr></thead>
+          <tbody>
+            <tr><td><b>Cold standby</b></td><td>Machines off; data in backups</td><td>Hours</td><td class="yes">Lowest</td><td>Restores are slow and untested backups often fail</td></tr>
+            <tr><td><b>Warm standby</b></td><td>Running, replicating, not serving</td><td>Seconds to minutes</td><td class="mid">Medium</td><td>Unexercised path — the standby may not actually work</td></tr>
+            <tr><td><b>Hot standby</b></td><td>Running, replicating, ready instantly</td><td>Seconds</td><td class="no">~2×</td><td>Same, but shorter</td></tr>
+            <tr><td><b>Active-active</b></td><td>All nodes serving</td><td>Effectively none</td><td class="yes">Efficient — no idle capacity</td><td>Write conflicts; each node must survive the others' load</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <span class="lab">The unexercised path is the one that fails</span>
+        <p>A standby that has never taken traffic is a hypothesis, not a plan. The certificate expired, the config drifted, the schema is two migrations behind, the security group blocks the port. Either <b>fail over regularly on purpose</b> — monthly, in business hours, as a routine — or accept that your failover will not work when you need it. Active-active is popular partly because the failover path is continuously exercised by definition.</p>
+      </div>
+
+      <h3>Failover mechanics, and the ways they go wrong</h3>
+
+      <p>Automatic failover means one part of the system decides another part is dead. That decision is unreliable, because "dead" and "unreachable" are indistinguishable from the outside.</p>
+
+      <dl>
+        <dt>Heartbeats and the detection window</dt>
+        <dd>Miss N heartbeats, declare death. Short windows detect fast but produce false positives under load — a GC pause looks like death. Long windows are stable but extend the outage. Typical: 3 missed beats at 1-second intervals, giving 3–5 seconds of detection.</dd>
+        <dt>Split brain</dt>
+        <dd>A network partition leaves two nodes each believing the other has died. Both promote themselves to primary, both accept writes, and the data diverges. Recovering from divergent writes is manual, slow, and sometimes impossible.</dd>
+        <dt>Quorum</dt>
+        <dd>The standard defence: only a majority of an odd-sized group may elect a leader, so at most one side of any partition can win. This is why clusters come in threes and fives, and why a two-node cluster cannot safely fail over on its own.</dd>
+        <dt>Fencing</dt>
+        <dd>Even with quorum, the deposed primary may still be running and still hold connections. Fencing forcibly excludes it: revoke its storage lease, block it at the network layer, or power it off. A fencing token — a monotonically increasing number that storage checks and rejects if stale — is the software equivalent and prevents a paused-then-resumed old primary from writing.</dd>
+        <dt>Flapping</dt>
+        <dd>A marginal node fails, recovers, fails again. Each transition costs a reconnect storm and a cache flush. Add hysteresis: require sustained health before returning to service.</dd>
+      </dl>
+
+      <figure class="diagram">
+        <div class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant P as Primary
+  participant S as Standby
+  participant W as Witness / quorum
+  P->>W: heartbeat (ok)
+  Note over P,S: network partition begins
+  P--xW: heartbeat lost
+  S->>W: is the primary alive?
+  W-->>S: no beat for 3s, and I can see you
+  W-->>S: majority agrees, take leadership (term 8)
+  S->>S: promote, fencing token = 8
+  C->>S: writes now go here
+  Note over P: old primary still running, still thinks it is leader
+  P->>S: write with fencing token 7
+  S-->>P: rejected, stale term
+        </div>
+        <figcaption>The witness turns a two-node system into an odd-sized quorum, and the fencing token stops the deposed primary from doing damage after it comes back. Without both, this sequence is a split brain.</figcaption>
+      </figure>
+
+      <h2><span class="h2n">4.7</span>Failure domains, blast radius and RTO/RPO</h2>
+
+      <p>Redundancy only helps if the copies fail independently, so availability design is really about arranging things across independent <b>failure domains</b>:</p>
+
+      <ol class="tight">
+        <li><b>Process</b> — a crash. Handled by running several processes.</li>
+        <li><b>Machine</b> — hardware, kernel, disk. Handled by multiple machines.</li>
+        <li><b>Rack</b> — a switch or power feed. Handled by anti-affinity placement.</li>
+        <li><b>Availability zone</b> — a datacenter building: power, cooling, network. Handled by multi-AZ, which is the standard bar for serious services.</li>
+        <li><b>Region</b> — a geographic area: a fibre cut, a regional control-plane outage, a natural disaster. Handled by multi-region, which is expensive and forces consistency decisions.</li>
+        <li><b>Global</b> — a bad deploy, an expired certificate, a DNS misconfiguration, a config push. <em>Not handled by geography at all</em>, and the cause of most large public outages. Handled by progressive rollout, config validation, and staged deployment across cells.</li>
+      </ol>
+
+      <p><b>Blast radius</b> is how much of the system one failure takes with it. Cell-based architecture attacks this deliberately: partition users into independent cells, each with its own full stack, and route each user to exactly one cell. A cell-level failure affects 1/N of users, deploys go cell by cell, and a poison-pill request cannot spread. The cost is operational complexity and per-cell overhead.</p>
+
+      <div class="tw">
+        <table>
+          <caption>The two disaster-recovery numbers, and what each demands</caption>
+          <thead><tr><th></th><th>Definition</th><th>Near zero requires</th><th>Hours is fine if</th></tr></thead>
+          <tbody>
+            <tr><td><b>RTO</b><br>recovery time objective</td><td>How long until service is restored</td><td>Hot standby or active-active, automated failover, pre-warmed capacity</td><td>You can run from backups and users tolerate a maintenance page</td></tr>
+            <tr><td><b>RPO</b><br>recovery point objective</td><td>How much data you may lose</td><td>Synchronous replication to a second failure domain, which costs latency on every write</td><td>Periodic snapshots plus log shipping are enough</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>RPO is where the honest conversation happens. An RPO of zero means every write must be durable in two places before you acknowledge it, and if those places are in different regions you have added tens of milliseconds to every single write forever. Most businesses, asked precisely, will accept an RPO of a few seconds for most data and demand zero for a narrow slice — payments, orders, audit logs. Designing those two classes differently is much cheaper than treating everything as critical.</p>
+
+      <h2><span class="h2n">4.8</span>Health checks, carefully</h2>
+
+      <p>Health checks are how the system decides what is alive, so getting them wrong is a direct route to an outage.</p>
+
+      <dl>
+        <dt>Liveness</dt>
+        <dd>"Is this process wedged and in need of a restart?" Should test almost nothing — if a liveness check depends on a database, a database blip restarts your entire fleet simultaneously and turns a partial outage into a total one.</dd>
+        <dt>Readiness</dt>
+        <dd>"Should this instance receive traffic right now?" May check that caches are warm, migrations are applied, and connection pools are established. Failing readiness removes an instance from the pool without killing it.</dd>
+        <dt>Deep / dependency health</dt>
+        <dd>"Can this instance actually do useful work?" Genuinely useful for detecting grey failure, and genuinely dangerous: if every instance checks the same shared dependency, one dependency hiccup marks the entire fleet unhealthy at once. Use it for observability and outlier detection, not as the sole input to a load balancer's remove-from-pool decision.</dd>
+      </dl>
+
+      <div class="note good">
+        <span class="lab">Fail-open at the fleet level</span>
+        <p>A load balancer that removes unhealthy hosts should refuse to remove more than a set fraction of them — typically it stops at 50%. If every host reports unhealthy, that is far more likely to be a bad health check or a shared dependency than 100% simultaneous host failure, and sending traffic to possibly-broken hosts is better than sending it nowhere. Most mature load balancers implement this as "panic mode" or "minimum healthy percentage"; make sure yours does.</p>
+      </div>
+
+      <h2><span class="h2n">4.9</span>Designing for degradation</h2>
+
+      <p>The best availability improvement is often not more redundancy but a smaller definition of "down". Rank features by importance and decide in advance what gets sacrificed:</p>
+
+      <div class="tw">
+        <table>
+          <caption>A degradation ladder for an e-commerce site</caption>
+          <thead><tr><th>Tier</th><th>Feature</th><th>When its dependency fails</th></tr></thead>
+          <tbody>
+            <tr><td>Critical</td><td>Browse, add to basket, pay</td><td>The site is down. Everything else exists to protect these</td></tr>
+            <tr><td>Important</td><td>Search, stock levels, account</td><td>Serve cached or approximate results; show "stock may be inaccurate"</td></tr>
+            <tr><td>Nice to have</td><td>Recommendations, recently viewed, reviews</td><td>Omit the section entirely. Never let it block a page render</td></tr>
+            <tr><td>Background</td><td>Analytics, emails, loyalty points</td><td>Queue it. Nobody notices a delay of minutes</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Two mechanics make this real. Every call to a lower tier gets an <b>aggressive timeout and a fallback value</b>, so a slow dependency costs 50 ms and a missing section rather than a hung page. And there should be a <b>kill switch</b> per feature, so that during an incident you can shed the optional work deliberately rather than waiting for timeouts to do it badly.</p>
+
+      <details class="check">
+        <summary>A request passes through a CDN (99.99%), a load balancer (99.99%), two services (99.95% each) and a database (99.95%). What is the end-to-end availability, and where should you spend?</summary>
+        <div class="ans">
+          <p>0.9999 × 0.9999 × 0.9995 × 0.9995 × 0.9995 = <b>0.99830</b>, about 99.83% — roughly 74 minutes of downtime a month, which is worse than every individual component. The weakest links are the three 99.95% components, and there are three of them. The highest-value moves are, in order: make one of the services optional or cacheable so it leaves the serial chain entirely; add redundancy to the database (a replica with automated failover takes it towards four nines); and question whether both services need to be in the synchronous path at all. Improving the CDN would be worthless.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Why is a two-node database cluster with automatic failover often less safe than a single node?</summary>
+        <div class="ans">
+          <p>Because two nodes cannot form a majority when they are partitioned from each other. Each sees the other as dead, each may promote itself, and you get split brain with divergent writes — a data-integrity incident, which is far worse than the availability incident you were trying to prevent. A single node fails cleanly and loses no data. The fix is a third voting member (a full replica or a lightweight witness that stores no data but breaks ties) plus fencing, so that at most one side of any partition can accept writes.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Your service has had zero downtime for eight months against a 99.9% SLO. Is this good?</summary>
+        <div class="ans">
+          <p>Probably not. You have spent none of an error budget that was deliberately allocated, which means you are buying reliability the users may not need with money and velocity that could have gone elsewhere. It also suggests the failover path is completely unexercised and might not work. The reasonable responses are to ship faster, reduce cost by removing redundancy that is not earning its keep, or deliberately spend some budget on planned failover exercises and chaos testing — which converts unspent budget into confidence that the redundancy is real.</p>
+        </div>
+      </details>
+
+      <div class="recap">
+        <h2>Recap</h2>
+        <ol>
+          <li><b>A = MTBF / (MTBF + MTTR).</b> Cutting recovery time is nearly always cheaper than preventing failures.</li>
+          <li><b>99.9% is 43 minutes a month; 99.99% is 4.4.</b> Between them, humans stop fitting in the recovery loop and everything must be automated.</li>
+          <li><b>Serial dependencies multiply availability down; parallel copies multiply unavailability down.</b> Shorten the chain and make links optional.</li>
+          <li><b>Independence is an assumption, and usually a false one.</b> Shared deploys, racks, configs and load make replicas fail together.</li>
+          <li><b>SLI → SLO → SLA, with the SLA looser than the SLO,</b> and an error budget policy that actually changes what the team does.</li>
+          <li><b>Grey failure beats fail-stop for damage caused.</b> Shallow health checks keep half-dead nodes in rotation; use outlier detection.</li>
+          <li><b>Quorum and fencing prevent split brain.</b> Two-node clusters cannot fail over safely on their own.</li>
+          <li><b>Failover paths that are never exercised do not work.</b> Practise them, or run active-active so they are exercised continuously.</li>
+          <li><b>Shrink the definition of "down"</b> with timeouts, fallbacks, kill switches and a written degradation ladder.</li>
+        </ol>
+      </div>
+
+      <nav class="pn" aria-label="Previous and next chapter"></nav>
+    </div>
+  </article>
+</div>
+
+<script src="assets/notes.js"></script>
+<script>
+function statEl(k, v, tone) {
+  var d = document.createElement("div"); d.className = "stat";
+  var a = document.createElement("div"); a.className = "k"; a.textContent = k;
+  var b = document.createElement("div"); b.className = "v"; b.textContent = v;
+  if (tone) b.style.color = tone;
+  d.append(a, b); return d;
+}
+function barEl(label, pct, value, colour) {
+  var row = document.createElement("div"); row.className = "bar";
+  var k = document.createElement("span"); k.textContent = label;
+  var t = document.createElement("span"); t.className = "track";
+  var f = document.createElement("span"); f.className = "fill";
+  f.style.width = Math.max(0, Math.min(100, pct)) + "%";
+  if (colour) f.style.background = colour;
+  t.appendChild(f);
+  var v = document.createElement("span"); v.className = "val"; v.textContent = value;
+  row.append(k, t, v); return row;
+}
+function dur(minutes) {
+  if (minutes < 1) return Math.round(minutes * 60) + " s";
+  if (minutes < 90) return minutes.toFixed(minutes < 10 ? 1 : 0) + " min";
+  if (minutes < 2880) return (minutes / 60).toFixed(1) + " h";
+  return (minutes / 1440).toFixed(1) + " d";
+}
+
+/* ---------- availability of a topology ---------- */
+(function () {
+  var tiers = document.getElementById("a-tiers"), comp = document.getElementById("a-comp"),
+      rep = document.getElementById("a-rep"), corr = document.getElementById("a-corr"),
+      stats = document.getElementById("a-stats"), bars = document.getElementById("a-bars"),
+      note = document.getElementById("a-note");
+
+  function draw() {
+    var T = +tiers.value, A = +comp.value, R = +rep.value, c = +corr.value / 100;
+    document.getElementById("a-tiersv").textContent = T;
+    document.getElementById("a-repv").textContent = R;
+    document.getElementById("a-corrv").textContent = +corr.value;
+
+    var u = 1 - A;
+    /* split unavailability into an independent part and a common-mode part */
+    var uCommon = u * c, uIndep = u * (1 - c);
+    var tierU = uCommon + Math.pow(uIndep, R);
+    var tierA = 1 - tierU;
+    var total = Math.pow(tierA, T);
+    var single = Math.pow(A, T);
+    var perfect = 1 - Math.pow(1 - A, R);
+
+    var mins = (1 - total) * 43200;
+    stats.innerHTML = "";
+    stats.appendChild(statEl("End-to-end availability", (total * 100).toFixed(total > 0.9999 ? 4 : 3) + "%",
+      total < 0.999 ? "var(--line)" : total > 0.9999 ? "var(--ok)" : ""));
+    stats.appendChild(statEl("Downtime per month", dur(mins), mins > 60 ? "var(--line)" : ""));
+    stats.appendChild(statEl("One tier alone", (tierA * 100).toFixed(4) + "%"));
+    stats.appendChild(statEl("Without redundancy", (single * 100).toFixed(3) + "%"));
+
+    bars.innerHTML = "";
+    var scale = function (a) { return Math.max(0, (Math.log10(1 - a) + 6) / 6 * 100); };
+    bars.appendChild(barEl("This topology", scale(total), (total * 100).toFixed(3) + "%"));
+    bars.appendChild(barEl("If failures were independent", scale(Math.pow(perfect, T)), (Math.pow(perfect, T) * 100).toFixed(3) + "%", "var(--ok)"));
+    bars.appendChild(barEl("No redundancy at all", scale(single), (single * 100).toFixed(3) + "%", "var(--text-3)"));
+
+    var lost = Math.pow(perfect, T) - total;
+    note.textContent = c === 0
+      ? "With perfectly independent failures, redundancy is enormously effective — this is the number that redundancy is usually sold on, and it is optimistic."
+      : "Correlated failure costs you " + (lost * 100).toFixed(3) + " percentage points here. Beyond a certain point extra replicas add nothing, because the common-mode failures — shared deploys, shared config, shared power — dominate what is left.";
+  }
+  [tiers, comp, rep, corr].forEach(function (n) { n.addEventListener("input", draw); n.addEventListener("change", draw); });
+  draw();
+})();
+
+/* ---------- error budget ---------- */
+(function () {
+  var slo = document.getElementById("e-slo"), days = document.getElementById("e-days"),
+      used = document.getElementById("e-used"), rate = document.getElementById("e-rate"),
+      stats = document.getElementById("e-stats"), bars = document.getElementById("e-bars"),
+      note = document.getElementById("e-note");
+
+  function draw() {
+    var s = +slo.value / 100, d = +days.value, u = +used.value, r = +rate.value / 100;
+    document.getElementById("e-daysv").textContent = d;
+    document.getElementById("e-usedv").textContent = u;
+    document.getElementById("e-ratev").textContent = (+rate.value).toFixed(2);
+
+    var windowMin = 28 * 24 * 60;
+    var budget = (1 - s) * windowMin;
+    var spent = Math.min(u, budget * 4);
+    var left = budget - spent;
+    var burnPerDay = r * 24 * 60;            /* minutes of budget burned per day at current rate */
+    var expected = budget * (d / 28);
+    var burnRate = expected > 0 ? spent / expected : 0;
+    var daysLeft = burnPerDay > 0 ? left / burnPerDay : Infinity;
+
+    stats.innerHTML = "";
+    stats.appendChild(statEl("Budget for 28 days", dur(budget)));
+    stats.appendChild(statEl("Remaining", left > 0 ? dur(left) : "exhausted", left <= 0 ? "var(--line)" : left / budget > 0.5 ? "var(--ok)" : ""));
+    stats.appendChild(statEl("Burn rate vs plan", burnRate.toFixed(2) + "×", burnRate > 1 ? "var(--line)" : "var(--ok)"));
+    stats.appendChild(statEl("Runs out in", left <= 0 ? "—" : (isFinite(daysLeft) ? (daysLeft > 60 ? "60+ days" : daysLeft.toFixed(1) + " days") : "never at this rate"),
+      isFinite(daysLeft) && daysLeft < (28 - d) ? "var(--line)" : ""));
+
+    bars.innerHTML = "";
+    bars.appendChild(barEl("Budget spent", (spent / budget) * 100, ((spent / budget) * 100).toFixed(0) + "%",
+      spent / budget > 1 ? "var(--line)" : spent / budget > 0.7 ? "#B87A17" : "var(--ok)"));
+    bars.appendChild(barEl("Window elapsed", (d / 28) * 100, Math.round((d / 28) * 100) + "%", "var(--text-3)"));
+
+    note.textContent = left <= 0
+      ? "Budget exhausted. Under a typical policy this means a feature freeze: no risky changes until the rolling window refills. The point is that the decision is automatic and not an argument."
+      : burnRate > 2
+      ? "Burning at more than twice the planned rate. This is the classic page-worthy signal — alert on burn rate, not on individual errors, because burn rate is the only thing that predicts an SLO miss."
+      : burnRate > 1
+      ? "Slightly ahead of plan. Worth a conversation about what is consuming the budget, not an emergency."
+      : "Comfortably within budget. If it stays this far under for months, you are over-invested in reliability and could be shipping faster or spending less.";
+  }
+  [slo, days, used, rate].forEach(function (n) { n.addEventListener("input", draw); n.addEventListener("change", draw); });
+  draw();
+})();
+</script>
+</body>
+</html>

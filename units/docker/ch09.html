@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>9 · docker run, end to end — Docker</title>
+<meta name="description" content="The container lifecycle and exit codes, the stop sequence and graceful shutdown, restart policies and exponential backoff, the docker run flag catalogue, and passing configuration.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Crect x='6' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='19' y='16' width='5' height='5' fill='%237C8CF8'/%3E%3Crect x='12.5' y='10' width='5' height='5' fill='%23fff'/%3E%3Cpath d='M4 22h22a5 5 0 004-4' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body data-ch="ch09">
+<div id="prog"><i></i></div>
+
+<header class="band">
+  <div class="band-in">
+    <a class="crumb" href="index.html">
+      <svg width="13" height="13" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M8 2L4 6.5 8 11" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Docker
+    </a>
+    <div class="chno"><b>Chapter 9</b><span>Running containers</span></div>
+    <h1><code>docker run</code>, end to end</h1>
+    <p class="lede">Starting a container is easy and stopping one is where the bugs live. <b>A deploy that drops connections, a crash loop that reports itself as healthy, a container that takes exactly ten seconds to die every single time</b> — all three are the same small set of mechanics, and all three are visible on a timeline once you know what the daemon is actually doing.</p>
+    <div class="meta"><span>28 min</span><span>2 demos</span><span>8 sections</span><span>4 self-checks</span></div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page"></nav>
+  <main>
+
+    <section id="lifecycle">
+      <h2 data-nav="What run does">What <code>docker run</code> actually does</h2>
+      <p class="sub">Two API calls, and about nine steps between them.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">watch it happen</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker events --filter type=container &amp;
+$ docker run -d --name web -p 8080:80 nginx
+
+container create  3f9c2a…  (image=nginx, name=web)
+container attach  3f9c2a…
+container connect 3f9c2a…  (container=3f9c2a…, network=bridge, type=bridge)
+container start   3f9c2a…
+$ docker stop web
+container kill    3f9c2a…  (signal=15)
+container die     3f9c2a…  (exitCode=0)
+container disconnect …
+container stop    3f9c2a…</pre>
+      </div>
+      <p>The interesting part is the order. <strong>Create allocates everything; start runs the process.</strong> Between them the image layers are mounted as an overlay (chapter 3), the writable layer is allocated, the network endpoint is created and attached (chapter 12), volumes are mounted (chapter 11), the cgroup is written (chapter 10) and the namespaces are set up (chapter 2). Only then does <code>runc</code> execute your entrypoint.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Exit code</th><th>Means</th></tr></thead>
+          <tbody>
+            <tr><td><code>0</code></td><td>Clean exit</td></tr>
+            <tr><td><code>1</code>–<code>124</code></td><td>The application's own exit code</td></tr>
+            <tr><td><code>125</code></td><td><b>Docker itself failed</b> — a bad flag, a missing network</td></tr>
+            <tr><td><code>126</code></td><td>The command exists but could not be invoked — usually not executable</td></tr>
+            <tr><td><code>127</code></td><td>Command not found — a typo, or a missing shell in a slim image</td></tr>
+            <tr><td><code>128 + N</code></td><td>Killed by signal N: <code>130</code> SIGINT, <code>137</code> SIGKILL, <code>139</code> SIGSEGV, <code>143</code> SIGTERM</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="key">
+        <span class="lbl">The three codes worth memorising</span>
+        <p><strong>137</strong> is SIGKILL — either the OOM killer (chapter 10) or a stop that timed out, and <code>State.OOMKilled</code> distinguishes them. <strong>143</strong> is SIGTERM, meaning the container was asked to stop and did. <strong>125</strong> means the container never ran at all, so stop reading your application logs and read the Docker error instead.</p>
+      </div>
+    </section>
+
+    <section id="stopping">
+      <h2 data-nav="Stopping">Stopping, in slow motion</h2>
+      <p class="sub"><code>docker stop</code> is a two-phase operation with a deadline.</p>
+      <p>The sequence is: send <strong>STOPSIGNAL</strong> (SIGTERM unless the image says otherwise) to PID 1, wait up to <strong>stop-timeout</strong> (10 seconds by default), then send SIGKILL, which cannot be caught. Everything interesting is in what your process does with that window.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Shutdown timeline</h3>
+          <span class="hint">Where the in-flight requests go, and which exit code you get</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <label for="s-drain" style="min-width:158px">app needs <b id="s-drainv">6</b>s to drain</label>
+            <input type="range" id="s-drain" min="0" max="45" value="6" style="width:130px">
+          </div>
+          <div class="ctrl tight">
+            <label for="s-timeout" style="min-width:158px">--stop-timeout <b id="s-timeoutv">10</b>s</label>
+            <input type="range" id="s-timeout" min="1" max="45" value="10" style="width:130px">
+          </div>
+          <div class="ctrl tight">
+            <label for="s-reqs" style="min-width:158px">in-flight requests <b id="s-reqsv">120</b></label>
+            <input type="range" id="s-reqs" min="0" max="500" step="10" value="120" style="width:130px">
+          </div>
+          <div class="ctrl">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:158px">PID 1 is</span>
+            <span id="s-mode" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div id="s-chart" style="margin:6px 0 10px"></div>
+          <div class="term" id="s-term"></div>
+          <div class="rgrid" id="s-out"></div>
+          <p class="readout" id="s-note"></p>
+        </div>
+      </div>
+
+      <div class="code">
+        <div class="code-top"><span class="tag">the controls</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker stop web                    # STOPSIGNAL, then SIGKILL after the timeout
+$ docker stop -t 30 web               # a longer grace period, for this stop
+$ docker run --stop-timeout 30 …      # ...baked into the container
+$ docker run --stop-signal SIGQUIT …  # nginx drains gracefully on SIGQUIT
+$ docker kill web                      # SIGKILL immediately, no grace at all
+$ docker kill -s HUP web                # any signal — reload rather than stop
+$ docker run --init …                    # tini as PID 1: forwards signals, reaps zombies</pre>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Runtime</th><th>Graceful shutdown needs</th></tr></thead>
+          <tbody>
+            <tr><td>Node / Express</td><td><code>process.on('SIGTERM', …)</code> plus <code>server.close()</code>; nothing is automatic</td></tr>
+            <tr><td>nginx</td><td><code>STOPSIGNAL SIGQUIT</code> — SIGTERM is a <em>fast</em> shutdown that drops connections</td></tr>
+            <tr><td>Go</td><td><code>signal.NotifyContext</code> plus <code>srv.Shutdown(ctx)</code></td></tr>
+            <tr><td>Python / Gunicorn</td><td>Handles SIGTERM itself; set <code>--graceful-timeout</code> below the stop timeout</td></tr>
+            <tr><td>JVM / Spring Boot</td><td><code>server.shutdown=graceful</code> and a matching <code>spring.lifecycle.timeout-per-shutdown-phase</code></td></tr>
+            <tr><td>A shell script</td><td>Usually nothing — use <code>exec</code> so the real process is PID 1 (chapter 5)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="trap">
+        <span class="lbl">The stop timeout must exceed the drain time, and usually does not</span>
+        <p>A service that takes 25 seconds to finish long-lived requests, behind a default 10-second timeout, has 15 seconds of work killed on every single deploy — quietly, because the container does exit and the exit code is buried. Set <code>--stop-timeout</code> above your worst-case drain, make the application's own graceful timeout slightly <em>lower</em> than that, and check the exit code is 0 rather than 137 after a deploy. The timeline above shows exactly which requests fall off the end.</p>
+      </div>
+    </section>
+
+    <section id="restart">
+      <h2 data-nav="Restart policies">Restart policies and backoff</h2>
+      <p class="sub">There is an exponential backoff, and almost nobody knows its rules.</p>
+      <p>Docker's restart manager waits before each retry: <strong>100&nbsp;ms, doubling each time, capped at one minute.</strong> The delay resets to 100&nbsp;ms once the container has run for more than 10 seconds. Those two numbers produce very different behaviour depending on how fast your container fails:</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <h3>Restart backoff simulator</h3>
+          <span class="hint">Ten minutes of a failing container, under each policy</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl tight">
+            <span style="font-size:12.5px;color:var(--text-2);min-width:74px">policy</span>
+            <span id="r-policy" style="display:flex;gap:8px;flex-wrap:wrap"></span>
+          </div>
+          <div class="ctrl">
+            <label for="r-life" style="min-width:170px">crashes after <b id="r-lifev">0.5</b>s</label>
+            <input type="range" id="r-life" min="1" max="300" value="5" style="width:140px">
+          </div>
+          <div id="r-chart" style="margin:6px 0 10px"></div>
+          <div class="term" id="r-term"></div>
+          <div class="rgrid" id="r-out"></div>
+          <p class="readout" id="r-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Policy</th><th>Restarts</th><th>After a daemon restart</th></tr></thead>
+          <tbody>
+            <tr><td><code>no</code></td><td>Never</td><td>Stays stopped</td></tr>
+            <tr><td><code>on-failure[:N]</code></td><td>Non-zero exits only, up to N attempts</td><td>Resumed if it was running</td></tr>
+            <tr><td><code>unless-stopped</code></td><td>Any exit</td><td>Resumed <b>unless</b> you had stopped it explicitly</td></tr>
+            <tr><td><code>always</code></td><td>Any exit</td><td>Resumed even if you had stopped it</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">seeing a crash loop for what it is</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker ps
+CONTAINER ID   IMAGE     STATUS                          NAMES
+7d6c5b4a3928   api:2.4   Restarting (1) 34 seconds ago   api      &lt;- not "Up"
+
+$ docker inspect -f '{{.RestartCount}} {{.State.Status}} {{.State.ExitCode}}' api
+47 restarting 1
+
+$ docker events --filter container=api --filter event=restart
+$ docker logs --tail 20 api                  # the same startup error, 47 times</pre>
+      </div>
+      <div class="warn">
+        <span class="lbl"><code>always</code> plus a fast crash is an outage that looks like a running service</span>
+        <p>After a dozen failures the delay reaches a minute, so the container spends most of every minute stopped while <code>docker ps</code> shows <code>Restarting</code> rather than <code>Exited</code>. Nothing alerts, because from the daemon's point of view the policy is working. The two things that turn this into a visible failure are a <code>HEALTHCHECK</code> (chapter 5) and alerting on <code>RestartCount</code> — and the reason orchestrators exist is that they treat a crash loop as a state to report rather than a policy to honour (chapter 20).</p>
+      </div>
+    </section>
+
+    <section id="flags">
+      <h2 data-nav="The flag catalogue">The flag catalogue</h2>
+      <p class="sub">Organised by what they are for, since <code>docker run --help</code> is not.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Purpose</th><th>Flags</th></tr></thead>
+          <tbody>
+            <tr><td>Identity and lifecycle</td><td><code>--name</code>, <code>-d</code>, <code>--rm</code>, <code>--restart</code>, <code>--stop-signal</code>, <code>--stop-timeout</code>, <code>--init</code></td></tr>
+            <tr><td>Terminal</td><td><code>-i</code>, <code>-t</code>, <code>--detach-keys</code>, <code>--sig-proxy</code></td></tr>
+            <tr><td>Configuration</td><td><code>-e</code>, <code>--env-file</code>, <code>-w</code>, <code>-u</code>, <code>--entrypoint</code>, <code>--label</code></td></tr>
+            <tr><td>Resources (chapter 10)</td><td><code>-m</code>, <code>--cpus</code>, <code>--cpuset-cpus</code>, <code>--pids-limit</code>, <code>--shm-size</code>, <code>--ulimit</code></td></tr>
+            <tr><td>Storage (chapter 11)</td><td><code>-v</code>, <code>--mount</code>, <code>--tmpfs</code>, <code>--read-only</code>, <code>--volumes-from</code></td></tr>
+            <tr><td>Network (chapter 12)</td><td><code>-p</code>, <code>-P</code>, <code>--network</code>, <code>--dns</code>, <code>--add-host</code>, <code>--hostname</code></td></tr>
+            <tr><td>Security (chapter 18)</td><td><code>--cap-drop</code>, <code>--cap-add</code>, <code>--security-opt</code>, <code>--read-only</code>, <code>--privileged</code></td></tr>
+            <tr><td>Health</td><td><code>--health-cmd</code>, <code>--health-interval</code>, <code>--no-healthcheck</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">a production-shaped run command</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run -d \
+    --name api \
+    --restart unless-stopped \
+    --stop-timeout 30 \
+    --init \
+    -m 512m --cpus 1.5 --pids-limit 256 \
+    --read-only --tmpfs /tmp \
+    --cap-drop ALL \
+    --security-opt no-new-privileges \
+    -u 10001:10001 \
+    --env-file ./api.env \
+    -p 127.0.0.1:3000:3000 \
+    --health-cmd 'wget -qO- http://localhost:3000/healthz || exit 1' \
+    --health-interval 30s --health-start-period 20s \
+    ghcr.io/acme/api@sha256:41523187cf…</pre>
+      </div>
+      <p>Every line there is a chapter of this unit. Note <code>-p 127.0.0.1:3000:3000</code> rather than <code>-p 3000:3000</code> — the difference between "reachable from localhost" and "reachable from the internet", and chapter 12 explains why the second one surprises people.</p>
+    </section>
+
+    <section id="attach">
+      <h2 data-nav="attach, exec, logs">attach, exec and logs</h2>
+      <p class="sub">Three ways to see a container, doing three different things.</p>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th></th><th>Connects to</th><th>Ctrl-C does</th></tr></thead>
+          <tbody>
+            <tr><td><code>docker attach</code></td><td>PID 1's own stdin, stdout and stderr</td><td><b>Signals PID 1</b> — it stops the container</td></tr>
+            <tr><td><code>docker exec</code></td><td>A new process in the same namespaces</td><td>Kills only your process</td></tr>
+            <tr><td><code>docker logs</code></td><td>The daemon's captured stdout and stderr</td><td>Nothing — it is a read</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">detaching without killing it</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker attach web              # Ctrl-P Ctrl-Q detaches; Ctrl-C stops the container
+$ docker attach --no-stdin web    # safer: you cannot type into it
+$ docker attach --sig-proxy=false web    # Ctrl-C detaches instead of signalling
+$ docker run -d --detach-keys 'ctrl-e,e' …
+
+$ docker logs -f --tail 100 --timestamps --since 10m web</pre>
+      </div>
+      <div class="key">
+        <span class="lbl">Why <code>docker logs</code> sometimes shows nothing</span>
+        <p>It replays what the daemon captured from PID 1's stdout and stderr, so anything the application wrote to a file inside the container is invisible to it. That is the single most common logging misconfiguration in containers: a framework defaulting to <code>/var/log/app.log</code> produces an empty <code>docker logs</code> and a log file that vanishes with the container. Log to stdout and let the platform route it (chapter 19).</p>
+      </div>
+    </section>
+
+    <section id="oneshot">
+      <h2 data-nav="One-shot containers">One-shot containers</h2>
+      <p class="sub">The underused half of Docker: containers as commands.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">tools you never install</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run --rm -v "$PWD:/w" -w /w node:22-alpine npm ci
+$ docker run --rm -i alpine sh -c 'apk add -q jq &amp;&amp; jq .' &lt; data.json
+$ docker run --rm -v "$PWD:/w" -w /w hadolint/hadolint hadolint Dockerfile
+$ docker run --rm -it --network container:web nicolaka/netshoot   # ch. 12, ch. 19
+
+# an alias that behaves like a local binary
+$ alias aws='docker run --rm -it -v ~/.aws:/root/.aws -v "$PWD:/w" -w /w amazon/aws-cli'</pre>
+      </div>
+      <div class="code">
+        <div class="code-top"><span class="tag">exit codes as job status</span><button class="copy">Copy</button></div>
+<pre data-lang="sh">$ docker run --rm migrate-image ./migrate up &amp;&amp; echo "migrated"
+$ docker create --name job batch-image ./process
+$ docker start job &amp;&amp; docker wait job          # prints the exit code
+0
+$ docker logs job &amp;&amp; docker rm job</pre>
+      </div>
+      <p><code>docker wait</code> blocks until the container exits and prints its exit code, which makes a container a usable unit of work in a shell script or a CI step. Pair it with <code>--rm</code> for anything you do not need to inspect afterwards, since an exited container keeps its writable layer until removed (chapter 4).</p>
+    </section>
+
+    <section id="config">
+      <h2 data-nav="Configuration">Passing configuration</h2>
+      <p class="sub">Four sources, one precedence order, and one parsing surprise.</p>
+      <div class="code">
+        <div class="code-top"><span class="tag">precedence, lowest to highest</span><button class="copy">Copy</button></div>
+<pre data-lang="sh"># 1. ENV in the image           (chapter 5)
+# 2. --env-file, in file order
+# 3. -e NAME=value
+# 4. -e NAME                     (inherits the value from your shell)
+
+$ docker run -e NODE_ENV=staging --env-file base.env --env-file prod.env app
+#   -e wins over both files; later files win over earlier ones</pre>
+      </div>
+      <div class="trap">
+        <span class="lbl"><code>--env-file</code> is not a shell script</span>
+        <p>Docker parses it literally: <code>KEY=value</code> per line, no interpolation, no <code>export</code>, and <strong>quotes are part of the value</strong>. So <code>PASSWORD="hunter2"</code> sets a password including the quote characters, and <code>URL=$HOST/api</code> sets the literal string <code>$HOST/api</code>. A line with just <code>KEY</code> and no <code>=</code> means "take it from my environment", which is occasionally useful and often an accident. Verify with <code>docker run --rm --env-file x.env alpine env</code> before debugging anything else.</p>
+      </div>
+      <div class="tw">
+        <table class="tbl">
+          <thead><tr><th>Kind of configuration</th><th>Pass it as</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td>Non-secret settings</td><td><code>-e</code> or <code>--env-file</code></td><td>Simple, visible in <code>inspect</code>, which is fine</td></tr>
+            <tr><td>Secrets</td><td>A mounted file, read at startup</td><td>Environment variables appear in <code>docker inspect</code>, in crash dumps and in child processes</td></tr>
+            <tr><td>Large config files</td><td>A read-only bind mount or volume</td><td>Chapter 11</td></tr>
+            <tr><td>Anything differing per environment</td><td>Never baked into the image</td><td>One image, promoted between environments (chapter 15)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>The last row is the principle worth holding onto: <strong>the image is the same in staging and production and the configuration is not.</strong> An image with the staging database URL compiled in cannot be promoted, so every environment needs its own build, and now the thing you tested is not the thing you shipped.</p>
+    </section>
+
+    <section id="recap">
+      <h2 data-nav="The short version">The short version</h2>
+      <div class="recap">
+        <h2>Chapter 9 in eight lines</h2>
+        <ul>
+          <li><b>Create allocates, start runs.</b> Layers, writable layer, network endpoint, volumes, cgroup and namespaces are all set up before your process exists.</li>
+          <li><b>137</b> is SIGKILL (OOM or a stop that timed out), <b>143</b> is SIGTERM, <b>125</b> means the container never ran.</li>
+          <li><code>docker stop</code> sends STOPSIGNAL, waits <code>--stop-timeout</code> (10s default), then SIGKILL — which cannot be caught.</li>
+          <li>Set the stop timeout above your worst-case drain time, and the application's own graceful timeout slightly below it.</li>
+          <li>Restart backoff is <b>100 ms doubling to a 1-minute cap</b>, resetting once the container survives 10 seconds.</li>
+          <li>So a fast crash loop settles into one attempt per minute while <code>docker ps</code> reports <code>Restarting</code> — an outage that raises no alarm.</li>
+          <li><code>attach</code> connects to PID 1 (Ctrl-C stops the container); <code>exec</code> starts a new process; <code>logs</code> only ever shows what PID 1 wrote to stdout and stderr.</li>
+          <li><code>--env-file</code> is parsed literally: <b>quotes become part of the value</b> and nothing is interpolated.</li>
+        </ul>
+      </div>
+
+      <h3 style="margin-top:30px">Check yourself</h3>
+      <details class="chk">
+        <summary>Every deploy shows a spike of 502s, and containers exit with 137 after exactly ten seconds. What is the fix, in two parts?</summary>
+        <div class="ans"><p>The application is not finishing its shutdown inside the default ten-second grace period, so SIGKILL arrives mid-request. Part one: raise <code>--stop-timeout</code> above the worst-case drain time. Part two — and this is the part usually missed — make the application actually drain: install a SIGTERM handler that stops accepting new connections, waits for in-flight requests, then exits, with its own graceful timeout set slightly <em>below</em> the Docker timeout so it exits by choice rather than by SIGKILL. If the process cannot be made to handle signals, add <code>--init</code>. Verify by checking the exit code is 0 rather than 137 after a stop.</p></div>
+      </details>
+      <details class="chk">
+        <summary>A container with <code>--restart always</code> has <code>RestartCount</code> of 340 and reports <code>Restarting</code>. Users say the service is down. Reconcile those.</summary>
+        <div class="ans"><p>It is down, and the restart policy is hiding it. The container fails immediately on start, so the backoff has grown to its one-minute cap: it spends nearly every minute stopped, briefly starts, fails, and waits again. <code>docker ps</code> says <code>Restarting</code> rather than <code>Exited</code>, so nothing looks broken to the daemon — the policy is working as designed. Read the logs for the repeated startup error, and add a <code>HEALTHCHECK</code> plus alerting on <code>RestartCount</code> so the next one is visible. The simulator above shows the delay sequence.</p></div>
+      </details>
+      <details class="chk">
+        <summary>Why does a container that crashes after 15 seconds hammer the host, while one that crashes instantly does not?</summary>
+        <div class="ans"><p>Because the backoff resets once the container has run for more than 10 seconds. A container living 15 seconds each time satisfies that threshold on every attempt, so the delay never grows past 100&nbsp;ms — it restarts roughly four times a minute forever, and each attempt does whatever expensive startup work it does. The instant-crash case backs off to a one-minute cap and becomes cheap, if invisible. It is a genuinely counter-intuitive result: <b>failing slightly slower makes the loop far more expensive</b>, and it is why restart budgets belong in an orchestrator rather than in a doubling timer.</p></div>
+      </details>
+      <details class="chk">
+        <summary><code>docker logs</code> is empty but the application is clearly running and writing logs. Where are they?</summary>
+        <div class="ans"><p>In a file inside the container. <code>docker logs</code> replays only what the daemon captured from PID 1's stdout and stderr, so a framework configured to write <code>/var/log/app.log</code> produces nothing there — and that file lives in the writable layer, so it disappears when the container is removed. Find it with <code>docker exec ls /var/log</code> or <code>docker diff</code> (chapter 4), then reconfigure the application to log to stdout. A related case: logs written by a <em>child</em> process that redirected its own output, which is one more reason to make the real application PID 1.</p></div>
+      </details>
+    </section>
+
+  </main>
+</div>
+
+<footer class="foot">
+  <div class="foot-in">
+    <div class="fi">
+      <h2>Next</h2>
+      <p>Chapter 10 takes the resource flags seriously: choosing limits from measurement, memory accounting that explains why <code>docker stats</code> looks alarming, and CPU shares versus quotas under contention.</p>
+    </div>
+    <div class="fi">
+      <h2>Try it now</h2>
+      <ul>
+        <li><code>docker events --filter type=container</code> in one terminal, <code>docker run</code> in another.</li>
+        <li><code>time docker stop &lt;name&gt;</code> — ten seconds, or fifty milliseconds?</li>
+        <li><code>docker run --rm --env-file x.env alpine env</code> with a quoted value.</li>
+      </ul>
+    </div>
+    <div class="fi">
+      <h2>Sources</h2>
+      <p>Docker's <code>run</code> reference, the container lifecycle and restart-policy documentation, and the Engine API container endpoints.</p>
+    </div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">↑</button>
+
+<script src="assets/unit.js"></script>
+<script>initChapter();</script>
+<script>
+/* ============================================================
+   Demo 1 — shutdown timeline
+   ============================================================ */
+(function () {
+  var MODES = [
+    { id: "handler", label: "the app, with a SIGTERM handler" },
+    { id: "nohandler", label: "the app, no handler" },
+    { id: "shell", label: "/bin/sh (shell form)" },
+    { id: "init", label: "tini (--init), app has no handler" }
+  ];
+  var mode = "handler";
+
+  var host = document.getElementById("s-mode");
+  var chart = document.getElementById("s-chart");
+  var term = document.getElementById("s-term");
+  var out = document.getElementById("s-out");
+  var note = document.getElementById("s-note");
+
+  MODES.forEach(function (m) {
+    var b = document.createElement("button");
+    b.className = "btn" + (m.id === mode ? " on" : "");
+    b.textContent = m.label;
+    b.addEventListener("click", function () {
+      mode = m.id;
+      Array.prototype.forEach.call(host.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      render();
+    });
+    host.appendChild(b);
+  });
+
+  function val(k) { return parseInt(document.getElementById("s-" + k).value, 10); }
+
+  function model() {
+    var drain = val("drain"), timeout = val("timeout"), reqs = val("reqs");
+
+    if (mode === "shell" || mode === "nohandler") {
+      /* the signal is delivered but nothing acts on it */
+      return { exitAt: timeout, code: 137, dropped: reqs, drained: 0,
+               why: mode === "shell" ? "sh is PID 1 and does not forward SIGTERM to its child"
+                                     : "PID 1 with no handler ignores SIGTERM entirely",
+               killed: true, drainWindow: 0 };
+    }
+    if (mode === "init") {
+      /* tini forwards; with no handler the default action terminates immediately */
+      return { exitAt: 0.05, code: 143, dropped: reqs, drained: 0,
+               why: "tini forwards SIGTERM and the default action terminates the process at once",
+               killed: false, drainWindow: 0 };
+    }
+    /* a real handler: drains, then exits */
+    if (drain <= timeout) {
+      return { exitAt: drain, code: 0, dropped: 0, drained: reqs,
+               why: "the handler finished draining inside the grace period",
+               killed: false, drainWindow: drain };
+    }
+    var frac = timeout / drain;
+    var drained = Math.floor(reqs * frac);
+    return { exitAt: timeout, code: 137, dropped: reqs - drained, drained: drained,
+             why: "SIGKILL arrived mid-drain, " + (drain - timeout) + "s short",
+             killed: true, drainWindow: timeout };
+  }
+
+  function render() {
+    ["drain", "timeout", "reqs"].forEach(function (k) {
+      document.getElementById("s-" + k + "v").textContent = k === "drain" ? val(k) : val(k);
+    });
+    var m = model();
+    var drain = val("drain"), timeout = val("timeout"), reqs = val("reqs");
+    var span = Math.max(timeout, drain, m.exitAt) * 1.12 + 0.5;
+
+    var W = 470, H = 60, padL = 8;
+    var x = function (t) { return padL + (t / span) * (W - padL - 8); };
+    var svg = ['<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;max-width:' + W + 'px;height:auto;font-family:var(--mono)">'];
+    svg.push('<rect x="' + padL + '" y="18" width="' + (W - padL - 8) + '" height="14" rx="3" fill="#E9EDF1"/>');
+    if (m.drainWindow > 0) {
+      svg.push('<rect x="' + padL + '" y="18" width="' + (x(m.drainWindow) - padL) + '" height="14" rx="3" fill="#7C8CF8"/>');
+    }
+    if (m.killed) {
+      svg.push('<rect x="' + x(timeout) + '" y="18" width="' + Math.max(2, x(span) - x(timeout)) + '" height="14" fill="#F3D9D6"/>');
+    }
+    /* markers */
+    svg.push('<line x1="' + padL + '" y1="12" x2="' + padL + '" y2="38" stroke="#0C1D30" stroke-width="2"/>');
+    svg.push('<text x="' + padL + '" y="9" font-size="8.5" fill="#54677A">SIGTERM</text>');
+    svg.push('<line x1="' + x(timeout) + '" y1="12" x2="' + x(timeout) + '" y2="38" stroke="#B3372F" stroke-width="2" stroke-dasharray="3 2"/>');
+    svg.push('<text x="' + x(timeout) + '" y="9" font-size="8.5" fill="#B3372F" text-anchor="middle">timeout ' + timeout + "s</text>");
+    svg.push('<circle cx="' + x(m.exitAt) + '" cy="25" r="4.5" fill="' + (m.code === 0 ? "#1F7A52" : "#B3372F") + '"/>');
+    svg.push('<text x="' + x(m.exitAt) + '" y="50" font-size="8.5" fill="' + (m.code === 0 ? "#1F7A52" : "#B3372F") +
+      '" text-anchor="middle">exit ' + m.code + " @ " + (m.exitAt < 1 ? "0.05" : m.exitAt) + "s</text>");
+    svg.push("</svg>");
+    chart.innerHTML = svg.join("");
+
+    var lines = ['<span class="p">$</span> time docker stop' + (timeout !== 10 ? " -t " + timeout : "") + " api"];
+    lines.push('<span class="d">  0.00s  SIGTERM -> PID 1</span>');
+    if (m.drainWindow > 0) {
+      lines.push('<span class="g">  0.00s  handler: stop accepting, drain ' + reqs + " in-flight</span>");
+      if (!m.killed) lines.push('<span class="g">  ' + m.exitAt.toFixed(2) + "s  drained cleanly, process exits 0</span>");
+    }
+    if (m.killed) {
+      lines.push('<span class="r">  ' + timeout.toFixed(2) + "s  grace period expired -> SIGKILL</span>");
+      lines.push('<span class="r">  ' + timeout.toFixed(2) + "s  container dies, exit 137</span>");
+    } else if (mode === "init") {
+      lines.push('<span class="y">  0.05s  tini forwarded SIGTERM; default action terminated the process</span>');
+      lines.push('<span class="y">  0.05s  exit 143</span>');
+    }
+    lines.push("");
+    lines.push('<span class="p">real</span> ' + (m.exitAt < 1 ? "0m0.05s" : "0m" + m.exitAt.toFixed(2) + "s"));
+    lines.push('<span class="d">' + m.why + "</span>");
+    term.innerHTML = lines.join("\n");
+
+    out.innerHTML = "";
+    tile("Exit code", String(m.code), m.code === 0 ? "clean" : m.code === 137 ? "SIGKILL" : "SIGTERM", m.code === 0);
+    tile("Time to exit", (m.exitAt < 1 ? "0.05" : m.exitAt) + "s", m.killed ? "hit the timeout" : "by choice", !m.killed);
+    tile("Requests drained", String(m.drained) + "/" + reqs, "completed", m.dropped === 0);
+    tile("Dropped", String(m.dropped), m.dropped ? "became 502s" : "none", m.dropped === 0);
+
+    var msgs = [];
+    if (mode === "handler" && !m.killed) {
+      msgs.push("<b>This is what you want.</b> The handler stops accepting connections, finishes the " + reqs +
+        " in flight, and the process exits by its own choice after " + drain +
+        " seconds — well inside the " + timeout + "-second grace period, with exit code 0 and nothing dropped.");
+    } else if (mode === "handler" && m.killed) {
+      msgs.push("<b>The drain is " + (drain - timeout) + " seconds longer than the grace period</b>, so SIGKILL lands mid-shutdown: " +
+        m.drained + " requests completed and <b>" + m.dropped +
+        " were cut off</b>. Note the container still exits and the deploy still \"succeeds\" — the only visible trace is the 137. Raise <code>--stop-timeout</code> past " +
+        drain + "s.");
+    } else if (mode === "nohandler") {
+      msgs.push("The signal is delivered to PID 1 and <b>ignored</b>, because the kernel does not apply default signal actions to PID 1 (chapter 5). So the full grace period elapses doing nothing useful, then SIGKILL drops all " +
+        reqs + " requests. Every stop costs exactly " + timeout + " seconds.");
+    } else if (mode === "shell") {
+      msgs.push("Shell form: <code>sh</code> is PID 1 and does not forward the signal while waiting on its child, so the application never learns it should stop. Identical outcome to no handler, arrived at differently — and <code>--init</code> does not fix this one.");
+    } else if (mode === "init") {
+      msgs.push("<code>--init</code> is a genuine improvement and not a substitute for a handler. tini forwards SIGTERM and the app's <em>default</em> action terminates it immediately — so the container stops in milliseconds with exit 143 instead of hanging for " +
+        timeout + " seconds, but the " + reqs + " in-flight requests are still dropped. <b>Fast and abrupt beats slow and abrupt; only a handler is graceful.</b>");
+    }
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13.5px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  ["drain", "timeout", "reqs"].forEach(function (k) {
+    document.getElementById("s-" + k).addEventListener("input", render);
+  });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — restart backoff simulator
+   ============================================================ */
+(function () {
+  var POLICIES = [
+    { id: "no", label: "no", restarts: false, max: 0 },
+    { id: "onfail3", label: "on-failure:3", restarts: true, max: 3 },
+    { id: "onfail", label: "on-failure", restarts: true, max: Infinity },
+    { id: "unless", label: "unless-stopped", restarts: true, max: Infinity },
+    { id: "always", label: "always", restarts: true, max: Infinity }
+  ];
+  var policy = "always";
+  var WINDOW = 600;          /* ten minutes */
+  var RESET_AFTER = 10;      /* the delay resets once the container survives this long */
+  var CAP = 60;              /* maximum delay */
+
+  var host = document.getElementById("r-policy");
+  var chart = document.getElementById("r-chart");
+  var term = document.getElementById("r-term");
+  var out = document.getElementById("r-out");
+  var note = document.getElementById("r-note");
+
+  POLICIES.forEach(function (p) {
+    var b = document.createElement("button");
+    b.className = "btn mono" + (p.id === policy ? " on" : "");
+    b.textContent = p.label;
+    b.addEventListener("click", function () {
+      policy = p.id;
+      Array.prototype.forEach.call(host.querySelectorAll(".btn"), function (x) { x.classList.remove("on"); });
+      b.classList.add("on");
+      render();
+    });
+    host.appendChild(b);
+  });
+
+  function life() { return parseInt(document.getElementById("r-life").value, 10) / 10; }
+
+  function simulate() {
+    var P = POLICIES.filter(function (x) { return x.id === policy; })[0];
+    var t = 0, delay = 0.1, restarts = 0, up = 0, runs = [], gaveUp = false;
+
+    /* the first run */
+    var span = Math.min(life(), WINDOW - t);
+    runs.push({ start: t, dur: span, full: life() });
+    up += span;
+    t += span;
+
+    while (P.restarts && t < WINDOW) {
+      if (restarts >= P.max) { gaveUp = true; break; }
+      /* the previous run resets the backoff if it lasted long enough */
+      /* the reset keys on how long the container actually ran, not on a run
+         cut short by the edge of the observation window */
+      if (runs[runs.length - 1].full > RESET_AFTER) delay = 0.1;
+      t += delay;
+      if (t >= WINDOW) break;
+      restarts++;
+      var d = Math.min(life(), WINDOW - t);
+      runs.push({ start: t, dur: d, full: life(), delayBefore: delay });
+      up += d;
+      t += d;
+      delay = Math.min(delay * 2, CAP);
+    }
+    /* the delay that would actually be used next: the reset rule is applied at the
+       top of the loop, so report the post-reset value rather than the raw doubling */
+    var last = runs[runs.length - 1];
+    var nextDelay = (last && last.full > RESET_AFTER) ? 0.1 : delay;
+    return { P: P, restarts: restarts, up: up, down: WINDOW - up, runs: runs, gaveUp: gaveUp,
+             finalDelay: nextDelay, capped: nextDelay >= CAP };
+  }
+
+  function render() {
+    document.getElementById("r-lifev").textContent = life().toFixed(1);
+    var s = simulate();
+
+    var W = 470, H = 34, padL = 8;
+    var x = function (t) { return padL + (t / WINDOW) * (W - padL - 8); };
+    var svg = ['<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;max-width:' + W + 'px;height:auto;font-family:var(--mono)">'];
+    svg.push('<rect x="' + padL + '" y="10" width="' + (W - padL - 8) + '" height="13" rx="3" fill="#F3D9D6"/>');
+    s.runs.forEach(function (r) {
+      svg.push('<rect x="' + x(r.start) + '" y="10" width="' + Math.max(0.7, x(r.start + r.dur) - x(r.start)) +
+        '" height="13" fill="#1F7A52"/>');
+    });
+    svg.push('<text x="' + padL + '" y="32" font-size="8.5" fill="#54677A">0</text>');
+    svg.push('<text x="' + (W - 8) + '" y="32" font-size="8.5" fill="#54677A" text-anchor="end">10 min</text>');
+    svg.push('<text x="' + (W / 2) + '" y="8" font-size="8.5" fill="#54677A" text-anchor="middle">green = running, red = waiting to restart</text>');
+    svg.push("</svg>");
+    chart.innerHTML = svg.join("");
+
+    var lines = ['<span class="p">$</span> docker run -d --restart ' + s.P.label + " api"];
+    lines.push("");
+    var shown = s.runs.slice(0, 9);
+    shown.forEach(function (r, i) {
+      var pre = r.delayBefore !== undefined ? '<span class="y">wait ' + r.delayBefore.toFixed(2) + "s</span>  " : "            ";
+      lines.push(pre + '<span class="g">run ' + String(i).padStart(2) + "</span>  t=" +
+        r.start.toFixed(2) + "s  lived " + r.dur.toFixed(2) + "s");
+    });
+    if (s.runs.length > 9) lines.push('<span class="d">… ' + (s.runs.length - 9) + " more</span>");
+    lines.push("");
+    if (!s.P.restarts) {
+      lines.push('<span class="d">policy is "no": the container stays exited</span>');
+    } else if (s.gaveUp) {
+      lines.push('<span class="r">gave up after ' + s.restarts + " restarts (on-failure:" + s.P.max + ")</span>");
+    } else {
+      lines.push('<span class="d">delay now ' + s.finalDelay.toFixed(2) + "s" + (s.capped ? " (at the 60s cap)" : "") + "</span>");
+    }
+    lines.push('<span class="p">$</span> docker inspect -f \'{{.RestartCount}} {{.State.Status}}\' api');
+    lines.push(s.restarts + " " + (s.gaveUp || !s.P.restarts ? "exited" : "restarting"));
+    term.innerHTML = lines.join("\n");
+
+    var avail = (s.up / WINDOW) * 100;
+    out.innerHTML = "";
+    tile("Restarts", String(s.restarts), "in 10 minutes", s.restarts < 20);
+    tile("Running", s.up.toFixed(0) + "s", "of 600", avail > 90);
+    tile("Availability", avail.toFixed(1) + "%", "over the window", avail > 90);
+    tile("Final delay", s.finalDelay.toFixed(2) + "s", s.capped ? "capped" : "still doubling", !s.capped);
+
+    var msgs = [];
+    if (!s.P.restarts) {
+      msgs.push("With no restart policy the container exits once and stays exited — honest, and visible in <code>docker ps -a</code> as <code>Exited</code>. For a one-shot job this is correct; for a service it means a single transient failure takes you down until someone notices.");
+    } else if (s.gaveUp) {
+      msgs.push("<code>on-failure:" + s.P.max + "</code> stopped after " + s.restarts +
+        " attempts, so the container ends as <code>Exited</code> rather than <code>Restarting</code>. That is the useful property: <b>a bounded policy fails loudly</b>, and an unbounded one fails quietly.");
+    } else if (life() > RESET_AFTER) {
+      msgs.push("<b>The container lives " + life().toFixed(1) + " seconds — longer than the 10-second reset threshold — so the backoff never grows.</b> Every restart waits only 100&nbsp;ms, giving " +
+        s.restarts + " restarts in ten minutes. Note the trap: raw uptime is <b>" + avail.toFixed(1) +
+        "%</b>, which looks healthy on any dashboard, while the process is restarting " + s.restarts +
+        " times and losing every in-flight request. This is also the expensive case for the host, since full startup work runs " +
+        s.restarts + " times rather than a handful. Drag the slider below 10 seconds and watch both numbers invert.");
+    } else if (s.capped) {
+      msgs.push("<b>The delay has reached its one-minute cap.</b> The container now runs for " + life().toFixed(1) +
+        "s roughly once a minute — " + avail.toFixed(1) + "% availability — and <code>docker ps</code> reports <code>Restarting</code> rather than <code>Exited</code>, so nothing looks broken to the daemon. Only " +
+        s.restarts + " restarts happened, which is why the host load looks fine while the service is down.");
+    } else {
+      msgs.push("The backoff is still doubling: " + s.restarts + " restarts so far with the next wait at " +
+        s.finalDelay.toFixed(2) + "s. Left alone it reaches the one-minute cap after about ten failures.");
+    }
+    msgs.push("<b>The rule:</b> 100&nbsp;ms doubling to a 60-second cap, reset whenever a run exceeds 10 seconds.");
+    note.innerHTML = msgs.join(" ");
+  }
+
+  function tile(k, v, small, hi) {
+    var d = document.createElement("div");
+    d.className = "r" + (hi ? " hi" : "");
+    var kk = document.createElement("span"); kk.className = "k"; kk.textContent = k;
+    var vv = document.createElement("span"); vv.className = "v"; vv.textContent = v;
+    vv.style.fontSize = String(v).length > 8 ? "13.5px" : "18px";
+    if (small) { var s = document.createElement("small"); s.textContent = " " + small; vv.appendChild(s); }
+    d.appendChild(kk); d.appendChild(vv);
+    out.appendChild(d);
+  }
+
+  document.getElementById("r-life").addEventListener("input", render);
+  render();
+})();
+</script>
+</body>
+</html>

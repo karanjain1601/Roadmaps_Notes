@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Databases: engines, indexes, transactions — System Design Notes</title>
+<meta name="description" content="B-trees versus LSM trees, what an index costs, query plans, ACID precisely, isolation levels and the anomalies each one still permits.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/notes.css">
+</head>
+<body>
+<div class="readbar"></div>
+
+<header class="top">
+  <div class="top-inner">
+    <a class="home" href="../../index.html"><span class="mark"></span>All roadmaps</a>
+    <span class="top-sep">/</span>
+    <a class="home" href="index.html" style="color:var(--band-text)">System Design</a>
+    <span class="top-spacer"></span>
+    <button class="rail-toggle" aria-expanded="false">Contents</button>
+    <nav class="top-nav" aria-label="Chapter navigation"></nav>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail" id="rail" aria-label="Chapter and section navigation"></aside>
+
+  <article>
+    <p class="crumb">Part 4 · Storing the data &nbsp;·&nbsp; <b>Chapter 12</b></p>
+    <h1>Databases: engines, indexes, transactions</h1>
+    <p class="standfirst">Most system design conversations treat the database as a box labelled "DB". The box has internals, and they determine everything: whether writes are cheap, whether a query is a lookup or a scan, and which concurrency bugs are possible at all. This chapter opens the box far enough to make those predictions yourself.</p>
+    <div class="meta">
+      <span>~45 min read</span>
+      <span>B-tree vs LSM · indexes · ACID · isolation</span>
+      <span>2 interactive panels</span>
+      <span>Prerequisite: chapter 2</span>
+    </div>
+
+    <div class="body">
+
+      <h2><span class="h2n">12.1</span>The two halves of a database</h2>
+
+      <p>Every database splits into a <b>storage engine</b> — how bytes are laid out on disk and in memory, and how they are found and updated — and an <b>execution layer</b> — how a query is parsed, planned and turned into calls to the storage engine. Two databases with the same SQL dialect can behave completely differently because they use different engines, and the same engine can be wrapped in a SQL interface, a key-value interface or a document interface.</p>
+
+      <p>The storage engine answers one question: <em>given a key, what is the cheapest way to find the value, and what does it cost to change it?</em> There are essentially two answers in production use.</p>
+
+      <h2><span class="h2n">12.2</span>B-trees</h2>
+
+      <p>A B-tree (in practice a B+tree, where only leaves hold data) keeps keys sorted in fixed-size <b>pages</b>, typically 4–16 KB, matching the unit the disk and the operating system move anyway. Interior pages hold keys and pointers to child pages; leaf pages hold the actual rows or pointers to them.</p>
+
+      <div class="codewrap">
+        <span class="lang">Why the tree is so shallow</span>
+        <pre><code>page size            8 192 bytes
+key + child pointer  ~16 bytes
+fanout               8 192 / 16  ≈  500 children per page
+
+depth for N rows = log(N) / log(500)
+
+  1 million rows      →  ~2.3  →  3 levels
+  1 billion rows      →  ~3.5  →  4 levels
+  1 trillion rows     →  ~4.6  →  5 levels
+
+And the top levels are always in memory, so a point lookup in a
+billion-row table is typically one or two disk reads.</code></pre>
+      </div>
+
+      <p>Updates happen <b>in place</b>: find the leaf page, modify it, write it back. That is simple and gives excellent read behaviour, but it means a single 200-byte row update rewrites an entire 8 KB page. Because a crash mid-page-write would corrupt the tree, every change is first appended to a <b>write-ahead log</b>, so recovery can replay it. So one logical write becomes: one WAL append plus, eventually, one full page write.</p>
+
+      <p>Two structural consequences worth remembering. Pages split when full, which is why a B-tree is typically only 70% full and why insert-in-random-order is slower than insert-in-sorted-order. And random writes scatter dirty pages across the whole file, so the flush is random I/O — cheap on SSD, catastrophic on spinning disks, which is the historical reason for the next design.</p>
+
+      <h2><span class="h2n">12.3</span>LSM trees</h2>
+
+      <p>A log-structured merge tree never updates in place. Writes go to an in-memory sorted structure (the <b>memtable</b>) plus a WAL append. When the memtable is full it is written out, sequentially, as an immutable sorted file (an <b>SSTable</b>). Background <b>compaction</b> merges SSTables, discarding overwritten and deleted entries.</p>
+
+      <figure class="diagram">
+        <div class="mermaid">
+flowchart TB
+  W["Write"] --> WAL[["WAL append<br/>sequential, durable"]]
+  W --> MT["Memtable<br/>sorted, in memory"]
+  MT -->|"full: flush sequentially"| L0["Level 0<br/>recent SSTables"]
+  L0 -->|"compaction"| L1["Level 1<br/>~10× larger"]
+  L1 -->|"compaction"| L2["Level 2<br/>~10× larger"]
+  L2 -->|"compaction"| L3["Level 3 …"]
+  R["Read"] --> MT
+  R -->|"miss"| BF{"Bloom filter<br/>per SSTable"}
+  BF -->|"probably present"| L0
+  BF -->|"definitely absent"| SKIP["skip the file"]
+        </div>
+        <figcaption>Every write is sequential. Every read may have to look in several places, which is what bloom filters exist to prevent — they answer "definitely not here" cheaply, so a read usually touches only the one file that has the key.</figcaption>
+      </figure>
+
+      <p>A deletion writes a <b>tombstone</b> — a marker saying "this key is gone" — which is why an LSM store can temporarily grow when you delete data, and why compaction is what actually reclaims space. Three amplification factors describe the cost of the whole arrangement, and they are the vocabulary for comparing engines:</p>
+
+      <dl>
+        <dt>Write amplification</dt>
+        <dd>Bytes written to disk per byte of user data. LSM: each level rewrite multiplies it, so leveled compaction with a size ratio of 10 costs roughly 10 per level. B-tree: the page-to-row ratio, plus the WAL.</dd>
+        <dt>Read amplification</dt>
+        <dd>Disk reads per lookup. LSM: potentially one per level, cut to near one by bloom filters. B-tree: the tree depth, mostly cached.</dd>
+        <dt>Space amplification</dt>
+        <dd>Disk used per byte of live data. LSM leveled: ~1.1. LSM tiered: 2 or more, since old versions linger. B-tree: ~1.4 from partially full pages.</dd>
+      </dl>
+
+      <div class="tw">
+        <table>
+          <caption>Choosing between them</caption>
+          <thead><tr><th></th><th>B-tree</th><th>LSM tree</th></tr></thead>
+          <tbody>
+            <tr><td>Write path</td><td class="mid">Random page writes; WAL first</td><td class="yes">Always sequential appends</td></tr>
+            <tr><td>Write throughput</td><td class="mid">Good</td><td class="yes">Much higher, especially for small writes</td></tr>
+            <tr><td>Point read</td><td class="yes">Predictable, 1–2 I/O</td><td class="mid">Usually 1, occasionally several</td></tr>
+            <tr><td>Range scan</td><td class="yes">Excellent — leaves are linked in order</td><td class="mid">Good, but merges across levels</td></tr>
+            <tr><td>Space</td><td class="mid">~1.4× from page fill</td><td class="yes">Compact, and compresses well because blocks are immutable</td></tr>
+            <tr><td>Latency predictability</td><td class="yes">Steady</td><td class="no">Compaction causes latency spikes and steals I/O</td></tr>
+            <tr><td>Used by</td><td>Postgres, MySQL InnoDB, SQL Server, Oracle, SQLite</td><td>RocksDB, Cassandra, LevelDB, HBase, ScyllaDB, MyRocks, most modern time-series stores</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <span class="lab">The one-line rule</span>
+        <p><b>Write-heavy and append-shaped → LSM. Read-heavy with updates and range scans → B-tree.</b> If your workload is metrics, events, logs or messages, an LSM engine will absorb writes that would flatten a B-tree. If it is an application's transactional data with lots of updates and ad-hoc queries, a B-tree gives you steadier latency and simpler operations.</p>
+      </div>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Storage engine cost model</h4>
+          <p>The same workload through both engines. Amplification factors are estimates, but the shape of the comparison is real.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="se-rows">Rows in the table <b><span id="se-rowsv">100M</span></b></label>
+              <input type="range" id="se-rows" min="4" max="12" step="0.25" value="8">
+            </div>
+            <div class="ctrl">
+              <label for="se-size">Row size <b><span id="se-sizev">200</span> B</b></label>
+              <input type="range" id="se-size" min="50" max="4000" step="50" value="200">
+            </div>
+            <div class="ctrl">
+              <label for="se-wps">Writes/s <b><span id="se-wpsv">20000</span></b></label>
+              <input type="range" id="se-wps" min="100" max="200000" step="100" value="20000">
+            </div>
+            <div class="ctrl">
+              <label for="se-cache">Working set in RAM <b><span id="se-cachev">20</span>%</b></label>
+              <input type="range" id="se-cache" min="1" max="100" step="1" value="20">
+            </div>
+            <div class="ctrl">
+              <label for="se-ratio">LSM size ratio between levels <b><span id="se-ratiov">10</span></b></label>
+              <input type="range" id="se-ratio" min="2" max="20" step="1" value="10">
+            </div>
+          </div>
+          <div class="bars" id="se-bars"></div>
+          <div class="out">
+            <div class="stats" id="se-stats"></div>
+            <p id="se-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">12.4</span>Indexes</h2>
+
+      <p>An index is a second data structure that maps a column's values to row locations, so a query can find rows without reading all of them. Everything about indexes is a trade of write cost and disk space for read cost.</p>
+
+      <dl>
+        <dt>Clustered index / primary storage</dt>
+        <dd>The table itself is stored in the order of this key, so the index leaf <em>is</em> the row. There can only be one, and looking up by it costs nothing extra. InnoDB always clusters on the primary key; Postgres does not cluster at all by default, storing rows in a heap.</dd>
+        <dt>Secondary index</dt>
+        <dd>Maps values to a pointer at the row. Using it costs two lookups: index, then the row itself. In InnoDB the pointer is the primary key, so a secondary lookup is an index descent plus a clustered index descent.</dd>
+        <dt>Composite index</dt>
+        <dd>An index on several columns in order. Usable for a query only if the query constrains a <b>leftmost prefix</b> — an index on <code>(a, b, c)</code> helps queries filtering on <code>a</code>, on <code>a, b</code>, or on <code>a, b, c</code>, and is useless for a query filtering only on <code>b</code>. Column order is a design decision, not a formatting one.</dd>
+        <dt>Covering index</dt>
+        <dd>An index containing every column the query needs, so the row itself is never read. This often makes a query several times faster, and it is the single most effective index technique that people underuse.</dd>
+        <dt>Partial index</dt>
+        <dd>Indexes only rows matching a predicate: <code>WHERE status = 'pending'</code>. When 99% of rows are complete and you only query the pending ones, the index is 1% of the size and stays in memory.</dd>
+        <dt>Expression index</dt>
+        <dd>Indexes the result of a function — <code>lower(email)</code>. Necessary because <code>WHERE lower(email) = …</code> cannot use a plain index on <code>email</code>.</dd>
+      </dl>
+
+      <div class="note trap">
+        <span class="lab">Why the database ignored your index</span>
+        <ul class="tight">
+          <li><b>Low selectivity.</b> If the predicate matches more than roughly 5–15% of rows, a sequential scan is genuinely faster than millions of random row fetches. The planner is right and the index is the wrong tool.</li>
+          <li><b>A function or cast on the column.</b> <code>WHERE date(created_at) = …</code> or comparing a <code>varchar</code> column to a number defeats the index. Rewrite as a range, or index the expression.</li>
+          <li><b>Leading wildcard.</b> <code>LIKE '%term'</code> cannot use a B-tree. Use a trigram or full-text index.</li>
+          <li><b>Wrong prefix.</b> The composite index is on <code>(a, b)</code> and you filter on <code>b</code>.</li>
+          <li><b>Stale statistics.</b> The planner's row estimates come from sampled statistics; after a bulk load they can be wildly wrong until analysed.</li>
+          <li><b><code>OR</code> across columns.</b> Often prevents index use; a <code>UNION</code> of two indexed queries can be dramatically faster.</li>
+        </ul>
+      </div>
+
+      <p>And the cost side, which is invisible until it is not: every index must be updated on every insert, update of an indexed column, and delete. A table with eight indexes does roughly nine times the write work of one with none, the indexes may collectively exceed the table's own size, and they compete for the same buffer pool. Auditing for unused indexes — every mature database exposes index usage statistics — is one of the highest-yield hours of database work available.</p>
+
+      <div class="demo">
+        <div class="demo-head">
+          <h4>Index or scan?</h4>
+          <p>Move selectivity and watch the crossover where the planner stops using your index — and why it is right to.</p>
+        </div>
+        <div class="demo-body">
+          <div class="controls">
+            <div class="ctrl">
+              <label for="ix-rows">Rows in the table <b><span id="ix-rowsv">10M</span></b></label>
+              <input type="range" id="ix-rows" min="4" max="10" step="0.25" value="7">
+            </div>
+            <div class="ctrl">
+              <label for="ix-sel">Rows matched by the filter <b><span id="ix-selv">0.01</span>%</b></label>
+              <input type="range" id="ix-sel" min="-4" max="2" step="0.05" value="-2">
+            </div>
+            <div class="ctrl">
+              <label for="ix-row">Row size <b><span id="ix-rowv">200</span> B</b></label>
+              <input type="range" id="ix-row" min="50" max="4000" step="50" value="200">
+            </div>
+            <div class="ctrl">
+              <label for="ix-cache">Buffer pool hit rate <b><span id="ix-cachev">90</span>%</b></label>
+              <input type="range" id="ix-cache" min="0" max="100" step="1" value="90">
+            </div>
+          </div>
+          <div class="bars" id="ix-bars"></div>
+          <div class="out">
+            <div class="stats" id="ix-stats"></div>
+            <p id="ix-note" style="margin:12px 0 0;font-family:var(--sans);font-size:13.5px;color:var(--text-2)"></p>
+          </div>
+        </div>
+      </div>
+
+      <h2><span class="h2n">12.5</span>How a query is executed</h2>
+
+      <p>Reading a query plan is the most transferable database skill there is. Four things to look for, in order:</p>
+
+      <ol>
+        <li><b>The access method.</b> Sequential scan (read everything), index scan (walk the index, fetch rows), index-only scan (never touch the table), bitmap scan (collect row locations, then fetch in physical order — Postgres's answer to medium selectivity).</li>
+        <li><b>The join algorithm.</b> <em>Nested loop</em>: for each row of A, look up in B — excellent when A is tiny and B is indexed, quadratic otherwise. <em>Hash join</em>: build a hash table from the smaller side, probe with the larger — the workhorse for large unsorted joins, needs memory. <em>Merge join</em>: both inputs sorted, walk them together — great when the sort comes free from an index.</li>
+        <li><b>Estimated versus actual rows.</b> The single most useful diagnostic. A plan that expected 10 rows and got 2 million chose a nested loop and is now doing two million lookups. The fix is statistics or a rewrite, not a hint.</li>
+        <li><b>Where the time actually went.</b> Sorts spilling to disk, filters applied after the fetch rather than pushed into the index, and rows discarded late are all visible in the plan.</li>
+      </ol>
+
+      <div class="codewrap">
+        <span class="lang">SQL</span>
+        <pre><code>-- Ask for the plan with real measurements, not just estimates
+EXPLAIN (ANALYZE, BUFFERS) SELECT …;
+
+-- The classic pathology, in plan form:
+--   Nested Loop  (rows=10 ACTUAL rows=2,140,556 loops=1)
+--     -&gt; Seq Scan on orders  (rows=10 ACTUAL rows=2,140,556)
+--   The estimate was wrong by five orders of magnitude, so the planner
+--   picked a strategy that is correct for 10 rows and ruinous for 2 million.</code></pre>
+      </div>
+
+      <h2><span class="h2n">12.6</span>ACID, precisely</h2>
+
+      <dl>
+        <dt>Atomicity</dt>
+        <dd>All of a transaction's changes apply, or none do. It is about <em>abortability</em> — the ability to throw everything away on failure — not about concurrency.</dd>
+        <dt>Consistency</dt>
+        <dd>The database moves from one valid state to another, where "valid" means your constraints, foreign keys and invariants hold. This is largely the application's property; the database only enforces the constraints you declared. It is the weakest letter and shares no meaning with the C in CAP.</dd>
+        <dt>Isolation</dt>
+        <dd>Concurrent transactions do not observe each other's partial work. This is the letter with a dial on it — see below — and the one that causes real bugs.</dd>
+        <dt>Durability</dt>
+        <dd>Once committed, it survives a crash. In practice this means "written to a WAL and fsynced", and in a distributed setting it means "on more than one machine" — a single disk's fsync does not survive the disk.</dd>
+      </dl>
+
+      <h2><span class="h2n">12.7</span>Isolation levels and the anomalies they allow</h2>
+
+      <p>Perfect isolation means transactions behave as if they ran one after another. That is expensive, so databases offer weaker levels, each permitting specific anomalies. The names come from the SQL standard and the implementations differ, which is why you must know the anomalies rather than the labels.</p>
+
+      <div class="tw">
+        <table>
+          <caption>The anomalies</caption>
+          <thead><tr><th>Anomaly</th><th>What happens</th><th>Example</th></tr></thead>
+          <tbody>
+            <tr><td><b>Dirty read</b></td><td>You read another transaction's uncommitted change</td><td>You see a balance that is rolled back a moment later</td></tr>
+            <tr><td><b>Non-repeatable read</b></td><td>You read the same row twice in one transaction and get different values</td><td>A report totals a column, then re-reads a row and it has changed</td></tr>
+            <tr><td><b>Phantom read</b></td><td>You run the same query twice and new rows have appeared</td><td>"Count the pending orders" returns 12, then 14</td></tr>
+            <tr><td><b>Lost update</b></td><td>Two read-modify-write cycles overlap; one is silently overwritten</td><td>Two increments of a counter produce +1</td></tr>
+            <tr><td><b>Read skew</b></td><td>You read two rows at different points in time and see an inconsistent pair</td><td>A transfer that appears to have left one account without arriving in the other</td></tr>
+            <tr><td><b>Write skew</b></td><td>Two transactions each read a set, each decide their write is fine, and together they break an invariant</td><td>Two doctors each check "someone else is on call" and both go off call</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Levels versus anomalies (typical implementations)</caption>
+          <thead><tr><th>Level</th><th>Dirty read</th><th>Non-repeatable</th><th>Phantom</th><th>Lost update</th><th>Write skew</th></tr></thead>
+          <tbody>
+            <tr><td><b>Read uncommitted</b></td><td class="no">possible</td><td class="no">possible</td><td class="no">possible</td><td class="no">possible</td><td class="no">possible</td></tr>
+            <tr><td><b>Read committed</b><br><span style="font-size:12px;color:var(--text-2)">Postgres and Oracle default</span></td><td class="yes">no</td><td class="no">possible</td><td class="no">possible</td><td class="no">possible</td><td class="no">possible</td></tr>
+            <tr><td><b>Repeatable read</b><br><span style="font-size:12px;color:var(--text-2)">MySQL InnoDB default</span></td><td class="yes">no</td><td class="yes">no</td><td class="mid">MySQL: no<br>standard: possible</td><td class="mid">depends</td><td class="no">possible</td></tr>
+            <tr><td><b>Snapshot isolation</b><br><span style="font-size:12px;color:var(--text-2)">Postgres calls it repeatable read</span></td><td class="yes">no</td><td class="yes">no</td><td class="yes">no</td><td class="yes">detected, aborts</td><td class="no">possible</td></tr>
+            <tr><td><b>Serializable</b></td><td class="yes">no</td><td class="yes">no</td><td class="yes">no</td><td class="yes">no</td><td class="yes">no</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <span class="lab">Write skew is the one that gets shipped</span>
+        <p>It survives every level below serializable, including snapshot isolation, and it is invisible in testing because it needs true concurrency. The shape: each transaction <em>reads</em> a set of rows, makes a decision based on what it read, and then <em>writes a different row</em>. Neither write conflicts, so no conflict is detected, and the invariant that spanned both breaks. Booking the last seat, going off call, staying within a budget, enforcing "at most one primary" — all write skew. The fixes are to use <code>SERIALIZABLE</code>, to materialise the conflict by locking the rows you read with <code>SELECT … FOR UPDATE</code>, or to introduce a row that both transactions must write so the conflict becomes real.</p>
+      </div>
+
+      <h3>MVCC, and why it needs a vacuum</h3>
+
+      <p>Most modern databases implement isolation with <b>multi-version concurrency control</b>: an update writes a new version of a row rather than overwriting it, and each transaction sees the versions that were committed when it started. The enormous benefit is that <b>readers never block writers and writers never block readers</b> — a long analytical query does not stop the application from writing.</p>
+
+      <p>The cost is that old versions accumulate and must be reclaimed. In Postgres that is <code>VACUUM</code>; in InnoDB it is the purge thread and the undo log. Two operational consequences follow directly, and both cause real incidents: a <b>long-running transaction holds back cleanup for the whole database</b>, because any version it might still need must be kept, so an idle-in-transaction session left open by a buggy client can bloat a table by hundreds of gigabytes. And a table with a high update rate can accumulate dead rows faster than they are reclaimed, so queries slowly scan more and more dead space. Monitor the age of your oldest transaction; it is a leading indicator for both.</p>
+
+      <h2><span class="h2n">12.8</span>Locking, and deadlocks</h2>
+
+      <p>Even with MVCC, writes need locks. Two transactions cannot both modify the same row, so the second waits.</p>
+
+      <ul class="tight">
+        <li><b>Row locks</b> are what you normally hit. Held from the moment of the write until commit — so a transaction that writes early and commits late holds locks for its whole duration. Keep transactions short, and do the network calls before you open one.</li>
+        <li><b><code>SELECT … FOR UPDATE</code></b> takes a write lock on rows you have only read, which is how you turn a read-modify-write into a safe operation without moving to serializable.</li>
+        <li><b>Table and DDL locks</b> are the dangerous ones. A migration that needs an exclusive lock will queue behind every open transaction, and every new query will queue behind <em>it</em> — a table that was fine a second ago now has a thousand waiting connections. Always set a short lock timeout on DDL.</li>
+        <li><b>Deadlocks</b> happen when two transactions each hold what the other wants. The database detects the cycle and kills one. They are normal and your application must retry — but the frequency drops close to zero if every transaction acquires locks <b>in a consistent order</b> (for instance, always update accounts in ascending id order).</li>
+      </ul>
+
+      <h2><span class="h2n">12.9</span>Practical guidance</h2>
+
+      <ol>
+        <li><b>Default to read committed</b> and handle concurrency explicitly where it matters, using conditional updates (<code>UPDATE … WHERE version = ?</code>) or <code>FOR UPDATE</code>. Reach for <code>SERIALIZABLE</code> on the specific transactions with an invariant across rows, and be prepared to retry on serialization failures.</li>
+        <li><b>Do updates in the database, not in the application.</b> <code>UPDATE counters SET n = n + 1</code> is atomic; read-then-write from application code is a lost update waiting to happen.</li>
+        <li><b>Keep transactions short and never hold one across a network call.</b> An HTTP request inside a transaction holds locks for as long as the remote service takes to respond, which under an incident is forever.</li>
+        <li><b>Retry on serialization failures and deadlocks</b> with jitter, and make the transaction idempotent so a retry is safe.</li>
+        <li><b>Index for your queries, then delete the indexes nothing uses.</b> Check the usage statistics rather than guessing.</li>
+        <li><b>Look at plans with real numbers,</b> and treat a large gap between estimated and actual rows as the finding, not a detail.</li>
+      </ol>
+
+      <details class="check">
+        <summary>Two users buy the last item in stock at the same moment. Both succeed. Which anomaly, and what are three fixes?</summary>
+        <div class="ans">
+          <p>Lost update if both did <code>SELECT stock</code> then <code>UPDATE stock = 4</code>; write skew if each read the stock row and then inserted an order row without writing the stock row at all. Three fixes, in increasing cost. <b>Conditional update:</b> <code>UPDATE items SET stock = stock - 1 WHERE id = ? AND stock &gt; 0</code> and check that one row was affected — atomic, no extra locking, and the correct answer most of the time. <b>Pessimistic lock:</b> <code>SELECT … FOR UPDATE</code> on the item row before deciding, which serialises buyers of the same item. <b>Serializable isolation</b>, which detects the conflict and aborts one transaction for you, at the cost of retry handling and lower throughput. Note that only the first works if the check and the write are separated by application logic you cannot avoid.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>A query on a 50-million-row table takes 4 seconds. You add an index and it is still 4 seconds. What are the likely explanations?</summary>
+        <div class="ans">
+          <p>In rough order of likelihood: the predicate is not selective enough, so a scan really is cheaper and the planner declined the index; the column is wrapped in a function or implicitly cast, so the index is unusable; the index is on the wrong prefix of a composite; statistics are stale, so the planner is estimating badly; the query returns so many rows that the time is in transferring them, not finding them; or the cost is not in the filter at all but in a sort, a join or an aggregate further up the plan. Run <code>EXPLAIN (ANALYZE, BUFFERS)</code> and look at where the time and the buffer reads actually accumulate — the answer is nearly always visible immediately, and guessing at indexes without the plan is the slow way to find it.</p>
+        </div>
+      </details>
+
+      <details class="check">
+        <summary>Why does a write-heavy workload favour an LSM engine, and what do you give up?</summary>
+        <div class="ans">
+          <p>Because every LSM write is a sequential append to a memtable and a log, whereas a B-tree write eventually rewrites a whole page — so a 200-byte insert costs 8 KB of page write plus WAL in a B-tree, and roughly its own size, deferred and batched, in an LSM. Compaction does eventually rewrite the data several times, but sequentially and in the background rather than randomly and on the critical path. What you give up: predictable latency, because compaction periodically steals I/O and CPU and produces visible spikes; read amplification on keys not in the top level, which bloom filters reduce but do not remove; and space that briefly balloons after mass deletes because tombstones only free space once compaction runs. In a design discussion, the honest phrasing is "sequential writes and higher throughput, paid for with background work and less predictable read latency".</p>
+        </div>
+      </details>
+
+      <div class="recap">
+        <h2>Recap</h2>
+        <ol>
+          <li><b>B-trees update pages in place</b> with a WAL for safety, giving shallow trees, predictable reads and page-sized write amplification.</li>
+          <li><b>LSM trees append and compact,</b> converting random writes into sequential ones at the cost of background work and latency spikes.</li>
+          <li><b>Write-heavy → LSM; update-and-range-scan-heavy → B-tree.</b> Compare on write, read and space amplification.</li>
+          <li><b>Indexes trade write cost and space for read speed.</b> Composite indexes need a leftmost prefix; covering indexes avoid touching the table at all.</li>
+          <li><b>Above roughly 5–15% selectivity a scan beats an index,</b> and the planner is right to switch.</li>
+          <li><b>Read plans with actual row counts.</b> A large estimate-versus-actual gap is the diagnosis.</li>
+          <li><b>ACID's isolation is the letter with a dial.</b> Learn the anomalies, not the level names.</li>
+          <li><b>Write skew survives snapshot isolation</b> and is the anomaly most likely to reach production. Serializable, <code>FOR UPDATE</code>, or materialise the conflict.</li>
+          <li><b>MVCC means readers never block writers</b> — and that a long-running transaction blocks cleanup for the whole database.</li>
+          <li><b>Keep transactions short, acquire locks in a consistent order, and retry deadlocks.</b></li>
+        </ol>
+      </div>
+
+      <nav class="pn" aria-label="Previous and next chapter"></nav>
+    </div>
+  </article>
+</div>
+
+<script src="assets/notes.js"></script>
+<script>
+function st12(k, v, tone) {
+  var d = document.createElement("div"); d.className = "stat";
+  var a = document.createElement("div"); a.className = "k"; a.textContent = k;
+  var b = document.createElement("div"); b.className = "v"; b.textContent = v;
+  if (tone) b.style.color = tone;
+  d.append(a, b); return d;
+}
+function bar12(label, pct, value, colour) {
+  var row = document.createElement("div"); row.className = "bar";
+  var k = document.createElement("span"); k.textContent = label;
+  var t = document.createElement("span"); t.className = "track";
+  var f = document.createElement("span"); f.className = "fill";
+  f.style.width = Math.max(0.5, Math.min(100, pct)) + "%";
+  if (colour) f.style.background = colour;
+  t.appendChild(f);
+  var v = document.createElement("span"); v.className = "val"; v.textContent = value;
+  row.append(k, t, v); return row;
+}
+function fmtB12(b) {
+  var u = ["B", "KB", "MB", "GB", "TB", "PB"], i = 0;
+  while (b >= 1000 && i < u.length - 1) { b /= 1000; i++; }
+  return (b < 10 ? b.toFixed(1) : Math.round(b)) + " " + u[i];
+}
+function fmtN12(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "k";
+  return n < 10 ? n.toFixed(1) : Math.round(n).toString();
+}
+
+/* ---------- storage engine cost model ---------- */
+(function () {
+  var rows = document.getElementById("se-rows"), size = document.getElementById("se-size"),
+      wps = document.getElementById("se-wps"), cache = document.getElementById("se-cache"),
+      ratio = document.getElementById("se-ratio"),
+      bars = document.getElementById("se-bars"), stats = document.getElementById("se-stats"),
+      note = document.getElementById("se-note");
+  var PAGE = 8192;
+
+  function draw() {
+    var N = Math.pow(10, +rows.value), R = +size.value, W = +wps.value,
+        c = +cache.value / 100, T = +ratio.value;
+    document.getElementById("se-rowsv").textContent = fmtN12(N);
+    document.getElementById("se-sizev").textContent = R;
+    document.getElementById("se-wpsv").textContent = W;
+    document.getElementById("se-cachev").textContent = +cache.value;
+    document.getElementById("se-ratiov").textContent = T;
+
+    var data = N * R;
+    var fanout = PAGE / 16;
+    var depth = Math.max(1, Math.ceil(Math.log(N) / Math.log(fanout)));
+    /* B-tree: WAL + a page write per dirtied page; caching lets several row
+       updates share one page flush */
+    var pagesPerRow = PAGE / R;
+    var coalesce = 1 + c * Math.min(pagesPerRow - 1, pagesPerRow * 0.9);
+    var bWA = 1 + (PAGE / R) / coalesce;
+    var bRA = Math.max(1, depth * (1 - c) + 1);
+    var bSA = 1.4;
+
+    var levels = Math.max(1, Math.ceil(Math.log(data / 64e6) / Math.log(T)));
+    var lWA = 1 + levels * T * 0.5;
+    var lRA = 1 + 0.02 * levels;      /* bloom filters make most levels free */
+    var lSA = 1.1;
+
+    var bBytes = W * R * bWA, lBytes = W * R * lWA;
+    var worst = Math.max(bWA, lWA);
+
+    bars.innerHTML = "";
+    bars.appendChild(bar12("B-tree write amp", bWA / worst * 100, bWA.toFixed(1) + "×", bWA > lWA ? "var(--line)" : "var(--ok)"));
+    bars.appendChild(bar12("LSM write amp", lWA / worst * 100, lWA.toFixed(1) + "×", lWA > bWA ? "var(--line)" : "var(--ok)"));
+    var wr = Math.max(bRA, lRA);
+    bars.appendChild(bar12("B-tree read I/O", bRA / wr * 100, bRA.toFixed(1) + " reads", bRA > lRA ? "#B87A17" : "var(--ok)"));
+    bars.appendChild(bar12("LSM read I/O", lRA / wr * 100, lRA.toFixed(1) + " reads", lRA > bRA ? "#B87A17" : "var(--ok)"));
+
+    stats.innerHTML = "";
+    stats.appendChild(st12("Logical data", fmtB12(data)));
+    stats.appendChild(st12("B-tree depth", depth + " levels"));
+    stats.appendChild(st12("LSM levels", levels));
+    stats.appendChild(st12("Disk written, B-tree", fmtB12(bBytes) + "/s", bBytes > 5e8 ? "var(--line)" : ""));
+    stats.appendChild(st12("Disk written, LSM", fmtB12(lBytes) + "/s", lBytes > 5e8 ? "var(--line)" : ""));
+    stats.appendChild(st12("On disk (B-tree / LSM)", fmtB12(data * bSA) + " / " + fmtB12(data * lSA)));
+
+    note.textContent = bBytes > 1.5e9 && bWA > lWA
+      ? "The B-tree is asking for " + fmtB12(bBytes) + " per second of disk writes for " + fmtB12(W * R) + " per second of user data. That is past a single NVMe device's sustained write budget and it is entirely amplification — this workload wants an LSM engine."
+      : R > 2000
+      ? "With large rows the page-to-row ratio is small, so B-tree write amplification is modest and its predictable read latency is worth more than the LSM's sequential writes."
+      : lWA > bWA
+      ? "At this size ratio the LSM writes more bytes than the B-tree, because leveled compaction rewrites data once per level. Increasing the size ratio means fewer levels and less compaction, at the cost of larger merges."
+      : "The LSM writes fewer bytes and does so sequentially; the B-tree does fewer read I/Os and does them predictably. Which matters depends on whether your workload is dominated by ingest or by latency-sensitive reads.";
+  }
+  [rows, size, wps, cache, ratio].forEach(function (x) { x.addEventListener("input", draw); });
+  draw();
+})();
+
+/* ---------- index or scan ---------- */
+(function () {
+  var rows = document.getElementById("ix-rows"), sel = document.getElementById("ix-sel"),
+      rsz = document.getElementById("ix-row"), cache = document.getElementById("ix-cache"),
+      bars = document.getElementById("ix-bars"), stats = document.getElementById("ix-stats"),
+      note = document.getElementById("ix-note");
+  var PAGE = 8192, SEQ_MS_PER_MB = 0.35, RANDOM_MS = 0.1, CACHED_MS = 0.002;
+
+  function draw() {
+    var N = Math.pow(10, +rows.value), s = Math.pow(10, +sel.value) / 100, R = +rsz.value,
+        c = +cache.value / 100;
+    document.getElementById("ix-rowsv").textContent = fmtN12(N);
+    document.getElementById("ix-selv").textContent = (s * 100) < 0.01 ? (s * 100).toExponential(1) : (s * 100).toFixed(3);
+    document.getElementById("ix-rowv").textContent = R;
+    document.getElementById("ix-cachev").textContent = +cache.value;
+
+    var matched = Math.max(1, N * s);
+    var rowsPerPage = Math.max(1, Math.floor(PAGE / R));
+    var pages = Math.ceil(N / rowsPerPage);
+    var tableBytes = pages * PAGE;
+
+    /* sequential scan: streaming read of the whole table */
+    var seqMs = (tableBytes / 1e6) * SEQ_MS_PER_MB;
+    /* index scan: descend once, then one random row fetch per matched row */
+    var depth = Math.max(1, Math.ceil(Math.log(N) / Math.log(PAGE / 16)));
+    var perFetch = c * CACHED_MS + (1 - c) * RANDOM_MS;
+    var idxMs = depth * perFetch + matched * perFetch;
+    /* index-only scan: no row fetches at all */
+    var ionlyMs = depth * perFetch + (matched / (PAGE / 24)) * perFetch;
+
+    var worst = Math.max(seqMs, idxMs, ionlyMs);
+    bars.innerHTML = "";
+    bars.appendChild(bar12("Sequential scan", Math.sqrt(seqMs / worst) * 100, seqMs.toFixed(seqMs < 10 ? 1 : 0) + " ms",
+      seqMs <= Math.min(idxMs, ionlyMs) ? "var(--ok)" : "#B87A17"));
+    bars.appendChild(bar12("Index scan + fetch", Math.sqrt(idxMs / worst) * 100, idxMs.toFixed(idxMs < 10 ? 1 : 0) + " ms",
+      idxMs <= Math.min(seqMs, ionlyMs) ? "var(--ok)" : "#B87A17"));
+    bars.appendChild(bar12("Index-only (covering)", Math.sqrt(ionlyMs / worst) * 100, ionlyMs.toFixed(ionlyMs < 10 ? 1 : 0) + " ms",
+      ionlyMs <= Math.min(seqMs, idxMs) ? "var(--ok)" : "#B87A17"));
+
+    /* crossover selectivity where index scan stops winning */
+    var cross = (seqMs - depth * perFetch) / (N * perFetch);
+
+    stats.innerHTML = "";
+    stats.appendChild(st12("Rows matched", fmtN12(matched)));
+    stats.appendChild(st12("Table size", fmtB12(tableBytes)));
+    stats.appendChild(st12("Pages to scan", fmtN12(pages)));
+    stats.appendChild(st12("Index wins below", (cross * 100).toFixed(cross * 100 < 1 ? 2 : 1) + "% selectivity"));
+    stats.appendChild(st12("Covering index speedup", (idxMs / ionlyMs).toFixed(1) + "×", idxMs / ionlyMs > 3 ? "var(--ok)" : ""));
+    stats.appendChild(st12("Planner would choose", seqMs < idxMs && seqMs < ionlyMs ? "sequential scan" : ionlyMs < idxMs ? "index-only scan" : "index scan",
+      seqMs < idxMs ? "var(--line)" : "var(--ok)"));
+
+    note.textContent = s > cross
+      ? "Above roughly " + (cross * 100).toFixed(2) + "% selectivity the index loses, because each matched row costs a random fetch while the scan streams. This is why a query that matches a third of the table ignores your index no matter how many you add — and why the planner is not being stupid."
+      : idxMs / ionlyMs > 4
+      ? "The row fetches dominate the index scan. Adding the selected columns to the index turns this into an index-only scan and removes them entirely — this is the highest-value indexing technique and it is routinely overlooked."
+      : c < 0.5
+      ? "With a cold buffer pool every fetch is a real disk read, so the crossover point moves sharply in favour of the sequential scan. Cache hit rate changes which plan is correct, which is why plans differ between staging and production."
+      : "Highly selective query: the index descends in " + depth + " page reads and fetches a handful of rows. This is what indexes are for.";
+  }
+  [rows, sel, rsz, cache].forEach(function (x) { x.addEventListener("input", draw); });
+  draw();
+})();
+</script>
+</body>
+</html>
