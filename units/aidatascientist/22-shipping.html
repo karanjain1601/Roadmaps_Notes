@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>22 · Shipping a model, and watching it drift — AI and Data Scientist</title>
+<meta name="description" content="Why the drift monitor most teams run fires on the harmless case and misses the fatal one, and how retraining on your own model's decisions makes performance oscillate.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">AI and Data Scientist</a> <span>/</span> Chapter 22</p>
+    <p class="chnum">CHAPTER 22</p>
+    <h1>Shipping a model, and watching it drift</h1>
+    <p class="lede">The drift monitor most teams run trips hard on the failure that does <em>no damage</em> and stays completely silent on the one that takes AUC from 0.81 to <strong>0.24</strong>. And a model retrained on the cases its own decisions let it observe does not decay gently — its true accuracy oscillates between 70.8% and <strong>47.3%</strong> while the accuracy on the dashboard correlates with reality at <strong>r = 0.03</strong>.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~28 min</b> read</div>
+      <div><b>Part 6</b> Delivering</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="gap">
+      <p class="kicker">THE HANDOVER</p>
+      <h2>What changes when a model ships</h2>
+      <p class="sub">Everything up to this point assumed a fixed dataset. Production has none of those guarantees.</p>
+
+      <div class="tw">
+        <table>
+          <caption>The four assumptions that stop holding</caption>
+          <thead>
+            <tr><th>Offline</th><th>In production</th><th>Covered in</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>The data distribution is fixed</td><td>It moves, in three distinguishable ways</td><td>Next section</td></tr>
+            <tr><td>Labels are available</td><td>They arrive late, partially, or never</td><td>The monitoring section</td></tr>
+            <tr><td>The model does not affect the data</td><td><strong>Its decisions determine what you observe</strong></td><td>The feedback section</td></tr>
+            <tr><td>Features are computed the same way</td><td>Training and serving pipelines diverge</td><td>Below</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>Training-serving skew deserves its own mention because it is so common</b>
+        <p>A feature computed with a window function over a historical table and recomputed live from a streaming source will not match, and the mismatch is silent. The model receives inputs it was never trained on and degrades without any distribution having actually changed.</p>
+        <p>The fix is structural rather than vigilant: compute features <em>once</em>, in one piece of code, used by both paths. That is what a feature store is for, and it is why the discipline exists at all.</p>
+      </div>
+    </section>
+
+    <section id="drift">
+      <p class="kicker">THREE DIFFERENT FAILURES</p>
+      <h2>What actually degrades, and which monitor sees it</h2>
+      <p class="sub">"Drift" names three distinct things with three distinct consequences. Conflating them is why monitoring so often fails.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Three kinds of drift, four monitors</b>
+          <span>6,000 cases per window, 25 replications</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>What has changed
+              <select id="dr-kind">
+                <option value="none">Nothing</option>
+                <option value="covariate">The inputs have moved</option>
+                <option value="label">The base rate has moved</option>
+                <option value="concept" selected>The rule has changed</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="dr-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="dr-f-tile"><i>INPUT MONITOR</i><b id="dr-f">0</b><s>standard deviations of shift</s></div>
+            <div class="tile" id="dr-c-tile"><i>CALIBRATION MONITOR</i><b id="dr-c">0</b><s id="dr-c-sub"></s></div>
+            <div class="tile" id="dr-a-tile"><i>ROC-AUC</i><b id="dr-a">0</b><s>needs labels to compute</s></div>
+            <div class="tile hi" id="dr-v-tile"><i>ACTUAL DAMAGE</i><b id="dr-v">&mdash;</b><s id="dr-v-sub"></s></div>
+          </div>
+
+          <p class="readout" id="dr-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>The same trained model, evaluated under each kind of change</caption>
+          <thead>
+            <tr><th>What changed</th><th>Input monitor</th><th>Prediction monitor</th><th>Calibration</th><th>ROC-AUC</th><th>Accuracy</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Nothing</td><td>0.024</td><td>0.0047</td><td>0.0064</td><td>0.8122</td><td>73.8%</td></tr>
+            <tr><td><strong>Inputs move</strong></td><td><strong>1.605</strong></td><td>0.3201</td><td>0.0064</td><td>0.8185</td><td>80.2%</td></tr>
+            <tr><td>Base rate moves</td><td>0.024</td><td>0.0047</td><td><strong>0.2545</strong></td><td>0.8150</td><td>64.1%</td></tr>
+            <tr><td><strong>The rule changes</strong></td><td><strong>0.024</strong></td><td>0.0047</td><td>0.0093</td><td><strong>0.2437</strong></td><td><strong>34.1%</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <b>Read the input-monitor column against the AUC column</b>
+        <p><strong>Covariate shift</strong> trips it at 1.605 standard deviations — a loud alarm. And the model is fine: AUC 0.8185 against a baseline 0.8122, calibration error 0.0064. Nothing is wrong, because P(y|x) has not changed and the model was never asked about anything else.</p>
+        <p><strong>Concept drift</strong> leaves it at <strong>0.024</strong> — completely silent, because the inputs look exactly as they always did. Meanwhile AUC has fallen to <strong>0.2437</strong> and accuracy to 34.1%. The relationship between inputs and outcome has inverted, and the input distribution cannot possibly show that.</p>
+        <p>So the monitor most teams run <strong>fires on the harmless case and misses the fatal one</strong>. Of the two genuinely damaging cases here it catches zero.</p>
+      </div>
+
+      <div class="note key">
+        <b>Label shift is chapter 20's split arriving as a production failure</b>
+        <p>The base rate moves and the model predicts 43.2% against an observed 68.7%. Calibration error <strong>0.2545</strong>, and the ranking survives untouched at 0.8150.</p>
+        <p>That is exactly <a href="20-evaluation.html">chapter 20</a>'s finding — four models with bit-identical AUC differing by up to 34% in cost — happening to one model over time instead of across four models at once. If the score feeds a threshold or an expected-value calculation, this is a serious failure that every ranking metric will report as fine.</p>
+        <p>It is also the easiest of the three to fix: recalibrate on recent labelled data and the ranking you already have becomes usable again.</p>
+      </div>
+    </section>
+
+    <section id="monitoring">
+      <p class="kicker">WHAT TO WATCH</p>
+      <h2>Monitors, in order of what they buy</h2>
+      <p class="sub">Ranked by how much real failure each one catches per unit of effort.</p>
+
+      <div class="terms">
+        <dt>1. Operational health</dt>
+        <dd>Error rates, latency, null rates per feature, request volume. Boring, and it catches the most common production failure by far: a broken upstream pipeline feeding nulls or stale values into a model that scores them without complaint.</dd>
+
+        <dt>2. Calibration against outcomes, as they arrive</dt>
+        <dd>Mean predicted against observed, on whatever labels have landed. One line of code, catches label shift immediately, and it is the monitor the table above shows earning its place. The lag is the problem, not the computation.</dd>
+
+        <dt>3. Prediction distribution</dt>
+        <dd>Available with no labels at all. It moves under covariate shift (0.3201 above) and, importantly, moves when an upstream pipeline breaks. Silent under concept drift, so it is a supplement rather than a safety net.</dd>
+
+        <dt>4. Input distribution</dt>
+        <dd>Popular, cheap, and the demo shows why it disappoints: it fires at 1.605 on the harmless case and 0.024 on the fatal one. Worth having as a diagnostic <em>after</em> something else has alarmed, and a poor primary alarm.</dd>
+
+        <dt>5. The business metric</dt>
+        <dd>The only thing that is definitely worth measuring, and the slowest and noisiest. Which is the argument for a permanent holdout: keep a small randomised slice unscored, and the difference is a continuous measurement of what the model is actually worth.</dd>
+      </div>
+
+      <div class="note warn">
+        <b>Concept drift needs labels, and there is no way around it</b>
+        <p>No label-free monitor can detect a change in P(y|x), because every label-free monitor only sees x. The demo makes this concrete: the input and prediction monitors both read exactly their no-drift values while the model collapses.</p>
+        <p>So the practical answer is to shorten the label loop rather than to find a cleverer unsupervised statistic. Label a small random sample deliberately and quickly, even when the natural labels take months. A few hundred fast labels a week detects concept drift that no amount of distribution monitoring ever will.</p>
+      </div>
+    </section>
+
+    <section id="feedback">
+      <p class="kicker">THE SELF-INFLICTED ONE</p>
+      <h2>When the model decides what you get to see</h2>
+      <p class="sub">Credit approvals, fraud review, content moderation, recommendations. If the model's decision determines which outcomes you observe, retraining on those outcomes has a problem.</p>
+
+      <p>The demo below approves the top 20% by score, observes labels only for those, and retrains on recent data. The truth is mildly curved and the model is linear — which is the normal case, since no model is exactly right.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Retraining on the data your own model let you see</b>
+          <span>8 generations, 4,000 candidates each, 40 replications</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Approval policy
+              <select id="fb-policy">
+                <option value="greedy" selected>Approve the top 20% by score</option>
+                <option value="holdout">Top 18%, plus 2% chosen at random</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="fb-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="fb-app-tile"><i>WHAT THE DASHBOARD SHOWS</i><b id="fb-app">0%</b><s>accuracy on observed cases</s></div>
+            <div class="tile" id="fb-real-tile"><i>TRUE ACCURACY</i><b id="fb-real">0%</b><s>across everyone who applied</s></div>
+            <div class="tile" id="fb-swing-tile"><i>SWING ACROSS GENERATIONS</i><b id="fb-swing">0</b><s>points of true accuracy</s></div>
+            <div class="tile hi" id="fb-corr-tile"><i>DASHBOARD vs TRUTH</i><b id="fb-corr">0</b><s>correlation over 8 generations</s></div>
+          </div>
+
+          <p class="readout" id="fb-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Approving the top 20% by score, retraining each generation on recent data</caption>
+          <thead>
+            <tr><th>Generation</th><th>Apparent accuracy</th><th>True accuracy</th><th>Spread of training inputs</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>1</td><td>66.5%</td><td>70.8%</td><td>1.365</td></tr>
+            <tr><td><strong>2</strong></td><td>69.8%</td><td><strong>47.3%</strong></td><td><strong>1.038</strong></td></tr>
+            <tr><td>3</td><td><strong>79.6%</strong></td><td>69.2%</td><td>1.520</td></tr>
+            <tr><td>4</td><td>62.0%</td><td>69.3%</td><td>1.508</td></tr>
+            <tr><td>5</td><td>68.0%</td><td>55.2%</td><td>1.113</td></tr>
+            <tr><td>6</td><td>74.6%</td><td>70.0%</td><td>1.384</td></tr>
+            <tr><td>7</td><td>64.1%</td><td>69.8%</td><td>1.382</td></tr>
+            <tr><td>8</td><td>68.0%</td><td><strong>53.7%</strong></td><td>1.112</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <b>It does not decay. It oscillates.</b>
+        <p>True accuracy runs 70.8, 47.3, 69.2, 69.3, 55.2, 70.0, 69.8, 53.7 — a <strong>24-point swing</strong>, crashing to near chance and recovering on a roughly three-generation cycle. I expected a slow decline and the model does something worse: it is <em>unstable</em>, so any single generation's reading tells you almost nothing about the next one.</p>
+        <p>And the number the team actually sees is uncorrelated with all of it: apparent accuracy correlates with true accuracy at <strong>r = 0.03</strong>. Generation 3 shows the dashboard's best reading, 79.6%, while generation 2's true accuracy was 47.3%. The monitor is not lagging or noisy. It is measuring something else.</p>
+      </div>
+
+      <div class="note key">
+        <b>But the mechanism is visible without any labels at all</b>
+        <p>The spread of the training inputs tracks true accuracy at <strong>r = 0.933</strong>: 1.37, 1.04, 1.52, 1.51, 1.11, 1.38, 1.38, 1.11 against the accuracy series above. When the approved region narrows, a linear fit to a curved truth becomes locally excellent and globally wrong; when it happens to re-broaden, the model recovers.</p>
+        <p>That is an actionable finding. <strong>Monitor the diversity of what you are training on</strong>, not just the distribution of what you are scoring — and treat a narrowing training set as the alarm it is.</p>
+      </div>
+
+      <div class="note tip">
+        <b>The fix is a few per cent of deliberate exploration</b>
+        <p>Approve 18% by score and 2% at random and the instability disappears: true accuracy runs 70.5, 65.0, 70.3, 70.3, 67.3, 70.3, 70.4, 68.4 — a swing of <strong>5.5 points against 24</strong>, and it never crashes.</p>
+        <p>Those random approvals cost something real, and they are the only thing that keeps the training set representative of the population you actually face. They also give you an unbiased estimate of performance in the region the model rejects, which is the thing you otherwise have no way to learn.</p>
+        <p>It is the same principle as <a href="09-design.html">chapter 9</a>'s holdout and <a href="10-aa-tests.html">chapter 10</a>'s A/A test: pay a small known cost for information you cannot otherwise obtain.</p>
+      </div>
+    </section>
+
+    <section id="retraining">
+      <p class="kicker">MAINTENANCE</p>
+      <h2>Retraining</h2>
+      <p class="sub">Less obvious than it looks, and the demo above is the reason.</p>
+
+      <div class="check">
+        <li><strong>Retrain on a trigger, not a schedule.</strong> Monthly retraining is a ritual; retraining when calibration drifts past a threshold is a response. And retraining fixes covariate and label shift while doing nothing for a broken pipeline.</li>
+        <li><strong>Validate every retrained model against the incumbent before it ships.</strong> The demo's generation-3 model looked best on the dashboard and the generation-2 model was the disaster. Offline comparison on a <em>fresh, randomly sampled</em> set is the only version that means anything.</li>
+        <li><strong>Watch the training set, not just the model.</strong> The input-spread correlation of 0.933 is the leading indicator here, and it needs no labels.</li>
+        <li><strong>Keep the exploration budget through every retrain.</strong> It is the first thing cut when someone optimises the approval rate, and its value only shows up as an absence of failures.</li>
+        <li><strong>Automate the rollback, not just the deploy.</strong> If the new model can go out automatically, it must be able to come back automatically.</li>
+      </div>
+    </section>
+
+    <section id="rollout">
+      <p class="kicker">GOING LIVE</p>
+      <h2>Shipping it</h2>
+      <p class="sub">The rollout is an experiment, and Part 3 already covered how to run one.</p>
+
+      <div class="terms">
+        <dt>Shadow mode first</dt>
+        <dd>Score live traffic, act on nothing, compare predictions with what happens. Catches training-serving skew and pipeline breakage before any user is affected, and costs nothing but compute.</dd>
+
+        <dt>Then a randomised rollout</dt>
+        <dd>Not a percentage ramp by itself &mdash; a randomised comparison against the current policy, measured on the business metric. <a href="09-design.html">Chapter 9</a> applies unchanged, including its warning about interference: a recommender changes what everyone sees, so user-level randomisation may understate or overstate the effect.</dd>
+
+        <dt>Guardrail metrics, agreed in advance</dt>
+        <dd>Latency, error rate, and the outcomes the model is <em>not</em> optimising. <a href="14-reading.html">Chapter 14</a>'s multiplicity applies: with twenty guardrails, something will fire.</dd>
+
+        <dt>Keep the holdout permanently</dt>
+        <dd>Not just for the launch. A small unscored slice is the only continuous measurement of what the model is worth, and it is what tells you whether a year of retraining has helped or quietly cost you.</dd>
+      </div>
+
+      <div class="note key">
+        <b>The launch is the cheapest measurement you will ever get</b>
+        <p>At launch there is a natural comparison, an obvious reason to randomise, and everyone's attention. Six months later, establishing what the model is worth requires turning it off for some users, which is a conversation nobody wants to have.</p>
+        <p>So set up the permanent holdout at launch, when it is free, rather than deciding later that you need one.</p>
+      </div>
+    </section>
+
+    <section id="reading">
+      <p class="kicker">JUDGEMENT</p>
+      <h2>Reading a production model</h2>
+      <p class="sub">Five questions to ask about something already running.</p>
+
+      <div class="check">
+        <li><strong>How would you know if it stopped working?</strong> If the answer is a feature-drift dashboard, the answer is that you would not — 0.024 while AUC fell to 0.2437.</li>
+        <li><strong>How long until a label arrives, and what happens in the meantime?</strong> This sets the maximum speed of every response.</li>
+        <li><strong>Does the model influence its own training data?</strong> If yes, ask what the exploration budget is. If there is none, the performance you see is not the performance you have.</li>
+        <li><strong>Is there a holdout?</strong> Without one, nobody knows what the model is worth, only what it predicts.</li>
+        <li><strong>Are training and serving features computed by the same code?</strong> If not, they have diverged; the only question is by how much.</li>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>Four offline assumptions break in production,</b> and training-serving skew is the most common and quietest.</li>
+          <li><b>&quot;Drift&quot; is three different failures</b> with three different consequences.</li>
+          <li><b>Covariate shift trips the input monitor at 1.605</b> while AUC stays at 0.8185 and calibration at 0.0064.</li>
+          <li><b>Concept drift leaves it at 0.024</b> while AUC falls to 0.2437 and accuracy to 34.1%.</li>
+          <li><b>So the popular monitor fires on the harmless case and misses the fatal one</b> &mdash; catching zero of two.</li>
+          <li><b>Label shift breaks calibration (0.2545) and leaves the ranking intact (0.8150)</b> &mdash; chapter 20's split, in production.</li>
+          <li><b>No label-free monitor can detect concept drift,</b> because every label-free monitor only sees x.</li>
+          <li><b>So shorten the label loop</b> rather than looking for a cleverer unsupervised statistic.</li>
+          <li><b>Monitor operational health first,</b> then calibration, then prediction distribution, then inputs.</li>
+          <li><b>A model retrained on its own decisions does not decay, it oscillates:</b> 70.8, 47.3, 69.2, 69.3, 55.2, 70.0, 69.8, 53.7.</li>
+          <li><b>A 24-point swing, crashing to near chance and recovering</b> on a roughly three-generation cycle.</li>
+          <li><b>The dashboard correlates with the truth at r = 0.03.</b> It is measuring something else.</li>
+          <li><b>The spread of the training inputs tracks true accuracy at r = 0.933,</b> and needs no labels.</li>
+          <li><b>Approving 2% at random cuts the swing from 24 points to 5.5</b> and stops the crashes.</li>
+          <li><b>Retrain on a trigger, validate against the incumbent, and automate the rollback.</b></li>
+          <li><b>Set up the permanent holdout at launch,</b> when it is free.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="23-craft.html">Chapter 23 &mdash; The craft</a>. Working practices, communicating results, and the habits that separate analysis that changes decisions from analysis that gets filed.</p>
+          </div>
+          <div class="fi">
+            <i>PICKED UP FROM</i>
+            <p>The holdout principle came from <a href="09-design.html">chapter 9</a>, the calibration split from <a href="20-evaluation.html">chapter 20</a>, and the leakage discipline from <a href="19-two-cultures.html">chapter 19</a>.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>For a model your team runs, write down how you would find out it had stopped working, and how long that would take.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   shared helpers
+   ============================================================ */
+function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+function gauss(rnd) {
+  var u1 = Math.max(1e-12, rnd()), u2 = rnd();
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+function avg(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i]; return s / a.length; }
+function sd(a) {
+  var m = avg(a), s = 0;
+  for (var i = 0; i < a.length; i++) s += (a[i] - m) * (a[i] - m);
+  return Math.sqrt(s / a.length);
+}
+function corrOf(a, b) {
+  var ma = avg(a), mb = avg(b), n = 0, da = 0, db = 0;
+  for (var i = 0; i < a.length; i++) {
+    n += (a[i] - ma) * (b[i] - mb);
+    da += (a[i] - ma) * (a[i] - ma);
+    db += (b[i] - mb) * (b[i] - mb);
+  }
+  return n / Math.max(1e-12, Math.sqrt(da * db));
+}
+function sigm(z) { return 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z)))); }
+function auc(scores, labels) {
+  var idx = scores.map(function (s, i) { return i; }).sort(function (a, b) { return scores[a] - scores[b]; });
+  var ranks = new Array(scores.length), i = 0;
+  while (i < idx.length) {
+    var j = i;
+    while (j + 1 < idx.length && scores[idx[j + 1]] === scores[idx[i]]) j++;
+    var r = (i + j) / 2 + 1;
+    for (var k = i; k <= j; k++) ranks[idx[k]] = r;
+    i = j + 1;
+  }
+  var np = 0, nn = 0, sp = 0;
+  for (var t = 0; t < labels.length; t++) { if (labels[t]) { np++; sp += ranks[t]; } else nn++; }
+  if (!np || !nn) return 0.5;
+  return (sp - np * (np + 1) / 2) / (np * nn);
+}
+/* logistic regression by IRLS */
+function fitLogit(X, y, lam) {
+  var n = y.length, p = X[0].length + 1, D = X.map(function (r) { return [1].concat(r); });
+  var beta = new Array(p).fill(0);
+  for (var it = 0; it < 30; it++) {
+    var A = [], b = [];
+    for (var a = 0; a < p; a++) { A.push(new Array(p).fill(0)); b.push(0); }
+    for (var i = 0; i < n; i++) {
+      var eta = 0;
+      for (var q = 0; q < p; q++) eta += D[i][q] * beta[q];
+      var mu = sigm(eta), w = Math.max(1e-6, mu * (1 - mu)), z = eta + (y[i] - mu) / w;
+      for (var a2 = 0; a2 < p; a2++) {
+        for (var b2 = 0; b2 < p; b2++) A[a2][b2] += D[i][a2] * w * D[i][b2];
+        b[a2] += D[i][a2] * w * z;
+      }
+    }
+    for (var d = 1; d < p; d++) A[d][d] += lam;
+    var M = A.map(function (r, ix) { return r.concat([b[ix]]); });
+    var ok = true;
+    for (var c = 0; c < p; c++) {
+      var pv = c;
+      for (var r2 = c + 1; r2 < p; r2++) if (Math.abs(M[r2][c]) > Math.abs(M[pv][c])) pv = r2;
+      var tmp = M[c]; M[c] = M[pv]; M[pv] = tmp;
+      if (Math.abs(M[c][c]) < 1e-12) { ok = false; break; }
+      for (var r3 = 0; r3 < p; r3++) {
+        if (r3 === c) continue;
+        var f = M[r3][c] / M[c][c];
+        for (var k2 = c; k2 <= p; k2++) M[r3][k2] -= f * M[c][k2];
+      }
+    }
+    if (!ok) break;
+    var nb = M.map(function (r, ix) { return r[p] / M[ix][ix]; });
+    var move = 0;
+    for (var q2 = 0; q2 < p; q2++) move += Math.abs(nb[q2] - beta[q2]);
+    beta = nb;
+    if (move < 1e-9) break;
+  }
+  return beta;
+}
+function scoreOf(beta, x) {
+  var s = beta[0];
+  for (var i = 0; i < x.length; i++) s += beta[i + 1] * x[i];
+  return sigm(s);
+}
+
+/* ============================================================
+   Demo 1 — three kinds of drift, and which monitor sees them
+   ============================================================ */
+(function () {
+  var TRUE_B = [-0.4, 1.2, -0.9], REPS = 25;
+  var $ = function (id) { return document.getElementById(id); };
+  var KLBL = {
+    none: "nothing has changed", covariate: "the inputs have moved",
+    label: "the base rate has moved", concept: "the rule has changed"
+  };
+
+  function draw(kind, n, rnd) {
+    var X = [], y = [];
+    for (var i = 0; i < n; i++) {
+      var shift = kind === "covariate" ? 1.6 : 0;
+      var x = [gauss(rnd) + shift, gauss(rnd)];
+      var b = kind === "concept" ? [-0.4, -0.5, 1.4] : TRUE_B;   /* the RULE changes, inputs do not */
+      var inter = kind === "label" ? 1.5 : 0;                     /* the base rate moves */
+      X.push(x);
+      y.push(rnd() < sigm(b[0] + inter + b[1] * x[0] + b[2] * x[1]) ? 1 : 0);
+    }
+    return { X: X, y: y };
+  }
+
+  var cache = {};
+  function run(kind) {
+    if (cache[kind]) return cache[kind];
+    var rnd = lcg(311);
+    var fdrift = [], pdrift = [], cal = [], aucs = [], accs = [], obs = [], meanP = [], example = null;
+    for (var r = 0; r < REPS; r++) {
+      var tr = draw("none", 6000, rnd), ref = draw("none", 6000, rnd), te = draw(kind, 6000, rnd);
+      var beta = fitLogit(tr.X, tr.y, 1.0);
+      var refS = ref.X.map(function (x) { return scoreOf(beta, x); });
+      var teS = te.X.map(function (x) { return scoreOf(beta, x); });
+      /* monitor 1: has the INPUT distribution moved? */
+      var f = 0;
+      for (var j = 0; j < 2; j++) {
+        var a = ref.X.map(function (x) { return x[j]; }), b2 = te.X.map(function (x) { return x[j]; });
+        f = Math.max(f, Math.abs(avg(b2) - avg(a)) / Math.max(1e-9, sd(a)));
+      }
+      fdrift.push(f);
+      /* monitor 2: has the PREDICTION distribution moved? */
+      pdrift.push(Math.abs(avg(teS) - avg(refS)));
+      /* monitor 3: calibration, which needs labels */
+      cal.push(Math.abs(avg(teS) - avg(te.y)));
+      meanP.push(avg(teS)); obs.push(avg(te.y));
+      aucs.push(auc(teS, te.y));
+      var right = 0;
+      for (var i2 = 0; i2 < te.y.length; i2++) if ((teS[i2] > 0.5 ? 1 : 0) === te.y[i2]) right++;
+      accs.push(right / te.y.length);
+      if (!example) example = { refS: refS, teS: teS };
+    }
+    cache[kind] = {
+      fdrift: avg(fdrift), pdrift: avg(pdrift), cal: avg(cal), auc: avg(aucs),
+      acc: avg(accs), meanP: avg(meanP), obs: avg(obs), example: example
+    };
+    return cache[kind];
+  }
+
+  function chart(kind) {
+    var W = 700, H = 190, B = 28, L = 8;
+    var d = run(kind), n = run("none");
+    var MON = [
+      { k: "input monitor", v: d.fdrift, base: n.fdrift, hi: 2.0, real: false },
+      { k: "prediction monitor", v: d.pdrift, base: n.pdrift, hi: 0.4, real: false },
+      { k: "calibration", v: d.cal, base: n.cal, hi: 0.3, real: true },
+      { k: "1 \u2212 ROC-AUC", v: 1 - d.auc, base: 1 - n.auc, hi: 0.8, real: true }
+    ];
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="What each monitor reports under this kind of drift">'];
+    svg.push('<text x="' + L + '" y="11" font-size="10" font-weight="700" fill="#7C8B99">WHAT EACH MONITOR REPORTS \u2014 ' +
+      KLBL[kind].toUpperCase() + '</text>');
+    var avail = W - L - 300;
+    MON.forEach(function (m, i) {
+      var y = 30 + i * 36;
+      var frac = Math.min(1, m.v / m.hi), bfrac = Math.min(1, m.base / m.hi);
+      var alarmed = m.v > m.base * 3 + 0.02;
+      svg.push('<text x="' + L + '" y="' + (y + 13) + '" font-size="10" font-weight="600" fill="#16232F">' +
+        m.k + '</text>');
+      svg.push('<rect x="' + (L + 130) + '" y="' + y + '" width="' + avail + '" height="16" rx="2" fill="#ECEFF2"/>');
+      svg.push('<rect x="' + (L + 130) + '" y="' + y + '" width="' + Math.max(1, avail * frac).toFixed(1) +
+        '" height="16" rx="2" fill="' + (alarmed ? (m.real ? "#C0453A" : "#F2A03D") : "#8FA0AF") + '"/>');
+      svg.push('<line x1="' + (L + 130 + avail * bfrac).toFixed(1) + '" y1="' + (y - 3) + '" x2="' +
+        (L + 130 + avail * bfrac).toFixed(1) + '" y2="' + (y + 19) + '" stroke="#166B47" stroke-width="2"/>');
+      svg.push('<text x="' + (L + 138 + avail) + '" y="' + (y + 12) + '" font-size="10" font-weight="' +
+        (alarmed ? 700 : 400) + '" fill="' + (alarmed ? (m.real ? "#9B2C22" : "#8A5A16") : "#54677A") + '">' +
+        m.v.toFixed(4) + (alarmed ? (m.real ? "  REAL DAMAGE" : "  ALARM") : "  quiet") + '</text>');
+    });
+    svg.push('<text x="' + L + '" y="' + (H - 4) + '" font-size="9.5" fill="#7C8B99">green marks are the no-drift baseline; amber is an alarm with no damage behind it, red is damage</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var kind = $("dr-kind").value;
+    var d = run(kind), n = run("none");
+    var damaged = d.auc < n.auc - 0.05 || d.cal > 0.05;
+
+    $("dr-f").textContent = d.fdrift.toFixed(3);
+    $("dr-f-tile").className = "tile " + (d.fdrift > 0.3 ? (damaged ? "bad" : "") : (damaged ? "bad" : "good"));
+    $("dr-c").textContent = d.cal.toFixed(4);
+    $("dr-c-sub").textContent = "predicts " + (d.meanP * 100).toFixed(1) + "%, observed " + (d.obs * 100).toFixed(1) + "%";
+    $("dr-c-tile").className = "tile " + (d.cal > 0.05 ? "bad" : "good");
+    $("dr-a").textContent = d.auc.toFixed(4);
+    $("dr-a-tile").className = "tile " + (d.auc < n.auc - 0.05 ? "bad" : "good");
+    $("dr-v").textContent = damaged ? "Serious" : "None";
+    $("dr-v-sub").textContent = damaged
+      ? (d.auc < n.auc - 0.05 ? "the ranking is broken" : "the probabilities are wrong")
+      : "the model still works";
+    $("dr-v-tile").className = "tile " + (damaged ? "bad" : "good");
+
+    $("dr-canvas").innerHTML = chart(kind);
+
+    var lines = [];
+    lines.push("The model was trained once and has not changed. What has changed is that " +
+      KLBL[kind] + ".");
+
+    if (kind === "none") {
+      lines.push("Every monitor is quiet and the model performs as trained: AUC " + d.auc.toFixed(4) +
+        ", calibration error " + d.cal.toFixed(4) + ". This is the reference. Now work through the three kinds of drift and note which monitor reacts to which.");
+    } else if (kind === "covariate") {
+      lines.push("The input monitor trips hard \u2014 " + d.fdrift.toFixed(3) +
+        " standard deviations of shift, against " + n.fdrift.toFixed(3) +
+        " when nothing is happening. That is an unmissable alarm.");
+      lines.push("And the model is fine. AUC is " + d.auc.toFixed(4) + " against a baseline " +
+        n.auc.toFixed(4) + ", and the calibration error is " + d.cal.toFixed(4) +
+        ". The relationship between inputs and outcome has not changed, so the model was never asked anything it cannot answer. The alarm is real and the damage is zero.");
+      lines.push("This matters because it is how monitoring gets switched off. A monitor that fires loudly on harmless changes trains people to ignore it, and the fatal case is the one that never fires at all \u2014 try the rule change.");
+    } else if (kind === "concept") {
+      lines.push("The input monitor reads " + d.fdrift.toFixed(3) + " \u2014 exactly its no-drift value of " +
+        n.fdrift.toFixed(3) + ". Completely silent, because the inputs look precisely as they always did.");
+      lines.push("Meanwhile AUC has fallen from " + n.auc.toFixed(4) + " to " + d.auc.toFixed(4) +
+        " and accuracy from " + (n.acc * 100).toFixed(1) + "% to " + (d.acc * 100).toFixed(1) +
+        "%. The relationship between inputs and outcome has inverted, and no statistic computed from x alone can possibly show that.");
+      lines.push("Which is the hard constraint of production monitoring: detecting concept drift REQUIRES labels. The answer is not a cleverer unsupervised statistic, it is a shorter label loop \u2014 deliberately labelling a small random sample fast, even when the natural labels take months.");
+    } else {
+      lines.push("Calibration has broken: the model predicts " + (d.meanP * 100).toFixed(1) +
+        "% against an observed " + (d.obs * 100).toFixed(1) + "%, an error of " + d.cal.toFixed(4) +
+        " against " + n.cal.toFixed(4) + " at baseline.");
+      lines.push("And the ranking survives untouched \u2014 AUC " + d.auc.toFixed(4) + " against " +
+        n.auc.toFixed(4) + ". This is chapter 20's split arriving as a production failure: if you only ever act on the top N by score, nothing is wrong; if the score feeds a threshold or an expected-value calculation, it is seriously wrong and every ranking metric will report it as fine.");
+      lines.push("It is also the easiest of the three to fix. Recalibrate on recent labelled data and the ranking you already have becomes usable again.");
+    }
+    $("dr-note").textContent = lines.join("\n\n");
+  }
+
+  $("dr-kind").addEventListener("change", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — retraining on the data your own model let you see
+   ============================================================ */
+(function () {
+  var CURVE = 0.6, APPROVE = 0.2, WINDOW = 2, GENS = 8, PERGEN = 4000, REPS = 40;
+  var $ = function (id) { return document.getElementById(id); };
+  /* the TRUTH is curved and the deployed model is linear, which is the normal case */
+  function trueP(x) { return sigm(-0.2 + 1.3 * x[0] - CURVE * x[0] * x[0] - 0.8 * x[1]); }
+
+  var cache = {};
+  function run(policy) {
+    if (cache[policy]) return cache[policy];
+    var rnd = lcg(321), app = [], real = [], cov = [];
+    for (var r = 0; r < REPS; r++) {
+      var hist = [];
+      /* generation 0: approve at random, so the first labels are unbiased */
+      var X0 = [], Y0 = [];
+      for (var i = 0; i < PERGEN; i++) {
+        var x = [gauss(rnd) * 1.3, gauss(rnd)];
+        if (rnd() < 0.5) { X0.push(x); Y0.push(rnd() < trueP(x) ? 1 : 0); }
+      }
+      hist.push({ X: X0, Y: Y0 });
+      /* retrain on a sliding window of recent data, as production systems do */
+      function trainOn() {
+        var w = hist.slice(-WINDOW), X = [], Y = [];
+        w.forEach(function (h) { X = X.concat(h.X); Y = Y.concat(h.Y); });
+        return { X: X, Y: Y };
+      }
+      var t = trainOn(), beta = fitLogit(t.X, t.Y, 1.0), aS = [], rS = [], cS = [];
+      for (var g = 1; g <= GENS; g++) {
+        var cand = [];
+        for (var i2 = 0; i2 < PERGEN; i2++) {
+          var x2 = [gauss(rnd) * 1.3, gauss(rnd)];
+          cand.push({ x: x2, s: scoreOf(beta, x2), y: rnd() < trueP(x2) ? 1 : 0 });
+        }
+        var sorted = cand.slice().sort(function (a, b) { return b.s - a.s; });
+        var k = Math.round(PERGEN * APPROVE), take;
+        if (policy === "greedy") { take = sorted.slice(0, k); }
+        else {
+          /* spend a tenth of the budget on cases chosen at random, whatever they scored */
+          take = sorted.slice(0, Math.round(k * 0.9));
+          var rest = sorted.slice(Math.round(k * 0.9)), need = k - take.length;
+          for (var q = 0; q < rest.length && need > 0; q++) {
+            if (rnd() < need / (rest.length - q)) { take.push(rest[q]); need--; }
+          }
+        }
+        hist.push({ X: take.map(function (c) { return c.x; }), Y: take.map(function (c) { return c.y; }) });
+        var tt = trainOn();
+        beta = fitLogit(tt.X, tt.Y, 1.0);
+        /* what the team SEES: accuracy on the cases it actually observed */
+        var ro = 0;
+        take.forEach(function (c) { if ((scoreOf(beta, c.x) > 0.5 ? 1 : 0) === c.y) ro++; });
+        aS.push(ro / take.length);
+        /* the TRUTH: accuracy across the whole incoming population */
+        var ra = 0;
+        cand.forEach(function (c) { if ((scoreOf(beta, c.x) > 0.5 ? 1 : 0) === c.y) ra++; });
+        rS.push(ra / cand.length);
+        cS.push(sd(tt.X.map(function (x) { return x[0]; })));
+      }
+      app.push(aS); real.push(rS); cov.push(cS);
+    }
+    function ca(m, g) { var s = 0; for (var i = 0; i < m.length; i++) s += m[i][g]; return s / m.length; }
+    var out = [];
+    for (var g2 = 0; g2 < GENS; g2++) {
+      out.push({ gen: g2 + 1, apparent: ca(app, g2), real: ca(real, g2), cov: ca(cov, g2) });
+    }
+    cache[policy] = out;
+    return out;
+  }
+
+  function chart(policy) {
+    var W = 700, H = 190, B = 30, L = 44;
+    var d = run(policy);
+    var xOf = function (i) { return L + i / (GENS - 1) * (W - L - 140); };
+    var lo = 0.42, hi = 0.85;
+    var yOf = function (v) { return (H - B) - (v - lo) / (hi - lo) * (H - B - 24); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Apparent and true accuracy across retraining generations">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">WHAT THE DASHBOARD SHOWS, AND WHAT IS ACTUALLY HAPPENING</text>');
+    svg.push('<line x1="' + L + '" y1="' + yOf(0.5).toFixed(1) + '" x2="' + (W - 136) + '" y2="' + yOf(0.5).toFixed(1) +
+      '" stroke="#CFD8E0" stroke-dasharray="4 3"/>');
+    svg.push('<text x="' + (W - 132) + '" y="' + (yOf(0.5) + 4).toFixed(1) + '" font-size="9" fill="#8FA0AF">chance</text>');
+    [["apparent", "#8FA0AF", "on observed cases"], ["real", "#C0453A", "true, everyone"]].forEach(function (c) {
+      var pts = d.map(function (g, i) { return [i, g[c[0]]]; });
+      svg.push('<path d="' + pts.map(function (p, i) {
+        return (i ? "L" : "M") + xOf(p[0]).toFixed(1) + " " + yOf(p[1]).toFixed(1);
+      }).join(" ") + '" fill="none" stroke="' + c[1] + '" stroke-width="2.6"' +
+        (c[0] === "apparent" ? ' stroke-dasharray="5 3"' : '') + '/>');
+      pts.forEach(function (p) {
+        svg.push('<circle cx="' + xOf(p[0]).toFixed(1) + '" cy="' + yOf(p[1]).toFixed(1) + '" r="3" fill="' + c[1] + '"/>');
+      });
+    });
+    d.forEach(function (g, i) {
+      svg.push('<text x="' + xOf(i).toFixed(1) + '" y="' + (H - 12) + '" font-size="9" fill="#7C8B99" text-anchor="middle">' +
+        g.gen + '</text>');
+    });
+    [0.5, 0.6, 0.7, 0.8].forEach(function (v) {
+      svg.push('<text x="' + (L - 6) + '" y="' + (yOf(v) + 4).toFixed(1) + '" font-size="9" fill="#7C8B99" text-anchor="end">' +
+        (v * 100).toFixed(0) + '%</text>');
+    });
+    var px = W - 130;
+    svg.push('<line x1="' + px + '" y1="34" x2="' + (px + 16) + '" y2="34" stroke="#8FA0AF" stroke-width="2.6" stroke-dasharray="5 3"/>');
+    svg.push('<text x="' + (px + 21) + '" y="38" font-size="9" fill="#54677A">dashboard</text>');
+    svg.push('<line x1="' + px + '" y1="52" x2="' + (px + 16) + '" y2="52" stroke="#C0453A" stroke-width="2.6"/>');
+    svg.push('<text x="' + (px + 21) + '" y="56" font-size="9" fill="#54677A">the truth</text>');
+    var reals = d.map(function (g) { return g.real; });
+    var swing = Math.max.apply(null, reals) - Math.min.apply(null, reals);
+    svg.push('<text x="0" y="' + (H - 1) + '" font-size="9.5" fill="' + (swing > 0.15 ? "#9B2C22" : "#166B47") + '">' +
+      (swing > 0.15
+        ? "true accuracy swings " + (swing * 100).toFixed(0) + " points and crashes to near chance, while the dashboard barely moves"
+        : "true accuracy stays within " + (swing * 100).toFixed(1) + " points across every generation") + '</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var policy = $("fb-policy").value;
+    var d = run(policy), g = run("greedy");
+    var reals = d.map(function (x) { return x.real; });
+    var apps = d.map(function (x) { return x.apparent; });
+    var covs = d.map(function (x) { return x.cov; });
+    var swing = Math.max.apply(null, reals) - Math.min.apply(null, reals);
+    var cAR = corrOf(apps, reals), cCR = corrOf(covs, reals);
+    var last = d[GENS - 1];
+
+    $("fb-app").textContent = (last.apparent * 100).toFixed(1) + "%";
+    $("fb-app-tile").className = "tile " + (policy === "greedy" ? "bad" : "");
+    $("fb-real").textContent = (last.real * 100).toFixed(1) + "%";
+    $("fb-real-tile").className = "tile " + (last.real < 0.6 ? "bad" : "good");
+    $("fb-swing").textContent = (swing * 100).toFixed(1);
+    $("fb-swing-tile").className = "tile " + (swing > 0.15 ? "bad" : "good");
+    $("fb-corr").textContent = cAR.toFixed(3);
+    $("fb-corr-tile").className = "tile " + (Math.abs(cAR) < 0.5 ? "bad" : "good");
+
+    $("fb-canvas").innerHTML = chart(policy);
+
+    var lines = [];
+    lines.push("Each generation the model scores 4,000 fresh candidates, " +
+      (policy === "greedy" ? "approves the top 20% by score" : "approves 18% by score plus 2% chosen at random") +
+      ", observes outcomes only for those, and retrains on recent data. The truth is mildly curved and the model is linear \u2014 which is the normal case, since no model is exactly right.");
+
+    if (policy === "greedy") {
+      lines.push("True accuracy does not decay gently. It OSCILLATES: " +
+        reals.map(function (v) { return (v * 100).toFixed(1); }).join(", ") + " \u2014 a " +
+        (swing * 100).toFixed(0) + "-point swing, crashing to " +
+        (Math.min.apply(null, reals) * 100).toFixed(1) +
+        "% and recovering on a roughly three-generation cycle. Any single generation's reading tells you almost nothing about the next.");
+      lines.push("And the number the team actually sees is uncorrelated with all of it: apparent accuracy runs " +
+        apps.map(function (v) { return (v * 100).toFixed(1); }).join(", ") + ", correlating with the truth at r = " +
+        cAR.toFixed(3) +
+        ". Generation 3 gives the dashboard's best reading while generation 2's true accuracy was the worst. The monitor is not lagging or noisy \u2014 it is measuring something else.");
+      lines.push("But the mechanism IS visible without labels. The spread of the training inputs tracks true accuracy at r = " +
+        cCR.toFixed(3) + " (" + covs.map(function (v) { return v.toFixed(2); }).join(", ") +
+        "). When the approved region narrows, a linear fit to a curved truth becomes locally excellent and globally wrong; when it happens to re-broaden, the model recovers.");
+      lines.push("So monitor the DIVERSITY of what you are training on, not just the distribution of what you are scoring \u2014 and treat a narrowing training set as the alarm it is. Then try the other policy.");
+    } else {
+      var gs = g.map(function (x) { return x.real; });
+      var gswing = Math.max.apply(null, gs) - Math.min.apply(null, gs);
+      lines.push("Spending a tenth of the approval budget on random cases removes the instability entirely. True accuracy runs " +
+        reals.map(function (v) { return (v * 100).toFixed(1); }).join(", ") + " \u2014 a swing of " +
+        (swing * 100).toFixed(1) + " points against the greedy policy's " + (gswing * 100).toFixed(0) +
+        ", and it never crashes.");
+      lines.push("Those random approvals cost something real. They are also the only thing keeping the training set representative of the population you actually face, and they give you an unbiased estimate of performance in the region the model rejects \u2014 which you otherwise have no way at all to learn.");
+      lines.push("It is the same principle as chapter 9's holdout and chapter 10's A/A test: pay a small known cost for information you cannot otherwise obtain. And it is always the first thing cut when someone optimises the approval rate, because its value shows up only as an absence of failures.");
+    }
+    $("fb-note").textContent = lines.join("\n\n");
+  }
+
+  $("fb-policy").addEventListener("change", render);
+  render();
+})();
+
+initChapter("22-shipping.html");
+</script>
+</body>
+</html>

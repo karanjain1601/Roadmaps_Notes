@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Data contracts and schema evolution — Data Engineer</title>
+<meta name="description" content="Schema languages, backward and forward compatibility, the registry that enforces them, and which deploy order each class of change permits.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">Data Engineer</a> <span>/</span> Chapter 06</p>
+    <p class="chnum">CHAPTER 06</p>
+    <h1>Data contracts and schema evolution</h1>
+    <p class="lede">Chapter 4 showed that the dangerous upstream changes are the quiet ones, and chapter 5 arranged for those changes to arrive with no warning whatsoever. This chapter is the defence: a machine-checkable agreement about shape, and a small set of compatibility rules precise enough that a build can reject a breaking change before it ships.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~27 min</b> read</div>
+      <div><b>Part 2</b> Where data comes from</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="problem">
+      <p class="kicker">WHY THIS EXISTS</p>
+      <h2>The gap a contract closes</h2>
+      <p class="sub">The producer of data and its consumers have no shared artefact describing what passes between them. Everything else follows from that.</p>
+
+      <p>An application team owns a table. They understand it as internal state, because that is what it was built as. Downstream, four pipelines, nine dashboards and a churn model depend on its exact shape. Nobody told the application team that, and there is no document anywhere recording the dependency. So they rename a column during a refactor, entirely reasonably, and something breaks in a team they have never met.</p>
+
+      <p>Notice this is not a technical failure. Both teams behaved correctly given what they knew. The failure is the absence of an interface: something that says <em>this is what we promise, this is what you may rely on, and this is how it will change</em>. Every other engineering discipline has this. Data mostly does not.</p>
+
+      <div class="note key">
+        <b>What makes a contract different from documentation</b>
+        <p>Documentation describes what a thing currently is; a contract constrains what it is allowed to become. The distinguishing feature of a useful contract is that <strong>a machine can reject a violation</strong> before it reaches production. A wiki page recording the schema of a table is genuinely helpful and will not stop a single incident, because nothing checks it. The compatibility rules in this chapter matter precisely because they are decidable.</p>
+      </div>
+    </section>
+
+    <section id="what">
+      <p class="kicker">CONTENTS</p>
+      <h2>What a contract contains</h2>
+      <p class="sub">Schema is the part people implement. It is roughly half of what makes the agreement useful.</p>
+
+      <div class="terms">
+        <dt>Schema</dt>
+        <dd>Field names, types, nullability, and which fields are required. The mechanically checkable core, and the subject of the rest of this chapter.</dd>
+
+        <dt>Semantics</dt>
+        <dd>What the fields mean. That <code>total_cents</code> excludes shipping, that <code>status</code> has exactly six legal values, that <code>created_at</code> is UTC. This is where the disagreements from chapter 1 get settled, and it cannot be inferred from types.</dd>
+
+        <dt>Guarantees</dt>
+        <dd>Freshness, completeness, uniqueness, ordering. "Available within fifteen minutes of the event", "primary key is unique", "no more than 0.1% of rows have a null customer". These are the assertions that become the tests in <a href="20-cicd-testing.html">chapter 20</a>.</dd>
+
+        <dt>Ownership</dt>
+        <dd>A named team, a channel to reach them, and an escalation path. A contract with no owner is a wiki page.</dd>
+
+        <dt>Change policy</dt>
+        <dd>The compatibility level enforced, notice required for a breaking change, and how long old versions are supported. This is what makes the contract a contract rather than a snapshot.</dd>
+      </div>
+
+      <p>The schema half is where nearly all tooling investment goes, because it is the half a computer can check. That is a good reason to start there and a bad reason to stop there — the expensive incidents from chapter 4 were semantic drift, and no schema language will catch a field whose meaning changed while its type did not.</p>
+    </section>
+
+    <section id="schemas">
+      <p class="kicker">THE LANGUAGES</p>
+      <h2>Avro, Protobuf and JSON Schema</h2>
+      <p class="sub">Three serious options with genuinely different trade-offs. The compatibility rules that follow are Avro's, because they are the most fully specified.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Schema languages compared on what matters for a data platform</caption>
+          <thead>
+            <tr><th></th><th>Avro</th><th>Protobuf</th><th>JSON Schema</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Encoding</td><td>Compact binary</td><td>Compact binary</td><td>Text JSON</td></tr>
+            <tr><td>Schema travels with data</td><td>Yes, or by registry id</td><td>By registry id</td><td>No</td></tr>
+            <tr><td>Reader and writer schemas differ</td><td>Yes, resolution is a core feature</td><td>Yes, via field numbers</td><td>Validation only</td></tr>
+            <tr><td>Field identity</td><td>By name, with aliases</td><td>By tag number</td><td>By name</td></tr>
+            <tr><td>Compatibility rules</td><td>Fully specified</td><td>Well defined, tag-based</td><td>Weakly defined</td></tr>
+            <tr><td>Human readable on the wire</td><td>No</td><td>No</td><td>Yes</td></tr>
+            <tr><td>Natural fit</td><td>Kafka, Hadoop lineage, analytics</td><td>Service RPC, gRPC</td><td>APIs, config, loose pipelines</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The row that decides most choices is <strong>field identity</strong>. Avro matches fields by name, so renaming is a breaking change unless you declare an alias. Protobuf matches by tag number, so renaming a field is <em>free</em> — the wire format never contained the name — while reusing a retired tag number is catastrophic. These produce opposite habits: Avro teams are careful about names, Protobuf teams are careful about numbers and mark retired tags <code>reserved</code>.</p>
+
+      <div class="note tip">
+        <b>Practical guidance</b>
+        <p>If your data flows through Kafka into analytics, Avro with a registry is the well-trodden path and everything in the next section applies directly. If your organisation already runs gRPC, use Protobuf and inherit the schemas the services already have rather than translating them. JSON Schema is the right answer for HTTP APIs and for validating files, and the wrong answer for a high-volume event pipeline — the encoding overhead is large and the compatibility story is weak.</p>
+      </div>
+    </section>
+
+    <section id="compat">
+      <p class="kicker">THE DECIDABLE PART</p>
+      <h2>Compatibility, and which deploy order it permits</h2>
+      <p class="sub">Two directions, four classes, and one consequence that most explanations leave out.</p>
+
+      <p>Get the definitions exactly right, because they are easy to say backwards:</p>
+
+      <div class="terms">
+        <dt>Backward compatible</dt>
+        <dd>A reader using the <strong>new</strong> schema can read data written with the <strong>old</strong> one. New code copes with old data. Permits: upgrade <em>consumers first</em>.</dd>
+
+        <dt>Forward compatible</dt>
+        <dd>A reader using the <strong>old</strong> schema can read data written with the <strong>new</strong> one. Old code copes with new data. Permits: upgrade <em>producers first</em>.</dd>
+
+        <dt>Fully compatible</dt>
+        <dd>Both. Deploy in any order, which in a real distributed system with a rolling deploy is the only genuinely comfortable position.</dd>
+
+        <dt>Incompatible</dt>
+        <dd>Neither. There is no deploy order that works, so it needs a coordinated change: a new schema version consumed in parallel, or dual-writing during a migration window.</dd>
+      </div>
+
+      <p>That last column is the part usually omitted, and it is the part you need on the day. Pick a change below and the demo works out both directions from the actual Avro resolution rules, then tells you what you are allowed to do with it.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Compatibility checker</b>
+          <span>Avro resolution rules applied to a proposed change</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Proposed change
+              <select id="cc-change"></select>
+            </label>
+          </div>
+
+          <div class="canvas" id="cc-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="cc-b-tile"><i>BACKWARD</i><b id="cc-b">&mdash;</b><s>new reader, old data</s></div>
+            <div class="tile" id="cc-f-tile"><i>FORWARD</i><b id="cc-f">&mdash;</b><s>old reader, new data</s></div>
+            <div class="tile hi"><i>CLASS</i><b id="cc-class">&mdash;</b><s>registry level</s></div>
+            <div class="tile" id="cc-order-tile"><i>SAFE DEPLOY ORDER</i><b id="cc-order">&mdash;</b><s id="cc-order-sub"></s></div>
+          </div>
+
+          <p class="readout" id="cc-note"></p>
+        </div>
+      </div>
+
+      <p>Three results are worth pulling out because they contradict common intuition.</p>
+
+      <ol>
+        <li><strong>Adding a field is not automatically safe.</strong> With a default it is fully compatible; without one it is forward-compatible only, so a new reader hitting old data has no value to use and no default to fall back on. The default is what makes the change safe, not the addition.</li>
+        <li><strong>Widening a type is only safe in one direction.</strong> Promoting <code>int</code> to <code>long</code> is backward compatible — a long reader handles int data — but not forward compatible, because an old int reader cannot hold a long. So a change that feels purely additive still constrains your deploy order.</li>
+        <li><strong>An alias buys backward compatibility only.</strong> Aliases are declared on the <em>reader</em> schema, so a new reader can resolve an old field name. An old reader has no alias for the new name and cannot resolve it. Renaming is therefore never fully compatible in Avro, however carefully you do it.</li>
+      </ol>
+
+      <div class="note warn">
+        <b>Which level to enforce in the registry</b>
+        <p>The common default is <code>BACKWARD</code>, and for a Kafka topic feeding analytics it is usually right: it lets producers evolve while requiring consumers to be upgraded first, which is the order you can actually control. But if you do not control your consumers &mdash; other teams, third parties, a dashboard someone built and forgot &mdash; <code>FULL</code> is the honest setting, because <code>BACKWARD</code> quietly assumes a coordination you do not have.</p>
+      </div>
+    </section>
+
+    <section id="rollout">
+      <p class="kicker">WHY ORDER MATTERS</p>
+      <h2>What a rolling deploy does to a one-way change</h2>
+      <p class="sub">Compatibility is not an abstract property. It decides how many messages break during the window when both versions are running.</p>
+
+      <p>In a real deployment there is no instant when versions swap. For minutes or hours you have a mixture: some producers on the new schema, some consumers still on the old. Every message crosses one of four pairings, and two of them are where compatibility gets tested for real.</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">pairings.txt</span><button class="code-copy">Copy</button></div>
+        <pre><code data-lang="python">old writer -> old reader   always fine
+new writer -> new reader   always fine
+new writer -> old reader   needs FORWARD compatibility
+old writer -> new reader   needs BACKWARD compatibility</code></pre>
+      </div>
+
+      <p>So a backward-compatible change survives a deploy that upgrades consumers first, and breaks if a producer gets there before them. Set the change class and the deploy order below and watch what happens to the broken-message count.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Broken messages during a rolling deploy</b>
+          <span>mixed-version pairings integrated across the deploy window</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Change class
+              <select id="rd-class">
+                <option value="full">Fully compatible</option>
+                <option value="backward" selected>Backward only</option>
+                <option value="forward">Forward only</option>
+                <option value="none">Incompatible</option>
+              </select>
+            </label>
+            <label>Deploy order
+              <select id="rd-order">
+                <option value="readers">Consumers first</option>
+                <option value="writers">Producers first</option>
+                <option value="both" selected>Both at once</option>
+              </select>
+            </label>
+            <label>Deploy window
+              <input type="range" id="rd-win" min="5" max="240" step="5" value="45">
+              <output id="rd-win-o">45 min</output>
+            </label>
+            <label>Message rate
+              <select id="rd-rate">
+                <option value="100">100 /sec</option>
+                <option value="2000" selected>2,000 /sec</option>
+                <option value="20000">20,000 /sec</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="rd-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="rd-tot-tile"><i>MESSAGES BROKEN</i><b id="rd-tot">0</b><s id="rd-tot-sub"></s></div>
+            <div class="tile"><i>PEAK BREAKAGE</i><b id="rd-peak">0%</b><s>worst moment</s></div>
+            <div class="tile"><i>TIME DEGRADED</i><b id="rd-time">0</b><s>any breakage at all</s></div>
+            <div class="tile hi"><i>BEST ORDER</i><b id="rd-best">&mdash;</b><s id="rd-best-sub"></s></div>
+          </div>
+
+          <p class="readout" id="rd-note"></p>
+        </div>
+      </div>
+
+      <p>The model makes three practical points. A fully compatible change is genuinely free — zero broken messages in any order, which is why it is worth paying the small design cost of always supplying a default. A one-way change is free <em>if</em> you deploy in the matching order and expensive otherwise, so the compatibility class is really an instruction about sequencing. And an incompatible change breaks messages under every order, at a volume proportional to how long the deploy takes, which is why the answer there is never "deploy carefully" but "do not do this as a deploy".</p>
+
+      <div class="note trap">
+        <b>The rollback trap</b>
+        <p>Deploy order also governs rollback, in reverse. If you upgraded consumers first for a backward-compatible change and then need to roll the producers back, you are fine. If you upgraded producers first for a forward-compatible change and need to roll <em>consumers</em> back, you are fine. Mismatch it and your rollback is the breaking direction &mdash; so you have an outage during the recovery from an outage. Decide the rollback order at the same time as the deploy order, not during the incident.</p>
+      </div>
+    </section>
+
+    <section id="registry">
+      <p class="kicker">ENFORCEMENT</p>
+      <h2>The registry, and where the check belongs</h2>
+      <p class="sub">Rules nobody enforces are documentation. The value is entirely in the rejection.</p>
+
+      <p>A schema registry is a small service holding schemas by subject and version, assigning each an id, and — the part that matters — refusing to register a new version that violates the configured compatibility level for that subject.</p>
+
+      <p>The runtime path is straightforward. A producer registers its schema, gets an id, and prefixes each message with that id rather than the whole schema, which is what keeps the encoding compact. A consumer reads the id, fetches and caches the schema, and resolves the writer's schema against its own.</p>
+
+      <div class="note key">
+        <b>Move the check left</b>
+        <p>A registry rejecting a bad schema at <em>runtime</em> means the producer deploys and then fails, which is a production incident with extra steps. The valuable configuration is a <strong>CI check</strong>: on every pull request touching a schema, test the proposed version against the registered one and fail the build. The same rules, applied hours earlier, to the person who can still change their mind cheaply. That single job prevents more incidents than the registry itself.</p>
+      </div>
+
+      <p>Two things a registry does not do, worth being clear about. It does not know your semantics — nothing stops <code>total_cents</code> silently becoming tax-inclusive, since the type is unchanged. And it does not cover tables, only serialised messages, so a warehouse table has no registry unless you build the equivalent yourself with schema tests in your transformation tool.</p>
+    </section>
+
+    <section id="social">
+      <p class="kicker">THE HARDER HALF</p>
+      <h2>Getting a contract agreed</h2>
+      <p class="sub">The technology has been solved for a decade. Adoption is where this fails, and it fails for a predictable reason.</p>
+
+      <p>From the producing team's chair, a data contract is pure cost. They gain a constraint on their own schema, a CI check that can block their deploy, and an obligation to a team whose roadmap they do not share. Presented as a governance requirement, it will be resisted, and the resistance is rational.</p>
+
+      <p>What works is inverting the framing so the contract is something they receive rather than something imposed:</p>
+
+      <div class="check">
+        <li><strong>Start where it already hurt.</strong> One interface, chosen because a real incident happened there. A contract that visibly prevents a recurrence is an easier sell than a policy covering forty tables.</li>
+        <li><strong>Give them the blast radius.</strong> The lineage from <a href="01-what-it-is.html">chapter 1</a> turns "please be careful" into "this column has fourteen downstream dependencies across three teams". Most people are perfectly willing to be careful once they can see what they are being careful about.</li>
+        <li><strong>Supply the check, do not request compliance.</strong> Write the CI job, open the pull request, make it green. Adoption cost near zero beats adoption benefit argued in the abstract.</li>
+        <li><strong>Offer something back.</strong> Ownership metadata, a schema they can validate against in their own tests, freedom from ad-hoc data questions because consumers now read the contract. Reciprocity, not compliance.</li>
+        <li><strong>Make the contract narrower than the table.</strong> Promising three columns is a small commitment; promising a whole table forbids all internal change. A deliberately minimal contract is far easier to agree and far more likely to hold.</li>
+      </div>
+
+      <p>That last point is the one most worth internalising, because it is where enthusiasm usually overreaches. A contract covering every column of every table is a freeze on someone else's codebase, and it will be either refused or quietly ignored. Promise little, enforce it properly, and expand only where a real consumer needs more.</p>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>A contract differs from documentation because a machine can reject a violation.</b> A wiki page recording a schema prevents nothing.</li>
+          <li><b>Schema is about half of it.</b> Semantics, guarantees, ownership and a change policy are the rest, and semantic drift is the class that caused the expensive incidents in chapter 4.</li>
+          <li><b>Field identity decides your habits.</b> Avro matches by name, so renames break and aliases are needed. Protobuf matches by tag, so renames are free and reusing a retired tag is catastrophic.</li>
+          <li><b>Backward means new code reads old data</b> and permits upgrading consumers first. <b>Forward means old code reads new data</b> and permits upgrading producers first. Full permits any order.</li>
+          <li><b>Adding a field is only fully compatible with a default.</b> Without one it is forward-compatible only.</li>
+          <li><b>Widening int to long is backward but not forward compatible.</b> An apparently additive change still dictates deploy order.</li>
+          <li><b>Aliases give backward compatibility only,</b> because they live on the reader schema. Renaming is never fully compatible in Avro.</li>
+          <li><b>A rolling deploy tests compatibility for real.</b> One-way changes cost nothing in the matching order and break messages in the wrong one, proportionally to the deploy window.</li>
+          <li><b>Plan the rollback order with the deploy order.</b> Mismatched, your recovery is the breaking direction.</li>
+          <li><b>Enforce in CI, not at runtime.</b> Same rules, hours earlier, to someone who can still change their mind cheaply.</li>
+          <li><b>Promise less than the whole table.</b> A narrow contract gets agreed and holds; a total one gets refused or ignored.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="07-storage-foundations.html">Chapter 7 &mdash; Storage foundations</a>. Part 3 opens on the substrate: block, file and object storage, durability against availability, and why cheap object storage restructured the whole field.</p>
+          </div>
+          <div class="fi">
+            <i>PART 2 IS NOW COMPLETE</i>
+            <p>Chapters 4 to 6 covered sources you do not control, detecting that they changed, and constraining how they are allowed to change. The remaining chapters assume data has arrived and is yours.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>Take the most important table you consume and write the narrowest contract you would actually be happy with: three columns, their types, one freshness guarantee, one owner. If that document does not exist, it is an hour's work and the start of the conversation.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Demo 1 — Avro compatibility checker
+   ============================================================ */
+(function () {
+  /* the registered schema every change is measured against */
+  var BASE = [
+    { name: "order_id",    type: "long",              def: false },
+    { name: "status",      type: "string",            def: false },
+    { name: "total_cents", type: "int",               def: false },
+    { name: "currency",    type: "string",            def: true  },
+    { name: "channel",     type: "enum{web,app}",     def: true  },
+    { name: "note",        type: "union{null,string}",def: true  }
+  ];
+
+  /* Avro read-side type promotions: writer type -> types a reader may use */
+  var PROMOTES = { "int": ["long", "float", "double"], "long": ["float", "double"], "float": ["double"] };
+  function promotable(from, to) {
+    return !!(PROMOTES[from] && PROMOTES[from].indexOf(to) >= 0);
+  }
+
+  /*  Each change declares the field-level edit. Compatibility is then
+      derived from the edit, not hard-coded per change.  */
+  var CHANGES = [
+    { id:"add-def",     lab:"Add discount_cents, default 0",            kind:"add",    field:"discount_cents", newType:"int", newDef:true },
+    { id:"add-nodef",   lab:"Add discount_cents, no default",           kind:"add",    field:"discount_cents", newType:"int", newDef:false },
+    { id:"drop-opt",    lab:"Remove currency (has a default)",          kind:"remove", field:"currency" },
+    { id:"drop-req",    lab:"Remove status (no default)",               kind:"remove", field:"status" },
+    { id:"widen",       lab:"Widen total_cents: int to long",           kind:"retype", field:"total_cents", newType:"long" },
+    { id:"narrow",      lab:"Narrow order_id: long to int",             kind:"retype", field:"order_id",    newType:"int" },
+    { id:"retype",      lab:"Retype total_cents: int to string",        kind:"retype", field:"total_cents", newType:"string" },
+    { id:"nullable",    lab:"Make total_cents nullable, default null",  kind:"retype", field:"total_cents", newType:"union{null,int}", newDef:true },
+    { id:"rename",      lab:"Rename status to state, no alias",         kind:"rename", field:"status", to:"state", alias:false },
+    { id:"rename-alias",lab:"Rename status to state, with alias",       kind:"rename", field:"status", to:"state", alias:true },
+    { id:"enum-add",    lab:"Add kiosk to the channel enum",            kind:"enum",   field:"channel" },
+    { id:"reorder",     lab:"Reorder the fields",                       kind:"reorder" }
+  ];
+
+  var $ = function (id) { return document.getElementById(id); };
+  var find = function (n) { return BASE.filter(function (f) { return f.name === n; })[0]; };
+
+  /* Derive both directions from the edit.
+     backward = a reader on the NEW schema can read data written with the OLD one.
+     forward  = a reader on the OLD schema can read data written with the NEW one. */
+  function analyse(c) {
+    var f = c.field ? find(c.field) : null;
+    var why = { b: "", f: "" };
+    var back, fwd;
+
+    if (c.kind === "add") {
+      /* old data lacks the field: the new reader needs a default */
+      back = !!c.newDef;
+      why.b = back ? "the new reader fills the missing field from its default"
+                   : "old data has no value for it and the new reader has no default to use";
+      /* new data carries an extra field: an old reader ignores unknown fields */
+      fwd = true;
+      why.f = "an old reader simply ignores a field it does not know about";
+
+    } else if (c.kind === "remove") {
+      /* new reader ignores the field that old data still carries */
+      back = true;
+      why.b = "the new reader ignores a field it no longer declares";
+      /* old reader still wants it: only survivable if it had a default */
+      fwd = !!f.def;
+      why.f = fwd ? "the old reader falls back on its own default for the field"
+                  : "the old reader requires the field and has no default";
+
+    } else if (c.kind === "retype") {
+      var from = f.type, to = c.newType;
+      var toUnionWithNull = to.indexOf("union{null,") === 0;
+      if (toUnionWithNull) {
+        back = true;
+        why.b = "a nullable reader accepts the non-null values old data contains";
+        fwd = false;
+        why.f = "the old reader declares a non-null type and cannot represent null";
+      } else {
+        back = promotable(from, to);
+        why.b = back ? "Avro promotes " + from + " to " + to + " when resolving on read"
+                     : "there is no read-side promotion from " + from + " to " + to;
+        fwd = promotable(to, from);
+        why.f = fwd ? "Avro promotes " + to + " back to " + from + " for the old reader"
+                    : "the old reader cannot hold a " + to + " in a " + from;
+      }
+
+    } else if (c.kind === "rename") {
+      /* a rename is a remove plus an add; aliases live on the READER schema */
+      back = !!c.alias;
+      why.b = back ? "the new reader declares an alias, so it resolves the old field name"
+                   : "the new reader looks for " + c.to + ", which old data does not contain";
+      fwd = !!f.def;
+      why.f = fwd ? "the old reader falls back on its default for " + c.field
+                  : "the old reader requires " + c.field + ", which new data does not contain, and has no default";
+
+    } else if (c.kind === "enum") {
+      back = true;
+      why.b = "the new reader's symbol set is a superset, so every old symbol resolves";
+      fwd = false;
+      why.f = "the old reader has no symbol for the new value and no enum default";
+
+    } else { /* reorder */
+      back = true; fwd = true;
+      why.b = why.f = "Avro resolves fields by name, so declaration order carries no meaning";
+    }
+
+    var cls = back && fwd ? "FULL" : back ? "BACKWARD" : fwd ? "FORWARD" : "NONE";
+    var order = { FULL: "Any order", BACKWARD: "Consumers first", FORWARD: "Producers first", NONE: "No safe order" }[cls];
+    return { back: back, fwd: fwd, cls: cls, order: order, why: why };
+  }
+
+  function diagram(c, res) {
+    var W = 700, H = 176, colW = 300;
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Field-level difference between the registered and proposed schema">'];
+    svg.push('<text x="8" y="12" font-size="10" font-weight="700" fill="#7C8B99">REGISTERED</text>');
+    svg.push('<text x="' + (colW + 96) + '" y="12" font-size="10" font-weight="700" fill="#A8386B">PROPOSED</text>');
+
+    var newFields = BASE.map(function (f) { return { name: f.name, type: f.type, def: f.def, state: "same" }; });
+    if (c.kind === "add") {
+      newFields.push({ name: c.field, type: c.newType, def: c.newDef, state: "added" });
+    } else if (c.kind === "remove") {
+      newFields = newFields.filter(function (f) { return f.name !== c.field; });
+    } else if (c.kind === "retype") {
+      newFields.forEach(function (f) { if (f.name === c.field) { f.type = c.newType; f.state = "changed"; if (c.newDef) f.def = true; } });
+    } else if (c.kind === "rename") {
+      newFields.forEach(function (f) { if (f.name === c.field) { f.name = c.to; f.state = "changed"; } });
+    } else if (c.kind === "enum") {
+      newFields.forEach(function (f) { if (f.name === c.field) { f.type = "enum{web,app,kiosk}"; f.state = "changed"; } });
+    } else if (c.kind === "reorder") {
+      newFields = [newFields[2], newFields[0], newFields[5], newFields[1], newFields[4], newFields[3]]
+        .map(function (f) { return { name: f.name, type: f.type, def: f.def, state: "moved" }; });
+    }
+
+    var row = function (f, x, y, right) {
+      var col = f.state === "added" ? "#2E8B5F" : f.state === "changed" ? "#C0453A" : f.state === "moved" ? "#7C8CF8" : "#54677A";
+      var weight = f.state === "same" ? 400 : 700;
+      svg.push('<text x="' + x + '" y="' + y + '" font-size="11" font-weight="' + weight + '" fill="' + col + '">' +
+        f.name + '</text>');
+      svg.push('<text x="' + (x + 118) + '" y="' + y + '" font-size="10" fill="#7C8B99">' + f.type +
+        (f.def ? "  (default)" : "") + '</text>');
+    };
+    BASE.forEach(function (f, i) {
+      var gone = (c.kind === "remove" && f.name === c.field) || (c.kind === "rename" && f.name === c.field);
+      var fx = { name: f.name, type: f.type, def: f.def, state: gone ? "changed" : "same" };
+      row(fx, 8, 30 + i * 22, false);
+      if (gone) svg.push('<line x1="6" y1="' + (26 + i * 22) + '" x2="' + (colW - 24) + '" y2="' + (26 + i * 22) + '" stroke="#C0453A" stroke-width="1"/>');
+    });
+    newFields.forEach(function (f, i) { row(f, colW + 96, 30 + i * 22, true); });
+
+    var y = 30 + Math.max(BASE.length, newFields.length) * 22 + 6;
+    var arrow = function (yy, ok, label) {
+      var col = ok ? "#2E8B5F" : "#C0453A";
+      svg.push('<text x="8" y="' + yy + '" font-size="10.5" font-weight="700" fill="' + col + '">' +
+        label + ": " + (ok ? "compatible" : "breaks") + '</text>');
+    };
+    arrow(y, res.back, "backward");
+    arrow(y + 15, res.fwd, "forward");
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  var sel = $("cc-change");
+  CHANGES.forEach(function (c) {
+    var o = document.createElement("option");
+    o.value = c.id; o.textContent = c.lab;
+    sel.appendChild(o);
+  });
+
+  function render() {
+    var c = CHANGES.filter(function (x) { return x.id === sel.value; })[0];
+    var res = analyse(c);
+
+    $("cc-b").textContent = res.back ? "Yes" : "No";
+    $("cc-f").textContent = res.fwd ? "Yes" : "No";
+    $("cc-b-tile").className = "tile " + (res.back ? "good" : "bad");
+    $("cc-f-tile").className = "tile " + (res.fwd ? "good" : "bad");
+    $("cc-class").textContent = res.cls;
+    $("cc-order").textContent = res.order;
+    $("cc-order-tile").className = "tile " + (res.cls === "NONE" ? "bad" : res.cls === "FULL" ? "good" : "");
+    $("cc-order-sub").textContent = res.cls === "FULL" ? "rolling deploy is safe"
+      : res.cls === "NONE" ? "needs a coordinated migration" : "order is not optional";
+
+    $("cc-canvas").innerHTML = diagram(c, res);
+
+    var lines = [];
+    lines.push("Backward " + (res.back ? "holds" : "fails") + ": " + res.why.b + ".");
+    lines.push("Forward " + (res.fwd ? "holds" : "fails") + ": " + res.why.f + ".");
+
+    if (res.cls === "FULL") {
+      lines.push("Fully compatible, so producers and consumers can be upgraded in any order and a rolling deploy needs no coordination at all. This is worth engineering for deliberately \u2014 it is the difference between a schema change being a deploy and being a project.");
+    } else if (res.cls === "BACKWARD") {
+      lines.push("Backward only. Upgrade every consumer before any producer: new readers cope with old data, but an old reader meeting new data will fail. A registry set to BACKWARD accepts this change, which is a statement that you can control consumer rollout \u2014 if some consumers belong to other teams, that assumption is doing a lot of unexamined work.");
+    } else if (res.cls === "FORWARD") {
+      lines.push("Forward only. Upgrade producers first: old readers tolerate the new data, but a new reader meeting old data will fail. Note that this direction is awkward in practice, because historical data in a topic or a table is old data \u2014 so a new reader replaying history breaks even after the deploy finishes.");
+    } else {
+      lines.push("Incompatible in both directions, so no deploy order works. The options are a new schema subject consumed in parallel, dual-writing both shapes through a migration window, or a coordinated stop. Attempting it as an ordinary deploy will break messages whatever sequence you choose.");
+    }
+    $("cc-note").textContent = lines.join("\n\n");
+  }
+
+  sel.addEventListener("change", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — broken messages during a rolling deploy
+   ============================================================ */
+(function () {
+  var CLASSES = {
+    full:     { back: true,  fwd: true,  lab: "fully compatible" },
+    backward: { back: true,  fwd: false, lab: "backward only" },
+    forward:  { back: false, fwd: true,  lab: "forward only" },
+    none:     { back: false, fwd: false, lab: "incompatible" }
+  };
+  var STEPS = 400;
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  function ramps(order, u) {
+    /* u runs 0..1 across the deploy window; returns fraction on the new
+       schema for writers and readers under each sequencing choice */
+    if (order === "readers") {
+      return { r: Math.min(1, u / 0.5), w: Math.max(0, (u - 0.5) / 0.5) };
+    }
+    if (order === "writers") {
+      return { w: Math.min(1, u / 0.5), r: Math.max(0, (u - 0.5) / 0.5) };
+    }
+    return { w: u, r: u };
+  }
+
+  function simulate(cls, order, windowMin, rate) {
+    var c = CLASSES[cls], dt = windowMin * 60 / STEPS;
+    var total = 0, peak = 0, degraded = 0, curve = [];
+    for (var i = 0; i <= STEPS; i++) {
+      var u = i / STEPS, f = ramps(order, u);
+      /* new writer -> old reader needs forward; old writer -> new reader needs backward */
+      var broken = (c.fwd ? 0 : f.w * (1 - f.r)) + (c.back ? 0 : (1 - f.w) * f.r);
+      curve.push(broken);
+      total += broken * rate * dt;
+      if (broken > peak) peak = broken;
+      if (broken > 1e-9) degraded += dt;
+    }
+    return { total: total, peak: peak, degraded: degraded, curve: curve };
+  }
+
+  function best(cls, windowMin, rate) {
+    var opts = ["readers", "writers", "both"], out = null;
+    opts.forEach(function (o) {
+      var s = simulate(cls, o, windowMin, rate);
+      if (!out || s.total < out.total - 1e-9) out = { order: o, total: s.total };
+    });
+    return out;
+  }
+
+  function big(n) {
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + "bn";
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + "m";
+    if (n >= 1e3) return Math.round(n / 1000) + "k";
+    return String(Math.round(n));
+  }
+  function mins(s) {
+    if (s < 90) return Math.round(s) + " sec";
+    return (s / 60).toFixed(0) + " min";
+  }
+
+  function chart(sim, windowMin, order) {
+    var W = 700, H = 150, L = 44, B = 26;
+    var xOf = function (u) { return L + u * (W - L - 12); };
+    var yOf = function (v) { return (H - B) - v * (H - B - 16); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Fraction of messages broken over the deploy window">'];
+    svg.push('<line x1="' + L + '" y1="' + (H - B) + '" x2="' + (W - 12) + '" y2="' + (H - B) + '" stroke="#CFD8E0"/>');
+    svg.push('<line x1="' + L + '" y1="10" x2="' + L + '" y2="' + (H - B) + '" stroke="#CFD8E0"/>');
+    [0, 0.25, 0.5].forEach(function (v) {
+      svg.push('<line x1="' + L + '" y1="' + yOf(v) + '" x2="' + (W - 12) + '" y2="' + yOf(v) + '" stroke="#E1E7EC" stroke-dasharray="3 3"/>');
+      svg.push('<text x="6" y="' + (yOf(v) + 4) + '" font-size="10" fill="#7C8B99">' + Math.round(v * 100) + '%</text>');
+    });
+
+    /* writer and reader ramps, faint */
+    ["w", "r"].forEach(function (which, k) {
+      var d = [];
+      for (var i = 0; i <= STEPS; i += 4) {
+        var f = ramps(order, i / STEPS);
+        d.push((i ? "L" : "M") + xOf(i / STEPS).toFixed(1) + " " + ((H - B) - f[which] * (H - B - 16) * 0.5).toFixed(1));
+      }
+      svg.push('<path d="' + d.join(" ") + '" fill="none" stroke="' + (k ? "#7C8CF8" : "#2E8B5F") +
+        '" stroke-width="1.2" stroke-dasharray="4 3" opacity="0.75"/>');
+    });
+    svg.push('<text x="' + (L + 6) + '" y="' + (H - B - 4) + '" font-size="9.5" fill="#2E8B5F">producers on new</text>');
+    svg.push('<text x="' + (L + 120) + '" y="' + (H - B - 4) + '" font-size="9.5" fill="#7C8CF8">consumers on new</text>');
+
+    var d2 = sim.curve.map(function (v, i) {
+      return (i ? "L" : "M") + xOf(i / STEPS).toFixed(1) + " " + yOf(v).toFixed(1);
+    }).join(" ");
+    svg.push('<path d="' + d2 + ' L' + xOf(1).toFixed(1) + ' ' + yOf(0) + ' L' + xOf(0).toFixed(1) + ' ' + yOf(0) +
+      ' Z" fill="#C0453A" opacity="0.20"/>');
+    svg.push('<path d="' + d2 + '" fill="none" stroke="#C0453A" stroke-width="2.2"/>');
+
+    [0, 0.5, 1].forEach(function (u) {
+      svg.push('<text x="' + xOf(u) + '" y="' + (H - 8) + '" font-size="10" fill="#7C8B99" text-anchor="middle">' +
+        Math.round(u * windowMin) + ' min</text>');
+    });
+    svg.push('<text x="' + L + '" y="12" font-size="10" font-weight="700" fill="#7C8B99">SHARE OF MESSAGES THAT FAIL TO DESERIALISE</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var cls = $("rd-class").value, order = $("rd-order").value;
+    var win = +$("rd-win").value, rate = +$("rd-rate").value;
+    $("rd-win-o").textContent = win + " min";
+
+    var sim = simulate(cls, order, win, rate);
+    var b = best(cls, win, rate);
+    var names = { readers: "Consumers first", writers: "Producers first", both: "Both at once" };
+
+    $("rd-tot").textContent = big(sim.total);
+    $("rd-tot-sub").textContent = "of " + big(rate * win * 60) + " in the window";
+    $("rd-tot-tile").className = "tile " + (sim.total > 0 ? "bad" : "good");
+    $("rd-peak").textContent = (sim.peak * 100).toFixed(1) + "%";
+    $("rd-time").textContent = sim.degraded > 0 ? mins(sim.degraded) : "none";
+    $("rd-best").textContent = b.total > 0 ? "None is safe" : names[b.order];
+    $("rd-best-sub").textContent = b.total > 0 ? "every order breaks messages" : "zero broken messages";
+
+    $("rd-canvas").innerHTML = chart(sim, win, order);
+
+    var lines = [];
+    lines.push("A " + CLASSES[cls].lab + " change, deployed " + names[order].toLowerCase() +
+      " over " + win + " minutes at " + big(rate) + " messages a second: " + big(sim.total) +
+      " messages fail, peaking at " + (sim.peak * 100).toFixed(1) + "% of traffic" +
+      (sim.degraded > 0 ? " and degraded for " + mins(sim.degraded) + "." : "."));
+
+    if (cls === "full") {
+      lines.push("Nothing breaks in any order, and the deploy window is irrelevant. Every mixed-version pairing is readable in both directions, so a rolling deploy needs no coordination between the teams involved. This is what a default on a new field buys you.");
+    } else if (sim.total === 0) {
+      lines.push("Zero failures, because the deploy order matches the direction of compatibility. Note how fragile that is: the same change in the opposite order would break " +
+        big(simulate(cls, order === "readers" ? "writers" : "readers", win, rate).total) +
+        " messages. Compatibility class is not a quality rating, it is an instruction about sequencing.");
+    } else if (cls === "none") {
+      lines.push("Every order breaks messages, because there is no version pairing that works in both directions. The breakage scales directly with the deploy window \u2014 halve the window and you halve the damage \u2014 which tempts people into fast risky deploys. The real answer is a parallel schema version or a dual-write window, not a faster rollout.");
+    } else {
+      lines.push("This is the wrong order for a " + CLASSES[cls].lab + " change. Switching to " +
+        names[b.order].toLowerCase() + " takes the failures to zero at no cost. The mistake is almost always made by whoever is quickest to deploy rather than by anyone deciding, which is why the order belongs in the change plan rather than in someone's head.");
+    }
+    $("rd-note").textContent = lines.join("\n\n");
+  }
+
+  ["rd-class", "rd-order", "rd-win", "rd-rate"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+initChapter("06-contracts.html");
+</script>
+</body>
+</html>

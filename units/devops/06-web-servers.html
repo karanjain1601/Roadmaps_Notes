@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Web servers, proxies and load balancers — DevOps</title>
+<meta name="description" content="What a reverse proxy is for, nginx configuration that makes sense, load-balancing algorithms compared at the tail, health checks and ejection, and the timeout budget that decides whether one slow dependency takes everything down.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%237C8CF8' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">DevOps</a><span class="sep">/</span><span>Chapter 06</span></p>
+    <p class="chno">Chapter 06 · Source and servers</p>
+    <h1>Web servers, proxies and load balancers</h1>
+    <p class="lede">Almost nothing you run is reached directly. There is a proxy in front of it terminating TLS, choosing a backend, enforcing timeouts and deciding what a failure looks like — and the configuration of that proxy determines more about your tail latency and your blast radius than the application behind it usually does. This chapter is about the choices it makes on your behalf.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapters 02, 04</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="proxies">
+<h2>What a reverse proxy is actually for</h2><div class="h2rule"></div>
+
+<p class="lead">A <strong>forward</strong> proxy sits in front of clients and represents them to the internet: egress filtering, corporate web gateways, an outbound allowlist. A <strong>reverse</strong> proxy sits in front of servers and represents them to clients. Same mechanism, opposite direction, and it is the reverse case that carries almost all of your operational concerns.</p>
+
+<div class="kv">
+<dt>It terminates TLS in one place</dt><dd>Certificates, renewal, cipher policy and protocol versions are configured once instead of in every service in every language. Chapter 7 covers what that configuration should contain.</dd>
+<dt>It absorbs slow clients</dt><dd>A client on a poor mobile connection takes eight seconds to send a request body. If it talks directly to your application, one of your workers is held for those eight seconds doing nothing. The proxy buffers the whole request first and only then opens a fast local connection to the backend, so the worker is occupied for milliseconds. This one behaviour is why a proxy in front of a thread-per-request application is not optional.</dd>
+<dt>It is where cross-cutting policy lives</dt><dd>Rate limiting, request size caps, header normalisation, compression, static file serving, access logging, IP allowlists, redirects. All things you would otherwise implement N times, inconsistently.</dd>
+<dt>It decouples clients from instances</dt><dd>Backends can be added, removed, restarted and redeployed without any client knowing an address. This is the precondition for every deployment strategy in chapter 18.</dd>
+<dt>It chooses where each request goes</dt><dd>Which is the interesting part, and the subject of the next two sections.</dd>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th>Layer 4</th><th>Layer 7</th></tr></thead>
+<tbody>
+<tr><td>Decides using</td><td>IP address and port</td><td class="yes">Path, host, headers, cookies, method</td></tr>
+<tr><td>Sees the payload</td><td class="no">No — it forwards a TCP stream</td><td class="yes">Yes, so it can route, retry and rewrite</td></tr>
+<tr><td>TLS</td><td>Passes through encrypted, or re-encrypts</td><td>Terminates it</td></tr>
+<tr><td>Cost</td><td class="yes">Very low; scales to enormous throughput</td><td>Parses every request; more CPU per connection</td></tr>
+<tr><td>Retries a failed request</td><td class="no">Cannot — it does not know where a request begins</td><td class="yes">Can, if the request is idempotent</td></tr>
+<tr><td>Typical</td><td>AWS NLB, HAProxy in TCP mode, IPVS</td><td>nginx, Envoy, Traefik, AWS ALB, HAProxy in HTTP mode</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">nginx — a reverse proxy configuration with the parts that matter annotated</span><button class="code-copy">Copy</button></div><pre>upstream api {
+    least_conn;                          <span class="c">← not the default. see the next section for what it buys</span>
+    keepalive 32;                        <span class="c">← reuse upstream connections. without this nginx opens a new</span>
+                                         <span class="c">  TCP connection per request and you meet chapter 4's port ceiling</span>
+    server 10.0.1.11:8080 max_fails=3 fail_timeout=10s;
+    server 10.0.1.12:8080 max_fails=3 fail_timeout=10s;
+    server 10.0.1.13:8080 backup;        <span class="c">← only used when the others are all down</span>
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name api.example.com;
+
+    client_max_body_size 10m;            <span class="c">← default is 1m. the cause of most unexplained 413s</span>
+    client_body_timeout 15s;
+
+    location / {
+        proxy_pass http://api;
+
+        <span class="c"># without these four the backend sees nginx's IP as the client and</span>
+        <span class="c"># generates http:// URLs behind an https:// listener</span>
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        <span class="c"># keepalive to the upstream needs HTTP/1.1 and an empty Connection header.</span>
+        <span class="c"># omitting these two silently disables the `keepalive 32` above</span>
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        proxy_connect_timeout 2s;        <span class="c">← TCP connect. should be small; a healthy backend</span>
+                                         <span class="c">  on the same network answers in single-digit ms</span>
+        proxy_send_timeout   10s;
+        proxy_read_timeout   10s;        <span class="c">← DEFAULT IS 60s. this is the number in the second demo,</span>
+                                         <span class="c">  and leaving it at 60 is how one slow dependency</span>
+                                         <span class="c">  consumes an entire worker pool</span>
+
+        proxy_next_upstream error timeout http_502 http_503;
+        proxy_next_upstream_tries 2;     <span class="c">← bound the retries. unbounded retry across N backends</span>
+        proxy_next_upstream_timeout 5s;  <span class="c">  turns one slow request into N slow requests</span>
+    }
+
+    location /healthz { access_log off; proxy_pass http://api; }
+}</pre></div>
+</section>
+
+<section id="algorithms">
+<h2>Load-balancing algorithms, measured</h2><div class="h2rule"></div>
+
+<p>Round robin is the default nearly everywhere and it is the wrong default. Its assumption is that all backends are equally fast and all requests cost the same, and in production neither holds: one instance shares a host with a noisy neighbour, one has a cold cache after a restart, one is on older hardware, and request costs vary by an order of magnitude. Round robin cannot observe any of that, because it does not look.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Algorithm</th><th>Chooses by</th><th>Adapts to a slow backend</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><td><strong>Round robin</strong></td><td>Position in a rotation</td><td class="no">No. Keeps sending an equal share into a growing queue</td><td>Nothing</td></tr>
+<tr><td><strong>Random</strong></td><td>Uniformly at random</td><td class="no">No, and it is slightly worse than round robin because it also clusters by chance</td><td>Nothing</td></tr>
+<tr><td><strong>Weighted round robin</strong></td><td>Static weights</td><td>Only if you knew in advance and set the weights</td><td>Nothing</td></tr>
+<tr><td><strong>Least connections</strong></td><td>Fewest in-flight requests</td><td class="yes">Yes — a slow backend accumulates in-flight requests, so it stops being chosen</td><td>Global state across the proxy's workers</td></tr>
+<tr><td><strong>Power of two choices</strong></td><td>Two at random; the less loaded of them</td><td class="yes">Almost as well as least-connections</td><td class="yes">Two lookups. No global state, so it works in a distributed fleet of proxies</td></tr>
+<tr><td><strong>Consistent hash</strong></td><td>A hash of a key, e.g. the session id</td><td class="no">No — that is the point, it prioritises stickiness</td><td>Necessary for cache affinity; do not use it for general traffic</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="demo" id="d-lb">
+  <div class="demo-top"><div class="demo-title">Five algorithms, five backends, one of them slow</div><div class="demo-hint">Compare round robin against least-connections at the p99</div></div>
+  <div class="demo-body">
+    <canvas id="cLb" aria-label="Latency percentiles for each load-balancing algorithm, with per-backend queue depths"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>One backend is <b id="lbSo">4</b>× slower</label><input type="range" id="lbS" min="1" max="10" value="4"></div>
+      <div class="ctrl"><label>Arrival rate <b id="lbRo">90</b>/s</label><input type="range" id="lbR" min="20" max="95" value="90"></div>
+      <div class="ctrl"><label>Backends <b id="lbBo">5</b></label><input type="range" id="lbB" min="2" max="10" value="5"></div>
+      <div class="ctrl"><label>Show</label><select id="lbM">
+        <option value="p99" selected>p99 latency</option>
+        <option value="p95">p95 latency</option>
+        <option value="mean">mean latency</option>
+      </select></div>
+    </div>
+    <div class="rgrid" id="lbOut"></div>
+    <div class="readout" id="lbNote"></div>
+  </div>
+</div>
+
+<p>With one backend running four times slower than the others, round-robin's p99 is <b>12.5×</b> that of least-connections. That is not a tuning difference, it is a different service. The mechanism is worth being precise about: round robin keeps delivering a fifth of all traffic to a node that can absorb a twentieth of it, so its queue grows without bound and every request unlucky enough to land there waits behind the whole backlog. Least-connections sees the in-flight count rising and simply stops choosing it.</p>
+
+<div class="box tip"><b class="tag">Power of two choices is the one to know</b>
+<p style="margin-bottom:0">True least-connections needs a single view of every backend's in-flight count, which is easy inside one nginx process and hard across a fleet of forty proxies — each sees only its own connections, and they collectively stampede whichever backend looks idle. Picking <em>two backends at random and taking the less loaded one</em> gets within a few per cent of least-connections in the simulation above with no shared state at all, because the second sample is enough to avoid the worst choice almost every time. It is the default in Envoy for good reason, and it is a genuinely surprising result: one extra sample removes nearly all of the penalty.</p>
+</div>
+
+<div class="box intu"><b class="tag">It matters even when the backends are identical</b>
+<p style="margin-bottom:0">The intuition that "with homogeneous instances the algorithm does not matter" is wrong, and the simulation shows why. Even with every backend equally fast, service times vary — so a rotation that ignores load will sometimes hand a request to a node that is already working through three expensive ones. At 50% utilisation least-connections still beats round robin by <b>1.3×</b> on p99; at 90% utilisation the gap widens to <b>2.6×</b>, and the worst algorithm in the set (plain random, which clusters by chance as well as ignoring load) is <b>5.8×</b> the best. The higher your utilisation, the more the choice costs you, which is exactly the wrong direction for a default.</p>
+</div>
+</section>
+
+<section id="health">
+<h2>Health checks, and the two kinds of "healthy"</h2><div class="h2rule"></div>
+
+<p>A load balancer needs to know which backends to use, and there is a distinction that most outages in this area come from ignoring.</p>
+
+<div class="cards">
+<div>
+<h5>Liveness</h5>
+<p>"Is this process broken beyond recovery?" Failing it means <strong>restart me</strong>. Should test almost nothing — that the process can respond at all. A liveness check that queries the database will restart every instance when the database has a bad minute, turning a degradation into an outage.</p>
+</div>
+<div>
+<h5>Readiness</h5>
+<p>"Should this instance receive traffic right now?" Failing it means <strong>take me out of rotation</strong>, without restarting. This is where dependency checks belong, plus warm-up state and a deliberate fail during graceful shutdown.</p>
+</div>
+<div>
+<h5>Startup</h5>
+<p>"Has it finished booting?" A separate, more patient check that suppresses liveness until the application is up. Without it, a JVM that takes 90 seconds to start gets killed at 30 and restarts forever.</p>
+</div>
+</div>
+
+<div class="box trap"><b class="tag">The two health-check failures that cause outages</b>
+<p style="margin-bottom:6px"><strong>A liveness probe with dependencies.</strong> If <code>/healthz</code> checks the database and the database is briefly slow, every instance fails liveness simultaneously and the platform restarts the entire fleet. You now have a cold cache, a thundering herd of reconnections, and a real outage caused by a transient blip. Liveness checks nothing but itself; readiness is where dependencies go — and even there, a shared dependency failing readiness everywhere at once removes all capacity, so prefer serving degraded to serving nothing.</p>
+<p style="margin-bottom:0"><strong>Readiness not failing during shutdown.</strong> On <code>SIGTERM</code> the correct sequence is: fail readiness first, wait long enough for the load balancer to notice and stop sending traffic — typically two check intervals — <em>then</em> stop accepting and drain. Skip the wait and the balancer keeps routing to a socket that is closing, producing a burst of 502s on every single deploy. This is chapter 2's graceful shutdown contract seen from the other end, and it is why <code>preStop: sleep 5</code> appears in so many Kubernetes manifests.</p>
+</div>
+
+<p>Beyond the probes themselves, two proxy behaviours matter. <strong>Passive checks</strong> — nginx's <code>max_fails</code> and <code>fail_timeout</code>, Envoy's outlier detection — eject a backend that is producing errors on real traffic, which catches failures an active probe misses because the probe hits a different code path. And <strong>slow start</strong> ramps a returning backend's share up gradually rather than immediately, so an instance with a cold cache is not handed a fifth of production traffic the instant it passes one check.</p>
+
+<div class="box warn"><b class="tag">Ejection needs a floor, or it cascades</b>
+<p style="margin-bottom:0">If a shared dependency makes every backend return errors, naive ejection removes every backend and the service goes from degraded to dead. Envoy's <code>max_ejection_percent</code> caps how much of the pool can be removed — 50% is a common setting — so that a systemic failure leaves you serving badly rather than not at all. Any ejection policy without such a cap has a failure mode where the health check itself is the outage, and it is worth checking whether yours has one.</p>
+</div>
+</section>
+
+<section id="timeouts">
+<h2>Timeouts: the setting that decides your blast radius</h2><div class="h2rule"></div>
+
+<p>Every worker, thread or connection slot in your service is held for the entire duration of whatever it is waiting on. Little's Law from chapter 1 applies directly and unforgivingly:</p>
+
+<div class="eq plain"><code>workers needed &nbsp;=&nbsp; arrival rate &nbsp;×&nbsp; mean hold time</code></div>
+<p class="where">And the mean hold time is dominated by the slow tail rather than the common case, because the tail is where the seconds are. A service handling 200 requests a second at 20&nbsp;ms needs 4 workers. Let one per cent of those requests hang until a 30-second timeout and the mean hold time becomes 320&nbsp;ms — so it needs <b>64</b>, which is the entire pool, consumed by one request in a hundred. Utilisation reaches 100%, and a queue at 100% utilisation has no headroom for variance at all: the average fits exactly and every burst waits.</p>
+
+<div class="demo" id="d-timeout">
+  <div class="demo-top"><div class="demo-title">One slow dependency against a worker pool</div><div class="demo-hint">Set 1% hanging with a 30 s timeout, then drag the timeout down</div></div>
+  <div class="demo-body">
+    <canvas id="cTo" aria-label="Worker pool occupancy split between fast and hanging requests, against the pool size">
+    </canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Request rate <b id="toRo">200</b>/s</label><input type="range" id="toR" min="10" max="600" step="10" value="200"></div>
+      <div class="ctrl"><label>Workers <b id="toWo">64</b></label><input type="range" id="toW" min="8" max="512" step="8" value="64"></div>
+      <div class="ctrl"><label>Requests that hang <b id="toPo">1</b>%</label><input type="range" id="toP" min="0" max="20" step="1" value="1"></div>
+      <div class="ctrl"><label>Timeout <b id="toTo">30.0</b> s</label><input type="range" id="toT" min="1" max="600" step="1" value="300"></div>
+      <div class="ctrl"><label>Normal call <b id="toFo">20</b> ms</label><input type="range" id="toF" min="5" max="500" step="5" value="20"></div>
+    </div>
+    <div class="rgrid" id="toOut"></div>
+    <div class="readout" id="toNote"></div>
+  </div>
+</div>
+
+<p>Three conclusions come out of that model, and the third is the one that changes how you configure things.</p>
+
+<div class="kv">
+<dt>The failure is not proportional to the fault</dt><dd>One per cent of requests misbehaving takes down one hundred per cent of the service. Every user sees an outage caused by traffic they have nothing to do with, which is why the incident is so confusing to diagnose from the outside: the error rate on the dependency is 1% and the error rate on your service is 100%.</dd>
+<dt>Cutting the timeout fixes it with no new capacity</dt><dd>Dropping the same configuration from a 30-second timeout to 2 seconds takes the workers required from 64 to <b>8</b> on the identical load. The one per cent still fails — you cannot make a broken dependency work — but it now fails <em>fast</em>, which is the difference between one per cent of requests failing and all of them.</dd>
+<dt>Adding workers works, and does not scale</dt><dd>Quadrupling the pool to 256 does absorb a 1% hang rate. But the hang rate is not a constant you control: at 5% the same 256 workers need <b>304</b> and saturate again, while a 2-second timeout survives 5% on the original 64 workers using only 24. The timeout scales with the failure rate; the pool does not. That is why the timeout is the lever.</dd>
+</div>
+
+<p>Timeouts also have to be <em>ordered</em>. Each layer's timeout must be shorter than its caller's, or the caller gives up while the callee is still working — so you pay for the work, hold the resources and discard the result.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Layer</th><th>Sensible</th><th>Broken and why</th></tr></thead>
+<tbody>
+<tr><td>Browser / client</td><td>30 s</td><td>—</td></tr>
+<tr><td>Load balancer idle</td><td>25 s</td><td class="no">Longer than the client's, and the client's retry arrives while the first is still running — doubling load during an incident</td></tr>
+<tr><td>Proxy read from app</td><td>10 s</td><td class="no">nginx's default is 60 s. This is the single most common misconfiguration in this chapter</td></tr>
+<tr><td>App call to database</td><td>3 s</td><td class="no">No timeout at all is the default in several popular clients. It means "hold a worker forever"</td></tr>
+<tr><td>Database statement</td><td>2 s</td><td class="yes">Set <code>statement_timeout</code> server-side too, so a client that ignores its own timeout still gets cut off</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box trap"><b class="tag">Retries turn a partial failure into a total one</b>
+<p style="margin-bottom:6px">If every layer retries twice, a request that fails at the bottom is attempted 2×2×2 = 8 times. During a partial outage — exactly when the dependency has least capacity — the offered load multiplies by eight and the thing that was recovering stops recovering. This is a metastable failure: it persists after the original trigger is gone, because the retries are now the load.</p>
+<p style="margin-bottom:0">Three rules keep it bounded. Retry at <em>one</em> layer only, and usually the outermost one that knows whether the operation is idempotent. Use a <strong>retry budget</strong> — a cap such as "retries may not exceed 10% of requests" — rather than a per-request retry count, so that a widespread failure cannot amplify at all. And add jitter to the backoff: synchronised exponential backoff means every client retries at the same instant, converting a smooth recovery into a series of spikes.</p>
+</div>
+</section>
+
+<section id="close">
+<h2>Check yourself</h2><div class="h2rule"></div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>One of five identical instances is on a host with a noisy neighbour and runs about four times slower. Your load balancer uses round robin and the p99 has become terrible while the mean looks acceptable. Explain the mechanism and the fix.
+<button class="reveal">Show answer</button><div class="ans">Round robin sends one fifth of all traffic to a node that can absorb roughly one twentieth of it, so its queue grows without bound. The four healthy backends still serve most requests quickly, which keeps the mean respectable, but every request that lands on the slow node waits behind the entire backlog — so the damage concentrates in the tail. In the simulation this makes round-robin's p99 about 12.5 times that of least-connections. The fix is an algorithm that observes load: least-connections sees the in-flight count on that backend rising and stops choosing it, and power-of-two-choices gets within a few per cent of the same result without needing global state. Passive health checking helps too, by ejecting a backend that is timing out, but it is coarse — the point of least-connections is that it degrades the slow node's share smoothly rather than waiting for it to fail outright.</div></li>
+
+<li>Why is power-of-two-choices interesting, given that least-connections is strictly better informed?
+<button class="reveal">Show answer</button><div class="ans">Because least-connections needs a single consistent view of every backend's in-flight count, and that is only available inside one proxy process. With a fleet of forty proxies each sees only its own connections; they all conclude the same backend is least loaded and stampede it, which can be worse than round robin. Power-of-two-choices samples two backends at random and takes the less loaded, requires no shared state at all, and in the simulation lands within a few per cent of true least-connections. The reason one extra sample does so much is that the failure mode you are trying to avoid is picking the <em>worst</em> backend, and the chance that both random samples are the worst is small. It is the default in Envoy and it is the right choice at fleet scale.</div></li>
+
+<li>Your <code>/healthz</code> endpoint queries the database. The database has a slow thirty seconds. Describe what happens.
+<button class="reveal">Show answer</button><div class="ans">If that endpoint backs the liveness probe, every instance fails it at roughly the same moment, so the platform restarts the entire fleet at once. You now have a cold cache everywhere, a simultaneous reconnection storm against the database that was already struggling, and a real outage produced by a transient blip. If it backs the readiness probe, every instance is removed from rotation simultaneously and the load balancer has no healthy targets, so it either serves errors or — worse, in some configurations — falls back to sending traffic to everything anyway. The rule is that liveness checks nothing but the process's own ability to respond, readiness may check dependencies, and any ejection policy needs a floor such as Envoy's <code>max_ejection_percent</code> so that a systemic failure leaves you degraded rather than dead.</div></li>
+
+<li>A service handles 200 requests a second, each taking 20 ms, with a pool of 64 workers. It is completely healthy. A downstream dependency starts hanging on 1% of calls and the service becomes unavailable for everyone. What happened, and why is adding workers the weaker fix?
+<button class="reveal">Show answer</button><div class="ans">Workers are held for the whole downstream wait, so by Little's Law the pool requirement is arrival rate times mean hold time. Healthy, that is 200 × 0.02 = 4 workers out of 64 — enormous headroom. With 1% of calls hanging until a 30-second timeout, the mean hold becomes 0.99×0.02 + 0.01×30 = 0.32 s, so the requirement becomes 200 × 0.32 = 64 workers: the entire pool, consumed by one request in a hundred. Everything else queues and the service fails for all users. Adding workers does help linearly — 256 workers absorbs a 1% hang rate — but the hang rate is not something you control, and at 5% those 256 workers need 304 and saturate again. Cutting the timeout to 2 seconds takes the requirement to 8 workers at 1% and 24 at 5%, on the original pool. The timeout scales with the failure rate; the pool does not.</div></li>
+
+<li>The client times out at 30 s, the load balancer at 60 s and the application's database call has no timeout at all. What specifically goes wrong?
+<button class="reveal">Show answer</button><div class="ans">The ordering is inverted at every level. When a query is slow the client gives up at 30 s and typically retries, but the load balancer holds the original request for another 30 s and the application holds a worker and a database connection indefinitely — so the work continues, consuming resources, with nobody left to receive the result. The retry then arrives and starts a second copy of the same expensive query alongside the first, which is how a slow query becomes a saturated connection pool. Timeouts must decrease inward: client 30 s, balancer 25 s, proxy-to-app 10 s, app-to-database 3 s, and a server-side <code>statement_timeout</code> of 2 s as a backstop for clients that ignore their own setting. The inner deadline must always expire first, so that the layer doing the work is the one that decides to stop.</div></li>
+
+<li>Every layer in a four-layer path retries twice on failure. The bottom layer degrades to 50% success. What does the bottom layer see, and what is the correct design?
+<button class="reveal">Show answer</button><div class="ans">Retries multiply rather than add: two attempts at each of three calling layers is up to 2×2×2 = 8 attempts per original request. Exactly when the dependency has least capacity, the offered load rises by up to eight times, which prevents the recovery that would otherwise happen and can keep the system down after the original trigger has cleared — a metastable failure, where the retries have become the load. The correct design retries at one layer only, normally the outermost one that knows whether the operation is safe to repeat; caps total retries with a <em>budget</em> such as "no more than 10% of requests may be retries", so a widespread failure cannot amplify at all; and uses exponential backoff with jitter, because synchronised backoff makes every client retry at the same instant and converts a smooth recovery into repeated spikes.</div></li>
+
+<li>Why does a reverse proxy in front of a thread-per-request application server matter more than one in front of an event-loop server?
+<button class="reveal">Show answer</button><div class="ans">Because of slow clients. A thread-per-request server holds an entire thread — with its stack, and a slot in a small fixed pool — for as long as the client takes to send its request and receive its response. A client on a poor mobile link can take several seconds to upload a body, so a few hundred slow clients exhaust a pool sized for thousands of fast ones, and the server appears saturated while doing almost no work. A reverse proxy buffers the complete request before opening a fast local connection to the backend, so the expensive worker is occupied only for the actual processing time, and the cheap proxy connection absorbs the waiting. An event-loop server holds only a socket and a small amount of state per connection, so it tolerates slow clients natively and gains less from the buffering — though it still wants the proxy for TLS termination, routing, rate limiting and everything else in the first section.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin-bottom:0">Chapter 7 takes the two things this proxy depends on and that break most often: DNS, where the answer is cached in more places than you control, and TLS, where the certificate chain, renewal and SNI each have their own way of failing at 3am.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 06</h2><p>Web servers, proxies and load balancers. Part of the DevOps unit — <a href="index.html">all 24 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 07 (TLS termination), 08 (proxy caching), 12 (ingress and the mesh, which is this chapter distributed), 18 (traffic shifting), 23 (retry storms and metastable failure).</p></div>
+    <div><h2>Going deeper</h2><p>The nginx and Envoy documentation are both unusually good. Mitzenmacher's "The Power of Two Choices in Randomized Load Balancing" is the source of that result.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: load-balancing algorithms ============ */
+(function(){
+  const cv=document.getElementById("cLb"); if(!cv) return;
+  const sEl=document.getElementById("lbS"), rEl=document.getElementById("lbR"),
+        bEl=document.getElementById("lbB"), mEl=document.getElementById("lbM");
+  const out=document.getElementById("lbOut"), note=document.getElementById("lbNote");
+  const ALGS=[["rr","round robin"],["random","random"],["weighted","weighted RR"],
+              ["p2c","power of two"],["leastconn","least conn"]];
+
+  function rng(seed){ let s=seed>>>0;
+    return ()=> (s=(Math.imul(s,1664525)+1013904223)>>>0)/4294967296; }
+
+  /* single-server-per-backend simulation: each backend has a `free at` time */
+  function sim(alg,{n,lambda,meanS,slow,backends,seed}){
+    const R=rng(seed), exp=m=>-m*Math.log(1-R());
+    const speed=Array.from({length:backends},(_,i)=> i===0?1/slow:1);
+    const freeAt=new Array(backends).fill(0);
+    let finishes=Array.from({length:backends},()=>[]);
+    const inflight=new Array(backends).fill(0);
+    const totalW=speed.reduce((a,b)=>a+b,0);
+    let t=0, rr=0; const lat=[]; const sent=new Array(backends).fill(0);
+    for(let i=0;i<n;i++){
+      t+=exp(1/lambda);
+      for(let b=0;b<backends;b++){ finishes[b]=finishes[b].filter(f=>f>t); inflight[b]=finishes[b].length; }
+      let b=0;
+      if(alg==="rr") b=(rr++)%backends;
+      else if(alg==="random") b=Math.floor(R()*backends);
+      else if(alg==="leastconn"){ for(let k=1;k<backends;k++) if(inflight[k]<inflight[b]) b=k; }
+      else if(alg==="p2c"){ const a=Math.floor(R()*backends), c=Math.floor(R()*backends);
+                            b=inflight[a]<=inflight[c]?a:c; }
+      else if(alg==="weighted"){ let u=R(), acc=0; b=backends-1;
+        for(let k=0;k<backends;k++){ acc+=speed[k]/totalW; if(u<=acc){ b=k; break; } } }
+      const svc=exp(meanS/speed[b]);
+      const start=Math.max(t,freeAt[b]);
+      const fin=start+svc;
+      freeAt[b]=fin; finishes[b].push(fin); sent[b]++;
+      lat.push(fin-t);
+    }
+    lat.sort((a,b)=>a-b);
+    const q=p=>lat[Math.min(lat.length-1,Math.floor(lat.length*p))];
+    return {mean:lat.reduce((a,b)=>a+b,0)/lat.length, p95:q(0.95), p99:q(0.99), sent, inflight:inflight.slice()};
+  }
+
+  function draw(){
+    const slow=Math.round(+sEl.value), lambda=+rEl.value,
+          backends=Math.max(2,Math.round(+bEl.value)), metric=mEl.value;
+    document.getElementById("lbSo").textContent=slow;
+    document.getElementById("lbRo").textContent=lambda;
+    document.getElementById("lbBo").textContent=backends;
+    const cfg={n:6000,lambda,meanS:0.05,slow,backends,seed:7};
+    const res={}; ALGS.forEach(([k])=>res[k]=sim(k,cfg));
+    const vals=ALGS.map(([k])=>res[k][metric]);
+    const max=Math.max(...vals), min=Math.min(...vals);
+    const bestK=ALGS[vals.indexOf(min)][0], worstK=ALGS[vals.indexOf(max)][0];
+
+    const w=cv.clientWidth||660, h=32+ALGS.length*24+16, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText(metric+" latency  —  "+backends+" backends, one of them "+slow+"× slower, "+lambda+" req/s", 14, 12);
+
+    const L=112, R=w-84, span=R-L;
+    ALGS.forEach(([k,label],i)=>{
+      const y=26+i*24, v=res[k][metric], isBest=k===bestK, isWorst=k===worstK&&max>min*1.2;
+      ctx.textAlign="right"; ctx.font=(isBest?"700 ":"")+"11px Archivo, Arial";
+      ctx.fillStyle= isBest?PC.ok : isWorst?PC.bad : PC.ink;
+      ctx.fillText(label, L-10, y+9);
+      const bw=Math.max(2,(v/max)*span);
+      ctx.fillStyle="#EDF1F4"; ctx.fillRect(L,y+2,span,15);
+      ctx.fillStyle= isBest?PC.ok : isWorst?PC.bad : "#C7CEFB";
+      ctx.fillRect(L,y+2,bw,15);
+      ctx.textAlign="left"; ctx.font="10.5px ui-monospace, monospace"; ctx.fillStyle=PC.ink;
+      ctx.fillText((v*1000).toFixed(0)+" ms", R+8, y+9);
+    });
+
+    const ratio=max/min;
+    out.innerHTML=
+      '<div><span>best</span><b style="font-size:11.5px;color:'+PC.ok+'">'+ALGS.find(a=>a[0]===bestK)[1]+'</b></div>'+
+      '<div><span>worst</span><b style="font-size:11.5px;color:'+PC.bad+'">'+ALGS.find(a=>a[0]===worstK)[1]+'</b></div>'+
+      '<div><span>penalty</span><b style="color:'+(ratio>3?PC.bad:ratio>1.5?PC.warn:PC.ok)+'">'+ratio.toFixed(1)+'×</b></div>'+
+      '<div><span>round robin</span><b>'+(res.rr[metric]*1000).toFixed(0)+' ms</b></div>'+
+      '<div><span>least conn</span><b>'+(res.leastconn[metric]*1000).toFixed(0)+' ms</b></div>'+
+      '<div><span>power of two</span><b>'+(res.p2c[metric]*1000).toFixed(0)+' ms</b></div>';
+
+    const p2cGap=res.p2c[metric]/res.leastconn[metric];
+    note.innerHTML = slow>1
+      ? 'Round robin keeps sending <b>1/'+backends+'</b> of all traffic to a node that can absorb about <b>1/'+
+        (backends*slow)+'</b> of it, so its queue grows and every request unlucky enough to land there waits behind the backlog. '+
+        'That makes its '+metric+' <b>'+(res.rr[metric]/res.leastconn[metric]).toFixed(1)+'×</b> least-connections. '+
+        'Power-of-two-choices lands at <b>'+p2cGap.toFixed(2)+'×</b> least-connections while needing no shared state — '+
+        'sampling two at random is enough to almost never pick the worst one.'
+      : 'All '+backends+' backends are identical here, and the choice <b>still</b> matters: least-connections is <b>'+
+        (res.rr[metric]/res.leastconn[metric]).toFixed(1)+'×</b> better than round robin at the '+metric+
+        '. Service times vary even on identical hardware, so a blind rotation periodically hands a request to a node already working through several expensive ones. '+
+        'Raise the arrival rate and watch the gap widen — the busier you are, the more the default costs you.';
+  }
+  [sEl,rEl,bEl,mEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+
+/* ============ demo 2: timeouts and worker pool ============ */
+(function(){
+  const cv=document.getElementById("cTo"); if(!cv) return;
+  const rEl=document.getElementById("toR"), wEl=document.getElementById("toW"), pEl=document.getElementById("toP"),
+        tEl=document.getElementById("toT"), fEl=document.getElementById("toF");
+  const out=document.getElementById("toOut"), note=document.getElementById("toNote");
+
+  function model(){
+    const rate=+rEl.value, workers=+wEl.value, pct=+pEl.value/100;
+    const timeout=+tEl.value/10;                 /* slider is tenths of a second */
+    const fast=+fEl.value/1000;
+    const hangRaw=60;                            /* the dependency hangs for a minute if allowed */
+    const slow=Math.min(hangRaw,timeout);
+    const hold=(1-pct)*fast+pct*slow;
+    const needFast=rate*(1-pct)*fast;
+    const needSlow=rate*pct*slow;
+    const needed=needFast+needSlow;
+    const rho=needed/workers;
+    return {rate,workers,pct,timeout,fast,slow,hold,needFast,needSlow,needed,rho,
+            saturated:rho>=1, atLimit:rho>=0.9, maxRate:workers/hold, timesOut:hangRaw>timeout};
+  }
+
+  function draw(){
+    const m=model();
+    document.getElementById("toRo").textContent=m.rate;
+    document.getElementById("toWo").textContent=m.workers;
+    document.getElementById("toPo").textContent=+pEl.value;
+    document.getElementById("toTo").textContent=m.timeout.toFixed(1);
+    document.getElementById("toFo").textContent=+fEl.value;
+
+    const w=cv.clientWidth||660, h=112, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+
+    const L=14,R=w-14,span=R-L;
+    const scale=span/Math.max(m.workers,m.needed);
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("worker pool occupancy  —  "+m.workers+" workers", L, 12);
+
+    ctx.fillStyle="#EDF1F4"; ctx.fillRect(L,24,Math.min(span,m.workers*scale),28);
+    const wf=Math.min(span,m.needFast*scale);
+    ctx.fillStyle=PC.line; ctx.fillRect(L,24,Math.max(m.needFast>0?1.5:0,wf),28);
+    const ws=Math.min(span-wf,m.needSlow*scale);
+    ctx.fillStyle= m.saturated?PC.bad:PC.warn; ctx.fillRect(L+wf,24,Math.max(0,ws),28);
+    ctx.strokeStyle="#D5DDE4"; ctx.lineWidth=1; ctx.strokeRect(L+.5,24.5,Math.min(span,m.workers*scale),28);
+
+    const cx=L+Math.min(span,m.workers*scale);
+    ctx.setLineDash([3,3]); ctx.strokeStyle=PC.ink; ctx.lineWidth=1.4;
+    ctx.beginPath(); ctx.moveTo(cx,18); ctx.lineTo(cx,58); ctx.stroke(); ctx.setLineDash([]);
+
+    ctx.font="9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillStyle=PC.line; ctx.fillRect(L,66,12,7);
+    ctx.fillStyle=PC.text; ctx.fillText("normal traffic  "+m.needFast.toFixed(1)+" workers", L+17, 70);
+    const x2=L+Math.min(240,span*0.42);
+    ctx.fillStyle=m.saturated?PC.bad:PC.warn; ctx.fillRect(x2,66,12,7);
+    ctx.fillStyle=PC.text;
+    ctx.fillText("the "+(+pEl.value)+"% that hangs  "+m.needSlow.toFixed(1)+" workers"+
+      (m.needed>0?"  ("+(m.needSlow/m.needed*100).toFixed(0)+"% of the pool)":""), x2+17, 70);
+
+    ctx.textAlign="left"; ctx.font=(m.saturated?"700 ":"600 ")+"11px Archivo, Arial";
+    ctx.fillStyle=m.saturated?PC.bad:m.rho>0.8?PC.warn:PC.ok;
+    ctx.fillText(m.saturated
+      ? "SATURATED — needs "+m.needed.toFixed(0)+" workers, has "+m.workers+". Every request now queues, including the healthy "+(100-(+pEl.value))+"%"
+      : m.atLimit
+        ? "AT THE LIMIT — "+(m.rho*100).toFixed(0)+"% utilised. No headroom for variance; queueing is already severe"
+        : "needs "+m.needed.toFixed(1)+" of "+m.workers+" workers  ·  ceiling "+m.maxRate.toFixed(0)+" req/s", L, 94);
+
+    out.innerHTML=
+      '<div><span>mean hold time</span><b>'+(m.hold*1000).toFixed(0)+' ms</b></div>'+
+      '<div><span>workers needed</span><b style="color:'+(m.saturated?PC.bad:PC.ink)+'">'+m.needed.toFixed(1)+'</b></div>'+
+      '<div><span>utilisation</span><b style="color:'+(m.saturated?PC.bad:m.rho>0.8?PC.warn:PC.ok)+'">'+
+        Math.min(999,m.rho*100).toFixed(0)+'%</b></div>'+
+      '<div><span>held by the '+(+pEl.value)+'%</span><b>'+(m.needed>0?(m.needSlow/m.needed*100).toFixed(0):0)+'%</b></div>'+
+      '<div><span>throughput ceiling</span><b>'+m.maxRate.toFixed(0)+'/s</b></div>'+
+      '<div><span>state</span><b style="font-size:11.5px;color:'+(m.saturated?PC.bad:m.atLimit?PC.warn:PC.ok)+'">'+
+        (m.saturated?"saturated":m.atLimit?"at the limit":"ok")+'</b></div>';
+
+    let msg='Mean hold time is <b>'+(m.hold*1000).toFixed(0)+' ms</b> — '+(1-m.pct===1?'all traffic at '+(+fEl.value)+' ms'
+      : (100-(+pEl.value))+'% at '+(+fEl.value)+' ms plus '+(+pEl.value)+'% held for the full '+m.timeout.toFixed(1)+' s timeout')+
+      '. Little\u2019s Law gives '+m.rate+' × '+m.hold.toFixed(3)+' = <b>'+m.needed.toFixed(1)+'</b> workers.';
+    if(m.pct>0 && m.needed>0)
+      msg+=' The '+(+pEl.value)+'% that hangs is holding <b>'+(m.needSlow/m.needed*100).toFixed(0)+
+           '%</b> of the pool while the other '+(100-(+pEl.value))+'% of traffic holds '+(m.needFast/m.needed*100).toFixed(0)+'%.';
+    if(m.atLimit && !m.saturated)
+      msg+=' <b style="color:#D98324">That is '+(m.rho*100).toFixed(0)+'% of the pool.</b> The average fits, but averages are not what a queue responds to: '+
+           'with no headroom left for variance, a momentary burst has nowhere to go and waiting times climb steeply. Treat this as already failed.';
+    if(m.saturated)
+      msg+=' <b style="color:#D9534F">The pool cannot cover that</b>, so every request queues and the whole service fails — '+
+           'including the '+(100-(+pEl.value))+'% that has nothing to do with the broken dependency. '+
+           'Drag the timeout down and watch it recover without adding a single worker.';
+    else if(m.pct>0 && m.timeout<=3)
+      msg+=' The short timeout is what is saving you: the '+(+pEl.value)+'% still fails, but it fails <em>fast</em>, so the failure stays proportional to the fault.';
+    note.innerHTML=msg;
+  }
+  [rEl,wEl,pEl,tEl,fEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+</script>
+</body>
+</html>

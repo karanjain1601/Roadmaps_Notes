@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8. Locks, mutexes and semaphores — Computer Science</title>
+<meta name="description" content="Race conditions, atomicity and compare-and-swap, mutexes and futexes, semaphores, condition variables, the four Coffman conditions and lock-free alternatives.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span class="sep">/</span> <a href="index.html">Computer Science</a> <span class="sep">/</span> Chapter 8</p>
+    <p class="chapter">Chapter 8 <span class="part">· The operating system</span></p>
+    <h1>Locks, mutexes and semaphores</h1>
+    <p class="lede">Two threads incrementing a shared counter get the right answer in exactly two of the twenty possible schedules. The other eighteen silently lose an update. Concurrency bugs are not rare events you were unlucky to hit; they are the common case, hidden by a scheduler that usually happens to be kind.</p>
+    <div class="meta">
+      <span><b>8</b> sections</span>
+      <span><b>2</b> demos</span>
+      <span><b>7</b> self-check questions</span>
+      <span>Roughly <b>35</b> minutes</span>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page">
+    <h2>On this page</h2>
+    <div data-sections></div>
+    <h2>Nearby chapters</h2>
+    <div data-nearby></div>
+  </nav>
+
+  <main>
+
+    <!-- ==================================================== -->
+    <section id="s-race">
+      <h2>Why <code>counter++</code> is broken</h2>
+      <div class="h2rule"></div>
+
+      <p>The statement looks atomic because it is short. It is not. It compiles to three separate operations, and a thread can be preempted between any two of them.</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">one line of C, three machine operations</span><button class="code-copy">Copy</button></div>
+<pre>counter++;
+
+<span class="c">// becomes, roughly:</span>
+mov  eax, [counter]     <span class="c">// LOAD   read the current value into a register</span>
+add  eax, 1             <span class="c">// INC    add one, in the register</span>
+mov  [counter], eax     <span class="c">// STORE  write the register back</span></pre>
+      </div>
+
+      <p>The register is private to the thread. If a second thread loads <code>counter</code> before the first has stored, both compute the same new value and both write it. Two increments, one net change. This is a <strong>lost update</strong>, and it is the simplest possible data race.</p>
+
+      <!-- ------------- DEMO 1 ------------- -->
+      <div class="demo" id="demo-race">
+        <div class="demo-top">
+          <h3>Demo 1 — every possible interleaving</h3>
+          <p>Rather than running the race and hoping to catch it, this enumerates the complete schedule space and evaluates each one. Nothing is sampled or estimated: the counts below are exhaustive.</p>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Threads
+              <span class="seg" id="rc-n">
+                <button type="button" data-n="2" aria-pressed="true">2</button>
+                <button type="button" data-n="3" aria-pressed="false">3</button>
+              </span>
+            </label>
+            <label class="chk"><input type="checkbox" id="rc-lock"> Protect with a mutex</label>
+          </div>
+
+          <div class="stage">
+            <p style="margin:0 0 8px;font-size:12.5px;color:#54677A">Final value of the counter, across every schedule</p>
+            <div id="rc-chart"></div>
+          </div>
+
+          <div class="stage">
+            <p style="margin:0 0 8px;font-size:12.5px;color:#54677A">A schedule that loses an update, step by step</p>
+            <div id="rc-trace" style="font-family:var(--mono);font-size:12px;line-height:1.75"></div>
+          </div>
+
+          <div class="rgrid">
+            <div class="tile"><span class="k">Possible schedules</span><span class="v" id="rc-total">—</span></div>
+            <div class="tile"><span class="k">Correct</span><span class="v" id="rc-ok">—</span></div>
+            <div class="tile"><span class="k">Wrong</span><span class="v" id="rc-bad">—</span></div>
+            <div class="tile"><span class="k">Chance of being wrong</span><span class="v" id="rc-pct">—</span></div>
+          </div>
+
+          <p class="readout" id="rc-out"></p>
+        </div>
+      </div>
+
+      <p>With two threads there are <strong>20</strong> ways to interleave six operations, and only <strong>2</strong> produce the right answer — the two fully serial orders where one thread finishes before the other starts. <strong>90%</strong> of schedules are wrong. With three threads it is worse: 1,680 schedules, of which 6 are correct, or <strong>0.36%</strong>. Tick the mutex and the space collapses to just the serial orders, all of them correct.</p>
+
+      <div class="note warn">
+        <b class="tag">Why the bug hides in testing</b>
+        <p>The schedule space being 90% wrong does not mean 90% of runs are wrong. A real scheduler rarely preempts inside a three-instruction window, so the correct schedules are the ones that almost always happen. The bug shows up under load, on a different core count, after an unrelated change moves the code, or in production at 3am. That asymmetry — cheap to write, nearly impossible to reproduce — is why concurrency is treated with more formality than most programming. Use a tool that explores the space instead of sampling it: ThreadSanitizer, Helgrind, Go's <code>-race</code>, or a model checker.</p>
+      </div>
+
+      <div class="note key">
+        <b class="tag">Vocabulary that gets muddled</b>
+        <p>A <strong>race condition</strong> is when correctness depends on timing. A <strong>data race</strong> is the narrower case of two threads accessing the same location concurrently with at least one writing and no synchronisation between them; in C++ and Rust it is undefined behaviour, not merely wrong. A <strong>critical section</strong> is the code that must not run concurrently. <strong>Mutual exclusion</strong> is the guarantee that it does not. You can have a race condition with no data race — check-then-act on a file, for instance — so a clean race detector run is not a proof of correctness.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-atomic">
+      <h2>Atomicity from the hardware up</h2>
+      <div class="h2rule"></div>
+
+      <p>You cannot build mutual exclusion out of ordinary loads and stores efficiently — Dekker's and Peterson's algorithms prove it is possible, but they are slow and rely on memory ordering guarantees that modern CPUs do not give for free. Real locks are built on instructions that the hardware performs indivisibly.</p>
+
+      <dl class="terms">
+        <dt>Test-and-set</dt>
+        <dd>Write 1 to a location and return what was there before, as one indivisible operation. If it returns 0 you got the lock. The simplest primitive, and enough on its own.</dd>
+
+        <dt>Fetch-and-add</dt>
+        <dd>Add a value and return the previous one. This is what an atomic counter compiles to — <code>lock xadd</code> on x86 — and it is why an atomic increment is correct where <code>counter++</code> is not.</dd>
+
+        <dt>Compare-and-swap (CAS)</dt>
+        <dd>"If this location still holds <em>expected</em>, replace it with <em>new</em>, and tell me whether you did." The most general primitive, and the foundation of every lock-free algorithm. <code>cmpxchg</code> on x86.</dd>
+
+        <dt>Load-linked / store-conditional</dt>
+        <dd>ARM, RISC-V and POWER use a pair instead: load with a reservation, then store only if nothing has touched the address since. More flexible than CAS and the reason ARM code around atomics looks like a retry loop.</dd>
+      </dl>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">a lock-free increment, built from CAS</span><button class="code-copy">Copy</button></div>
+<pre><span class="k">do</span> {
+    old = counter;                     <span class="c">// read what we think is there</span>
+    next = old + 1;
+} <span class="k">while</span> (!compare_and_swap(&amp;counter, old, next));
+<span class="c">// if another thread changed counter in between, the CAS fails</span>
+<span class="c">// and we simply try again with the new value. No lock, no blocking,</span>
+<span class="c">// and someone always makes progress.</span></pre>
+      </div>
+
+      <p>These instructions are not free. On x86 a <code>lock</code>-prefixed instruction takes exclusive ownership of the cache line and orders memory around itself, costing tens of cycles uncontended and far more under contention, because the line has to be pulled away from whichever core has it. This is the same cache-line ping-pong that chapter 5 called false sharing, and it is why a single atomic counter incremented by sixteen cores can be slower than sixteen separate counters summed at the end.</p>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-mutex">
+      <h2>Mutexes: spinning, sleeping and futexes</h2>
+      <div class="h2rule"></div>
+
+      <p>A mutex has two states and two operations, and the interesting question is what a thread does when it cannot have the lock.</p>
+
+      <div class="cols">
+        <div>
+          <h4>Spinlock</h4>
+          <p>Loop on test-and-set until it succeeds. No system call, no context switch, so acquisition is a few tens of nanoseconds when the lock is free or held briefly. Burns a whole core while waiting, and is catastrophic if the holder is preempted — you spin for a full quantum waiting for a thread that is not running.</p>
+        </div>
+        <div>
+          <h4>Blocking mutex</h4>
+          <p>Ask the kernel to put the thread to sleep and wake it when the lock is released. Costs a system call and a context switch, several microseconds, but frees the core for other work. Correct under any amount of contention or preemption.</p>
+        </div>
+      </div>
+
+      <p>The right answer depends on how long you expect to wait, which is why modern implementations do both. A <strong>futex</strong> — fast userspace mutex — keeps the lock word in user memory and only enters the kernel when there is contention:</p>
+
+      <ol>
+        <li>Try to take the lock with a single CAS. If it succeeds, done, with no system call at all. This is the overwhelmingly common path.</li>
+        <li>If it fails, spin briefly — an adaptive number of iterations — in case the holder is about to release.</li>
+        <li>Only then call into the kernel to sleep, and record that a waiter exists so the releaser knows to issue a wake.</li>
+      </ol>
+
+      <p>The result is that an uncontended lock costs roughly the price of one atomic operation, around 20 ns, while a contended one degrades gracefully instead of burning cores. Linux's <code>futex</code>, Windows' <code>SRWLOCK</code> and Go's <code>sync.Mutex</code> all have this shape.</p>
+
+      <div class="tw">
+        <table>
+          <caption>The lock family, and when each earns its place</caption>
+          <thead><tr><th>Primitive</th><th>Guarantees</th><th>Use when</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Mutex</strong></td><td>One holder at a time; usually must be released by the acquirer</td><td>Default choice for protecting shared state</td></tr>
+            <tr><td><strong>Recursive mutex</strong></td><td>The same thread may lock it repeatedly</td><td>Rarely. It usually signals unclear ownership rather than a real need</td></tr>
+            <tr><td><strong>Reader-writer lock</strong></td><td>Many readers or one writer</td><td>Reads heavily outnumber writes <em>and</em> critical sections are long enough to pay for the extra bookkeeping</td></tr>
+            <tr><td><strong>Spinlock</strong></td><td>Mutual exclusion without sleeping</td><td>Inside a kernel, or critical sections of a few dozen instructions where preemption cannot happen</td></tr>
+            <tr><td><strong>Semaphore</strong></td><td>At most <em>n</em> holders; may be signalled by any thread</td><td>Resource pools, and signalling between threads</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <b class="tag">Reader-writer locks are slower than you expect</b>
+        <p>They look free for read-heavy workloads and often are not. The read path still has to modify a shared reader count atomically, which is exactly the cache-line ping-pong a plain mutex would have caused, so short read critical sections gain nothing and lose to the extra complexity. They also introduce a fairness question — do queued writers block new readers? If not, a steady stream of readers starves writers forever. Measure before reaching for one; for read-mostly data, a copy-on-write pointer swap or RCU is usually the better answer.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-semaphore">
+      <h2>Semaphores and condition variables</h2>
+      <div class="h2rule"></div>
+
+      <p>A semaphore is a counter with two atomic operations, invented by Dijkstra in 1965 and still the cleanest way to express "at most <em>n</em> of these at once".</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">the two operations, and the classic use</span><button class="code-copy">Copy</button></div>
+<pre>wait(s)   <span class="c">// P: if s &gt; 0 decrement and continue, else block</span>
+signal(s) <span class="c">// V: increment, and wake one waiter if there is one</span>
+
+<span class="c">// bounded buffer, the textbook producer-consumer</span>
+sem empty = N;      <span class="c">// how many free slots</span>
+sem full  = 0;      <span class="c">// how many filled slots</span>
+mutex m;            <span class="c">// protects the buffer itself</span>
+
+producer:                          consumer:
+  wait(empty)                        wait(full)
+  lock(m); put(item); unlock(m)      lock(m); item = take(); unlock(m)
+  signal(full)                       signal(empty)</pre>
+      </div>
+
+      <p>A semaphore initialised to 1 behaves like a mutex but is not one: any thread may signal it, not only the one that waited. That difference makes it the right tool for signalling between threads and the wrong tool for protecting data, where accidental release by the wrong thread is a bug you want the type system to catch.</p>
+
+      <div class="note warn">
+        <b class="tag">Order the waits, or deadlock</b>
+        <p>Swap the first two lines of the producer so it takes the mutex before <code>wait(empty)</code>, and a full buffer deadlocks instantly: the producer sleeps holding the mutex, and the consumer cannot take the mutex to drain the buffer. The rule that falls out of this is general — <strong>never block while holding a lock</strong>, and if you must acquire two things, acquire them in a fixed global order.</p>
+      </div>
+
+      <h3>Condition variables</h3>
+
+      <p>A condition variable lets a thread wait for a predicate to become true while holding a mutex, without spinning. <code>wait</code> atomically releases the mutex and sleeps; when woken it re-acquires it before returning. That atomicity is the whole point: without it, a wake-up arriving between the check and the sleep would be missed forever.</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">the only correct shape</span><button class="code-copy">Copy</button></div>
+<pre>lock(m);
+<span class="k">while</span> (!condition)        <span class="c">// while, NEVER if</span>
+    cond_wait(cv, m);
+<span class="c">// condition is true here, and we hold m</span>
+unlock(m);</pre>
+      </div>
+
+      <div class="note trap">
+        <b class="tag">Why it must be <code>while</code> and not <code>if</code></b>
+        <p>Three reasons, any one of which is enough. <strong>Spurious wakeups</strong> are permitted by POSIX and do occur, so a wake does not mean the predicate holds. <strong>Broadcast</strong> wakes every waiter, but only one may be able to proceed. And on most implementations a woken thread must re-acquire the mutex, during which a third thread can slip in and invalidate the condition again — this is called <em>mesa semantics</em>, and every mainstream library uses it. Re-checking in a loop handles all three; <code>if</code> handles none.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-deadlock">
+      <h2>Deadlock and the four conditions</h2>
+      <div class="h2rule"></div>
+
+      <p>Coffman's 1971 result is that deadlock requires all four of these simultaneously. Break any one and deadlock becomes impossible.</p>
+
+      <div class="tw">
+        <table>
+          <caption>The four conditions, and how each one is broken in practice</caption>
+          <thead><tr><th>Condition</th><th>Means</th><th>Breaking it</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Mutual exclusion</strong></td><td>A resource cannot be shared</td><td>Use immutable data, per-thread copies, or lock-free structures</td></tr>
+            <tr><td><strong>Hold and wait</strong></td><td>A thread holds one resource while requesting another</td><td>Acquire everything at once, or release before requesting more</td></tr>
+            <tr><td><strong>No preemption</strong></td><td>Resources cannot be taken back</td><td>Use <code>try_lock</code> with a timeout, and back off releasing what you hold</td></tr>
+            <tr><td><strong>Circular wait</strong></td><td>A cycle exists in the wait-for graph</td><td><strong>Impose a global order on lock acquisition.</strong> The usual answer</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ------------- DEMO 2 ------------- -->
+      <div class="demo" id="demo-dine">
+        <div class="demo-top">
+          <h3>Demo 2 — dining philosophers, with a real cycle detector</h3>
+          <p>Each philosopher needs the fork on both sides. The wait-for graph is rebuilt after every round and searched for a cycle — the deadlock is detected, not declared.</p>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Policy
+              <select id="dn-pol">
+                <option value="naive" selected>Everyone takes their left fork first</option>
+                <option value="asymmetric">The last one takes their right fork first</option>
+                <option value="ordered">Everyone takes the lower-numbered fork first</option>
+                <option value="arbitrator">Both forks at once, or neither</option>
+              </select>
+            </label>
+            <label>Philosophers <input type="number" id="dn-n" value="5" min="2" max="9"></label>
+            <button class="btn go" id="dn-step">Next round</button>
+            <button class="btn" id="dn-run">Run 20 rounds</button>
+            <button class="btn ghost" id="dn-reset">Reset</button>
+          </div>
+
+          <div class="legend">
+            <span><i style="background:#3FB984"></i>eating</span>
+            <span><i style="background:#FBF1DA;border-color:#EAD5A2"></i>hungry, holding one fork</span>
+            <span><i style="background:#E2574C"></i>part of a deadlock cycle</span>
+            <span><i style="background:#F4F6F8"></i>thinking</span>
+          </div>
+
+          <div class="stage">
+            <div id="dn-table"></div>
+            <p style="margin:12px 0 6px;font-size:12.5px;color:#54677A">Wait-for graph</p>
+            <div id="dn-graph" style="font-family:var(--mono);font-size:12px;line-height:1.7"></div>
+          </div>
+
+          <div class="rgrid">
+            <div class="tile"><span class="k">Round</span><span class="v" id="dn-round">0</span></div>
+            <div class="tile"><span class="k">Meals eaten</span><span class="v" id="dn-ate">0</span></div>
+            <div class="tile"><span class="k">Forks held</span><span class="v" id="dn-held">0</span></div>
+            <div class="tile"><span class="k">Blocked</span><span class="v" id="dn-blocked">0</span></div>
+            <div class="tile"><span class="k">Status</span><span class="v sm" id="dn-status">running</span></div>
+          </div>
+
+          <p class="readout" id="dn-out"></p>
+        </div>
+      </div>
+
+      <p>The naive policy deadlocks with any number of philosophers from two upwards. In the first round everyone successfully picks up their left fork; in the second, everyone reaches for a right fork that their neighbour is already holding, and the wait-for graph closes into a cycle <code>0 → 1 → 2 → 3 → 4 → 0</code>. Nobody eats, ever.</p>
+
+      <p>Each of the other three policies breaks a different Coffman condition. Global fork ordering breaks <strong>circular wait</strong>: with the lower-numbered fork always taken first, the last philosopher reaches for fork 0 instead of fork 4, and the cycle cannot close. The asymmetric policy does the same thing with one special case. The arbitrator takes both forks atomically, breaking <strong>hold and wait</strong>, and it gets more meals through — 26 in twenty rounds against 18 — because it never leaves a fork idle in the hand of a blocked philosopher.</p>
+
+      <div class="note key">
+        <b class="tag">Lock ordering is the practical rule</b>
+        <p>Give every lock in the system a rank and always acquire in increasing rank. The rank can be an address, a name, a documented layer number — anything total and consistent. This makes circular wait structurally impossible rather than merely unlikely, and it is checkable: Linux's lockdep and Java's <code>ThreadMXBean</code> both detect out-of-order acquisition, and clang's thread-safety analysis can enforce it at compile time.</p>
+      </div>
+
+      <p>Two conditions worth distinguishing from deadlock: in <strong>livelock</strong> threads keep running and keep responding to each other but make no progress, which is what naive back-off-and-retry produces without randomised delays. In <strong>starvation</strong> some threads do make progress and one never does, usually because a lock is unfair and a steady stream of arrivals keeps jumping the queue.</p>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-beyond">
+      <h2>Beyond locks</h2>
+      <div class="h2rule"></div>
+
+      <h3>Memory ordering</h3>
+
+      <p>Everything above assumed that if thread A writes X then Y, thread B sees X before Y. It does not. Compilers reorder instructions, and CPUs reorder loads and stores and buffer writes. Both are allowed to, because both must only preserve the behaviour of a <em>single</em> thread.</p>
+
+      <p>The C++11 and Java memory models make this explicit through a happens-before relation. In practice you need three levels:</p>
+
+      <div class="tw">
+        <table>
+          <caption>Memory orderings, weakest to strongest</caption>
+          <thead><tr><th>Ordering</th><th>Guarantees</th><th>Use for</th></tr></thead>
+          <tbody>
+            <tr><td><code>relaxed</code></td><td>Atomicity only, no ordering with respect to anything else</td><td>Statistics counters where only the final total matters</td></tr>
+            <tr><td><code>acquire</code> / <code>release</code></td><td>A release-store is visible to any acquire-load that reads it, along with everything written before it</td><td>The standard pairing for locks, flags and handoffs</td></tr>
+            <tr><td><code>seq_cst</code></td><td>A single global order that every thread agrees on</td><td>The default. Slower on ARM and POWER, nearly free on x86</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The practical advice is to use the default sequential consistency unless a profiler tells you it costs something, and to treat hand-written relaxed atomics as expert territory. The classic bug — a <code>volatile bool ready</code> flag guarding data written just before it — is broken in C and C++ because <code>volatile</code> says nothing about ordering or atomicity. It means "do not optimise away this access", which is a statement about compilers and hardware registers, not about threads. Java's <code>volatile</code> is a different keyword with genuine memory-model meaning; the confusion between the two is a reliable source of bugs.</p>
+
+      <h3>Lock-free, and RCU</h3>
+
+      <p>A <strong>lock-free</strong> algorithm guarantees that some thread always makes progress; a <strong>wait-free</strong> one guarantees every thread does, in bounded steps. Both are built from CAS retry loops. They avoid deadlock and priority inversion by construction and are genuinely faster under moderate contention, but they are extremely hard to get right — the ABA problem alone (a value changes from A to B and back to A, so the CAS succeeds when it should not) has produced a long history of subtly broken published algorithms. Use a library.</p>
+
+      <p><strong>Read-copy-update</strong> takes a different angle for read-mostly data: readers take no lock at all and pay nothing, while a writer builds a new version and swaps a pointer, then waits until every pre-existing reader has finished before freeing the old copy. It is heavily used inside the Linux kernel, and the same shape appears in userspace as immutable-data-plus-atomic-pointer-swap, which is one reason persistent data structures are popular in concurrent functional code.</p>
+
+      <div class="note tip">
+        <b class="tag">The advice that actually scales</b>
+        <p>Do not share mutable state. Message passing between threads that own their data — Go channels, Erlang processes, actors, worker queues — removes whole categories of these bugs by construction. Rust encodes the same discipline in its type system: <code>Send</code> and <code>Sync</code> make data races a compile error rather than a production incident. When you do share, hold locks for as short a time as possible, never call unknown code while holding one, and prefer one coarse lock you understand to five fine-grained ones you do not.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-check">
+      <h2>Check yourself</h2>
+      <div class="h2rule"></div>
+
+      <div class="check">
+        <details>
+          <summary>Two threads each increment a shared counter once. How many of the possible schedules give the right answer?</summary>
+          <div class="ans">
+            <p>Two out of twenty. Each thread performs load, increment, store, so there are C(6,3) = 20 ways to interleave six operations. The answer is correct only when one thread's store happens before the other's load, which means one thread ran entirely before the other — exactly two orders. The other 18 have both threads loading the same value, so both store the same result and one increment vanishes. With three threads it is 6 correct out of 1,680, or 0.36%.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Your race never reproduces locally but appears weekly in production. Why, and what would you do?</summary>
+          <div class="ans">
+            <p>Because the interleavings that are wrong are also the ones the scheduler rarely produces — preemption inside a three-instruction window is uncommon, and it becomes likelier with more cores, more load, and different timing. Reproducing by running more is a bad strategy. Use a tool that explores the schedule space rather than sampling it: ThreadSanitizer, Helgrind, Go's <code>-race</code>, or Java's jcstress. They detect unsynchronised access even when the run happened to be correct, which is the whole point.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Why can mutual exclusion not be built from ordinary loads and stores in practice?</summary>
+          <div class="ans">
+            <p>It can in theory — Peterson's and Dekker's algorithms do it for two threads with only loads and stores. In practice they are unusable: they need sequential consistency, which modern CPUs do not provide by default, so you need memory fences anyway, and they scale badly past two threads while spinning the whole time. Real locks use one hardware instruction that reads and writes indivisibly — test-and-set, fetch-and-add, or compare-and-swap — which is both correct and one operation instead of a protocol.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Why is a condition variable wait always written inside a <code>while</code> loop?</summary>
+          <div class="ans">
+            <p>Three independent reasons. POSIX permits <strong>spurious wakeups</strong>, so returning from <code>wait</code> does not mean anything happened. <strong>Broadcast</strong> wakes all waiters when perhaps only one can proceed. And under <strong>mesa semantics</strong>, which every mainstream implementation uses, a woken thread must re-acquire the mutex, and another thread can take it first and invalidate the condition again. A <code>while</code> loop re-checks the predicate and handles all three; an <code>if</code> handles none and produces a bug that appears under load.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Five philosophers each pick up their left fork then their right. What happens, and which Coffman condition would you break?</summary>
+          <div class="ans">
+            <p>Deadlock. Everyone acquires a left fork, then everyone blocks on a right fork their neighbour holds, closing a cycle in the wait-for graph. Any of the four conditions can be broken, but circular wait is the practical target: number the forks and always take the lower-numbered one first. The last philosopher then reaches for fork 0 rather than fork 4, so no cycle can form. Confirm it in demo 2 — the naive policy deadlocks at every size from 2 to 9, and the ordered policy at none.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>The arbitrator policy gets more meals through than fork ordering. Why, if both prevent deadlock?</summary>
+          <div class="ans">
+            <p>Because preventing deadlock and maximising throughput are different goals. Under fork ordering a philosopher can hold one fork while blocked on the second, so that fork is idle in a blocked hand and unavailable to a neighbour who could have used it. The arbitrator takes both or neither, so a fork is never held by someone unable to eat. In the demo that is 26 meals in twenty rounds against 18. The cost is that the arbitrator is itself a central point of contention, which is exactly the trade you make every time you replace fine-grained locking with a coarse one.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>A colleague guards shared data with <code>volatile bool ready</code> in C++. What is wrong?</summary>
+          <div class="ans">
+            <p><code>volatile</code> in C and C++ means only "do not optimise away or cache this access" — it was designed for memory-mapped hardware registers. It provides neither atomicity nor any ordering with respect to other variables, so the compiler and the CPU are both still free to move the data writes after the flag write, and the reader may see <code>ready == true</code> with the data not yet visible. The correct tool is <code>std::atomic&lt;bool&gt;</code> with release on the write and acquire on the read, or simply a mutex. Java's <code>volatile</code> is a different keyword that does carry memory-model guarantees, which is why the advice differs between the two languages.</p>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-recap">
+      <div class="recap">
+        <h2>Ten things to carry forward</h2>
+        <ol>
+          <li><b><code>counter++</code> is load, increment, store,</b> and a preemption between any two of them loses an update.</li>
+          <li><b>Two threads have 20 schedules and 18 are wrong.</b> Three threads have 1,680 and 1,674 are wrong. The bug is the default, not the exception.</li>
+          <li><b>Rarity in testing is the danger,</b> not the reassurance. Use a race detector that explores rather than samples.</li>
+          <li><b>Locks are built on one indivisible hardware instruction</b> — test-and-set, fetch-and-add or compare-and-swap — not on clever use of ordinary loads and stores.</li>
+          <li><b>A futex takes the fast path in userspace</b> and only enters the kernel under contention, which is why an uncontended lock costs about one atomic operation.</li>
+          <li><b>Semaphores count, mutexes own.</b> Any thread may signal a semaphore; that flexibility makes it good for signalling and bad for protecting data.</li>
+          <li><b>Condition variable waits go in a <code>while</code> loop,</b> because of spurious wakeups, broadcast, and mesa semantics.</li>
+          <li><b>Deadlock needs all four Coffman conditions.</b> Breaking circular wait with a global lock order is the practical answer.</li>
+          <li><b>Preventing deadlock is not the same as getting work done:</b> a policy that leaves resources idle in blocked hands is correct and slow.</li>
+          <li><b>The best concurrency is no shared mutable state.</b> Message passing, immutability and ownership remove these bugs instead of managing them.</li>
+        </ol>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<footer>
+  <div class="foot-inner">
+    <div class="fi-grid">
+      <div class="fi">
+        <h3>What comes next</h3>
+        <p>Chapter 9 closes Part 2 with memory management: the stack and the heap, virtual memory and page tables, what an allocator actually does with <code>malloc</code>, fragmentation, leaks, and how a garbage collector decides what is still alive.</p>
+      </div>
+      <div class="fi">
+        <h3>If you want to go deeper</h3>
+        <p><em>The Art of Multiprocessor Programming</em> by Herlihy and Shavit is the standard text and goes deep on lock-free structures. Paul McKenney's <em>Is Parallel Programming Hard?</em> is free, opinionated and the best treatment of memory ordering and RCU anywhere.</p>
+      </div>
+      <div class="fi">
+        <h3>Connections</h3>
+        <p>Chapter 5 explains why atomics are expensive: they move a cache line. Chapter 6 covers what threads share. Chapter 7 covers priority inversion's other half.</p>
+      </div>
+    </div>
+    <div class="pager" data-pager></div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">&uarr;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* =============================================================
+   Demo 1 — exhaustive interleaving enumeration
+   ============================================================= */
+(function(){
+  const STEP = ["LOAD  tmp <- counter", "INC   tmp <- tmp + 1", "STORE counter <- tmp"];
+  let N = 2, locked = false;
+
+  function enumerate(nThreads, useLock){
+    const results = new Map();
+    let firstBad = null;
+    const total = nThreads * 3;
+
+    function evaluate(seq){
+      let counter = 0;
+      const tmp = new Array(nThreads).fill(0), pc = new Array(nThreads).fill(0);
+      const trace = [];
+      for (const th of seq){
+        const step = pc[th]++;
+        if (step === 0){ tmp[th] = counter; }
+        else if (step === 1){ tmp[th] = tmp[th] + 1; }
+        else { counter = tmp[th]; }
+        trace.push({th, step, tmp:tmp[th], counter});
+      }
+      return {counter, trace};
+    }
+
+    function rec(pcs, seq){
+      if (seq.length === total){
+        const {counter, trace} = evaluate(seq);
+        results.set(counter, (results.get(counter) || 0) + 1);
+        if (counter !== nThreads && !firstBad) firstBad = {seq:seq.slice(), trace};
+        return;
+      }
+      for (let th = 0; th < nThreads; th++){
+        if (pcs[th] >= 3) continue;
+        if (useLock){
+          const started = pcs.findIndex((p, i) => p > 0 && p < 3);
+          if (started !== -1 && started !== th) continue;
+        }
+        pcs[th]++; seq.push(th);
+        rec(pcs, seq);
+        seq.pop(); pcs[th]--;
+      }
+    }
+    rec(new Array(nThreads).fill(0), []);
+    return {results, firstBad};
+  }
+
+  function draw(){
+    const {results, firstBad} = enumerate(N, locked);
+    const total = [...results.values()].reduce((a, b) => a + b, 0);
+    const correct = results.get(N) || 0;
+    const wrong = total - correct;
+
+    const host = document.getElementById("rc-chart");
+    host.innerHTML = "";
+    const keys = [...results.keys()].sort((a, b) => a - b);
+    const max = Math.max(...results.values());
+    keys.forEach(v => {
+      const count = results.get(v);
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;align-items:center;gap:10px;margin-bottom:6px";
+      const lab = document.createElement("span");
+      lab.style.cssText = "min-width:112px;font-size:12.5px;color:#54677A";
+      lab.innerHTML = "counter = <b>" + v + "</b>" + (v === N ? " (correct)" : "");
+      const bar = document.createElement("div");
+      bar.style.cssText = "flex:1;height:22px;background:#EFF2F5;border-radius:2px;overflow:hidden";
+      const fill = document.createElement("div");
+      fill.style.cssText = "height:100%;width:" + Math.round((count / max) * 100) + "%;background:" +
+                           (v === N ? "#3FB984" : "#E2574C");
+      bar.appendChild(fill);
+      const num = document.createElement("span");
+      num.style.cssText = "min-width:104px;text-align:right;font-size:12.5px;font-variant-numeric:tabular-nums;color:#16232F";
+      num.textContent = commas(count) + " (" + (count / total * 100).toFixed(count / total < 0.01 ? 2 : 0) + "%)";
+      row.append(lab, bar, num);
+      host.appendChild(row);
+    });
+
+    const tr = document.getElementById("rc-trace");
+    tr.innerHTML = "";
+    if (!firstBad){
+      tr.innerHTML = "<span style='color:#166B47'>No schedule loses an update — the mutex has removed them all from the space.</span>";
+    } else {
+      firstBad.trace.forEach((e, i) => {
+        const d = document.createElement("div");
+        const colour = ["#E2574C","#20456A","#B47BE5"][e.th];
+        d.innerHTML = "<span style='color:#7D8EA0'>" + String(i + 1).padStart(2, "0") + "</span>  " +
+                      "<b style='color:" + colour + "'>T" + (e.th + 1) + "</b>  " +
+                      STEP[e.step].padEnd(24).replace(/ /g, "&nbsp;") +
+                      "<span style='color:#7D8EA0'>tmp=" + e.tmp + " counter=" + e.counter + "</span>";
+        tr.appendChild(d);
+      });
+      const f = document.createElement("div");
+      f.style.cssText = "margin-top:6px;color:#B8362C";
+      f.innerHTML = "final counter = " + firstBad.trace[firstBad.trace.length - 1].counter +
+                    ", expected " + N;
+      tr.appendChild(f);
+    }
+
+    setTile("rc-total", commas(total));
+    setTile("rc-ok", commas(correct));
+    setTile("rc-bad", commas(wrong));
+    setTile("rc-pct", (wrong / total * 100).toFixed(wrong / total < 0.01 ? 2 : 0) + "%");
+
+    let msg;
+    if (locked){
+      msg = "With a mutex the critical section runs to completion before any other thread may start, so the " +
+            "schedule space shrinks from " + commas([...enumerate(N, false).results.values()].reduce((a,b)=>a+b,0)) +
+            " interleavings to just <b>" + total + "</b> — the " + total + " serial orders — and every one of them " +
+            "gives the right answer. The lock did not make a wrong schedule right; it made the wrong schedules impossible.";
+    } else {
+      msg = "<b>" + commas(total) + " possible schedules</b>, of which <b>" + correct +
+            "</b> give the correct answer of " + N + ". That is " + (wrong / total * 100).toFixed(wrong/total<0.01?2:0) +
+            "% wrong. The only correct orders are the ones where each thread's STORE lands before the next thread's " +
+            "LOAD, which means running them one at a time.";
+    }
+    document.getElementById("rc-out").innerHTML = msg;
+  }
+
+  document.getElementById("rc-n").addEventListener("click", e => {
+    const b = e.target.closest("button[data-n]");
+    if (!b) return;
+    N = +b.dataset.n;
+    [...e.currentTarget.querySelectorAll("button")].forEach(x => x.setAttribute("aria-pressed", String(x === b)));
+    draw();
+  });
+  document.getElementById("rc-lock").addEventListener("change", e => { locked = e.target.checked; draw(); });
+  draw();
+})();
+
+/* =============================================================
+   Demo 2 — dining philosophers with cycle detection
+   ============================================================= */
+(function(){
+  let n = 5, policy = "naive", forks = [], held = [], want = [], state = [],
+      round = 0, ate = 0, dead = null;
+
+  function reset(){
+    n = Math.max(2, Math.min(9, +document.getElementById("dn-n").value || 5));
+    policy = document.getElementById("dn-pol").value;
+    forks = new Array(n).fill(null);
+    held = Array.from({length:n}, () => []);
+    want = new Array(n).fill(null);
+    state = new Array(n).fill("thinking");
+    round = 0; ate = 0; dead = null;
+    draw();
+  }
+
+  const forkOrder = p => {
+    const left = p, right = (p + 1) % n;
+    if (policy === "ordered")    return [Math.min(left, right), Math.max(left, right)];
+    if (policy === "asymmetric") return p === n - 1 ? [right, left] : [left, right];
+    return [left, right];
+  };
+
+  function findCycle(){
+    const edge = new Array(n).fill(-1);
+    for (let p = 0; p < n; p++){
+      if (want[p] === null) continue;
+      const holder = forks[want[p]];
+      if (holder !== null && holder !== p) edge[p] = holder;
+    }
+    for (let start = 0; start < n; start++){
+      const seen = [], onPath = new Set();
+      let cur = start;
+      while (cur !== -1 && !onPath.has(cur)){ onPath.add(cur); seen.push(cur); cur = edge[cur]; }
+      if (cur !== -1){
+        const i = seen.indexOf(cur);
+        if (i !== -1) return {cycle:seen.slice(i), edge};
+      }
+    }
+    return {cycle:null, edge};
+  }
+
+  function step(){
+    if (dead) return;
+    round++;
+    for (let p = 0; p < n; p++){
+      const [a, b] = forkOrder(p);
+      if (state[p] === "eating"){
+        held[p].forEach(f => forks[f] = null);
+        held[p] = []; state[p] = "thinking"; want[p] = null;
+        continue;
+      }
+      if (policy === "arbitrator"){
+        if (forks[a] === null && forks[b] === null){
+          forks[a] = p; forks[b] = p; held[p] = [a, b];
+          state[p] = "eating"; want[p] = null; ate++;
+        } else { want[p] = forks[a] === null ? b : a; state[p] = "hungry"; }
+        continue;
+      }
+      const next = held[p].length === 0 ? a : b;
+      if (forks[next] === null){
+        forks[next] = p; held[p].push(next); want[p] = null;
+        if (held[p].length === 2){ state[p] = "eating"; ate++; } else state[p] = "hungry";
+      } else { want[p] = next; state[p] = "hungry"; }
+    }
+    const {cycle} = findCycle();
+    const anyEating = held.some(h => h.length === 2);
+    const allBlocked = want.every((w, p) => w !== null || held[p].length === 2);
+    if (!anyEating && allBlocked && cycle) dead = cycle;
+  }
+
+  function draw(){
+    const {cycle, edge} = findCycle();
+    const inCycle = new Set(dead || []);
+
+    const host = document.getElementById("dn-table");
+    const tbl = document.createElement("table");
+    tbl.style.cssText = "border-collapse:collapse;width:100%;font-size:13px;min-width:440px";
+    tbl.innerHTML = "<tr style='background:#0C1D30;color:#E9F0F6'>" +
+      ["Philosopher","Wants first","Holding","Blocked on","State"]
+        .map(h => "<th style='padding:6px 10px;text-align:left;font-weight:600'>" + h + "</th>").join("") + "</tr>";
+    for (let p = 0; p < n; p++){
+      const [a, b] = forkOrder(p);
+      const tr = document.createElement("tr");
+      tr.style.cssText = "border-bottom:1px solid #E1E7EC;background:" +
+        (inCycle.has(p) ? "#E2574C" : state[p] === "eating" ? "#DFF3E9" : held[p].length ? "#FBF1DA" : "#fff") +
+        (inCycle.has(p) ? ";color:#fff" : "");
+      tr.innerHTML =
+        "<td style='padding:6px 10px'>P" + p + "</td>" +
+        "<td style='padding:6px 10px'>fork " + a + ", then " + b + "</td>" +
+        "<td style='padding:6px 10px'>" + (held[p].length ? held[p].map(f => "fork " + f).join(", ") : "—") + "</td>" +
+        "<td style='padding:6px 10px'>" + (want[p] === null ? "—" : "fork " + want[p] +
+          (forks[want[p]] !== null ? " (P" + forks[want[p]] + " has it)" : "")) + "</td>" +
+        "<td style='padding:6px 10px'>" + state[p] + "</td>";
+      tbl.appendChild(tr);
+    }
+    host.innerHTML = "";
+    host.appendChild(tbl);
+
+    const g = document.getElementById("dn-graph");
+    const edges = [];
+    for (let p = 0; p < n; p++) if (edge[p] !== -1) edges.push("P" + p + " → P" + edge[p]);
+    g.innerHTML = edges.length
+      ? edges.join("&nbsp;&nbsp; ") + (dead ? "<br><span style='color:#B8362C'>cycle: " +
+          dead.map(p => "P" + p).join(" → ") + " → P" + dead[0] + "</span>" : "")
+      : "<span style='color:#7D8EA0'>no philosopher is currently blocked on another</span>";
+
+    setTile("dn-round", round);
+    setTile("dn-ate", ate);
+    setTile("dn-held", forks.filter(f => f !== null).length + " of " + n);
+    setTile("dn-blocked", want.filter(w => w !== null).length);
+    setTile("dn-status", dead ? "DEADLOCKED" : round === 0 ? "not started" : "running");
+    document.getElementById("dn-step").disabled = !!dead;
+    document.getElementById("dn-run").disabled = !!dead;
+
+    let msg;
+    if (dead){
+      msg = "<b>Deadlock, detected in round " + round + ".</b> The wait-for graph contains the cycle " +
+            dead.map(p => "P" + p).join(" → ") + " → P" + dead[0] + ", so every philosopher in it is waiting for a " +
+            "fork held by the next. All four Coffman conditions hold at once and nothing can break the tie. " +
+            "Meals served: <b>" + ate + "</b>.";
+    } else if (round === 0){
+      msg = "Nobody has picked anything up yet. Press <b>Next round</b> to let every philosopher attempt one action, " +
+            "and watch the wait-for graph after each.";
+    } else if (policy === "naive"){
+      msg = "Round " + round + ". Every philosopher reaches for their left fork first, which is exactly the pattern " +
+            "that closes a cycle — give it one more round.";
+    } else if (policy === "arbitrator"){
+      msg = "Round " + round + ", <b>" + ate + " meals</b>. Taking both forks atomically breaks <b>hold and wait</b>: " +
+            "a fork is never held by a philosopher who cannot eat, so no fork sits idle and throughput is higher than " +
+            "any of the ordering policies.";
+    } else {
+      msg = "Round " + round + ", <b>" + ate + " meals</b>. " +
+            (policy === "ordered"
+              ? "Every philosopher takes the lower-numbered fork first, so P" + (n-1) + " reaches for fork 0 rather " +
+                "than fork " + (n-1) + " and the cycle cannot close. This breaks <b>circular wait</b>."
+              : "Only P" + (n-1) + " reverses the order, which is enough to break <b>circular wait</b> — one " +
+                "asymmetry in the ring is all a cycle needs to be impossible.");
+    }
+    document.getElementById("dn-out").innerHTML = msg;
+  }
+
+  document.getElementById("dn-step").addEventListener("click", () => { step(); draw(); });
+  document.getElementById("dn-run").addEventListener("click", () => {
+    for (let i = 0; i < 20 && !dead; i++) step();
+    draw();
+  });
+  document.getElementById("dn-reset").addEventListener("click", reset);
+  document.getElementById("dn-pol").addEventListener("change", reset);
+  document.getElementById("dn-n").addEventListener("change", reset);
+  reset();
+})();
+
+initChapter("ch08-locks-mutexes-and-semaphores.html");
+</script>
+</body>
+</html>

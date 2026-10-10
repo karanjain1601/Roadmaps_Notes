@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Continuous integration — DevOps</title>
+<meta name="description" content="Pipeline anatomy, why stage ordering decides how long you wait for bad news, caching and test selection, the arithmetic that makes a small flake rate fatal at scale, and reproducible builds.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%237C8CF8' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">DevOps</a><span class="sep">/</span><span>Chapter 17</span></p>
+    <p class="chno">Chapter 17 · Delivery</p>
+    <h1>Continuous integration</h1>
+    <p class="lede">Chapter 1 showed that integration cost rises with batch size and that fixed merge overhead sets the floor on how small a batch is worth making. The pipeline <em>is</em> that fixed overhead. Every minute it takes and every spurious failure it produces feeds directly into the branch-lifetime and deploy-cadence models — which makes CI speed and CI trustworthiness delivery decisions rather than developer conveniences.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapters 01, 05, 10</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="anatomy">
+<h2>What a pipeline is for</h2><div class="h2rule"></div>
+
+<p class="lead">A CI pipeline answers one question — <em>is this change safe to merge?</em> — and it should answer it as cheaply and as early as it can. Everything else is arrangement.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Stage</th><th>Answers</th><th>Typical</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>Lint and format</td><td>Is it written the way we write things?</td><td>Seconds</td><td class="yes">Should already have run as a pre-commit hook (chapter 5); here it is enforcement</td></tr>
+<tr><td>Type check</td><td>Is it internally consistent?</td><td>Tens of seconds</td><td>Catches a large class of errors before a single test runs</td></tr>
+<tr><td>Unit tests</td><td>Does each piece behave?</td><td>1–3 min</td><td class="yes">The bulk of your coverage should be here, because it is the cheapest place for it</td></tr>
+<tr><td>Build the artefact</td><td>Does it compile and package?</td><td>1–5 min</td><td>Chapter 10 — cache layers and use registry-backed cache for ephemeral runners</td></tr>
+<tr><td>Integration tests</td><td>Do the pieces work with real dependencies?</td><td>5–15 min</td><td>Testcontainers or a compose file, not a shared staging database</td></tr>
+<tr><td>Security and policy</td><td>Any known vulnerabilities, secrets, or policy violations?</td><td>1–3 min</td><td>Chapters 10, 14 and 21. Can run in parallel with everything above</td></tr>
+<tr><td>End-to-end tests</td><td>Does a user journey work?</td><td>10–30 min</td><td class="no">The most expensive and most flaky. Keep the number small and deliberate</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The ordering of that list is not decorative. A pipeline gives you no information until it finishes or fails, so the time you spend waiting for bad news depends entirely on where in the sequence the failure is caught — and the optimum ordering is a scheduling problem with a known answer.</p>
+
+<div class="eq plain"><code>expected time to red &nbsp;=&nbsp; Σ P(first failure at stage i) × (time to reach the end of stage i)</code></div>
+<p class="where">Minimised by sorting stages by <b>duration ÷ failure probability</b> ascending — cheapest evidence first. A stage that takes eight seconds and fails 6% of the time is worth running before one that takes twelve minutes and fails 3%, even though the second finds more serious problems, because the first buys information at a hundredth of the price.</p>
+
+<div class="demo" id="d-order">
+  <div class="demo-top"><div class="demo-title">Same stages, same failure rate, different order</div><div class="demo-hint">Switch the ordering — the green run does not change and the wait for bad news does</div></div>
+  <div class="demo-body">
+    <canvas id="cOrder" aria-label="Pipeline stages in order, with the cumulative time and the probability of first failing at each"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Ordering</label><select id="odO">
+        <option value="ratio" selected>cheapest evidence first (duration ÷ failure rate)</option>
+        <option value="worst">slowest and least likely first</option>
+        <option value="duration">shortest first</option>
+        <option value="pfail">most likely to fail first</option>
+      </select></div>
+      <div class="ctrl"><label><input type="checkbox" id="odP"> run lint, typecheck and unit in parallel</label></div>
+      <div class="ctrl"><label>e2e suite <b id="odEo">700</b> s</label><input type="range" id="odE" min="60" max="1800" step="20" value="700"></div>
+      <div class="ctrl"><label>e2e failure rate <b id="odFo">2</b>%</label><input type="range" id="odF" min="1" max="30" value="2"></div>
+    </div>
+    <div class="rgrid" id="odOut"></div>
+    <div class="readout" id="odNote"></div>
+  </div>
+</div>
+
+<div class="box tip"><b class="tag">Ten minutes is the number that matters</b>
+<p style="margin-bottom:0">Below roughly ten minutes an engineer waits for the pipeline and stays in context. Above it they start something else, and the cost of the run is no longer the run — it is the run plus a context switch back, conventionally about fifteen minutes of re-orientation. So a 23-minute pipeline costs closer to <b>38 minutes</b> of elapsed developer attention per run, and at chapter 1's fixed merge cost that pushes the optimal branch lifetime outward and the deploy cadence down. The lever is not to make everyone more patient; it is to move the long stages off the critical path — run them after merge, on a schedule, or against the merge queue rather than every push.</p>
+</div>
+</section>
+
+<section id="speed">
+<h2>Making it fast</h2><div class="h2rule"></div>
+
+<div class="kv">
+<dt>Cache the right layer, and check it is hitting</dt><dd>Dependency caches — <code>~/.npm</code>, <code>~/.m2</code>, the Go module cache — keyed on the lockfile hash so they invalidate exactly when they should. Chapter 10's registry-backed Docker layer cache, so an ephemeral runner reuses the previous build. A cache with a poor key is worse than none: it is downloaded, missed, and rebuilt anyway. Log the hit rate; almost nobody does, and a silently broken cache is common.</dd>
+<dt>Parallelise, but understand the critical path</dt><dd>Running lint, typecheck and unit tests concurrently is nearly free and, in the demo, saves under a minute — because the long tail dominates. Sharding the <em>slow</em> suite across ten runners is the change that matters, and it costs ten runners.</dd>
+<dt>Run only the tests that could have broken</dt><dd>Affected-target detection — Bazel, Nx, Turborepo, or a dependency graph you maintain — turns a monorepo's forty-minute suite into two minutes for a change touching one service. This is the single biggest lever available in a monorepo and it is why chapter 5 listed CI cost as the monorepo's characteristic failure mode.</dd>
+<dt>Move the expensive stages off the blocking path</dt><dd>End-to-end tests, performance tests and full security scans on a merge queue or a post-merge schedule rather than on every push. The trade is real — you find out later — but "later" measured against a pipeline nobody waits for is often no worse in practice.</dd>
+<dt>Fail fast, and mean it</dt><dd>Stop the pipeline at the first failure rather than gathering a complete report. The exception is when several independent checks each produce useful findings; then run them in parallel and collect everything, which is not the same as running them in sequence.</dd>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">yaml — a pipeline shaped by the ordering above</span><button class="code-copy">Copy</button></div><pre>jobs:
+  quick:                                <span class="c">← seconds. fails 10% of the time. runs first, always</span>
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm                    <span class="c">← keyed on the lockfile, so it invalidates exactly when it should</span>
+      - run: npm ci
+      - run: npm run lint &amp;&amp; npm run typecheck
+
+  unit:
+    needs: quick                        <span class="c">← do not spend runner minutes if lint already failed</span>
+    strategy:
+      matrix: { shard: [1, 2, 3, 4] }   <span class="c">← sharding is what makes a slow suite fast;</span>
+    steps:                              <span class="c">  parallelising the FAST stages barely moves the total</span>
+      - run: npm test -- --shard=${{ matrix.shard }}/4
+
+  build:
+    needs: quick                        <span class="c">← parallel with unit, not after it</span>
+    steps:
+      - uses: docker/build-push-action@v6
+        with:
+          cache-from: type=registry,ref=ghcr.io/org/app:buildcache
+          cache-to:   type=registry,ref=ghcr.io/org/app:buildcache,mode=max
+                                        <span class="c">← chapter 10: without this an ephemeral runner has no</span>
+                                        <span class="c">  layer cache at all and rebuilds everything every time</span>
+  integration:
+    needs: build
+    steps:
+      - run: npm run test:integration   <span class="c">← testcontainers, not a shared staging database</span>
+
+  e2e:
+    if: github.event_name == 'merge_group'
+    needs: build                        <span class="c">← off the per-push path entirely. runs on the merge queue,</span>
+    steps:                              <span class="c">  so it gates merging without making everyone wait for it</span>
+      - run: npm run test:e2e</pre></div>
+</section>
+
+<section id="flaky">
+<h2>Flaky tests, and why a tiny rate is fatal</h2><div class="h2rule"></div>
+
+<p>A test that fails occasionally for reasons unrelated to the code is worse than no test. The reason is arithmetic rather than annoyance: the suite passes only if <em>every</em> test passes, so independent flake probabilities compound across the whole suite.</p>
+
+<div class="eq plain"><code>P(green | the code is fine) &nbsp;=&nbsp; (1 − flake rate)<sup>number of tests</sup></code></div>
+<p class="where">At 0.05% per test — one spurious failure in every two thousand runs of a single test, which sounds like nothing — a suite of 2,000 tests passes only <b>36.8%</b> of the time on perfectly good code. Nearly two runs in three go red for no reason.</p>
+
+<div class="demo" id="d-flake">
+  <div class="demo-top"><div class="demo-title">A negligible flake rate, multiplied by the suite</div><div class="demo-hint">Turn on one retry, then look at what it does to real intermittent failures</div></div>
+  <div class="demo-body">
+    <canvas id="cFlake" aria-label="Probability that a test suite passes on good code, against the number of tests"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Tests <b id="fkNo">2000</b></label><input type="range" id="fkN" min="50" max="10000" step="50" value="2000"></div>
+      <div class="ctrl"><label>Flake rate per test <b id="fkFo">0.050</b>%</label><input type="range" id="fkF" min="1" max="200" value="50"></div>
+      <div class="ctrl"><label>Retries of failed tests <b id="fkRo">0</b></label><input type="range" id="fkR" min="0" max="3" value="0"></div>
+      <div class="ctrl"><label>A genuinely broken test fails <b id="fkBo">50</b>% of the time</label><input type="range" id="fkB" min="10" max="95" value="50"></div>
+      <div class="ctrl"><label>CI minutes per run <b id="fkMo">23</b></label><input type="range" id="fkM" min="1" max="60" value="23"></div>
+    </div>
+    <div class="rgrid" id="fkOut"></div>
+    <div class="readout" id="fkNote"></div>
+  </div>
+</div>
+
+<div class="kv">
+<dt>Retries fix the symptom in one step</dt><dd>Retrying failed tests once takes the spurious failure rate from <b>63%</b> to <b>0.05%</b>, because a test must now flake twice in a row. It is genuinely effective and it is why almost every large suite does it.</dd>
+<dt>And they mask real failures at the same time</dt><dd>A genuinely broken test that fails half the time now passes on retry <b>25%</b> of the time. You have not made the suite more accurate, you have made it more <em>lenient</em> — in both directions, and the second direction is the one that reaches production.</dd>
+<dt>Fixing the tests achieves the same thing without the masking</dt><dd>A tenfold reduction in flake rate gets to <b>9.5%</b> spurious with no retries at all. Slower to achieve and strictly better, which is the argument for retries as a stopgap with an owner rather than as a permanent setting.</dd>
+<dt>There is a trust budget, and it is small</dt><dd>To stay under a 5% spurious rate at 0.05% per test you can have about <b>102 tests</b>. Beyond that the suite goes red often enough that engineers re-run on reflex without reading the output — and once that habit forms, genuine failures are re-run too. That is the real cost of flakiness: not the wasted minutes but the loss of the signal.</dd>
+</div>
+
+<div class="box warn"><b class="tag">The operational answer</b>
+<p style="margin-bottom:0">Detect flakes automatically by re-running the suite against an unchanged commit on a schedule; anything that fails is flaky by definition. <strong>Quarantine</strong> them — keep them running but non-blocking, with the results visible — so the signal is restored immediately while the fix is pending. Give every quarantined test an owner and a deadline, because a quarantine list with no expiry is just deletion with extra steps. And track the spurious failure rate as a first-class metric: it is the accuracy of your primary safety mechanism, and it belongs on the same dashboard as chapter 1's four numbers.</p>
+</div>
+</section>
+
+<section id="reproducible">
+<h2>What makes a build trustworthy</h2><div class="h2rule"></div>
+
+<div class="kv">
+<dt>Pin everything, including the runner</dt><dd>Lockfiles for dependencies, digests for base images (chapter 10), a lock file for Terraform providers (chapter 14), and pinned action versions by commit SHA rather than by tag — a mutable tag on a third-party action is arbitrary code execution with a credential attached.</dd>
+<dt>Build once, promote the artefact</dt><dd>Rebuilding per environment means what you tested is not what you shipped. Build one image, tag it with the commit, and promote that digest through environments. This is chapter 5's argument against long-lived environment branches, expressed as an artefact rather than a merge.</dd>
+<dt>Give CI an identity, not a key</dt><dd>OIDC federation to a cloud role with the trust policy constrained to your repository and branch — chapter 13's confused deputy applies directly. A long-lived cloud key in CI secrets is the credential most likely to leak and least likely to be rotated.</dd>
+<dt>Treat the pipeline as a supply chain</dt><dd>Anything CI runs has your credentials. A compromised dependency, a malicious pull request from a fork with access to secrets, or a typosquatted action are all direct paths to production. Forked pull requests must not receive secrets by default, and chapter 20 covers provenance and signing.</dd>
+</div>
+
+<div class="box trap"><b class="tag">The merge queue, and the semantic conflict it solves</b>
+<p style="margin-bottom:0">Chapter 5 described two pull requests that each pass CI and break trunk when combined — a semantic conflict no textual merge can detect. "Require branches to be up to date" solves it by forcing a rebase and a re-run before every merge, which works and serialises merging: with a twenty-minute pipeline, a busy repository can merge three times an hour. A <strong>merge queue</strong> solves the same problem without the serialisation, by speculatively testing batches of pull requests in their prospective merge order and merging the ones that pass together. When a batch fails it bisects to find the culprit. It is the right answer above a certain merge rate, and it is also where the expensive end-to-end suite belongs — gating the merge without making every push wait for it.</p>
+</div>
+</section>
+
+<section id="close">
+<h2>Check yourself</h2><div class="h2rule"></div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>Your pipeline runs end-to-end tests first because "they catch the most important problems". What is wrong with that?
+<button class="reveal">Show answer</button><div class="ans">It maximises the time you wait to be told about the cheap problems. A pipeline gives no information until it finishes or fails, so expected time-to-red is the sum over stages of the probability of first failing there multiplied by the time taken to get there — and putting the twelve-minute stage first means every lint error costs twelve minutes to discover. In the demo, reordering identical stages from slowest-first to cheapest-evidence-first takes expected time-to-red from 21 minutes to 4.3, with exactly the same total work and the same overall failure probability. The optimum is to sort by duration divided by failure probability: a stage that takes eight seconds and fails 6% of the time buys information a hundred times more cheaply than one taking twelve minutes and failing 3%, regardless of which finds the more serious problem. The serious problems are still found — just after the trivial ones have been eliminated for free.</div></li>
+
+<li>Your suite has 2,000 tests, each of which fails spuriously about one run in two thousand. How often does a good commit go red?
+<button class="reveal">Show answer</button><div class="ans">About 63% of the time. The suite passes only if every test passes, so the probability is (1 − 0.0005)^2000, which is approximately e^(−1) = 36.8%. A per-test flake rate that sounds entirely negligible produces a suite that is wrong about good code nearly two runs in three, because independent probabilities compound across the whole suite. The consequence is worse than the wasted minutes: at that rate engineers stop reading failures and re-run on reflex, so genuine failures are re-run too and the suite has stopped being a signal. The trust budget is small — to stay under 5% spurious at that per-test rate you can have about 102 tests — which means any suite of realistic size needs a per-test flake rate one or two orders of magnitude lower than instinct suggests.</div></li>
+
+<li>Adding "retry failed tests once" fixes your red builds overnight. What did you also change?
+<button class="reveal">Show answer</button><div class="ans">You made the suite more lenient in both directions. Spurious failures collapse — from 63% to 0.05% in the model — because a flaky test must now fail twice in a row. But a genuinely broken test that fails half the time now passes on retry 25% of the time, so real intermittent defects reach production more often than before. The retry has not improved accuracy, it has moved the threshold. It is still a reasonable stopgap and most large suites use it, provided two things are true: the retries are recorded and tracked so you can see which tests are relying on them, and there is an owner and a deadline for fixing the underlying flakiness. The alternative that has no downside is fixing the tests — a tenfold reduction in flake rate reaches 9.5% spurious with no retries at all — which is slower to achieve and strictly better.</div></li>
+
+<li>Two pull requests each pass CI and break trunk when merged together. Compare the two fixes.
+<button class="reveal">Show answer</button><div class="ans">This is chapter 5's semantic conflict: each branch was tested against a base that did not contain the other, and the conflict is behavioural rather than textual, so no merge algorithm can find it. The simple fix is "require branches to be up to date before merging", which forces a rebase and a full re-run before each merge — correct, and it serialises merging, so with a twenty-minute pipeline a busy repository can merge about three times an hour. That is a hard cap on chapter 1's deploy cadence imposed by pipeline duration. A merge queue solves it without serialising: it speculatively tests batches of pull requests in their prospective merge order, merges the batch if it passes, and bisects to find the culprit when it does not. It is the right answer above a modest merge rate, and it is also the natural home for the expensive end-to-end suite, which then gates merging without making every push wait for it.</div></li>
+
+<li>Your monorepo pipeline takes forty minutes for every change, however small. What is the highest-value fix?
+<button class="reveal">Show answer</button><div class="ans">Affected-target detection: work out which projects the change could possibly have affected, from the dependency graph, and run only those tests and builds. A change to one service in a monorepo of forty typically touches a handful of targets, so the pipeline goes from forty minutes to two or three. Bazel, Nx, Turborepo and Pants all do this; so does a hand-maintained mapping if the repository is simple enough. This is the specific fix for the specific problem, and chapter 5 named CI cost as the monorepo's characteristic failure mode for exactly this reason. Parallelising and caching help too but they are smaller: in the demo, running the three fast stages concurrently saves under a minute because the long tail dominates the critical path. Sharding the slow suite across runners does move the number, and it costs runners — worth doing after target detection, not instead of it.</div></li>
+
+<li>Why should CI build the artefact once rather than rebuilding it for each environment?
+<button class="reveal">Show answer</button><div class="ans">Because rebuilding means what you tested is not what you shipped. Two builds of the same commit at different times can differ — a floating base image tag, an unpinned transitive dependency, a different runner image, a package published in between — so a staging test result does not transfer to production. Build once, tag with the commit, and promote that digest through environments, with configuration supplied at runtime rather than baked per environment. It is faster as well as safer, since you build once instead of three times. This is the artefact-shaped version of chapter 5's argument against long-lived environment branches: promote a thing that was tested rather than re-derive it, and it depends on chapter 10's point that a tag is a mutable pointer while a digest is not.</div></li>
+
+<li>Someone proposes running the full end-to-end suite on every push so problems are found earlier. Evaluate.
+<button class="reveal">Show answer</button><div class="ans">It finds problems earlier in the pipeline and later in wall-clock time, which is usually the wrong trade. End-to-end suites are the slowest and by a wide margin the flakiest stage, so putting one on every push pushes the pipeline past the roughly ten-minute threshold at which the author stops waiting and context-switches — turning a 23-minute run into about 38 minutes of elapsed developer attention — and it multiplies the flake exposure by the number of pushes rather than the number of merges. Both effects feed straight into chapter 1's models: a higher fixed merge cost lengthens the optimal branch and lowers the deploy cadence. The better arrangement is to run the end-to-end suite on the merge queue, where it gates merging without gating iteration, keep the number of end-to-end tests small and deliberate, and push coverage down into unit and integration tests where it is cheaper and far more stable.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin-bottom:0">Chapter 18 takes the artefact this pipeline produced and gets it into production: rolling, blue-green and canary compared on how many users see a bad version, and the database migrations that keep rollback possible.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 17</h2><p>Continuous integration. Part of the DevOps unit — <a href="index.html">all 24 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 18 (promoting the artefact), 19 (the pipeline writing to a git repository), 20 (signing what CI produced), 21 (credentials in CI).</p></div>
+    <div><h2>Going deeper</h2><p>The Git &amp; GitHub unit covers Actions in detail. Google's <em>Software Engineering at Google</em> has the best published account of flaky-test management at scale.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: stage ordering ============ */
+(function(){
+  const cv=document.getElementById("cOrder"); if(!cv) return;
+  const oEl=document.getElementById("odO"), pEl=document.getElementById("odP"),
+        eEl=document.getElementById("odE"), fEl=document.getElementById("odF");
+  const out=document.getElementById("odOut"), note=document.getElementById("odNote");
+  const SWITCH=900;
+
+  function stages(){
+    return [
+      {id:"lint",        sec:8,   p:0.06},
+      {id:"typecheck",   sec:25,  p:0.04},
+      {id:"unit",        sec:95,  p:0.05},
+      {id:"build",       sec:140, p:0.01},
+      {id:"integration", sec:420, p:0.03},
+      {id:"e2e",         sec:Math.round(+eEl.value), p:(+fEl.value)/100}
+    ];
+  }
+  function order(list,how){
+    const c=list.slice();
+    if(how==="ratio")    return c.sort((a,b)=>a.sec/a.p-b.sec/b.p);
+    if(how==="worst")    return c.sort((a,b)=>b.sec/b.p-a.sec/a.p);
+    if(how==="duration") return c.sort((a,b)=>a.sec-b.sec);
+    return c.sort((a,b)=>b.p-a.p);
+  }
+  function analyse(seq){
+    let survive=1, cum=0, weighted=0, pAny=0;
+    const rows=seq.map(s=>{
+      cum+=s.sec;
+      const pHere=survive*s.p;
+      weighted+=pHere*cum; pAny+=pHere; survive*=(1-s.p);
+      return Object.assign({},s,{cum,pHere});
+    });
+    return {rows, green:cum, pAny, pGreen:survive,
+            timeToRed: pAny>0?weighted/pAny:0};
+  }
+
+  function draw(){
+    const list=stages(), seq=order(list,oEl.value), m=analyse(seq);
+    document.getElementById("odEo").textContent=Math.round(+eEl.value);
+    document.getElementById("odFo").textContent=Math.round(+fEl.value);
+    /* parallelising the three cheap stages only shortens the critical path */
+    const fast=["lint","typecheck","unit"];
+    const parallelGreen = Math.max(...list.filter(s=>fast.includes(s.id)).map(s=>s.sec))
+                        + list.filter(s=>!fast.includes(s.id)).reduce((a,s)=>a+s.sec,0);
+    const green = pEl.checked?parallelGreen:m.green;
+    const cost = green + (green>600?SWITCH:0);
+    const alt = analyse(order(list, oEl.value==="ratio"?"worst":"ratio"));
+
+    const w=cv.clientWidth||660, h=30+seq.length*17+20, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("cumulative time when each stage would fail", 116, 12);
+    ctx.textAlign="right"; ctx.fillText("P(first fail here)", w-14, 12);
+
+    const L=112, R=w-116, span=R-L;
+    m.rows.forEach((r,i)=>{
+      const y=24+i*17;
+      ctx.textAlign="right"; ctx.font="10.5px ui-monospace, monospace"; ctx.fillStyle=PC.ink;
+      ctx.fillText(r.id, L-10, y+6);
+      const bw=Math.max(1,(r.cum/m.green)*span);
+      ctx.fillStyle="#EDF1F4"; ctx.fillRect(L,y,span,11);
+      ctx.fillStyle= r.pHere>0.04?PC.bad : r.pHere>0.02?PC.warn : PC.line;
+      ctx.fillRect(L,y,bw,11);
+      ctx.textAlign="left"; ctx.font="9.5px ui-monospace, monospace"; ctx.fillStyle=PC.text;
+      ctx.fillText((r.cum/60).toFixed(1)+"m", R+8, y+6);
+      ctx.textAlign="right"; ctx.fillStyle= r.pHere>0.04?PC.bad:PC.ink;
+      ctx.fillText((r.pHere*100).toFixed(1)+"%", w-14, y+6);
+    });
+
+    const yb=24+seq.length*17+6;
+    const x=L+(m.timeToRed/m.green)*span;
+    ctx.setLineDash([3,3]); ctx.strokeStyle=PC.bad; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(x,20); ctx.lineTo(x,yb); ctx.stroke(); ctx.setLineDash([]);
+    ctx.textAlign="left"; ctx.font="700 10px Archivo, Arial"; ctx.fillStyle=PC.bad;
+    ctx.fillText("expected time to red "+(m.timeToRed/60).toFixed(1)+" min", 14, yb+8);
+
+    out.innerHTML=
+      '<div><span>green run</span><b>'+(green/60).toFixed(1)+' min</b></div>'+
+      '<div><span>P(fails somewhere)</span><b>'+(m.pAny*100).toFixed(1)+'%</b></div>'+
+      '<div><span>expected time to red</span><b style="color:'+(m.timeToRed>600?PC.bad:PC.ok)+'">'+
+        (m.timeToRed/60).toFixed(1)+' min</b></div>'+
+      '<div><span>other ordering</span><b>'+(alt.timeToRed/60).toFixed(1)+' min</b></div>'+
+      '<div><span>developer time per run</span><b style="color:'+(green>600?PC.bad:PC.ok)+'">'+
+        (cost/60).toFixed(0)+' min</b></div>'+
+      '<div><span>context switch</span><b style="font-size:11.5px;color:'+(green>600?PC.bad:PC.ok)+'">'+
+        (green>600?"yes":"no")+'</b></div>';
+
+    let msg='The total green run is <b>'+(green/60).toFixed(1)+
+      ' min</b> and the chance of failing somewhere is <b>'+(m.pAny*100).toFixed(1)+
+      '%</b> — <b>neither depends on the order</b>. What does depend on it is how long you wait to be told: <b>'+
+      (m.timeToRed/60).toFixed(1)+' min</b> here against <b>'+(alt.timeToRed/60).toFixed(1)+
+      ' min</b> for the opposite ordering, a factor of '+(Math.max(m.timeToRed,alt.timeToRed)/Math.min(m.timeToRed,alt.timeToRed)).toFixed(1)+'. ';
+    if(oEl.value==="ratio")
+      msg+='Sorting by duration ÷ failure rate is the optimum: cheapest evidence first, regardless of which stage finds the more serious problem.';
+    else if(oEl.value==="pfail")
+      msg+='Sorting by failure rate alone ignores cost, so an expensive stage that fails often still blocks the cheap ones behind it.';
+    else if(oEl.value==="duration")
+      msg+='Sorting by duration alone is close to optimal here, because the cheap stages also happen to fail often — but it is the ratio that is doing the work.';
+    else
+      msg+='This is the ordering a pipeline drifts into when stages are appended as they are written.';
+    if(pEl.checked)
+      msg+=' Parallelising the three cheap stages saves only '+((m.green-parallelGreen)/60).toFixed(1)+
+           ' min — the long tail is the critical path, so sharding the slow suite is the change that matters.';
+    if(green>600)
+      msg+=' <b>At '+(green/60).toFixed(1)+' min the author will not wait</b>, so each run costs roughly '+
+           (cost/60).toFixed(0)+' min of elapsed attention once the context switch back is counted — which is chapter 1\u2019s fixed merge cost, and it lengthens the optimal branch.';
+    note.innerHTML=msg;
+  }
+  [oEl,pEl,eEl,fEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+
+/* ============ demo 2: flaky tests ============ */
+(function(){
+  const cv=document.getElementById("cFlake"); if(!cv) return;
+  const nEl=document.getElementById("fkN"), fEl=document.getElementById("fkF"), rEl=document.getElementById("fkR"),
+        bEl=document.getElementById("fkB"), mEl=document.getElementById("fkM");
+  const out=document.getElementById("fkOut"), note=document.getElementById("fkNote");
+
+  function model(tests){
+    const flake=(+fEl.value)/100000;             /* slider is thousandths of a per cent */
+    const retries=Math.round(+rEl.value);
+    const realFail=(+bEl.value)/100;
+    const minutes=Math.round(+mEl.value);
+    const effective=Math.pow(flake,retries+1);   /* must flake on every attempt */
+    const pGreen=Math.pow(1-effective,tests);
+    const spurious=1-pGreen;
+    const runsPerGreen=1/Math.max(1e-9,pGreen);
+    const realCaught=1-Math.pow(1-realFail,retries+1);
+    return {tests,flake,retries,realFail,minutes,effective,pGreen,spurious,runsPerGreen,
+            realCaught, realMasked:1-realCaught,
+            wastedMin:(runsPerGreen-1)*minutes};
+  }
+
+  function draw(){
+    const tests=Math.round(+nEl.value), m=model(tests);
+    document.getElementById("fkNo").textContent=tests.toLocaleString();
+    document.getElementById("fkFo").textContent=(m.flake*100).toFixed(3);
+    document.getElementById("fkRo").textContent=m.retries;
+    document.getElementById("fkBo").textContent=Math.round(+bEl.value);
+    document.getElementById("fkMo").textContent=m.minutes;
+
+    const P=Plot(cv,{pad:[18,16,34,46],ratio:0.36});
+    P.o.xr=[0,10000]; P.o.yr=[0,100]; P.clear();
+    const ctx=P.ctx;
+    ctx.strokeStyle=PC.grid; ctx.lineWidth=1;
+    for(let g=0;g<=4;g++){ const v=g*25, y=Math.round(P.Y(v))+0.5;
+      ctx.beginPath(); ctx.moveTo(P.L,y); ctx.lineTo(P.R,y); ctx.stroke();
+      P.px(P.L-7,P.Y(v),v+"%",PC.text,"right","10.5px Archivo, Arial"); }
+    [0,2000,4000,6000,8000,10000].forEach(v=>{ const x=P.X(v);
+      ctx.strokeStyle=PC.grid; ctx.beginPath(); ctx.moveTo(x,P.T); ctx.lineTo(x,P.B); ctx.stroke();
+      P.px(x,P.B+13,v?(v/1000)+"k":"0",PC.text,"center","10px Archivo, Arial"); });
+    P.px((P.L+P.R)/2,P.B+27,"number of tests in the suite",PC.text,"center","600 10px Archivo, Arial");
+    P.px(P.L-7,P.Y(100)-11,"green",PC.text,"right","600 9.5px Archivo, Arial");
+
+    ctx.beginPath();
+    for(let i=0;i<=160;i++){ const n=10000*i/160, y=model(Math.max(1,n)).pGreen*100;
+      const X=P.X(n), Y=P.Y(y); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y); }
+    ctx.strokeStyle=PC.line; ctx.lineWidth=2.4; ctx.stroke();
+
+    /* the trust threshold: past ~5% spurious, engineers stop reading */
+    const y95=P.Y(95);
+    ctx.setLineDash([3,3]); ctx.strokeStyle=PC.warn; ctx.lineWidth=1.2;
+    ctx.beginPath(); ctx.moveTo(P.L,y95); ctx.lineTo(P.R,y95); ctx.stroke(); ctx.setLineDash([]);
+    P.px(P.R-4,y95-9,"95% — below this the suite gets re-run on reflex",PC.warn,"right","600 9.5px Archivo, Arial");
+
+    const cx=P.X(tests), cy=P.Y(m.pGreen*100);
+    ctx.strokeStyle=PC.ink; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.arc(cx,cy,5.5,0,7); ctx.stroke();
+    ctx.fillStyle="#fff"; ctx.beginPath(); ctx.arc(cx,cy,3.5,0,7); ctx.fill();
+
+    const maxTests=Math.floor(Math.log(0.95)/Math.log(1-m.effective));
+    out.innerHTML=
+      '<div><span>green on good code</span><b style="color:'+(m.pGreen>0.95?PC.ok:m.pGreen>0.8?PC.warn:PC.bad)+'">'+
+        (m.pGreen*100).toFixed(1)+'%</b></div>'+
+      '<div><span>spurious red</span><b style="color:'+(m.spurious>0.05?PC.bad:PC.ok)+'">'+
+        (m.spurious*100).toFixed(m.spurious<0.01?2:1)+'%</b></div>'+
+      '<div><span>runs per green</span><b>'+m.runsPerGreen.toFixed(2)+'</b></div>'+
+      '<div><span>wasted CI minutes</span><b>'+m.wastedMin.toFixed(0)+'</b></div>'+
+      '<div><span>real intermittent caught</span><b style="color:'+(m.realCaught<0.9?PC.bad:PC.ok)+'">'+
+        (m.realCaught*100).toFixed(0)+'%</b></div>'+
+      '<div><span>tests you can afford</span><b>'+(maxTests>1e6?"—":maxTests.toLocaleString())+'</b></div>';
+
+    let msg='A per-test flake rate of <b>'+(m.flake*100).toFixed(3)+'%</b> sounds negligible. Across <b>'+
+      tests.toLocaleString()+'</b> tests the suite passes on good code only <b>'+(m.pGreen*100).toFixed(1)+
+      '%</b> of the time, because it passes only if every test does. ';
+    if(m.retries>0)
+      msg+='With <b>'+m.retries+' retr'+(m.retries>1?'ies':'y')+'</b> a test must flake '+(m.retries+1)+
+           ' times in a row, so spurious red falls to <b>'+(m.spurious*100).toFixed(3)+
+           '%</b> — but a genuinely broken test that fails '+Math.round(+bEl.value)+'% of the time now passes <b>'+
+           (m.realMasked*100).toFixed(0)+'%</b> of the time. You have not made the suite more accurate, only more lenient, and the leniency runs in both directions.';
+    else if(m.spurious>0.05)
+      msg+='<b style="color:#D9534F">That is above the trust threshold.</b> At this rate engineers re-run without reading the output, and once that habit forms genuine failures are re-run too — which is the real cost, not the '+
+           m.wastedMin.toFixed(0)+' wasted CI minutes per merge. You can afford about <b>'+maxTests.toLocaleString()+
+           '</b> tests at this flake rate before crossing it.';
+    else
+      msg+='That is inside the trust budget, so a red build still means something. Note how steeply the curve falls as the suite grows — the flake rate you need scales inversely with the number of tests.';
+    note.innerHTML=msg;
+  }
+  [nEl,fEl,rEl,bEl,mEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+</script>
+</body>
+</html>

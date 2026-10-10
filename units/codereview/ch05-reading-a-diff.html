@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5. Reading a diff — Code Review</title>
+<meta name="description" content="An order of passes, the rename-detection cliff that doubles a diff, attention decay by file position, and the callers you cannot see.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span class="sep">/</span> <a href="index.html">Code Review</a> <span class="sep">/</span> Chapter 5</p>
+    <p class="chapter">Chapter 5 <span class="part">· The mechanics</span></p>
+    <h1>Reading a diff</h1>
+    <p class="lede">Edit 40% of a file while renaming it and the diff shows 80 lines. Edit 60% and the same operation shows <strong>200</strong> — because rename detection is a threshold, and crossing it silently reclassifies a move as a deletion plus an addition.</p>
+    <div class="meta">
+      <span><b>7</b> sections</span>
+      <span><b>2</b> demos</span>
+      <span><b>7</b> self-check questions</span>
+      <span>Roughly <b>30</b> minutes</span>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page">
+    <h2>On this page</h2>
+    <div data-sections></div>
+    <h2>Nearby chapters</h2>
+    <div data-nearby></div>
+  </nav>
+
+  <main>
+
+    <!-- ==================================================== -->
+    <section id="s-passes">
+      <h2>Five passes, three of them before the code</h2>
+      <div class="h2rule"></div>
+
+      <div class="tw">
+        <table>
+          <caption>What each pass is asking</caption>
+          <thead><tr><th>Pass</th><th>Read</th><th>Question</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>The description</td><td>Is this the right problem?</td></tr>
+            <tr><td>2</td><td>The tests</td><td>What does the author think this does?</td></tr>
+            <tr><td>3</td><td>The interfaces</td><td>What did this promise?</td></tr>
+            <tr><td>4</td><td>The diff, line by line</td><td>Is the implementation right?</td></tr>
+            <tr><td>5</td><td>What is missing</td><td>Which case is not handled?</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b class="tag">The first three can reject the change without reading it</b>
+        <p>Finding out at pass 1 that the problem is wrong costs a minute. Finding out after a line-by-line read costs an hour, and you have spent your attention establishing that code you are about to discard is correct.</p>
+        <p>Reading the <em>tests</em> before the implementation is the pass people skip and the highest-value one. The tests state what the author believed the change does — so you can check that belief against the description before checking the code against the belief.</p>
+      </div>
+
+      <p>The ordering also protects something measurable, which is the subject of section three: attention decays as a review goes on, and spending the early, sharp part of it on the wrong change is the most expensive mistake available.</p>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-rename">
+      <h2>The rename cliff</h2>
+      <div class="h2rule"></div>
+
+      <p>Git does not record renames. It infers them by comparing content: if a deleted file and an added file are similar enough — <strong>50% by default</strong> — it reports a rename. Otherwise it reports both operations in full.</p>
+
+      <!-- ------------- DEMO 1 ------------- -->
+      <div class="demo" id="demo-ren">
+        <div class="demo-top">
+          <h3>Demo 1 — moving a file and editing it</h3>
+          <p>A 100-line file renamed, with a varying fraction of its lines changed in the same commit.</p>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Lines edited <input type="range" id="rn-e" min="0" max="90" value="40" step="5"><span id="rn-ev" style="font-size:12px;color:#54677A"></span></label>
+            <label>Detection threshold <input type="range" id="rn-t" min="10" max="90" value="50" step="5"><span id="rn-tv" style="font-size:12px;color:#54677A"></span></label>
+          </div>
+
+          <div class="stage">
+            <div id="rn-bar" style="margin-bottom:12px"></div>
+            <div id="rn-view" style="font-family:var(--mono);font-size:12.5px"></div>
+          </div>
+
+          <div class="rgrid">
+            <div class="tile"><span class="k">Similarity</span><span class="v" id="rn-sim">—</span></div>
+            <div class="tile"><span class="k">Reported as</span><span class="v sm" id="rn-kind">—</span></div>
+            <div class="tile"><span class="k">Diff lines shown</span><span class="v" id="rn-size">—</span></div>
+            <div class="tile"><span class="k">Real change</span><span class="v sm" id="rn-real">—</span></div>
+            <div class="tile"><span class="k">Catch rate at that size</span><span class="v sm" id="rn-catch">—</span></div>
+            <div class="tile"><span class="k">Cliff at</span><span class="v sm" id="rn-cliff">—</span></div>
+          </div>
+
+          <p class="readout" id="rn-out"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>A 100-line file, renamed and edited in one commit</caption>
+          <thead><tr><th>Lines edited</th><th>Similarity</th><th>Reported as</th><th>Diff lines</th></tr></thead>
+          <tbody>
+            <tr><td>25%</td><td class="num">75%</td><td>rename + edit</td><td class="num">50</td></tr>
+            <tr><td>40%</td><td class="num">60%</td><td>rename + edit</td><td class="num">80</td></tr>
+            <tr><td>50%</td><td class="num">50%</td><td>rename + edit</td><td class="num">100</td></tr>
+            <tr><td><strong>60%</strong></td><td class="num">40%</td><td><strong>delete + add</strong></td><td class="num"><strong>200</strong></td></tr>
+            <tr><td>75%</td><td class="num">25%</td><td>delete + add</td><td class="num">200</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note warn">
+        <b class="tag">A 1.5× change in edit size produced a 2.5× change in diff size</b>
+        <p>The crossing point is at <strong>51%</strong> of lines edited, which is exactly git's <code>-M50</code> default. It is a cliff, not a gradient: one line either side of it, the same change presents as twice as much code with none of it marked as moved.</p>
+        <p>And by chapter 4's model that is not merely cosmetic. 80 diff lines is reviewed at a <strong>100%</strong> catch rate and 200 at <strong>80%</strong> — twenty points of detection lost to a display decision the author did not know they were making.</p>
+      </div>
+
+      <p class="big">Rename in one commit. Edit in another.</p>
+
+      <p>The reviewer then sees a rename with zero content change — which needs no reading at all — followed by an edit on the new path, at its true size. It costs the author one extra commit and it is the single highest-leverage habit in this chapter.</p>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-decay">
+      <h2>Where the findings land</h2>
+      <div class="h2rule"></div>
+
+      <!-- ------------- DEMO 2 ------------- -->
+      <div class="demo" id="demo-decay">
+        <div class="demo-top">
+          <h3>Demo 2 — attention across the files of one review</h3>
+          <p>Findings per file as the review goes on, with the option to split it in two.</p>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Files in the review <input type="range" id="dc-n" min="2" max="24" value="8"><span id="dc-nv" style="font-size:12px;color:#54677A"></span></label>
+            <label>Attention decay <input type="range" id="dc-d" min="2" max="30" value="12"><span id="dc-dv" style="font-size:12px;color:#54677A"></span></label>
+            <label class="chk"><input type="checkbox" id="dc-split"> Split into two reviews</label>
+          </div>
+
+          <div class="stage">
+            <div id="dc-bars"></div>
+          </div>
+
+          <div class="rgrid">
+            <div class="tile"><span class="k">First file</span><span class="v sm" id="dc-first">—</span></div>
+            <div class="tile"><span class="k">Last file</span><span class="v sm" id="dc-last">—</span></div>
+            <div class="tile"><span class="k">Ratio</span><span class="v" id="dc-ratio">—</span></div>
+            <div class="tile"><span class="k">Total findings</span><span class="v sm" id="dc-total">—</span></div>
+            <div class="tile"><span class="k">From the first three</span><span class="v sm" id="dc-front">—</span></div>
+            <div class="tile"><span class="k">Split would give</span><span class="v sm" id="dc-would">—</span></div>
+          </div>
+
+          <p class="readout" id="dc-out"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Findings per file by position, modelled</caption>
+          <thead><tr><th>Files in review</th><th>First file</th><th>Last file</th><th>Ratio</th></tr></thead>
+          <tbody>
+            <tr><td>3</td><td class="num">2.70</td><td class="num">2.12</td><td class="num">1.3×</td></tr>
+            <tr><td>8</td><td class="num">2.70</td><td class="num">1.17</td><td class="num">2.3×</td></tr>
+            <tr><td>20</td><td class="num">2.70</td><td class="num">0.28</td><td class="num"><strong>9.8×</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The last files in a pull request are reviewed markedly less carefully than the first, and nothing about their content caused it. Over eight files, the first three supply <strong>49% of the findings</strong> from 38% of the files.</p>
+
+      <div class="note tip">
+        <b class="tag">Two consequences, both actionable</b>
+        <p><strong>Put the file that matters first.</strong> Most tools order alphabetically, which is arbitrary — and the model says position is worth up to 9.8× in how hard a file gets looked at. Saying "start with <code>auth.py</code>" in the description is free.</p>
+        <p><strong>Splitting resets the curve.</strong> Eight files as one review yields 14.7 findings; as two reviews of four it yields 18.2 — a <strong>24% improvement</strong> from nothing but restarting attention. That is a <em>second</em> argument for splitting, independent of chapter 4's: smaller diffs have fewer defects to miss <em>and</em> each new review begins at full attention.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-invisible">
+      <h2>The code that is not in the diff</h2>
+      <div class="h2rule"></div>
+
+      <p>You are reviewing a change to a function. Its callers are almost certainly not on screen.</p>
+
+      <p>Modelled: a six-file diff in an 800-file repository, a function with 20 callers. The expected number of those callers visible in the diff is <strong>0.15</strong>. You are reviewing a signature change with <strong>99%</strong> of its blast radius off-screen.</p>
+
+      <div class="note key">
+        <b class="tag">What covers the gap, and what does not</b>
+        <p>For a <em>signature</em> change in a typed language, the compiler covers it — every caller either updates or fails to build. That is a real safety net and it is why chapter 3's type-coverage section matters here.</p>
+        <p>For a <strong>semantic</strong> change that keeps the signature, nothing covers it. The caller still compiles and now means something different.</p>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Five changes no compiler notices</caption>
+          <thead><tr><th>Change</th></tr></thead>
+          <tbody>
+            <tr><td>A unit changed — seconds to milliseconds</td></tr>
+            <tr><td>A default changed</td></tr>
+            <tr><td>An error is now raised instead of returned</td></tr>
+            <tr><td>An ordering guarantee dropped</td></tr>
+            <tr><td><code>None</code> became a valid return</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>So the reviewer's question is not "is this code correct" — which you can answer from the diff — but <strong>"what did this code promise, and does it still promise it?"</strong> That question is <em>also</em> answerable from the diff, which is what makes it the right one. The caller list is not.</p>
+
+      <p>When the answer is "the promise changed", the follow-up is mechanical: search for callers, and say so in the review rather than assuming the author did.</p>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-aids">
+      <h2>Reading aids</h2>
+      <div class="h2rule"></div>
+
+      <div class="tw">
+        <table>
+          <caption>Worth knowing before your next large diff</caption>
+          <thead><tr><th>Tool</th><th>Does</th></tr></thead>
+          <tbody>
+            <tr><td><code>git diff -w</code></td><td>Ignores whitespace — the manual version of chapter 3's formatter</td></tr>
+            <tr><td><code>git diff --color-moved</code></td><td>Colours moved blocks differently from added ones</td></tr>
+            <tr><td><code>git diff -M10%</code></td><td>Lowers the rename threshold when the cliff bit you</td></tr>
+            <tr><td><code>git log --follow</code></td><td>Traces history across renames</td></tr>
+            <tr><td><code>git blame -w -C</code></td><td>Blame ignoring whitespace and following moves between files</td></tr>
+            <tr><td>Reviewing commit by commit</td><td>If the author sequenced them, use the sequence</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p><code>--color-moved</code> is the one that changes the experience of a large refactor most. A 900-line diff where 850 lines are coloured as moves is a 50-line review, and the tool can tell you that in a way line counts cannot — which is chapter 4's point about counting sittings rather than lines.</p>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-traps">
+      <h2>Traps</h2>
+      <div class="h2rule"></div>
+
+      <div class="tw">
+        <table>
+          <caption>Where reading goes wrong</caption>
+          <thead><tr><th>Trap</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Starting at the first file</strong></td><td>Alphabetical order is arbitrary; position is worth up to 9.8×</td></tr>
+            <tr><td><strong>Renaming and editing in one commit</strong></td><td>Crossing 51% doubles the diff and costs 20 points of catch rate</td></tr>
+            <tr><td><strong>Reading the code before the tests</strong></td><td>You lose the author's stated intent as a cross-check</td></tr>
+            <tr><td><strong>Assuming callers were checked</strong></td><td>99% of them are off-screen; say it rather than assume it</td></tr>
+            <tr><td><strong>Trusting the compiler on semantics</strong></td><td>A unit change compiles perfectly</td></tr>
+            <tr><td><strong>Reviewing the squashed diff</strong></td><td>Discards a sequence the author built for you</td></tr>
+            <tr><td><strong>Pushing on when tired</strong></td><td>The tail of a long review is worth a fraction of the head</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The last one has a corollary worth stating: a reviewer who stops halfway through has lost far <em>less</em> than half the value, because the half they did was the sharp half. Stopping and returning tomorrow is better than finishing tired, and saying "I have reviewed the first four files" is a legitimate review state.</p>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-check">
+      <h2>Check yourself</h2>
+      <div class="h2rule"></div>
+
+      <div class="check">
+        <details>
+          <summary>What should you read before the diff itself?</summary>
+          <div class="ans">
+            <p>The description, the tests, and the interfaces — in that order. All three can <em>reject</em> the change without reading the implementation, and finding out at pass 1 that the problem is wrong costs a minute where finding out afterwards costs an hour. Reading the tests before the code is the pass people skip and the highest-value one: they state what the author believed the change does, so you can check that belief against the description before checking the code against the belief.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Why does renaming a file sometimes double the diff?</summary>
+          <div class="ans">
+            <p>Because git does not record renames — it infers them by content similarity, defaulting to 50%. Editing 40% of a renamed 100-line file gives 60% similarity and shows as a rename plus 80 diff lines; editing 60% gives 40% similarity and shows as a <em>delete plus an add</em> at <strong>200</strong> lines. The crossing point measured at <strong>51%</strong> of lines edited. It is a cliff, not a gradient.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Is that cliff just cosmetic?</summary>
+          <div class="ans">
+            <p>No — it moves the change along chapter 4's detection curve. 80 diff lines is reviewed at a 100% catch rate and 200 at <strong>80%</strong>, so twenty points of detection are lost to a display decision the author did not know they were making. The fix costs one commit: rename in one, edit in another. The reviewer then sees a rename with zero content change followed by an edit at its true size.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Does file position affect how carefully a file is reviewed?</summary>
+          <div class="ans">
+            <p>Substantially. Modelled attention decay gives the first file 2.70 findings and the last 1.17 over eight files — a 2.3× difference — rising to <strong>9.8×</strong> over twenty. Nothing about the content caused that. Over eight files the first three supply <strong>49%</strong> of the findings from 38% of the files, so the file that matters should be first, and most tools order alphabetically instead.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Chapter 4 said splitting helps. Does this chapter add anything?</summary>
+          <div class="ans">
+            <p>A second, independent effect. Chapter 4's argument was that smaller diffs have fewer defects to miss. This one is that <strong>each new review restarts attention at full</strong>: eight files as one review yields 14.7 findings, and as two reviews of four it yields 18.2 — a <strong>24%</strong> improvement from resetting the curve alone, before any of chapter 4's effect. The two compound.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>How much of a function's blast radius is visible while you review it?</summary>
+          <div class="ans">
+            <p>Almost none. Modelled with a six-file diff in an 800-file repository and 20 callers, the expected number of callers visible is <strong>0.15</strong> — you are reviewing with <strong>99%</strong> of the blast radius off-screen. For a signature change in a typed language the compiler covers it. For a semantic change that keeps the signature, nothing does: the caller still compiles and now means something else.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>What question should you ask instead of "is this correct"?</summary>
+          <div class="ans">
+            <p><strong>"What did this code promise, and does it still promise it?"</strong> A unit changing from seconds to milliseconds, a default changing, an error being raised instead of returned, an ordering guarantee dropped, <code>None</code> becoming a valid return — none of these are visible to a compiler and all are visible in the diff. That is what makes it the right question: it is answerable from what is on screen, and the caller list is not.</p>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-recap">
+      <div class="recap">
+        <h2>Ten things to carry forward</h2>
+        <ol>
+          <li><b>Five passes; three of them before reading code.</b> They can reject the change for free.</li>
+          <li><b>Read the tests before the implementation</b> — they state the author's intent.</li>
+          <li><b>Rename detection is a cliff at 51% edited,</b> not a gradient.</li>
+          <li><b>Crossing it turns 80 diff lines into 200</b> and costs 20 points of catch rate.</li>
+          <li><b>Rename in one commit, edit in another.</b></li>
+          <li><b>The first file gets 2.3× the attention of the eighth,</b> 9.8× of the twentieth.</li>
+          <li><b>Put the file that matters first;</b> alphabetical is arbitrary.</li>
+          <li><b>Splitting resets attention — 24% more findings</b> on top of chapter 4's effect.</li>
+          <li><b>99% of a function's callers are off-screen</b> while you review it.</li>
+          <li><b>Ask what the code promised,</b> not whether it is correct.</li>
+        </ol>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<footer>
+  <div class="foot-inner">
+    <div class="fi-grid">
+      <div class="fi">
+        <h3>What comes next</h3>
+        <p>Chapter 6 is writing the comment: blocking versus advisory, the question form, and the comments that cost more than they save.</p>
+      </div>
+      <div class="fi">
+        <h3>About the rename figures</h3>
+        <p>The detector is real — it computes content similarity with <code>difflib.SequenceMatcher</code>, the same idea git uses, and reports a rename above the threshold. The 51% crossing point is the output of a binary search over edit fractions, not a quoted default.</p>
+      </div>
+      <div class="fi">
+        <h3>The models</h3>
+        <p>Attention decay and caller visibility are models, stated as such, each implemented and asserted. Their parameters are visible in the demos so you can see how much the conclusions depend on them.</p>
+      </div>
+    </div>
+    <div class="pager" data-pager></div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">&uarr;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* =============================================================
+   Demo 1 — rename detection
+   ============================================================= */
+(function(){
+  const N = 100, DENSITY = 0.06, SCALE = 124.3, CAP = 12;
+  const caught = loc => loc ? Math.min(1, (CAP * (1 - Math.exp(-loc / SCALE))) / (DENSITY * loc)) : 1;
+
+  function draw(){
+    const edited = +document.getElementById("rn-e").value;
+    const thr = +document.getElementById("rn-t").value;
+    document.getElementById("rn-ev").textContent = edited + "% of lines";
+    document.getElementById("rn-tv").textContent = thr + "% similarity";
+    /* with N distinct lines, similarity is exactly the unedited fraction */
+    const sim = (N - edited) / N * 100;
+    const isRename = sim >= thr;
+    const size = isRename ? edited * 2 : N * 2;
+    const cliff = 100 - thr;
+
+    const host = document.getElementById("rn-bar");
+    host.innerHTML = "";
+    const wrap = document.createElement("div");
+    wrap.style.cssText = "position:relative;height:26px;background:#EFF2F5;border-radius:3px;overflow:hidden";
+    const fill = document.createElement("div");
+    fill.style.cssText = "height:100%;width:" + sim + "%;background:" +
+      (isRename ? "#3FB984" : "#E2574C") + ";transition:width .12s";
+    wrap.appendChild(fill);
+    const mark = document.createElement("div");
+    mark.style.cssText = "position:absolute;top:0;bottom:0;left:" + thr + "%;width:2px;background:#0C1D30";
+    wrap.appendChild(mark);
+    host.appendChild(wrap);
+    const cap = document.createElement("p");
+    cap.style.cssText = "margin:4px 0 0;font-size:11.5px;color:#7D8EA0";
+    cap.textContent = "bar = content similarity; the line is the detection threshold";
+    host.appendChild(cap);
+
+    const view = document.getElementById("rn-view");
+    view.innerHTML = "";
+    const lines = isRename
+      ? ["rename  src/old.py -> src/new.py", "  " + edited + " lines changed"]
+      : ["delete  src/old.py   (" + N + " lines)", "add     src/new.py   (" + N + " lines)"];
+    lines.forEach(l => {
+      const d = document.createElement("div");
+      d.style.cssText = "color:" + (isRename ? "#166B47" : "#9A2E22");
+      d.textContent = l;
+      view.appendChild(d);
+    });
+
+    setTile("rn-sim", sim.toFixed(0) + "%");
+    setTile("rn-kind", isRename ? "rename + edit" : "delete + add");
+    setTile("rn-size", size);
+    setTile("rn-real", edited * 2 + " lines");
+    setTile("rn-catch", Math.round(caught(size) * 100) + "%");
+    setTile("rn-cliff", cliff + "% edited");
+
+    let msg;
+    if (!isRename){
+      const lost = Math.round((caught(edited * 2) - caught(size)) * 100);
+      msg = "<b>Similarity " + sim.toFixed(0) + "% is below the " + thr + "% threshold</b>, so the same " +
+            "operation is reported as a delete plus an add: <b>" + size + " diff lines</b> where the real " +
+            "change is " + (edited * 2) + ". Nothing is marked as moved. By chapter 4's model that costs <b>" +
+            lost + " points</b> of catch rate — from a display decision, not from the code.";
+    } else if (sim - thr < 8){
+      msg = "<b>Just inside the threshold.</b> Similarity " + sim.toFixed(0) + "% against a " + thr +
+            "% bar — a few more edited lines and this becomes a " + (N * 2) + "-line diff instead of a " +
+            size + "-line one. That is the cliff: it is not a gradient, and the author gets no warning " +
+            "that they are near it.";
+    } else {
+      msg = "Comfortably detected as a rename, so the diff shows <b>" + size + " lines</b> — the actual " +
+            "edit. Move the slider right and watch what happens when similarity drops past " + thr + "%.";
+    }
+    document.getElementById("rn-out").innerHTML = msg;
+  }
+  ["rn-e","rn-t"].forEach(id => document.getElementById(id).addEventListener("input", draw));
+  draw();
+})();
+
+/* =============================================================
+   Demo 2 — attention decay
+   ============================================================= */
+(function(){
+  const PER_FILE = 3, BASE = 0.9;
+  const findings = (n, decay) =>
+    Array.from({length:n}, (_, i) => PER_FILE * BASE * Math.exp(-decay * i));
+
+  function draw(){
+    const n = +document.getElementById("dc-n").value;
+    const decay = +document.getElementById("dc-d").value / 100;
+    const split = document.getElementById("dc-split").checked;
+    document.getElementById("dc-nv").textContent = n + " files";
+    document.getElementById("dc-dv").textContent = decay.toFixed(2) + " per file";
+
+    const single = findings(n, decay);
+    const half = Math.ceil(n / 2);
+    const a = findings(half, decay), b = findings(n - half, decay);
+    const splitArr = [...a, ...b];
+    const shown = split ? splitArr : single;
+    const max = PER_FILE * BASE;
+
+    const host = document.getElementById("dc-bars");
+    host.innerHTML = "";
+    shown.forEach((v, i) => {
+      const isSecond = split && i >= half;
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;align-items:center;gap:9px;margin-bottom:3px";
+      const lab = document.createElement("span");
+      lab.style.cssText = "min-width:92px;font-size:12px;color:#54677A;font-family:var(--mono)";
+      lab.textContent = "file " + (i + 1) + (split && i === half ? "  ⟵ new" : "");
+      const bar = document.createElement("div");
+      bar.style.cssText = "flex:1;height:15px;background:#EFF2F5;border-radius:2px;overflow:hidden";
+      const fill = document.createElement("div");
+      fill.style.cssText = "height:100%;width:" + (v / max * 100) + "%;background:" +
+        (isSecond ? "#7C8CF8" : "#E2574C");
+      bar.appendChild(fill);
+      const num = document.createElement("span");
+      num.style.cssText = "min-width:44px;text-align:right;font-size:12px;font-variant-numeric:tabular-nums";
+      num.textContent = v.toFixed(2);
+      row.append(lab, bar, num);
+      host.appendChild(row);
+    });
+
+    const total = shown.reduce((x, y) => x + y, 0);
+    const singleTotal = single.reduce((x, y) => x + y, 0);
+    const splitTotal = splitArr.reduce((x, y) => x + y, 0);
+    setTile("dc-first", shown[0].toFixed(2));
+    setTile("dc-last", shown[shown.length - 1].toFixed(2));
+    setTile("dc-ratio", (single[0] / single[single.length - 1]).toFixed(1) + "×");
+    setTile("dc-total", total.toFixed(1));
+    setTile("dc-front", (shown.slice(0, 3).reduce((x, y) => x + y, 0)).toFixed(1) +
+      " (" + Math.round(100 * shown.slice(0,3).reduce((x,y)=>x+y,0) / total) + "%)");
+    setTile("dc-would", split ? "already split" : "+" + Math.round(100 * (splitTotal / singleTotal - 1)) + "%");
+
+    let msg;
+    if (split){
+      msg = "<b>Two reviews of " + half + " and " + (n - half) + " files: " + total.toFixed(1) +
+            " findings against " + singleTotal.toFixed(1) + " as one review.</b> The blue block is where " +
+            "attention restarts. That gain is <em>separate</em> from chapter 4's — smaller diffs have fewer " +
+            "defects to miss, and each new review also begins at full attention. The two compound.";
+    } else {
+      const r = single[0] / single[single.length - 1];
+      msg = "The first file gets <b>" + single[0].toFixed(2) + "</b> findings and the last <b>" +
+            single[single.length-1].toFixed(2) + "</b> — a <b>" + r.toFixed(1) + "×</b> difference caused " +
+            "entirely by position. Most tools order files alphabetically. Naming the important file in the " +
+            "description costs nothing and is worth up to that ratio.";
+    }
+    document.getElementById("dc-out").innerHTML = msg;
+  }
+  ["dc-n","dc-d","dc-split"].forEach(id => {
+    document.getElementById(id).addEventListener("input", draw);
+    document.getElementById(id).addEventListener("change", draw);
+  });
+  draw();
+})();
+
+initChapter("ch05-reading-a-diff.html");
+</script>
+</body>
+</html>

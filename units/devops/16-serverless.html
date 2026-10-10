@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Serverless and managed compute — DevOps</title>
+<meta name="description" content="What serverless actually is, where cold starts really come from and what they cost at the tail, the cost crossover against containers, event sources and the idempotency they demand, and the limits that decide fit.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%237C8CF8' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">DevOps</a><span class="sep">/</span><span>Chapter 16</span></p>
+    <p class="chno">Chapter 16 · Infrastructure</p>
+    <h1>Serverless and managed compute</h1>
+    <p class="lede">Chapter 15 ended with the argument for never modifying a server. Serverless takes it further: never having one. You hand over a function and an event source, and the platform decides when to run it, how many copies to run and what to charge you. The interesting questions are all quantitative — what cold starts really cost, and at what volume the economics turn against you.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapters 09, 13</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="model">
+<h2>What the word means</h2><div class="h2rule"></div>
+
+<p class="lead">There is obviously a server. The claim is narrower and more useful than the name suggests, and it is really four properties that happen to arrive together.</p>
+
+<div class="kv">
+<dt>No capacity decision</dt><dd>You do not choose an instance count. The platform runs as many concurrent copies as there are concurrent invocations, up to a limit you set. Chapter 11's autoscaler, with the lag removed and the decision taken from you.</dd>
+<dt>Scale to zero</dt><dd>No traffic, no instances, no bill. This is the property containers do not have, and it is why serverless dominates for anything intermittent.</dd>
+<dt>Billed per invocation and per gigabyte-second</dt><dd>Not per hour of a machine that might be idle. The unit of cost is the unit of work, which changes the economics entirely — in both directions.</dd>
+<dt>Event-driven by construction</dt><dd>The function is invoked by something: an HTTP request, a queue message, an object upload, a schedule, a database change. That shapes the programming model more than the absence of servers does.</dd>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th>Functions</th><th>Serverless containers</th><th>Containers on a cluster</th></tr></thead>
+<tbody>
+<tr><td>Examples</td><td>Lambda, Cloud Run functions, Azure Functions</td><td>Cloud Run, Fargate, Container Apps</td><td>EKS, GKE, ECS on EC2</td></tr>
+<tr><td>Unit</td><td>A handler function</td><td>An image with an HTTP port</td><td>An image</td></tr>
+<tr><td>Scale to zero</td><td class="yes">Yes</td><td class="yes">Usually</td><td class="no">No</td></tr>
+<tr><td>Max duration</td><td class="no">15 min (Lambda)</td><td>Hours</td><td class="yes">Unbounded</td></tr>
+<tr><td>Cold start</td><td>100 ms – several seconds</td><td>Seconds, and image size matters</td><td class="yes">Only on scale-up</td></tr>
+<tr><td>You manage</td><td class="yes">Code and configuration</td><td>An image</td><td class="no">An image, a cluster and its upgrades</td></tr>
+<tr><td>Cost shape</td><td>Per invocation</td><td>Per request-second, often with a floor</td><td>Per hour, whether used or not</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The middle column is where a great deal of workload has settled, because it keeps the container from chapter 10 as the unit while removing the cluster from chapter 11 — and it is the option people forget exists when framing this as functions-versus-Kubernetes.</p>
+</section>
+
+<section id="coldstart">
+<h2>Cold starts, and where they actually come from</h2><div class="h2rule"></div>
+
+<p>A cold start is the platform creating a new execution environment: allocating a sandbox, loading your code, initialising the runtime, and running whatever is outside your handler. Everything after that is warm and costs nothing extra. The usual framing treats it as a general tax on serverless, and the arithmetic says something more specific.</p>
+
+<div class="eq plain"><code>cold fraction &nbsp;≈&nbsp; e<sup>−(λ ÷ N) × T<sub>idle</sub></sup> &nbsp;&nbsp;where&nbsp; N = concurrency = ⌈λ × duration⌉</code></div>
+<p class="where">An instance is reaped after <b>T<sub>idle</sub></b> without a request. At steady load each of the N instances receives λ/N requests a second, so the chance of a gap long enough to be reaped falls away exponentially. Substituting N = λD, the rate cancels: the steady-state cold fraction depends on the ratio of idle timeout to duration, not on how busy you are.</p>
+
+<div class="demo" id="d-cold">
+  <div class="demo-top"><div class="demo-title">Cold starts against request rate</div><div class="demo-hint">Sweep the rate from 0.001 to 100 — then look at what a spike and a deploy cost</div></div>
+  <div class="demo-body">
+    <canvas id="cCold" aria-label="Cold start fraction and latency percentiles across request rates, with spike and deploy costs"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Request rate <b id="clRo">0.01</b>/s</label><input type="range" id="clR" min="0" max="1000" value="330"></div>
+      <div class="ctrl"><label>Duration <b id="clDo">200</b> ms</label><input type="range" id="clD" min="10" max="3000" step="10" value="200"></div>
+      <div class="ctrl"><label>Cold start <b id="clCo">900</b> ms</label><input type="range" id="clC" min="50" max="5000" step="50" value="900"></div>
+      <div class="ctrl"><label>Idle timeout <b id="clIo">300</b> s</label><input type="range" id="clI" min="30" max="900" step="30" value="300"></div>
+      <div class="ctrl"><label>Traffic spike <b id="clSo">10</b>×</label><input type="range" id="clS" min="1" max="50" value="10"></div>
+      <div class="ctrl"><label>Provisioned warm <b id="clPo">0</b></label><input type="range" id="clP" min="0" max="40" value="0"></div>
+    </div>
+    <div class="rgrid" id="clOut"></div>
+    <div class="readout" id="clNote"></div>
+  </div>
+</div>
+
+<div class="kv">
+<dt>Cold starts are a low-traffic problem, not a throughput one</dt><dd>At one request every seventeen minutes, <b>74%</b> of requests are cold. At 100 requests a second, essentially none are — the instance never idles long enough to be reaped. Busy functions do not have a steady-state cold start problem, and quiet ones have almost nothing else.</dd>
+<dt>The visible band is narrow</dt><dd>With a five-minute idle timeout, the cold fraction sits between 1% and 50% only for rates between about <b>0.0023 and 0.0154</b> a second — one request every 65 to 433 seconds. Below that almost everything is cold; above it almost nothing is. Most functions are firmly in one regime or the other.</dd>
+<dt>1% cold puts the whole cold start into your p99</dt><dd>At 5% cold, p50 stays at <b>200&nbsp;ms</b> and p99 becomes <b>1,100&nbsp;ms</b>. Percentiles do not average — anything above one per cent is entirely visible at the tail and entirely invisible at the median, which is why a dashboard showing mean latency will never reveal this.</dd>
+<dt>Spikes and deploys are cold-start events regardless</dt><dd>Even at 100 requests a second, a 10× spike needs <b>180</b> new instances and every one is cold, and each deploy replaces all <b>20</b>. So the steady-state number being near zero does not mean you never see them — it means you see them at exactly the moments that already matter.</dd>
+</div>
+
+<div class="box tip"><b class="tag">What actually reduces cold starts</b>
+<p style="margin-bottom:6px"><strong>Do less outside the handler.</strong> Initialisation code, dependency injection containers, large framework bootstraps and eager connections all run on every cold start. Lazy-initialise anything not needed on the first request, and be aware that a fat dependency tree costs you on every new instance rather than once.</p>
+<p style="margin-bottom:6px"><strong>Choose the runtime deliberately.</strong> Go and Rust start in tens of milliseconds; a JVM or .NET framework can take seconds. Snapshot features — Lambda SnapStart, CRaC — restore a pre-initialised memory image and cut this substantially for exactly those runtimes.</p>
+<p style="margin-bottom:0"><strong>Provisioned concurrency, knowingly.</strong> Keeping N instances warm removes steady-state cold starts entirely, and it also removes scale-to-zero, which was the reason to be here. You are now paying an hourly rate for idle capacity — a container with extra steps. It is right for a latency-sensitive endpoint with a predictable floor, and a signal to reconsider the platform if you need much of it.</p>
+</div>
+</section>
+
+<section id="cost">
+<h2>Where the economics turn</h2><div class="h2rule"></div>
+
+<p>Per-invocation billing is extraordinarily cheap when there is little traffic and extraordinarily expensive when there is a lot, because the price per unit of work does not fall with volume the way a rented machine's does. The crossover is calculable and it is lower than most people expect.</p>
+
+<div class="demo" id="d-cost">
+  <div class="demo-top"><div class="demo-title">Functions against containers, monthly</div><div class="demo-hint">Find the crossover, then set peak-to-average to 20 and look again</div></div>
+  <div class="demo-body">
+    <canvas id="cCost" aria-label="Monthly cost of functions and containers plotted against request rate, with the crossover marked"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Request rate <b id="coRo">25</b>/s</label><input type="range" id="coR" min="0" max="1000" value="500"></div>
+      <div class="ctrl"><label>Duration <b id="coDo">200</b> ms</label><input type="range" id="coD" min="10" max="3000" step="10" value="200"></div>
+      <div class="ctrl"><label>Memory <b id="coMo">512</b> MB</label><input type="range" id="coM" min="128" max="4096" step="128" value="512"></div>
+      <div class="ctrl"><label>Peak-to-average <b id="coPo">1</b>×</label><input type="range" id="coP" min="1" max="40" value="1"></div>
+      <div class="ctrl"><label>Minimum containers <b id="coNo">2</b></label><input type="range" id="coN" min="1" max="6" value="2"></div>
+    </div>
+    <div class="rgrid" id="coOut"></div>
+    <div class="readout" id="coNote"></div>
+  </div>
+</div>
+
+<div class="kv">
+<dt>For steady traffic the crossover is low</dt><dd>About <b>29 requests a second</b> at these parameters. Below it functions are cheaper, often by a lot — at 0.5 a second it is <b>$2</b> against <b>$140</b>. Above it containers win and the gap widens linearly: at 400 a second it is <b>$1,962</b> against <b>$280</b>, a factor of seven.</dd>
+<dt>Peakiness moves it enormously</dt><dd>Containers must be sized for the peak and paid for all month; functions pay for the area under the curve. Above a peak-to-average ratio of about <b>8.8×</b> there is no crossover at all — functions are cheaper at every volume, because the idle capacity you are renting for the peak costs more than the invocations you actually served.</dd>
+<dt>Memory is a direct multiplier</dt><dd>Billing is gigabyte-seconds, so going from 512&nbsp;MB to 2&nbsp;GB takes the bill at 100 requests a second from <b>$491</b> to <b>$1,805</b>. It is not free headroom. On some platforms more memory also means more CPU, so a function can get <em>cheaper</em> by being given more memory if that shortens the duration proportionally — worth measuring rather than assuming in either direction.</dd>
+<dt>None of this counts the operational cost</dt><dd>The container column omits the cluster, its upgrades, the on-call for node problems and the engineer-time in chapters 11 and 12. For a small team that can easily exceed the compute difference, which is why the crossover is a starting point for a conversation rather than the answer to it.</dd>
+</div>
+</section>
+
+<section id="events">
+<h2>Event sources, and the guarantee they impose</h2><div class="h2rule"></div>
+
+<p>Almost every serverless event source delivers <strong>at least once</strong>. Not exactly once — the platform will occasionally invoke your function twice with the same event, because the alternative is losing events. That is not a defect to be configured away; it is a requirement placed on your code.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Source</th><th>Delivery</th><th>On failure</th><th>Watch for</th></tr></thead>
+<tbody>
+<tr><td>HTTP / API Gateway</td><td>Synchronous, once</td><td>The caller sees the error</td><td>The gateway's own timeout is often shorter than the function's</td></tr>
+<tr><td>Queue (SQS, Pub/Sub)</td><td class="no">At least once</td><td>Redelivered, then to a dead-letter queue</td><td class="yes">A poison message retried forever is a real and expensive failure — always configure the DLQ</td></tr>
+<tr><td>Object storage events</td><td class="no">At least once</td><td>Retried</td><td>A function that writes to the same bucket it is triggered by is an infinite loop with a bill</td></tr>
+<tr><td>Stream (Kinesis, DynamoDB)</td><td>Ordered per shard, at least once</td><td class="no">Blocks the shard until it succeeds or expires</td><td class="no">One bad record halts everything behind it. Use a failure destination and bisect-on-error</td></tr>
+<tr><td>Schedule</td><td>At least once</td><td>Retried</td><td>Overlapping runs if the previous has not finished</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn"><b class="tag">Idempotency, again, and this time it is not optional</b>
+<p style="margin-bottom:0">Chapter 3 argued for idempotent scripts and chapter 15 made it the property convergence depends on. Here it is a correctness requirement enforced by the platform: your handler <em>will</em> be invoked twice for the same event and it must not charge the card twice. The standard implementation is an idempotency key — the event's own identifier, or one supplied by the caller — recorded in a store with a conditional write so the second attempt observes the first and returns its result. Two mistakes are common: checking for the key and then writing it as two operations, which is chapter 3's lockfile race, and expiring the record faster than the source's maximum redelivery window, which quietly reopens the hole.</p>
+</div>
+</section>
+
+<section id="limits">
+<h2>The limits that decide whether it fits</h2><div class="h2rule"></div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Limit</th><th>Typical</th><th>What it rules out</th></tr></thead>
+<tbody>
+<tr><td>Maximum duration</td><td>15 minutes</td><td>Long batch jobs, big migrations, video transcoding. Split into steps or use a container</td></tr>
+<tr><td>Payload size</td><td>6 MB synchronous, 256 KB async</td><td>Passing large objects. Put them in storage and pass a reference</td></tr>
+<tr><td>Account concurrency</td><td>1,000 by default</td><td class="no">Shared across every function in the account, so one runaway starves the others. Set per-function reserved concurrency</td></tr>
+<tr><td>Local storage</td><td>512 MB – 10 GB of <code>/tmp</code></td><td>Anything that needs real disk. It also persists between warm invocations, which is a cache and a data-leak risk</td></tr>
+<tr><td>No inbound connections</td><td>—</td><td>WebSockets and long polling, which need a separate gateway to hold the connection</td></tr>
+<tr><td>Statelessness between calls</td><td>—</td><td>In-memory session state. Anything warm-cached must be safe to lose at any moment</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box trap"><b class="tag">The connection pool problem, which catches everyone</b>
+<p style="margin-bottom:0">A container holds one connection pool shared by all its concurrent requests. A function holds one pool <em>per execution environment</em>, and there is one environment per concurrent invocation — so a thousand concurrent invocations means a thousand connection attempts against a database sized for a few dozen. It exhausts <code>max_connections</code>, and because each cold start opens its connections during initialisation, the failure arrives precisely during the traffic spike that caused the scale-up. The remedies are a connection proxy that multiplexes (RDS Proxy, PgBouncer from the PostgreSQL unit), reserved concurrency to cap the fan-out, or a data store designed for this access pattern — which is much of why DynamoDB and serverless are so often paired. It is also chapter 4's port-exhaustion argument arriving from the other side: a shortage of connections created by having too many independent clients rather than too few.</p>
+</div>
+
+<div class="cards">
+<div>
+<h5>Serverless suits</h5>
+<p>Intermittent or unpredictable traffic, where scale-to-zero and peak-shaped billing both pay. Event processing that is naturally per-item. Glue between managed services. Scheduled work. Anything where a small team's time is worth more than the compute difference, and anything whose peak-to-average ratio is above about ten.</p>
+</div>
+<div>
+<h5>Serverless suits badly</h5>
+<p>Sustained high throughput, where the crossover has been passed by a wide margin. Latency-sensitive work with a strict tail budget, unless you provision warm capacity and accept what that means. Long-running or stateful processing. Anything with a large per-instance initialisation cost, or a database connection model that cannot tolerate the fan-out.</p>
+</div>
+</div>
+</section>
+
+<section id="close">
+<h2>Check yourself</h2><div class="h2rule"></div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>Your function serves 100 requests a second and someone raises cold starts as a latency concern. Is it one?
+<button class="reveal">Show answer</button><div class="ans">Not in steady state. At 100 requests a second with a 200&nbsp;ms duration, concurrency is about twenty and each instance receives around five requests a second — so the chance of a gap exceeding a five-minute idle timeout is effectively zero and essentially no request is cold. Cold starts are a problem of low traffic, not of throughput. But they are still a problem for this function at two specific moments: a 10× spike needs 180 new instances and every one of them is cold, and every deploy replaces all twenty. So the honest answer is that the steady-state number is near zero and the events that produce cold starts are exactly the ones that already matter — a traffic surge and a release. If the tail during those windows is unacceptable, provisioned concurrency or a gradual rollout addresses it; a general worry about cold starts does not apply here.</div></li>
+
+<li>A function is invoked once every three minutes and users complain it is "sometimes slow". Explain precisely.
+<button class="reveal">Show answer</button><div class="ans">One invocation every 180 seconds against a 300-second idle timeout puts it in the narrow band where the instance is sometimes reaped between calls and sometimes not — the cold fraction at that rate is a meaningful percentage rather than approximately zero or approximately one. The user experience is bimodal: most calls take the warm duration and some take the warm duration plus the entire cold start, roughly 200&nbsp;ms against 1,100&nbsp;ms in the demo. "Sometimes slow" is exactly the right description and an average latency dashboard will show something unremarkable in between, which is why this often goes unexplained. Confirm with the platform's init-duration metric, which reports cold starts directly. Fixes in order of preference: reduce the initialisation work outside the handler, choose a faster-starting runtime, or provision one warm instance — the last being cheap at this volume, since one warm instance costs very little and this function is not benefiting much from scale-to-zero anyway.</div></li>
+
+<li>Your function bill is $2,000 a month for a steady 400 requests a second. What should you check?
+<button class="reveal">Show answer</button><div class="ans">Whether this workload should be on functions at all. At 400 requests a second, steady, the crossover was passed long ago: the model puts functions at about $1,962 against roughly $280 for containers sized to the same load — a factor of seven. Per-invocation pricing does not get cheaper with volume the way a rented machine does, so a workload that has grown into sustained high throughput has quietly outgrown the model. Before migrating, check two things that might close the gap. Memory: billing is gigabyte-seconds, so an over-provisioned memory setting is a direct multiplier, and on platforms where memory also scales CPU the optimum may be higher or lower than the current value — measure rather than assume. And peak-to-average: if the 400 a second is an average over a very spiky day, containers must be sized for the peak and paid for all month, which above a ratio of about nine makes functions cheaper again at any volume. If it is genuinely steady, the arithmetic is unambiguous.</div></li>
+
+<li>Why is a workload with a 20× peak-to-average ratio cheaper on functions at <em>any</em> volume?
+<button class="reveal">Show answer</button><div class="ans">Because the two pricing models charge for different things. Functions charge for the area under the traffic curve — you pay for the work actually done. Containers charge for provisioned capacity by the hour, and that capacity has to be sized for the peak or the peak fails, so you pay for the peak twenty-four hours a day while using a twentieth of it on average. The ratio between the two is roughly the peak-to-average multiple, and once it exceeds about 8.8× at these parameters the per-invocation premium is smaller than the idle-capacity premium at every volume — the lines never cross. Two caveats worth stating: autoscaling recovers some of the container side, though chapter 11 showed it is reactive and the scale-up lag is real, so you still over-provision to cover it. And the comparison assumes the peak genuinely must be served; if it can be queued and smoothed, the whole problem changes shape.</div></li>
+
+<li>A function triggered by a queue occasionally processes the same message twice and creates duplicate orders. Whose bug is it?
+<button class="reveal">Show answer</button><div class="ans">The function's. Queue-based event sources deliver at least once by design — the alternative is losing messages — so a duplicate invocation is expected behaviour rather than a platform fault, and no configuration removes it. The handler must be idempotent: derive a key from the message, such as its own identifier or a caller-supplied one, and record it in a store with a conditional write so a second attempt observes the first and returns the original result instead of repeating the work. Two implementation errors are common and both reopen the hole. Reading the key and then writing it as separate operations is a check-then-act race, exactly the lockfile problem from chapter 3, so it must be one atomic conditional write. And expiring the record sooner than the source's maximum redelivery window means a late redelivery finds no record and processes again. Configure the dead-letter queue at the same time, or a message that always fails is retried indefinitely at your expense.</div></li>
+
+<li>Your function scales to 800 concurrent executions during a spike and the database starts refusing connections. Explain and give three fixes.
+<button class="reveal">Show answer</button><div class="ans">Each execution environment holds its own connection pool, and there is one environment per concurrent invocation — so 800 concurrent executions means up to 800 independent clients each opening connections, against a database configured for perhaps a hundred. It exhausts <code>max_connections</code>, and because connections are opened during initialisation, the failure arrives precisely during the spike that caused the scale-up. Three fixes. Put a connection proxy in between — RDS Proxy or PgBouncer — which multiplexes many client connections onto a small pool, and is the standard answer. Set reserved concurrency on the function to cap the fan-out at something the database can serve, accepting throttling as the failure mode rather than a database outage, which is chapter 6's load-shedding argument. Or use a data store built for this access pattern, which is much of why DynamoDB and serverless are paired so often. Also worth checking that the function opens its connection outside the handler so it is reused across warm invocations rather than opened per request.</div></li>
+
+<li>You enable provisioned concurrency to fix cold starts. What have you given up?
+<button class="reveal">Show answer</button><div class="ans">Scale to zero, which was one of the four defining properties and usually the main reason to be on the platform. Provisioned concurrency keeps N environments warm and bills for them by the hour whether or not they are invoked, so you are now paying for idle capacity — which is what a container is, with a more restrictive programming model and a shorter maximum duration. That can still be the right call for a latency-sensitive endpoint with a predictable floor of traffic, where you provision for the floor and let on-demand handle the peak above it, keeping the peak-shaped billing where it pays. But if you find yourself provisioning enough to cover most of your traffic, the arithmetic has told you something: you have a steady workload, the cost crossover has probably been passed, and a serverless container platform such as Cloud Run or Fargate gives the same operational simplicity with pricing that suits sustained load better.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin-bottom:0">That closes the infrastructure part. Chapter 17 begins delivery: pipeline anatomy, why caching and test selection decide whether the feedback loop is ten minutes or fifty, and what makes a build reproducible.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 16</h2><p>Serverless and managed compute. Part of the DevOps unit — <a href="index.html">all 24 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 18 (deploying functions and traffic shifting by alias), 22 (tracing across event boundaries), 23 (cost and concurrency limits as reliability controls).</p></div>
+    <div><h2>Going deeper</h2><p>The AWS unit covers Lambda's operational surface. Each provider's quotas page is worth reading in full once — the limits section above is a summary of decisions those pages force.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: cold starts ============ */
+(function(){
+  const cv=document.getElementById("cCold"); if(!cv) return;
+  const rEl=document.getElementById("clR"), dEl=document.getElementById("clD"), cEl=document.getElementById("clC"),
+        iEl=document.getElementById("clI"), sEl=document.getElementById("clS"), pEl=document.getElementById("clP");
+  const out=document.getElementById("clOut"), note=document.getElementById("clNote");
+  const RMIN=0.0005, RMAX=500;
+  const NICE=[1,1.5,2,3,5,7,10];
+  const snap=v=>{ const k=Math.floor(Math.log10(v)), m=v/Math.pow(10,k);
+    let best=NICE[0]; for(const n of NICE) if(Math.abs(n-m)<Math.abs(best-m)) best=n;
+    return best*Math.pow(10,k); };
+  const posToRate=p=>snap(RMIN*Math.pow(RMAX/RMIN,p/1000));
+
+  function model(rate){
+    const D=Math.round(+dEl.value)/1000, coldMs=Math.round(+cEl.value),
+          idle=Math.round(+iEl.value), spike=Math.round(+sEl.value), prov=Math.round(+pEl.value);
+    const concurrency=Math.max(1,Math.ceil(rate*D));
+    const perInstance=rate/concurrency;
+    const gap=Math.exp(-perInstance*idle);
+    const covered=Math.min(1,prov/concurrency);
+    const coldFraction=Math.max(0,gap*(1-covered));
+    const spikeConc=Math.max(1,Math.ceil(rate*spike*D));
+    const newInstances=Math.max(0,spikeConc-Math.max(concurrency,prov));
+    const deployCold=Math.max(concurrency,prov);
+    const durMs=Math.round(+dEl.value);
+    return {rate,D,coldMs,idle,spike,prov,concurrency,perInstance,coldFraction,
+            newInstances,deployCold,durMs,
+            p50: coldFraction>0.5?durMs+coldMs:durMs,
+            p99: coldFraction>0.01?durMs+coldMs:durMs};
+  }
+
+  function draw(){
+    const rate=posToRate(+rEl.value), m=model(rate);
+    document.getElementById("clRo").textContent = rate<0.01?rate.toFixed(4):rate<1?rate.toFixed(3):rate<10?rate.toFixed(2):Math.round(rate);
+    document.getElementById("clDo").textContent=m.durMs;
+    document.getElementById("clCo").textContent=m.coldMs;
+    document.getElementById("clIo").textContent=m.idle;
+    document.getElementById("clSo").textContent=m.spike;
+    document.getElementById("clPo").textContent=m.prov;
+
+    const P=Plot(cv,{pad:[18,16,34,46],ratio:0.36});
+    P.o.xr=[0,1000]; P.o.yr=[0,100]; P.clear();
+    const ctx=P.ctx;
+    ctx.strokeStyle=PC.grid; ctx.lineWidth=1;
+    for(let g=0;g<=4;g++){ const v=g*25, y=Math.round(P.Y(v))+0.5;
+      ctx.beginPath(); ctx.moveTo(P.L,y); ctx.lineTo(P.R,y); ctx.stroke();
+      P.px(P.L-7,P.Y(v),v+"%",PC.text,"right","10.5px Archivo, Arial"); }
+    [0.001,0.01,0.1,1,10,100].forEach(v=>{
+      const pos=1000*Math.log(v/RMIN)/Math.log(RMAX/RMIN);
+      if(pos<0||pos>1000) return; const x=P.X(pos);
+      ctx.strokeStyle=PC.grid; ctx.beginPath(); ctx.moveTo(x,P.T); ctx.lineTo(x,P.B); ctx.stroke();
+      P.px(x,P.B+13,String(v),PC.text,"center","10px Archivo, Arial"); });
+    P.px((P.L+P.R)/2,P.B+27,"requests per second",PC.text,"center","600 10px Archivo, Arial");
+    P.px(P.L-7,P.Y(100)-11,"cold",PC.text,"right","600 9.5px Archivo, Arial");
+
+    ctx.beginPath();
+    for(let i=0;i<=200;i++){ const rr=posToRate(1000*i/200), y=model(rr).coldFraction*100;
+      const X=P.X(1000*i/200), Y=P.Y(y); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y); }
+    ctx.strokeStyle=PC.line; ctx.lineWidth=2.4; ctx.stroke();
+
+    /* the 1% line — above it, the cold start is entirely in your p99 */
+    const y1=P.Y(1);
+    ctx.setLineDash([3,3]); ctx.strokeStyle=PC.warn; ctx.lineWidth=1.2;
+    ctx.beginPath(); ctx.moveTo(P.L,y1); ctx.lineTo(P.R,y1); ctx.stroke(); ctx.setLineDash([]);
+    P.px(P.R-4,y1-9,"1% — the whole cold start lands in p99",PC.warn,"right","600 9.5px Archivo, Arial");
+
+    const cx=P.X(+rEl.value), cy=P.Y(m.coldFraction*100);
+    ctx.strokeStyle=PC.ink; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.arc(cx,cy,5.5,0,7); ctx.stroke();
+    ctx.fillStyle="#fff"; ctx.beginPath(); ctx.arc(cx,cy,3.5,0,7); ctx.fill();
+
+    const cf=m.coldFraction;
+    out.innerHTML=
+      '<div><span>concurrency</span><b>'+m.concurrency+'</b></div>'+
+      '<div><span>cold requests</span><b style="color:'+(cf>0.1?PC.bad:cf>0.01?PC.warn:PC.ok)+'">'+
+        (cf*100).toFixed(cf<0.01?2:1)+'%</b></div>'+
+      '<div><span>p50</span><b>'+m.p50+' ms</b></div>'+
+      '<div><span>p99</span><b style="color:'+(m.p99>m.p50?PC.bad:PC.ok)+'">'+m.p99+' ms</b></div>'+
+      '<div><span>a '+m.spike+'× spike needs</span><b style="color:'+(m.newInstances>10?PC.warn:PC.ink)+'">'+
+        m.newInstances+' cold</b></div>'+
+      '<div><span>each deploy costs</span><b>'+m.deployCold+' cold</b></div>';
+
+    let msg='At <b>'+(rate<1?rate.toFixed(3):Math.round(rate))+' req/s</b> with a '+m.durMs+
+      ' ms duration, concurrency is <b>'+m.concurrency+'</b> and each instance sees '+m.perInstance.toFixed(3)+
+      ' req/s — so the chance of a gap longer than the '+m.idle+' s idle timeout is <b>'+(cf*100).toFixed(cf<0.01?2:1)+'%</b>. ';
+    if(m.prov>0 && cf===0)
+      msg+='Provisioned concurrency covers the whole steady concurrency, so nothing is cold — but you have also given up scale-to-zero and are now paying hourly for idle capacity, which is a container with extra steps.';
+    else if(cf>0.5)
+      msg+='<b>Most requests are cold.</b> This function is idle long enough between calls that the platform reaps it almost every time, so the cold start is the normal experience rather than the exception.';
+    else if(cf>0.01)
+      msg+='p50 stays at <b>'+m.p50+' ms</b> and p99 becomes <b>'+m.p99+
+           ' ms</b>. Percentiles do not average: anything above 1% is fully visible at the tail and invisible at the median, so a mean-latency dashboard will never show it.';
+    else
+      msg+='<b>Essentially nothing is cold in steady state</b> — the instance never idles long enough to be reaped. But a '+m.spike+
+           '× spike still needs <b>'+m.newInstances+'</b> new instances, all cold, and every deploy replaces all <b>'+m.deployCold+
+           '</b>. The cold starts have not gone; they have moved to the two moments that already matter.';
+    note.innerHTML=msg;
+  }
+  [rEl,dEl,cEl,iEl,sEl,pEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+
+/* ============ demo 2: functions vs containers ============ */
+(function(){
+  const cv=document.getElementById("cCost"); if(!cv) return;
+  const rEl=document.getElementById("coR"), dEl=document.getElementById("coD"), mEl=document.getElementById("coM"),
+        pEl=document.getElementById("coP"), nEl=document.getElementById("coN");
+  const out=document.getElementById("coOut"), note=document.getElementById("coNote");
+  /* illustrative published-style rates */
+  const PR={perReq:0.20/1e6, perGbSec:0.0000166667, instHr:0.096, hrsMonth:730, concPerInst:25};
+  const RMIN=0.1, RMAX=2000;
+  const NICE=[1,1.5,2,3,4,5,7,10];
+  const snap=v=>{ const k=Math.floor(Math.log10(v)), m=v/Math.pow(10,k);
+    let best=NICE[0]; for(const n of NICE) if(Math.abs(n-m)<Math.abs(best-m)) best=n;
+    return best*Math.pow(10,k); };
+  const posToRate=p=>snap(RMIN*Math.pow(RMAX/RMIN,p/1000));
+
+  function cost(rate){
+    const D=Math.round(+dEl.value)/1000, memGb=Math.round(+mEl.value)/1024;
+    const peak=Math.max(1,Math.round(+pEl.value)), minInst=Math.max(1,Math.round(+nEl.value));
+    const reqMonth=rate*3600*PR.hrsMonth;
+    const fn=reqMonth*(PR.perReq+D*memGb*PR.perGbSec);
+    const peakConc=rate*peak*D;
+    const instances=Math.max(minInst,Math.ceil(peakConc/PR.concPerInst));
+    const container=instances*PR.instHr*PR.hrsMonth;
+    return {rate,reqMonth,fn,container,instances,peakConc,memGb,D,peak,
+            cheaper: fn<container?"functions":"containers"};
+  }
+  function crossover(){
+    let lo=RMIN, hi=RMAX, found=false;
+    if(cost(RMAX).cheaper==="containers" && cost(RMIN).cheaper==="functions"){
+      found=true;
+      for(let i=0;i<60;i++){ const mid=Math.sqrt(lo*hi);
+        if(cost(mid).cheaper==="functions") lo=mid; else hi=mid; }
+    }
+    return found?lo:null;
+  }
+
+  function draw(){
+    const rate=posToRate(+rEl.value), m=cost(rate), xo=crossover();
+    document.getElementById("coRo").textContent = rate<1?rate.toFixed(2):rate<10?rate.toFixed(1):Math.round(rate);
+    document.getElementById("coDo").textContent=Math.round(+dEl.value);
+    document.getElementById("coMo").textContent=Math.round(+mEl.value);
+    document.getElementById("coPo").textContent=Math.round(+pEl.value);
+    document.getElementById("coNo").textContent=Math.round(+nEl.value);
+
+    const P=Plot(cv,{pad:[18,16,34,56],ratio:0.36});
+    let ymax=0;
+    const pts=[];
+    for(let i=0;i<=200;i++){ const rr=posToRate(1000*i/200), c=cost(rr);
+      pts.push([1000*i/200,c.fn,c.container]);
+      ymax=Math.max(ymax,c.fn,c.container); }
+    ymax=Math.min(ymax, Math.max(cost(rate).fn,cost(rate).container)*6+200);
+    P.o.xr=[0,1000]; P.o.yr=[0,ymax]; P.clear();
+    const ctx=P.ctx;
+    ctx.strokeStyle=PC.grid; ctx.lineWidth=1;
+    for(let g=0;g<=4;g++){ const v=ymax*g/4, y=Math.round(P.Y(v))+0.5;
+      ctx.beginPath(); ctx.moveTo(P.L,y); ctx.lineTo(P.R,y); ctx.stroke();
+      P.px(P.L-7,P.Y(v),"$"+Math.round(v).toLocaleString(),PC.text,"right","10px Archivo, Arial"); }
+    [0.1,1,10,100,1000].forEach(v=>{
+      const pos=1000*Math.log(v/RMIN)/Math.log(RMAX/RMIN);
+      if(pos<0||pos>1000) return; const x=P.X(pos);
+      ctx.strokeStyle=PC.grid; ctx.beginPath(); ctx.moveTo(x,P.T); ctx.lineTo(x,P.B); ctx.stroke();
+      P.px(x,P.B+13,String(v),PC.text,"center","10px Archivo, Arial"); });
+    P.px((P.L+P.R)/2,P.B+27,"requests per second",PC.text,"center","600 10px Archivo, Arial");
+
+    const line=(idx,col)=>{ ctx.beginPath();
+      pts.forEach((p,k)=>{ const X=P.X(p[0]), Y=P.Y(Math.min(p[idx],ymax)); k?ctx.lineTo(X,Y):ctx.moveTo(X,Y); });
+      ctx.strokeStyle=col; ctx.lineWidth=2.2; ctx.stroke(); };
+    line(2,"#8195A6"); line(1,PC.line);
+    P.px(P.R-4,P.T+10,"functions",PC.line,"right","700 10px Archivo, Arial");
+    P.px(P.R-4,P.T+24,"containers","#8195A6","right","700 10px Archivo, Arial");
+
+    if(xo){ const xp=1000*Math.log(xo/RMIN)/Math.log(RMAX/RMIN), x=P.X(xp);
+      ctx.setLineDash([3,3]); ctx.strokeStyle=PC.warn; ctx.lineWidth=1.4;
+      ctx.beginPath(); ctx.moveTo(x,P.T); ctx.lineTo(x,P.B); ctx.stroke(); ctx.setLineDash([]);
+      P.px(x+5,P.T+10,"crossover "+xo.toFixed(1)+"/s",PC.warn,"left","700 10px Archivo, Arial"); }
+
+    const cx=P.X(+rEl.value);
+    ctx.strokeStyle=PC.ink; ctx.lineWidth=1.5;
+    [[m.fn,PC.line],[m.container,"#8195A6"]].forEach(([v,c])=>{
+      const cy=P.Y(Math.min(v,ymax));
+      ctx.beginPath(); ctx.arc(cx,cy,5,0,7); ctx.stroke();
+      ctx.fillStyle="#fff"; ctx.beginPath(); ctx.arc(cx,cy,3,0,7); ctx.fill(); });
+
+    out.innerHTML=
+      '<div><span>requests / month</span><b>'+(m.reqMonth/1e6).toFixed(1)+'M</b></div>'+
+      '<div><span>functions</span><b style="color:'+(m.cheaper==="functions"?PC.ok:PC.bad)+'">$'+Math.round(m.fn).toLocaleString()+'</b></div>'+
+      '<div><span>containers</span><b style="color:'+(m.cheaper==="containers"?PC.ok:PC.bad)+'">$'+Math.round(m.container).toLocaleString()+'</b></div>'+
+      '<div><span>instances needed</span><b>'+m.instances+'</b></div>'+
+      '<div><span>cheaper</span><b style="font-size:11.5px;color:'+PC.ok+'">'+m.cheaper+'</b></div>'+
+      '<div><span>crossover</span><b>'+(xo?xo.toFixed(1)+"/s":"none")+'</b></div>';
+
+    let msg='At '+(rate<1?rate.toFixed(2):Math.round(rate))+' req/s that is <b>'+(m.reqMonth/1e6).toFixed(1)+
+      'M invocations a month</b>: <b>$'+Math.round(m.fn).toLocaleString()+'</b> on functions against <b>$'+
+      Math.round(m.container).toLocaleString()+'</b> on '+m.instances+' container'+(m.instances>1?"s":"")+'. ';
+    if(xo)
+      msg+='The crossover is at about <b>'+xo.toFixed(1)+' req/s</b> — below it functions win, often by a lot; above it containers win and the gap widens linearly, because per-invocation pricing does not get cheaper with volume.';
+    else if(m.peak>1)
+      msg+='<b>There is no crossover at this peak-to-average ratio.</b> Containers must be sized for the peak and paid for all month while functions pay only for the area under the curve, so above roughly 9× peakiness functions are cheaper at every volume.';
+    else
+      msg+='Containers are cheaper across the whole range shown.';
+    if(m.memGb>0.6)
+      msg+=' Note the memory setting: billing is gigabyte-seconds, so '+Math.round(+mEl.value)+
+           ' MB is a direct multiplier on every invocation. On platforms where memory also scales CPU, a larger setting can be cheaper if it shortens the duration proportionally — worth measuring.';
+    note.innerHTML=msg;
+  }
+  [rEl,dEl,mEl,pEl,nEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+</script>
+</body>
+</html>

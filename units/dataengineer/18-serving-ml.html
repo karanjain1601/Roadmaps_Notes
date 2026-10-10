@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · Serving ML and applications — Data Engineer</title>
+<meta name="description" content="Point-in-time correctness and label leakage, feature stores, training-serving skew, vector serving, and pushing data back into applications.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">Data Engineer</a> <span>/</span> Chapter 18</p>
+    <p class="chnum">CHAPTER 18</p>
+    <h1>Serving ML and applications</h1>
+    <p class="lede">A dashboard reads what is true now. A model has to be trained on what was true at some moment in the past and then scored on what is true at some moment in the future, and the two must be computed identically. Almost every serious machine learning data bug is a violation of one of those two requirements.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~28 min</b> read</div>
+      <div><b>Part 5</b> Serving</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="different">
+      <p class="kicker">A DIFFERENT CUSTOMER</p>
+      <h2>What a model team needs that a dashboard team does not</h2>
+      <p class="sub">Four requirements, all of which are easy to serve badly without anybody noticing until the model underperforms in production.</p>
+
+      <div class="terms">
+        <dt>History as it was, not as it is</dt>
+        <dd>A dashboard wants the customer's current segment. A model trained on last March needs the segment they were in <em>last March</em>. That is exactly the type-2 dimension of <a href="09-modelling.html">chapter 9</a>, and where it was skipped, training data is quietly wrong.</dd>
+
+        <dt>The same computation twice</dt>
+        <dd>Features must be computed identically for training, over months of history in batch, and for scoring, for one entity in milliseconds. Two code paths for one definition is the default outcome and the second-largest source of failure here.</dd>
+
+        <dt>Low-latency lookup</dt>
+        <dd>Scoring a request needs a few hundred feature values in single-digit milliseconds. A warehouse cannot do that &mdash; <a href="10-engines.html">chapter 10</a> put columnar last on point lookups &mdash; so a second store is not optional.</dd>
+
+        <dt>Reproducibility</dt>
+        <dd>Retraining next quarter must be able to rebuild the exact training set, or you cannot tell whether a change in performance came from the model or the data.</dd>
+      </div>
+
+      <div class="note key">
+        <b>The framing that makes this tractable</b>
+        <p>A model is not a consumer of your data in the way a dashboard is. It is a consumer of a <em>function</em>: "the value of feature F for entity E as of time T". Training calls that function for millions of (E, T) pairs in the past; serving calls it for one entity at the present moment. Everything in this chapter is about making one function answer both calls consistently.</p>
+      </div>
+    </section>
+
+    <section id="pit">
+      <p class="kicker">THE FIRST REQUIREMENT</p>
+      <h2>Point-in-time correctness</h2>
+      <p class="sub">Joining features to labels without respecting time lets the future leak into the past, and the resulting model looks excellent right up until it is deployed.</p>
+
+      <p>The setup is ordinary. You have labelled examples — customer 4182 churned on 12 March — and you want features for them. The obvious join is against your customer table, which holds current values. That join is wrong, and wrong in the direction that flatters you: today's values for customer 4182 reflect everything that happened <em>after</em> March, including things caused by the churn itself.</p>
+
+      <p>Take a concrete leak. Support tickets tend to spike after a customer decides to leave. A feature counting support tickets, built from a full history, is therefore an excellent predictor of churn in your training data and worthless at decision time, because at the moment you need a prediction those tickets have not been filed.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>What leakage does to measured and actual performance</b>
+          <span>20,000 examples, ranked AUC computed for each evaluation</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Weight the model puts on the leaky feature
+              <input type="range" id="pt-leak" min="0" max="95" step="5" value="0">
+              <output id="pt-leak-o">none</output>
+            </label>
+            <label>Strength of the honest signal
+              <select id="pt-sig">
+                <option value="0.35">Weak</option>
+                <option value="0.55" selected>Moderate</option>
+                <option value="0.75">Strong</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="pt-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="pt-off-tile"><i>OFFLINE AUC</i><b id="pt-off">0</b><s>what the report says</s></div>
+            <div class="tile" id="pt-prod-tile"><i>IN PRODUCTION</i><b id="pt-prod">0</b><s>what it actually does</s></div>
+            <div class="tile good"><i>POINT-IN-TIME MODEL</i><b id="pt-pit">0</b><s>offline and production alike</s></div>
+            <div class="tile hi"><i>GAP</i><b id="pt-gap">0</b><s id="pt-gap-sub"></s></div>
+          </div>
+
+          <p class="readout" id="pt-note"></p>
+        </div>
+      </div>
+
+      <p>The shape of the result is worse than "the model is not as good as it looked".</p>
+
+      <ol>
+        <li><strong>Offline evaluation reports a near-perfect 1.000</strong> once the model leans on the leaked feature. Every offline check passes: held-out test set, cross-validation, all of it, because the leak is in the data rather than in the split.</li>
+        <li><strong>In production it collapses to 0.513</strong> — barely better than a coin toss — because the feature it relies on carries no information at decision time.</li>
+        <li><strong>The point-in-time model scores 0.882 both offline and in production.</strong> So the leaky model does not merely disappoint; it is <em>substantially worse than the honest one it beat in evaluation</em>. Leakage does not just inflate a number, it causes you to ship the wrong model.</li>
+      </ol>
+
+      <div class="note trap">
+        <b>Why cross-validation cannot catch this</b>
+        <p>Every offline validation technique splits the <em>examples</em>. Leakage is a property of how each example's features were <em>constructed</em>, so it is present in the training fold and the test fold equally. A perfectly executed cross-validation over leaked data reports a perfectly consistent, perfectly wrong number.</p>
+        <p>The only reliable defence is structural: build features with an as-of join and verify that no feature value used a row written after the label timestamp. And the loudest warning sign is a model that performs far better than the problem should allow. An AUC of 0.99 on churn is not a triumph, it is a bug report.</p>
+      </div>
+
+      <h3>The as-of join</h3>
+
+      <p>The correct join takes each labelled example's timestamp and asks for the feature value <em>as it stood at that moment</em>:</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">as_of_join.sql</span><button class="code-copy">Copy</button></div>
+        <pre><code data-lang="sql">-- for every label, the most recent feature row written strictly before it
+SELECT l.entity_id,
+       l.label_ts,
+       l.churned,
+       f.tickets_30d,
+       f.orders_90d
+FROM   labels l
+LEFT JOIN LATERAL (
+  SELECT *
+  FROM   feature_history f
+  WHERE  f.entity_id  = l.entity_id
+    AND  f.valid_from &lt;= l.label_ts        -- nothing from the future
+  ORDER BY f.valid_from DESC
+  LIMIT  1
+) f ON true;</code></pre>
+      </div>
+
+      <p>Two things that join needs, and both are chapters you have already read. It needs <code>feature_history</code> to exist at all, which is <a href="09-modelling.html">chapter 9</a>'s type-2 dimension — a type-1 table has overwritten the past and cannot answer the question. And it needs the timestamps to be trustworthy, which is <a href="04-source-systems.html">chapter 4</a>'s warning that <code>updated_at</code> is application convention rather than a guarantee.</p>
+
+      <p>There is a subtler version worth guarding against: a feature that is technically point-in-time correct but was <em>not available</em> at that moment. A daily aggregate stamped with the start of the day is correct as of midnight and was not computed until 02:00, so a model scoring at 00:30 will not have it. The rule is to join on <strong>when the value became available</strong>, not on when it became true.</p>
+    </section>
+
+    <section id="store">
+      <p class="kicker">THE INFRASTRUCTURE</p>
+      <h2>Feature stores</h2>
+      <p class="sub">Two stores, one definition. Most of the value is in the "one definition" half, which is also the half teams skip.</p>
+
+      <p>A feature store has an <strong>offline store</strong> — historical values with validity ranges, in your warehouse or lakehouse, supporting as-of joins over millions of rows — and an <strong>online store</strong>, a low-latency key-value store holding the current value per entity for millisecond lookups at scoring time. Redis, DynamoDB and similar, for exactly the reason <a href="10-engines.html">chapter 10</a> gave: point lookups are what key-value stores are for and what columnar stores are worst at.</p>
+
+      <p>The part that matters is that <strong>both are populated from one feature definition</strong>. Write the transformation once; a batch job materialises history into the offline store and a streaming or scheduled job pushes current values into the online store. That single-definition property is what prevents the skew in the next section, and it is the reason to adopt a feature store rather than building two pipelines.</p>
+
+      <div class="tw">
+        <table>
+          <caption>The two stores, and what each is for</caption>
+          <thead>
+            <tr><th></th><th>Offline store</th><th>Online store</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Used by</td><td>Training and batch scoring</td><td>Real-time scoring</td></tr>
+            <tr><td>Query shape</td><td>As-of join over millions of rows</td><td>Get a few hundred values by key</td></tr>
+            <tr><td>Latency target</td><td>Minutes</td><td>Single-digit milliseconds</td></tr>
+            <tr><td>Holds</td><td>Full history with validity ranges</td><td>Current value only</td></tr>
+            <tr><td>Typical technology</td><td>Warehouse or lakehouse table</td><td>Redis, DynamoDB, Cassandra</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note tip">
+        <b>You may not need the product</b>
+        <p>A feature store is a real category with real tools, and for one or two models it is straightforwardly more machinery than the problem justifies &mdash; chapter 3's arithmetic again. What you cannot skip are the <em>properties</em>: one definition, history retained, an as-of join, and a low-latency read path.</p>
+        <p>Those are achievable with a type-2 table in the warehouse, a scheduled job pushing current values into Redis, and the discipline of generating both from the same SQL. Adopt the product when you have enough models and teams that discovery and reuse become the bottleneck, which is the problem it is genuinely best at.</p>
+      </div>
+    </section>
+
+    <section id="skew">
+      <p class="kicker">THE SECOND REQUIREMENT</p>
+      <h2>Training-serving skew</h2>
+      <p class="sub">The same feature name computed two ways gives two distributions, and the model was fitted to one of them.</p>
+
+      <p>Skew is any systematic difference between a feature's value at training time and at serving time. It comes from four places, and the fourth is the one this unit has already measured:</p>
+
+      <div class="cols">
+        <div>
+          <h4>Where it comes from</h4>
+          <ul>
+            <li><strong>Two code paths.</strong> SQL for training, Python in the service. They diverge on nulls, rounding, timezones and edge cases.</li>
+            <li><strong>Different windows.</strong> "Last 30 days" from midnight in batch, from now in serving.</li>
+            <li><strong>Different null handling.</strong> Batch fills a missing value with the median; the service sends zero.</li>
+            <li><strong>Incomplete data at serving.</strong> The batch job had the benefit of a lookback window; the online store does not.</li>
+          </ul>
+        </div>
+        <div>
+          <h4>Why it is hard to see</h4>
+          <ul>
+            <li>Nothing errors &mdash; the feature has a plausible value.</li>
+            <li>Offline metrics are unaffected, because training used the training version.</li>
+            <li>The model degrades gradually rather than failing.</li>
+            <li>It is attributed to "drift" and answered with a retrain, which does not fix it.</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>The demo takes the fourth cause and prices it, using the exact completeness figures <a href="12-batch-ingestion.html">chapter 12</a> measured. The feature is "orders in the last thirty days"; the batch path enjoys a lookback window and sees nearly everything, while the online path sees only what has arrived.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Skew from incomplete serving data</b>
+          <span>40,000 entities, completeness figures taken from chapter 12's lookback measurements</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Serving-side completeness
+              <select id="sk-comp">
+                <option value="1">100% &mdash; complete</option>
+                <option value="0.984">98.4% &mdash; 7-day lookback</option>
+                <option value="0.956">95.6% &mdash; 3-day lookback</option>
+                <option value="0.762" selected>76.2% &mdash; 1-day lookback</option>
+                <option value="0.365">36.5% &mdash; no lookback</option>
+              </select>
+            </label>
+            <label>Decision threshold
+              <input type="range" id="sk-thresh" min="1" max="12" step="1" value="5">
+              <output id="sk-thresh-o">5 orders</output>
+            </label>
+          </div>
+
+          <div class="canvas" id="sk-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>MEAN AT TRAINING</i><b id="sk-train">0</b><s>orders in 30 days</s></div>
+            <div class="tile" id="sk-serve-tile"><i>MEAN AT SERVING</i><b id="sk-serve">0</b><s id="sk-serve-sub"></s></div>
+            <div class="tile" id="sk-flip-tile"><i>DECISIONS FLIPPED</i><b id="sk-flip">0%</b><s>against the same threshold</s></div>
+            <div class="tile hi"><i>ALL BELOW THRESHOLD</i><b id="sk-under">0%</b><s>wrongly, at serving</s></div>
+          </div>
+
+          <p class="readout" id="sk-note"></p>
+        </div>
+      </div>
+
+      <p>At chapter 12's one-day lookback — 76.2% completeness, which sounds tolerable — the mean feature value drops from 5.47 to 4.18 and <strong>8.8% of threshold decisions flip</strong>. Every one of those is a model making a different call than it would have on training-quality data, and there is no error anywhere in the system to notice it.</p>
+
+      <div class="note key">
+        <b>The three defences, in order</b>
+        <p><strong>One definition, executed twice.</strong> Generate both paths from one specification, which is the feature store's core benefit and removes the first three causes entirely.</p>
+        <p><strong>Log what you actually served.</strong> Record the feature vector used for each prediction. This gives you the serving distribution to compare against the training distribution &mdash; and, more valuable, it gives you the correct training data for the next model, because it is by construction exactly what will be available at decision time.</p>
+        <p><strong>Compare the distributions automatically.</strong> A scheduled check on mean, variance and null rate per feature, training against serving, alerting on divergence. This is the only defence that catches the fourth cause, because incompleteness is a property of the data rather than of the code.</p>
+      </div>
+    </section>
+
+    <section id="vectors">
+      <p class="kicker">A NEWER SHAPE</p>
+      <h2>Embeddings and vector serving</h2>
+      <p class="sub">Semantic search and retrieval-augmented generation put a new store in the platform, with familiar problems underneath.</p>
+
+      <p>An embedding is a fixed-length vector of floats representing a piece of content, positioned so that similar things sit near each other. Serving them means answering "which stored vectors are nearest to this one", which needs an approximate nearest-neighbour index — HNSW or IVF — because exact search over millions of vectors is too slow.</p>
+
+      <p>From a data engineering standpoint this is a pipeline like any other, with four properties worth planning for:</p>
+
+      <div class="terms">
+        <dt>Re-embedding is a full rebuild</dt>
+        <dd>Change the embedding model and every stored vector is invalid, because vectors from different models are not comparable. That is a complete reprocessing of the corpus, which is <a href="12-batch-ingestion.html">chapter 12</a>'s backfill with a GPU bill attached. Version the model with the vectors, and plan the migration before you need it.</dd>
+
+        <dt>Chunking is a modelling decision</dt>
+        <dd>How you split documents determines what can be retrieved. Too large and the relevant sentence is diluted; too small and context is lost. It is not a preprocessing detail, it is the grain decision of <a href="09-modelling.html">chapter 9</a> in another form, and it deserves the same deliberateness.</dd>
+
+        <dt>Freshness applies as it always did</dt>
+        <dd>A vector index built nightly answers yesterday's questions. The freshness arithmetic of <a href="02-lifecycle.html">chapter 2</a> is unchanged: worst case is the sum of every wait plus every run, and an embedding step is just another stage.</dd>
+
+        <dt>Recall is a tuning parameter with a cost</dt>
+        <dd>Approximate search trades accuracy for speed, and the index parameters set where you sit. That is the same recall-against-resources curve as the stream join in <a href="14-stream-processing.html">chapter 14</a>, and it should be measured rather than defaulted.</dd>
+      </div>
+
+      <p>Worth noting that a dedicated vector database is frequently unnecessary. Postgres with pgvector, or the vector support now in most warehouses and search engines, handles corpora of a few million vectors comfortably — and chapter 3's build-against-buy arithmetic applies exactly as it did to every other store in this unit.</p>
+    </section>
+
+    <section id="apps">
+      <p class="kicker">THE STRICTEST CONSUMER</p>
+      <h2>Serving data back into applications</h2>
+      <p class="sub">When a pipeline output appears in a product, the obligations change and usually nobody says so out loud.</p>
+
+      <p>A recommendation on a page, a risk score in a checkout, a personalised feed: these are pipeline outputs on a user-facing path. The differences from a dashboard are large.</p>
+
+      <div class="tw">
+        <table>
+          <caption>What changes when the consumer is the product</caption>
+          <thead>
+            <tr><th></th><th>Dashboard</th><th>Application</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Latency budget</td><td>Seconds</td><td>Tens of milliseconds</td></tr>
+            <tr><td>Concurrency</td><td>Tens</td><td>Thousands per second</td></tr>
+            <tr><td>Availability need</td><td>Business hours</td><td>Whatever the product promises</td></tr>
+            <tr><td>Missing data</td><td>An empty tile</td><td>A broken page, unless there is a fallback</td></tr>
+            <tr><td>Wrong data</td><td>A confused analyst</td><td>A customer-visible error</td></tr>
+            <tr><td>Rollback</td><td>Rerun the job</td><td>Needs a version to roll back <em>to</em></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note warn">
+        <b>Always define the degraded path</b>
+        <p>The single most important design decision on an application-serving path is what happens when the data is absent, stale or clearly wrong. Serve a default? A cached previous value? Hide the feature entirely? Every one of those is a legitimate answer and <em>no answer</em> is not, because the failure will happen and the behaviour will then be decided by whatever the code does by accident.</p>
+        <p>The corollary is that these paths need a staleness check <em>at read time</em>, not just an alert on the pipeline. A consumer that can tell the data is four hours old can degrade deliberately; one that cannot will serve four-hour-old prices with complete confidence.</p>
+      </div>
+
+      <p>Two other things follow from the table. <strong>You need a rollback target</strong>, which means the serving store should hold at least the previous version rather than being overwritten in place — the atomic pointer swap of <a href="11-warehouse-lake.html">chapter 11</a>, applied to a Redis key or a served index. And <strong>the pipeline now inherits the product's availability promise</strong>, which is a genuine on-call obligation and should be agreed explicitly rather than discovered during an incident.</p>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>A model consumes a function, not a table:</b> the value of feature F for entity E as of time T, called for millions of past pairs at training and for one entity now at serving.</li>
+          <li><b>Joining features to labels without respecting time lets the future leak in,</b> and it flatters you.</li>
+          <li><b>Offline AUC of 1.000, production 0.513, honest model 0.882 both.</b> The leaky model is not merely disappointing &mdash; it is worse in production than the model it beat in evaluation, so leakage makes you ship the wrong one.</li>
+          <li><b>Cross-validation cannot catch leakage,</b> because it splits examples while leakage is a property of how each example was constructed.</li>
+          <li><b>Performance far better than the problem allows is a bug report,</b> not a result.</li>
+          <li><b>An as-of join needs type-2 history and trustworthy timestamps</b> &mdash; chapters 9 and 4. And it should join on when a value became <em>available</em>, not when it became true.</li>
+          <li><b>A feature store is two stores and one definition,</b> and the single definition is the part that matters. The properties are achievable without the product; adopt it when discovery and reuse become the bottleneck.</li>
+          <li><b>Skew comes from two code paths, different windows, different null handling and incomplete serving data.</b></li>
+          <li><b>Chapter 12's one-day lookback, 76.2% complete, moves the mean feature from 5.47 to 4.18 and flips 8.8% of decisions</b> &mdash; with no error anywhere.</li>
+          <li><b>Log the feature vector you actually served.</b> It gives you the serving distribution and, better, correct training data for the next model.</li>
+          <li><b>Re-embedding is a full corpus rebuild,</b> and chunking is a grain decision rather than preprocessing.</li>
+          <li><b>Application paths need a defined degraded behaviour, a read-time staleness check and a rollback target.</b> The failure will happen; the only question is whether the response was designed.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="19-infrastructure.html">Chapter 19 &mdash; Infrastructure, cloud and IaC</a>. Part 6 opens on running it: compute and storage primitives, serverless economics, declarative infrastructure and idempotency.</p>
+          </div>
+          <div class="fi">
+            <i>PART 5 IS NOW COMPLETE</i>
+            <p>Chapters 17 and 18 covered both halves of serving. Everything from here is about operating what you have built rather than adding to it.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>Take any model in production and ask whether its training features were built with an as-of join. If the answer is that they were joined against current dimension tables, the offline metric is not measuring what you think.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Demo 1 — point-in-time correctness and leakage
+   ============================================================ */
+(function () {
+  var N = 20000;
+  var $ = function (id) { return document.getElementById(id); };
+  function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+
+  /* rank-based AUC: the probability a random positive outranks a random negative */
+  function auc(scores, labels) {
+    var idx = scores.map(function (s, i) { return i; });
+    idx.sort(function (a, b) { return scores[a] - scores[b]; });
+    var ranks = new Array(scores.length);
+    var i = 0;
+    while (i < idx.length) {
+      var j = i;
+      while (j + 1 < idx.length && scores[idx[j + 1]] === scores[idx[i]]) j++;
+      var avg = (i + j) / 2 + 1;
+      for (var k = i; k <= j; k++) ranks[idx[k]] = avg;
+      i = j + 1;
+    }
+    var nPos = 0, nNeg = 0, sumPos = 0;
+    for (var m = 0; m < labels.length; m++) {
+      if (labels[m]) { nPos++; sumPos += ranks[m]; } else nNeg++;
+    }
+    return (sumPos - nPos * (nPos + 1) / 2) / (nPos * nNeg);
+  }
+
+  /* A leaked feature is one largely CAUSED by the label. Built from a full
+     history it is nearly perfect; at decision time the causing event has not
+     happened, so the feature has the same distribution and no signal. */
+  function dataset(signal, seed) {
+    var rnd = lcg(seed), pre = [], leakTrain = [], leakServe = [], y = [];
+    for (var i = 0; i < N; i++) {
+      var latent = rnd();
+      var label = latent > 0.72 ? 1 : 0;
+      pre.push(latent * signal + rnd() * (1 - signal));
+      leakTrain.push(label * 0.9 + rnd() * 0.1);
+      leakServe.push(rnd());
+      y.push(label);
+    }
+    return { pre: pre, leakTrain: leakTrain, leakServe: leakServe, y: y };
+  }
+  function blend(a, b, w) { return a.map(function (v, i) { return (1 - w) * v + w * b[i]; }); }
+
+  var cache = {};
+  function evaluate(w, signal) {
+    var k = w + "|" + signal;
+    if (cache[k]) return cache[k];
+    var d = dataset(signal, 11);
+    var r = {
+      offline: auc(blend(d.pre, d.leakTrain, w), d.y),
+      prod: auc(blend(d.pre, d.leakServe, w), d.y),
+      pit: auc(d.pre, d.y)
+    };
+    cache[k] = r;
+    return r;
+  }
+
+  function chart(w, signal) {
+    var W = 700, H = 160, L = 46, B = 28;
+    var ws = [0, 0.2, 0.4, 0.6, 0.8, 0.95];
+    var xOf = function (i) { return L + i / (ws.length - 1) * (W - L - 74); };
+    var yOf = function (v) { return (H - B) - (v - 0.45) / 0.6 * (H - B - 22); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="AUC offline and in production against leakage weight">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">AUC AS THE MODEL LEANS HARDER ON THE LEAKY FEATURE</text>');
+    svg.push('<line x1="' + L + '" y1="' + (H - B) + '" x2="' + (W - 70) + '" y2="' + (H - B) + '" stroke="#CFD8E0"/>');
+    [0.5, 0.75, 1.0].forEach(function (v) {
+      svg.push('<line x1="' + L + '" y1="' + yOf(v) + '" x2="' + (W - 70) + '" y2="' + yOf(v) + '" stroke="#E1E7EC" stroke-dasharray="3 3"/>');
+      svg.push('<text x="2" y="' + (yOf(v) + 4) + '" font-size="9.5" fill="#7C8B99">' + v.toFixed(2) + '</text>');
+    });
+    var pit = evaluate(0, signal).pit;
+    svg.push('<line x1="' + L + '" y1="' + yOf(pit) + '" x2="' + (W - 70) + '" y2="' + yOf(pit) +
+      '" stroke="#2E8B5F" stroke-width="2" stroke-dasharray="5 3"/>');
+    svg.push('<text x="' + (W - 66) + '" y="' + (yOf(pit) + 4) + '" font-size="10" font-weight="700" fill="#166B47">point-in-time</text>');
+
+    [["offline", "#C0453A"], ["prod", "#0C1D30"]].forEach(function (s) {
+      var d = ws.map(function (wv, i) { return (i ? "L" : "M") + xOf(i).toFixed(1) + " " + yOf(evaluate(wv, signal)[s[0]]).toFixed(1); }).join(" ");
+      svg.push('<path d="' + d + '" fill="none" stroke="' + s[1] + '" stroke-width="2.4"/>');
+      svg.push('<text x="' + (W - 66) + '" y="' + (yOf(evaluate(0.95, signal)[s[0]]) + 4) + '" font-size="10" font-weight="700" fill="' + s[1] + '">' +
+        (s[0] === "offline" ? "offline" : "production") + '</text>');
+    });
+    ws.forEach(function (wv, i) {
+      var on = Math.abs(wv - w) < 0.03;
+      svg.push('<text x="' + xOf(i) + '" y="' + (H - 9) + '" font-size="9.5" fill="' + (on ? "#A8386B" : "#7C8B99") +
+        '" font-weight="' + (on ? 700 : 400) + '" text-anchor="middle">' + Math.round(wv * 100) + '%</text>');
+      if (on) {
+        svg.push('<circle cx="' + xOf(i) + '" cy="' + yOf(evaluate(wv, signal).offline) + '" r="4.5" fill="#C0453A"/>');
+        svg.push('<circle cx="' + xOf(i) + '" cy="' + yOf(evaluate(wv, signal).prod) + '" r="4.5" fill="#0C1D30"/>');
+      }
+    });
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var w = +$("pt-leak").value / 100, signal = +$("pt-sig").value;
+    $("pt-leak-o").textContent = w === 0 ? "none" : Math.round(w * 100) + "%";
+
+    /* snap to the nearest evaluated point so the chart marker lines up */
+    var ws = [0, 0.2, 0.4, 0.6, 0.8, 0.95];
+    var wSnap = ws.reduce(function (b, v) { return Math.abs(v - w) < Math.abs(b - w) ? v : b; }, 0);
+    var e = evaluate(wSnap, signal);
+    var gap = e.offline - e.prod;
+
+    $("pt-off").textContent = e.offline.toFixed(3);
+    $("pt-off-tile").className = "tile " + (gap > 0.1 ? "bad" : "good");
+    $("pt-prod").textContent = e.prod.toFixed(3);
+    $("pt-prod-tile").className = "tile " + (e.prod < e.pit - 0.02 ? "bad" : "good");
+    $("pt-pit").textContent = e.pit.toFixed(3);
+    $("pt-gap").textContent = gap.toFixed(3);
+    $("pt-gap-sub").textContent = e.prod < e.pit - 0.02
+      ? (e.pit - e.prod).toFixed(3) + " worse than honest" : "no illusion";
+
+    $("pt-canvas").innerHTML = chart(wSnap, signal);
+
+    var lines = [];
+    if (wSnap === 0) {
+      lines.push("With no leakage the model is the point-in-time model: " + e.offline.toFixed(3) +
+        " offline and " + e.prod.toFixed(3) +
+        " in production, identical. Offline evaluation is measuring what production will do, which is the only condition under which an offline number means anything.");
+      lines.push("Raise the leakage weight and watch the two curves separate. The green line is the honest model and does not move \u2014 keep an eye on where the production line ends up relative to it.");
+    } else {
+      lines.push("The model puts " + Math.round(wSnap * 100) + "% of its weight on the leaked feature. Offline it scores " +
+        e.offline.toFixed(3) + " \u2014 every held-out test and cross-validation fold agrees, because the leak is in the data rather than in the split. In production it scores " +
+        e.prod.toFixed(3) + ", a gap of " + gap.toFixed(3) + ".");
+
+      if (e.prod < e.pit - 0.02) {
+        lines.push("And here is the part that matters more than the inflated number. The point-in-time model scores " +
+          e.pit.toFixed(3) + " in production, so the leaky model is " + (e.pit - e.prod).toFixed(3) +
+          " WORSE than the model it beat in evaluation. Leakage does not merely make you overestimate a model, it makes you ship the wrong one.");
+      }
+
+      if (e.offline > 0.97) {
+        lines.push("An offline AUC of " + e.offline.toFixed(3) +
+          " on a problem like churn is not a triumph, it is a bug report. Performance far better than the problem should allow is the most reliable signal of leakage, and it is worth treating as one.");
+      }
+    }
+    $("pt-note").textContent = lines.join("\n\n");
+  }
+
+  ["pt-leak", "pt-sig"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — training-serving skew from incomplete data
+   ============================================================ */
+(function () {
+  var N = 40000;
+  var $ = function (id) { return document.getElementById(id); };
+  function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+
+  var cache = {};
+  function run(completeness, threshold) {
+    var k = completeness + "|" + threshold;
+    if (cache[k]) return cache[k];
+    var rnd = lcg(13), flips = 0, trainSum = 0, serveSum = 0, under = 0, aboveTrain = 0;
+    var trainHist = [], serveHist = [];
+    for (var b = 0; b <= 20; b++) { trainHist.push(0); serveHist.push(0); }
+    for (var i = 0; i < N; i++) {
+      var trueCount = Math.floor(-Math.log(1 - rnd() * 0.999) * 6);
+      var seen = 0;
+      for (var e = 0; e < trueCount; e++) if (rnd() < completeness) seen++;
+      trainSum += trueCount; serveSum += seen;
+      trainHist[Math.min(20, trueCount)]++;
+      serveHist[Math.min(20, seen)]++;
+      var a = trueCount >= threshold, s = seen >= threshold;
+      if (a !== s) flips++;
+      if (a) { aboveTrain++; if (!s) under++; }
+    }
+    var r = { flip: flips / N * 100, trainMean: trainSum / N, serveMean: serveSum / N,
+              under: aboveTrain ? under / aboveTrain * 100 : 0,
+              trainHist: trainHist, serveHist: serveHist };
+    cache[k] = r;
+    return r;
+  }
+
+  function chart(r, threshold) {
+    var W = 700, H = 152, L = 34, B = 28;
+    var bins = 16;
+    var max = Math.max.apply(null, r.trainHist.slice(0, bins).concat(r.serveHist.slice(0, bins)));
+    var bw = (W - L - 12) / bins;
+    var yOf = function (v) { return (H - B) - v / max * (H - B - 22); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Feature distribution at training and at serving">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">FEATURE DISTRIBUTION: TRAINING (BLUE) AGAINST SERVING (PINK)</text>');
+    for (var i = 0; i < bins; i++) {
+      var x = L + i * bw;
+      svg.push('<rect x="' + (x + 1).toFixed(1) + '" y="' + yOf(r.trainHist[i]).toFixed(1) + '" width="' + (bw / 2 - 1).toFixed(1) +
+        '" height="' + ((H - B) - yOf(r.trainHist[i])).toFixed(1) + '" fill="#20456A"/>');
+      svg.push('<rect x="' + (x + bw / 2).toFixed(1) + '" y="' + yOf(r.serveHist[i]).toFixed(1) + '" width="' + (bw / 2 - 1).toFixed(1) +
+        '" height="' + ((H - B) - yOf(r.serveHist[i])).toFixed(1) + '" fill="#E0699F"/>');
+      if (i % 2 === 0) {
+        svg.push('<text x="' + (x + bw / 2).toFixed(1) + '" y="' + (H - 10) + '" font-size="9" fill="#7C8B99" text-anchor="middle">' + i + '</text>');
+      }
+    }
+    var tx = L + threshold * bw;
+    svg.push('<line x1="' + tx.toFixed(1) + '" y1="16" x2="' + tx.toFixed(1) + '" y2="' + (H - B) + '" stroke="#0C1D30" stroke-width="2"/>');
+    svg.push('<text x="' + (tx + 5) + '" y="26" font-size="10" font-weight="700" fill="#0C1D30">threshold</text>');
+    svg.push('<text x="' + L + '" y="' + (H - 1) + '" font-size="9.5" fill="#7C8B99">orders in the last 30 days</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var c = +$("sk-comp").value, t = +$("sk-thresh").value;
+    $("sk-thresh-o").textContent = t + " orders";
+
+    var r = run(c, t);
+    $("sk-train").textContent = r.trainMean.toFixed(2);
+    $("sk-serve").textContent = r.serveMean.toFixed(2);
+    $("sk-serve-sub").textContent = c < 1 ? ((1 - r.serveMean / r.trainMean) * 100).toFixed(0) + "% understated" : "identical";
+    $("sk-serve-tile").className = "tile " + (c === 1 ? "good" : "bad");
+    $("sk-flip").textContent = r.flip.toFixed(1) + "%";
+    $("sk-flip-tile").className = "tile " + (r.flip === 0 ? "good" : r.flip > 5 ? "bad" : "");
+    $("sk-under").textContent = r.under.toFixed(1) + "%";
+
+    $("sk-canvas").innerHTML = chart(r, t);
+
+    var lines = [];
+    if (c === 1) {
+      lines.push("With complete data at serving the two distributions coincide exactly and no decision changes. This is the only configuration in which the model is being asked the question it was trained to answer.");
+      lines.push("Now pick one of chapter 12's lookback figures. Those completeness numbers were measured on a batch pipeline; here they are the difference between the feature the model learned and the feature it is given.");
+    } else {
+      lines.push("At " + (c * 100).toFixed(1) + "% completeness the feature mean falls from " + r.trainMean.toFixed(2) +
+        " at training to " + r.serveMean.toFixed(2) + " at serving \u2014 understated by " +
+        ((1 - r.serveMean / r.trainMean) * 100).toFixed(0) + "%. Against a threshold of " + t +
+        " orders, " + r.flip.toFixed(1) + "% of decisions flip, and " + r.under.toFixed(1) +
+        "% of entities that genuinely qualify are scored as though they do not.");
+
+      lines.push("Nothing errors. The feature has a plausible integer value, the service returns in time, the model produces a confident score. Offline metrics are unaffected because training used the complete version. The model simply makes a different call than it would have, on " +
+        r.flip.toFixed(1) + "% of requests, forever.");
+
+      lines.push("This gets attributed to drift and answered with a retrain, which does not fix it \u2014 retraining on complete data reproduces exactly the same mismatch. The fixes are one definition executed twice, logging the feature vector actually served, and an automated comparison of the two distributions.");
+    }
+    $("sk-note").textContent = lines.join("\n\n");
+  }
+
+  ["sk-comp", "sk-thresh"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+initChapter("18-serving-ml.html");
+</script>
+</body>
+</html>

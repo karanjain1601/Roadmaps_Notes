@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>20 · When pandas stops — Python for Data Analysis</title>
+<meta name="description" content="Where each engine's memory ceiling actually is, Polars and DuckDB, lazy evaluation, and why a filter on unsorted Parquet reads the whole file.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">Python for Data Analysis</a> <span>/</span> Chapter 20</p>
+    <p class="chnum">CHAPTER 20</p>
+    <h1>When pandas stops</h1>
+    <p class="lede">Tuning buys you roughly one order of magnitude and changing engine buys the next. But the result worth the chapter is this: a filter selecting one row in ten thousand from unsorted Parquet reads <em>every byte of the file</em>, however good the predicate pushdown, and sorting the data is what fixes it.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~25 min</b> read</div>
+      <div><b>Part 6</b> Beyond one machine</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="ceiling">
+      <p class="kicker">THE ARITHMETIC</p>
+      <h2>Where each ceiling is</h2>
+      <p class="sub">Before choosing a tool, compute whether you need one. The answer is usually smaller than the panic suggests.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Peak memory by engine and row count</b>
+          <span>12 columns in use, and a RAM budget you set</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Rows
+              <select id="ce-rows">
+                <option value="10">10 million</option>
+                <option value="50" selected>50 million</option>
+                <option value="200">200 million</option>
+                <option value="800">800 million</option>
+              </select>
+            </label>
+            <label>Columns actually used
+              <input type="range" id="ce-cols" min="3" max="40" step="1" value="12">
+              <output id="ce-cols-o">12</output>
+            </label>
+            <label>RAM available
+              <select id="ce-ram">
+                <option value="8">8 GB</option>
+                <option value="16" selected>16 GB</option>
+                <option value="64">64 GB</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="ce-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>RAW DATA</i><b id="ce-raw">0</b><s id="ce-raw-sub"></s></div>
+            <div class="tile" id="ce-naive-tile"><i>PANDAS, NAIVE</i><b id="ce-naive">0</b><s id="ce-naive-sub"></s></div>
+            <div class="tile" id="ce-tuned-tile"><i>PANDAS, TUNED</i><b id="ce-tuned">0</b><s id="ce-tuned-sub"></s></div>
+            <div class="tile hi" id="ce-rec-tile"><i>SMALLEST TOOL THAT WORKS</i><b id="ce-rec">&mdash;</b><s id="ce-rec-sub"></s></div>
+          </div>
+
+          <p class="readout" id="ce-note"></p>
+        </div>
+      </div>
+
+      <p>The measured ceilings at 16 GB with twelve columns in use:</p>
+
+      <div class="tw">
+        <table>
+          <caption>Largest row count that fits</caption>
+          <thead>
+            <tr><th>Approach</th><th>Peak, relative to the raw data</th><th>Ceiling at 16 GB</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>pandas, straight <code>read_csv</code></td><td>&times;2.5, from operation copies</td><td><strong>71 million rows</strong></td></tr>
+            <tr><td>pandas, dtypes and <code>usecols</code></td><td>&times;1.2</td><td><strong>149 million rows</strong></td></tr>
+            <tr><td>pandas, chunked</td><td>One chunk</td><td>Effectively unbounded</td></tr>
+            <tr><td>Polars, eager</td><td>&times;1.1</td><td>~163 million rows</td></tr>
+            <tr><td>Polars, streaming</td><td>Bounded</td><td>Effectively unbounded</td></tr>
+            <tr><td>DuckDB</td><td>Bounded, spills to disk</td><td>Effectively unbounded</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>Two things that follow, and they are the chapter's practical summary</b>
+        <p><strong>Tuning is worth roughly a doubling and costs one line.</strong> Declaring dtypes and reading only the columns you need takes pandas from 71 million rows to 149 million on the same machine, which is the difference between "this does not fit" and "this is fine" for a great many datasets.</p>
+        <p><strong>Beyond that, the choice is about memory model rather than speed.</strong> Chunked pandas, streaming Polars and DuckDB all have bounded peak memory, so their ceiling is disk rather than RAM. They differ in how pleasant they are to write and how fast they run, not in whether they work.</p>
+      </div>
+
+      <p>One caveat on the numbers above: the &times;2.5 multiplier for naive pandas is a rule of thumb rather than a law, because it depends on how many intermediate copies your operations create. A single <code>groupby</code> is cheap; a chain of merges and sorts can be far worse. The reliable version is to measure it — <code>df.memory_usage(deep=True).sum()</code> for the frame and the operating system's own figure for the process.</p>
+    </section>
+
+    <section id="cheaper">
+      <p class="kicker">FIRST</p>
+      <h2>Making pandas go further</h2>
+      <p class="sub">Five changes, in order of return. Most "we need Spark" conversations end here.</p>
+
+      <div class="check">
+        <li><strong>Read fewer columns.</strong> <code>usecols=</code> is the largest single win, because it avoids reading rather than shrinking, and <a href="09-files.html">chapter 9</a> measured 40 columns down to 4 as 107 MB against 5,096.</li>
+        <li><strong>Declare dtypes.</strong> <code>int32</code> instead of <code>int64</code>, <code>category</code> for repetitive text — <a href="05-numpy-arrays.html">chapter 5</a> measured 66&times; on a low-cardinality column. Watch for the silent overflow that chapter also measured.</li>
+        <li><strong>Store Parquet, not CSV.</strong> Types preserved, 5&ndash;10&times; smaller, and column selection happens in the reader rather than after parsing.</li>
+        <li><strong>Filter early.</strong> If the analysis only needs last quarter, do not load three years. Obvious, and routinely not done because the file is already there.</li>
+        <li><strong>Aggregate before joining.</strong> A <code>groupby</code> that turns 40 million rows into 12,000 before a merge avoids the row explosion of <a href="08-reshape-join.html">chapter 8</a> and most of the memory pressure with it.</li>
+      </div>
+
+      <div class="note tip">
+        <b>The question to ask before switching tools</b>
+        <p><strong>How much of this data does the answer actually depend on?</strong> A monthly revenue summary from three years of transactions needs a few thousand numbers, and moving 60 GB into a distributed engine to produce them is solving the wrong problem &mdash; <a href="10-databases.html">chapter 10</a> measured that as a 44-million-fold difference in bytes moved.</p>
+        <p>The honest ordering is: reduce the data, then reach for a better engine, then reach for more machines. Skipping to the third is common and expensive, and it usually makes the analysis harder to write as well.</p>
+      </div>
+    </section>
+
+    <section id="lazy">
+      <p class="kicker">THE MECHANISM</p>
+      <h2>Lazy evaluation, and what an optimiser can do</h2>
+      <p class="sub">The reason Polars and DuckDB win is not that their loops are faster. It is that they see the whole query before running any of it.</p>
+
+      <p>Pandas is eager: each line executes when written, so <code>pd.read_parquet(path)</code> reads everything and the filter on the next line discards most of it. A lazy engine builds a plan, rewrites it, and then executes — pushing the filter and the column selection down into the file scan.</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">lazy.py</span><button class="code-copy">Copy</button></div>
+        <pre><code data-lang="python">import polars as pl
+
+# eager: reads every column and every row, then throws most of it away
+df = pl.read_parquet("events.parquet")
+out = df.filter(pl.col("date") >= "2024-07-01") \
+        .group_by("region").agg(pl.col("revenue").sum())
+
+# lazy: the filter and the columns are pushed into the scan
+out = (pl.scan_parquet("events.parquet")
+         .filter(pl.col("date") >= "2024-07-01")
+         .group_by("region")
+         .agg(pl.col("revenue").sum())
+         .collect())                       # nothing runs until here
+
+# and you can read the plan it chose
+print(pl.scan_parquet("events.parquet").filter(...).explain())</code></pre>
+      </div>
+
+      <div class="terms">
+        <dt>Projection pushdown</dt>
+        <dd>The engine works out which columns the query needs and reads only those. With 40 columns and a query using 3, that is most of the win, and it happens without <code>usecols</code> because the optimiser can see what you used.</dd>
+
+        <dt>Predicate pushdown</dt>
+        <dd>The filter is applied during the scan rather than after, so non-matching rows are never materialised. This is the same argument as <a href="10-databases.html">chapter 10</a>'s, applied to a local file instead of a database.</dd>
+
+        <dt>Streaming</dt>
+        <dd>Processing in batches so peak memory is bounded regardless of file size. <code>collect(engine="streaming")</code> in Polars; the default in DuckDB. This is chunked pandas with the chunking written for you.</dd>
+
+        <dt><code>explain()</code> before optimising anything</dt>
+        <dd>Both engines will show you the plan they chose. If the plan does not mention your filter as part of the scan, the pushdown did not happen &mdash; usually because the predicate references a computed column or a Python function the optimiser cannot see through.</dd>
+      </div>
+    </section>
+
+    <section id="pruning">
+      <p class="kicker">THE LIMIT OF PUSHDOWN</p>
+      <h2>Why sort order decides whether pruning works</h2>
+      <p class="sub">Predicate pushdown lets the reader skip row groups. Whether there are any it can skip depends entirely on how the data was written.</p>
+
+      <p>A Parquet file is divided into row groups, each with min and max statistics per column. A filter can skip a group whose range excludes the value. That works beautifully when matching rows are clustered together, and not at all when they are scattered.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Row groups read, sorted against unsorted</b>
+          <span>400 million rows in 100,000-row groups</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Filter selectivity
+              <select id="pr-sel">
+                <option value="0.5">50% of rows</option>
+                <option value="0.1">10%</option>
+                <option value="0.01" selected>1%</option>
+                <option value="0.001">0.1%</option>
+                <option value="0.0001">0.01%</option>
+                <option value="0.00001">0.001%</option>
+              </select>
+            </label>
+            <label>Data written
+              <select id="pr-sorted">
+                <option value="yes" selected>Sorted by the filter column</option>
+                <option value="no">In arrival order</option>
+              </select>
+            </label>
+            <label>Rows per row group
+              <select id="pr-rg">
+                <option value="10000">10,000</option>
+                <option value="100000" selected>100,000</option>
+                <option value="1000000">1,000,000</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="pr-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="pr-groups-tile"><i>ROW GROUPS READ</i><b id="pr-groups">0</b><s id="pr-groups-sub"></s></div>
+            <div class="tile" id="pr-rows-tile"><i>ROWS READ</i><b id="pr-rows">0</b><s id="pr-rows-sub"></s></div>
+            <div class="tile"><i>ROWS WANTED</i><b id="pr-want">0</b><s>what the query returns</s></div>
+            <div class="tile hi" id="pr-waste-tile"><i>WASTE FACTOR</i><b id="pr-waste">0</b><s>read against needed</s></div>
+          </div>
+
+          <p class="readout" id="pr-note"></p>
+        </div>
+      </div>
+
+      <p>The measured comparison, at 100,000 rows per group:</p>
+
+      <div class="tw">
+        <table>
+          <caption>Row groups read out of 4,000, and rows scanned</caption>
+          <thead>
+            <tr><th>Selectivity</th><th>Sorted: groups</th><th>Unsorted: groups</th><th>Sorted: rows</th><th>Unsorted: rows</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>10%</td><td>401</td><td><strong>4,000</strong></td><td>40.1m</td><td>400m</td></tr>
+            <tr><td>1%</td><td>41</td><td><strong>4,000</strong></td><td>4.1m</td><td>400m</td></tr>
+            <tr><td>0.1%</td><td>5</td><td><strong>4,000</strong></td><td>0.5m</td><td>400m</td></tr>
+            <tr><td>0.01%</td><td><strong>2</strong></td><td><strong>4,000</strong></td><td>0.2m</td><td><strong>400m</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p><strong>On unsorted data the pruning does nothing at any of those selectivities.</strong> Even a filter selecting one row in ten thousand reads all four thousand row groups — every byte of the file — because almost every group happens to contain at least one matching row.</p>
+
+      <div class="note key">
+        <b>The rule, and it is a formula rather than a heuristic</b>
+        <p>A row group is skipped only when it contains <em>no</em> matching row. With <em>R</em> rows per group and selectivity <em>s</em>, the expected number of matches per group is <code>s &times; R</code>, and pruning starts working only when that falls well below one &mdash; so <strong>selectivity must be under about 1/R</strong>.</p>
+        <p>At 100,000 rows per group that threshold is 0.001%. Measured: at 0.01% selectivity (ten matches expected per group) <strong>100% of groups are read</strong>; at 0.001% (one match per group) 63.2%; at 0.0001% (a tenth of a match) 9.5%. Analytical filters are almost never that tight.</p>
+        <p>Which means <strong>sorting is the change that matters, and tuning the row-group size is not.</strong> Smaller groups shift the threshold proportionally and cost you metadata overhead and worse compression, so they help a little and never enough.</p>
+      </div>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">layout.py</span><button class="code-copy">Copy</button></div>
+        <pre><code data-lang="python"># sort by whatever you filter on most, once, when writing
+df.sort_values("event_date").to_parquet("events.parquet", row_group_size=100_000)
+
+# or partition, which is pruning by directory and needs no statistics at all
+df.to_parquet("events/", partition_cols=["event_date"])
+# -> events/event_date=2024-07-01/part-0.parquet
+
+# then a filter on the partition column skips whole directories
+pl.scan_parquet("events/**/*.parquet").filter(pl.col("event_date") >= "2024-07-01")</code></pre>
+      </div>
+
+      <p>Partitioning is the stronger version of the same idea: the filter column becomes a directory name, so the reader skips files without opening them and no statistics are involved. The cost is that you must choose the partition column when writing, and choosing one with too many distinct values produces thousands of tiny files — which is its own performance problem, and one the <a href="../dataengineer/index.html">Data Engineer</a> unit treats properly.</p>
+    </section>
+
+    <section id="tools">
+      <p class="kicker">THE OPTIONS</p>
+      <h2>Polars, DuckDB, Dask, PySpark</h2>
+
+      <div class="tw">
+        <table>
+          <caption>What each is for</caption>
+          <thead>
+            <tr><th></th><th>Model</th><th>Good at</th><th>The catch</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>Polars</strong></td><td>Lazy DataFrame, one machine</td><td>Everything pandas does, faster, with a stricter API</td><td>A new API to learn; a smaller ecosystem</td></tr>
+            <tr><td><strong>DuckDB</strong></td><td>SQL, one machine, out of core</td><td>Aggregation, joins, querying files in place</td><td>You write SQL; less natural for row-level work</td></tr>
+            <tr><td><strong>Dask</strong></td><td>Parallel pandas</td><td>Reusing pandas code across cores or machines</td><td>Leaky abstraction; debugging is genuinely harder</td></tr>
+            <tr><td><strong>PySpark</strong></td><td>Distributed cluster</td><td>Terabytes, and existing Spark infrastructure</td><td>Large fixed overhead in setup and in latency</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>The order to consider them</b>
+        <p><strong>DuckDB if the work is aggregation and joins</strong>, which most analytical work is. It queries Parquet and pandas objects in place, needs no server, and SQL is often the clearer language for a complicated group-and-aggregate anyway.</p>
+        <p><strong>Polars if the work is DataFrame-shaped</strong> and you want to stay in Python expressions. The API is stricter than pandas in ways that prevent several of this unit's bugs outright &mdash; there is no ambiguous index, and no chained-assignment problem.</p>
+        <p><strong>Dask if you have a large pandas codebase</strong> that must keep working. The appeal is not rewriting; the cost is that failures happen inside a scheduler rather than in your code.</p>
+        <p><strong>PySpark if you already run Spark,</strong> or the data genuinely exceeds one machine's disk. A single machine now holds terabytes of SSD and hundreds of gigabytes of RAM, so that threshold is higher than most people assume.</p>
+      </div>
+
+      <p>One note on Polars that matters for this unit: it has <strong>no index</strong>. Everything <a href="07-pandas-basics.html">chapter 7</a> measured about automatic alignment — the fifteen-row result from two ten-row inputs, the twenty rows silently assigned the wrong values — cannot happen, because there is nothing to align on. That is a real reduction in the number of ways to be wrong, and it is worth weighing against the cost of learning a second API.</p>
+    </section>
+
+    <section id="deciding">
+      <p class="kicker">IN PRACTICE</p>
+      <h2>A decision procedure</h2>
+
+      <div class="check">
+        <li><strong>Compute the raw size first.</strong> Rows &times; columns used &times; 8 bytes. If that is comfortably inside RAM, the problem is not size and switching tools will not help.</li>
+        <li><strong>Then apply <code>usecols</code> and dtypes</strong> and recompute. This alone doubles what fits, and it is the cheapest step available.</li>
+        <li><strong>If it still does not fit, ask how much the answer depends on.</strong> An aggregate over three years is a small result from a large input, and <a href="10-databases.html">chapter 10</a>'s pushdown argument applies directly.</li>
+        <li><strong>Then reach for DuckDB or Polars streaming.</strong> Both bound peak memory, both run on the machine you have, and both take an afternoon rather than a project.</li>
+        <li><strong>Only then consider a cluster</strong> — and if you do, check the data layout first, because the row-group result above says an unsorted file makes every engine read everything.</li>
+      </div>
+
+      <div class="note warn">
+        <b>The most expensive mistake in this chapter</b>
+        <p>Moving to a distributed engine while leaving the data layout alone. A Spark cluster reading unsorted Parquet with a 0.01% filter reads the whole file, exactly as pandas would &mdash; it just does it on more machines and bills you for them.</p>
+        <p>Sorting the file and adding a partition column is usually a smaller change than adopting a new engine, and it frequently removes the need for one. Layout before infrastructure.</p>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>Compute the raw size before choosing a tool:</b> rows &times; columns used &times; 8 bytes.</li>
+          <li><b>Naive pandas peaks at about 2.5&times; the raw data, giving 71 million rows in 16 GB</b> with twelve columns in use.</li>
+          <li><b>Dtypes and <code>usecols</code> take that to 149 million</b> &mdash; a doubling, for one line.</li>
+          <li><b>Chunked pandas, streaming Polars and DuckDB all bound peak memory,</b> so their ceiling is disk rather than RAM.</li>
+          <li><b>Five cheap wins first:</b> fewer columns, declared dtypes, Parquet, filter early, aggregate before joining.</li>
+          <li><b>Ask how much of the data the answer depends on.</b> A monthly summary from three years is a small result from a large input.</li>
+          <li><b>Lazy engines win by seeing the whole query,</b> pushing the filter and the column list into the scan.</li>
+          <li><b>Run <code>explain()</code>.</b> If the plan does not show your filter in the scan, the pushdown did not happen.</li>
+          <li><b>On unsorted Parquet, a 0.01% filter reads all 4,000 row groups</b> &mdash; every byte &mdash; because nearly every group holds a matching row.</li>
+          <li><b>A group is skipped only if it contains no match,</b> so unsorted pruning needs selectivity below about 1/rows-per-group.</li>
+          <li><b>Measured: 10 expected matches per group reads 100% of groups; 1 reads 63.2%; 0.1 reads 9.5%.</b></li>
+          <li><b>Sorting is the fix; row-group size is not.</b> Smaller groups shift the threshold and cost metadata and compression.</li>
+          <li><b>Partitioning is pruning by directory,</b> and needs no statistics &mdash; at the cost of choosing the column when writing.</li>
+          <li><b>DuckDB for aggregation and joins, Polars for DataFrame work, Dask to keep pandas code, PySpark if you already run it.</b></li>
+          <li><b>Polars has no index,</b> so chapter 7's alignment and chained-assignment failures cannot occur.</li>
+          <li><b>Layout before infrastructure.</b> A cluster reading an unsorted file reads all of it, on more machines.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="21-repeatable.html">Chapter 21 &mdash; Making it repeatable</a>. Project structure, notebooks against modules, testing an analysis, and the arithmetic of how often a pipeline of independent steps succeeds.</p>
+          </div>
+          <div class="fi">
+            <i>BUILDS ON</i>
+            <p>The memory arithmetic extends <a href="09-files.html">chapter 9</a>'s five reading strategies, and the pruning result is <a href="10-databases.html">chapter 10</a>'s pushdown argument meeting the physical layout of a file.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>Check whether your largest Parquet file is sorted by the column you filter on most. If not, sorting it once may be the whole performance fix.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Demo 1 — where each engine's ceiling is
+   ============================================================ */
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var ENGINES = ["pandas (naive)", "pandas (tuned)", "pandas (chunked)",
+                 "Polars (eager)", "Polars (streaming)", "DuckDB"];
+
+  function plan(rowsM, colsUsed, ramGB) {
+    var raw = rowsM * 1e6 * colsUsed * 8;
+    var chunkPeak = 100000 * colsUsed * 8 * 3;
+    var need = {
+      "pandas (naive)": raw * 2.5,
+      "pandas (tuned)": raw * 1.2,
+      "pandas (chunked)": Math.min(raw * 1.2, chunkPeak),
+      "Polars (eager)": raw * 1.1,
+      "Polars (streaming)": Math.min(raw * 1.1, 2e9),
+      "DuckDB": Math.min(raw * 0.9, 2e9)
+    };
+    var out = {};
+    ENGINES.forEach(function (k) {
+      out[k] = { bytes: need[k], fits: need[k] <= ramGB * 1073741824 };
+    });
+    return { raw: raw, engines: out };
+  }
+  function maxRows(engine, colsUsed, ramGB) {
+    var lo = 1, hi = 100000;
+    while (hi - lo > 1) {
+      var mid = Math.floor((lo + hi) / 2);
+      if (plan(mid, colsUsed, ramGB).engines[engine].fits) lo = mid; else hi = mid;
+    }
+    return lo;
+  }
+  function sz(b) {
+    if (b >= 1073741824) return (b / 1073741824).toFixed(1) + " GB";
+    return (b / 1048576).toFixed(0) + " MB";
+  }
+
+  function chart(rowsM, colsUsed, ramGB) {
+    var W = 700, H = 190, L = 132;
+    var p = plan(rowsM, colsUsed, ramGB);
+    var maxB = Math.max(p.engines["pandas (naive)"].bytes, ramGB * 1073741824 * 1.15);
+    var avail = W - L - 128;
+    var wOf = function (b) { return Math.max(3, b / maxB * avail); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Peak memory by engine against the RAM budget">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">PEAK MEMORY FOR ' +
+      rowsM + 'M ROWS \u00d7 ' + colsUsed + ' COLUMNS (' + sz(p.raw) + ' RAW)</text>');
+    var rx = L + wOf(ramGB * 1073741824);
+    svg.push('<rect x="' + rx.toFixed(1) + '" y="18" width="' + (W - 14 - rx).toFixed(1) + '" height="' + (H - 40) +
+      '" fill="#FBEAE7" opacity="0.6"/>');
+    svg.push('<line x1="' + rx.toFixed(1) + '" y1="18" x2="' + rx.toFixed(1) + '" y2="' + (H - 22) +
+      '" stroke="#0C1D30" stroke-width="1.8" stroke-dasharray="4 3"/>');
+    svg.push('<text x="' + (rx + 5) + '" y="28" font-size="9.5" font-weight="700" fill="#0C1D30">' + ramGB + ' GB</text>');
+    ENGINES.forEach(function (e, i) {
+      var y = 22 + i * 25;
+      var g = p.engines[e];
+      svg.push('<text x="0" y="' + (y + 13) + '" font-size="10" fill="#16232F">' + e + '</text>');
+      svg.push('<rect x="' + L + '" y="' + y + '" width="' + wOf(g.bytes).toFixed(1) + '" height="17" rx="2" fill="' +
+        (g.fits ? "#2E8B5F" : "#C0453A") + '"/>');
+      svg.push('<text x="' + (L + wOf(g.bytes) + 7) + '" y="' + (y + 13) + '" font-size="10" fill="' +
+        (g.fits ? "#54677A" : "#9B2C22") + '" font-weight="' + (g.fits ? 400 : 700) + '">' + sz(g.bytes) +
+        (g.fits ? "" : "  over budget") + '</text>');
+    });
+    svg.push('<text x="0" y="' + (H - 5) + '" font-size="9.5" fill="#7C8B99">the three bounded-memory options do not grow with the row count \u2014 their ceiling is disk</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var rowsM = +$("ce-rows").value, cols = +$("ce-cols").value, ram = +$("ce-ram").value;
+    $("ce-cols-o").textContent = cols;
+    var p = plan(rowsM, cols, ram);
+
+    $("ce-raw").textContent = sz(p.raw);
+    $("ce-raw-sub").textContent = rowsM + "m \u00d7 " + cols + " \u00d7 8 bytes";
+    $("ce-naive").textContent = sz(p.engines["pandas (naive)"].bytes);
+    $("ce-naive-sub").textContent = p.engines["pandas (naive)"].fits ? "fits" : "over budget";
+    $("ce-naive-tile").className = "tile " + (p.engines["pandas (naive)"].fits ? "good" : "bad");
+    $("ce-tuned").textContent = sz(p.engines["pandas (tuned)"].bytes);
+    $("ce-tuned-sub").textContent = p.engines["pandas (tuned)"].fits ? "fits" : "over budget";
+    $("ce-tuned-tile").className = "tile " + (p.engines["pandas (tuned)"].fits ? "good" : "bad");
+
+    var rec = ENGINES.filter(function (e) { return p.engines[e].fits; })[0] || "a cluster";
+    $("ce-rec").textContent = rec === "pandas (naive)" ? "pandas" : rec.replace(" (", " \u2014 ").replace(")", "");
+    $("ce-rec-sub").textContent = rec === "pandas (naive)" ? "no changes needed"
+      : rec === "pandas (tuned)" ? "dtypes and usecols" : "bounded peak memory";
+    $("ce-rec-tile").className = "tile " + (rec.indexOf("pandas") === 0 ? "good" : "");
+
+    $("ce-canvas").innerHTML = chart(rowsM, cols, ram);
+
+    var lines = [];
+    lines.push(rowsM + " million rows across " + cols + " columns is " + sz(p.raw) +
+      " of raw values. Naive pandas peaks at about 2.5 times that \u2014 " + sz(p.engines["pandas (naive)"].bytes) +
+      " \u2014 because operations create intermediate copies. Tuned, with declared dtypes and only the columns you need, it is " +
+      sz(p.engines["pandas (tuned)"].bytes) + ".");
+
+    var cNaive = maxRows("pandas (naive)", cols, ram), cTuned = maxRows("pandas (tuned)", cols, ram);
+    lines.push("At " + ram + " GB with " + cols + " columns in use, that puts the naive ceiling at about " +
+      cNaive + " million rows and the tuned ceiling at " + cTuned +
+      " million. Tuning is worth roughly a doubling and costs one line, which for a great many datasets is the difference between \u201cthis does not fit\u201d and \u201cthis is fine\u201d.");
+
+    if (!p.engines["pandas (tuned)"].fits) {
+      lines.push("This dataset is past both. The next step is not a faster engine but a bounded-memory one: chunked pandas, streaming Polars or DuckDB all process in batches, so their peak does not grow with the row count and their real ceiling is disk. Note in the chart that those three bars do not move as you raise the row count.");
+      lines.push("Before adopting any of them, though, ask how much of the data the answer depends on. An aggregate over three years is a small result from a large input, and chapter 10 measured that difference as 44 million-fold in bytes moved.");
+    } else if (!p.engines["pandas (naive)"].fits) {
+      lines.push("So this dataset does not fit naive pandas and does fit tuned pandas. That is the most common situation in practice, and it is solved by two arguments to read_csv rather than by a new tool.");
+    } else {
+      lines.push("This fits comfortably with no changes at all, which is worth stating: if the raw arithmetic is inside your RAM, the problem is not size and switching tools will not help. Raise the row count to find where each ceiling actually is.");
+    }
+
+    lines.push("One caveat on the 2.5 multiplier: it is a rule of thumb rather than a law, since it depends on how many copies your operations create. A single groupby is cheap; a chain of merges and sorts can be far worse. Measure it with df.memory_usage(deep=True).sum() and the operating system's figure for the process.");
+    $("ce-note").textContent = lines.join("\n\n");
+  }
+
+  ["ce-rows", "ce-cols", "ce-ram"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — row-group pruning and sort order
+   ============================================================ */
+(function () {
+  var TOTAL = 4e8;
+  var $ = function (id) { return document.getElementById(id); };
+
+  function prune(rowsPerGroup, selectivity, sorted) {
+    var groups = Math.ceil(TOTAL / rowsPerGroup);
+    var touched;
+    if (sorted) {
+      /* matching rows are contiguous, so only the covering groups are read */
+      touched = Math.min(groups, Math.ceil(selectivity * groups) + 1);
+    } else {
+      /* a group is skipped only if it contains NO matching row */
+      touched = Math.round(groups * (1 - Math.pow(1 - selectivity, rowsPerGroup)));
+    }
+    var wanted = Math.round(TOTAL * selectivity);
+    return {
+      groups: groups, touched: touched, fraction: touched / groups,
+      rowsRead: touched * rowsPerGroup, wanted: wanted,
+      waste: wanted > 0 ? (touched * rowsPerGroup) / wanted : Infinity,
+      perGroup: selectivity * rowsPerGroup
+    };
+  }
+  function num(n) {
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + "bn";
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "m";
+    if (n >= 1000) return Math.round(n / 1000) + "k";
+    return String(Math.round(n));
+  }
+
+  function chart(rg, sel, sorted) {
+    var W = 700, H = 190, L = 8;
+    var p = prune(rg, sel, sorted);
+    var q = prune(rg, sel, !sorted);
+    var cols = 80, rows = 8, cells = cols * rows;
+    var cw = (W - L - 14) / cols, ch = 9;
+    var litCells = Math.round(p.fraction * cells);
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Row groups read out of the total">'];
+    svg.push('<text x="' + L + '" y="11" font-size="10" font-weight="700" fill="#7C8B99">' +
+      p.groups.toLocaleString() + ' ROW GROUPS, EACH CELL IS ' + Math.round(p.groups / cells) +
+      ' \u2014 SHADED MEANS READ</text>');
+    for (var i = 0; i < cells; i++) {
+      var r = Math.floor(i / cols), c = i % cols;
+      /* sorted: the read groups are contiguous. unsorted: scattered */
+      var lit = sorted ? i < litCells : (i * 2654435761 % cells) < litCells;
+      svg.push('<rect x="' + (L + c * cw).toFixed(1) + '" y="' + (20 + r * (ch + 2)).toFixed(1) + '" width="' + (cw - 0.8).toFixed(1) +
+        '" height="' + ch + '" fill="' + (lit ? "#C0453A" : "#E4E9ED") + '"/>');
+    }
+    var by = 20 + rows * (ch + 2) + 12;
+    svg.push('<text x="' + L + '" y="' + by + '" font-size="11" font-weight="700" fill="' +
+      (p.fraction > 0.5 ? "#9B2C22" : "#166B47") + '">' + p.touched.toLocaleString() + ' of ' +
+      p.groups.toLocaleString() + ' groups read (' + (p.fraction * 100).toFixed(1) + '%), ' +
+      num(p.rowsRead) + ' rows scanned to return ' + num(p.wanted) + '</text>');
+    svg.push('<text x="' + L + '" y="' + (by + 18) + '" font-size="10.5" fill="#54677A">' +
+      (sorted ? "in arrival order the same query would read " : "sorted by the filter column it would read ") +
+      q.touched.toLocaleString() + ' groups \u2014 ' + num(q.rowsRead) + ' rows</text>');
+    svg.push('<text x="' + L + '" y="' + (by + 34) + '" font-size="10" fill="#7C8B99">expected matches per group: ' +
+      p.perGroup.toFixed(p.perGroup < 1 ? 3 : 0) + '. A group is skipped only when that is zero.</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var rg = +$("pr-rg").value, sel = +$("pr-sel").value, sorted = $("pr-sorted").value === "yes";
+    var p = prune(rg, sel, sorted), q = prune(rg, sel, !sorted);
+
+    $("pr-groups").textContent = p.touched.toLocaleString();
+    $("pr-groups-sub").textContent = "of " + p.groups.toLocaleString() + " \u2014 " + (p.fraction * 100).toFixed(1) + "%";
+    $("pr-groups-tile").className = "tile " + (p.fraction > 0.5 ? "bad" : "good");
+    $("pr-rows").textContent = num(p.rowsRead);
+    $("pr-rows-sub").textContent = "of " + num(TOTAL) + " in the file";
+    $("pr-rows-tile").className = "tile " + (p.rowsRead > TOTAL * 0.5 ? "bad" : "good");
+    $("pr-want").textContent = num(p.wanted);
+    $("pr-waste").textContent = p.waste >= 100 ? Math.round(p.waste).toLocaleString() + "\u00d7" : p.waste.toFixed(1) + "\u00d7";
+    $("pr-waste-tile").className = "tile " + (p.waste > 20 ? "bad" : p.waste < 3 ? "good" : "");
+
+    $("pr-canvas").innerHTML = chart(rg, sel, sorted);
+
+    var lines = [];
+    lines.push("A filter selecting " + (sel * 100).toFixed(sel < 0.001 ? 4 : 2) + "% of " + num(TOTAL) +
+      " rows, from a file written " + (sorted ? "sorted by the filter column" : "in arrival order") +
+      " with " + rg.toLocaleString() + " rows per group: " + p.touched.toLocaleString() + " of " +
+      p.groups.toLocaleString() + " groups are read, scanning " + num(p.rowsRead) + " rows to return " +
+      num(p.wanted) + ".");
+
+    if (!sorted && p.fraction > 0.9) {
+      lines.push("So the pruning does nothing. Every row group is read \u2014 the whole file \u2014 despite a filter that discards " +
+        ((1 - sel) * 100).toFixed(2) +
+        "% of the rows and despite the predicate being pushed down correctly. The pushdown works; there is simply nothing it can skip.");
+      lines.push("The reason is in the last line of the chart. A group is skipped only when it contains NO matching row, and with " +
+        p.perGroup.toFixed(p.perGroup < 1 ? 3 : 0) +
+        " matches expected per group, essentially every group contains at least one. Scattering the matching rows across the file guarantees that.");
+      lines.push("Sorted by the filter column, the same query reads " + q.touched.toLocaleString() +
+        " groups and " + num(q.rowsRead) + " rows \u2014 a " + Math.round(p.rowsRead / q.rowsRead).toLocaleString() +
+        "-fold difference from a decision made when the file was written, not when the query was run.");
+      lines.push("The rule worth carrying is a formula: unsorted pruning needs selectivity below about 1 / rows-per-group, which is " +
+        (1 / rg).toExponential(0) +
+        " here. Analytical filters are almost never that tight, so sorting is the change that matters and tuning the row-group size is not \u2014 smaller groups shift the threshold proportionally and cost you metadata and compression.");
+    } else if (sorted) {
+      lines.push("Because the matching rows are contiguous, only the groups covering them are opened: " +
+        (p.fraction * 100).toFixed(2) + "% of the file, and a waste factor of " +
+        (p.waste < 100 ? p.waste.toFixed(1) : Math.round(p.waste).toLocaleString()) +
+        "\u00d7 against the rows actually returned. That factor cannot go below 1 because a group is the smallest readable unit.");
+      lines.push("Switch to arrival order to see the same query on the same data: " + q.touched.toLocaleString() +
+        " groups and " + num(q.rowsRead) + " rows, which is " +
+        (q.fraction > 0.99 ? "the entire file" : (q.fraction * 100).toFixed(0) + "% of it") + ".");
+      lines.push("Partitioning is the stronger version of this: the filter column becomes a directory name, so the reader skips whole files without opening them and no statistics are involved. The cost is choosing the column at write time, and choosing one with too many distinct values produces thousands of tiny files.");
+    } else {
+      lines.push("At this selectivity the expected matches per group is " + p.perGroup.toFixed(3) +
+        ", which is low enough that many groups genuinely contain none and can be skipped \u2014 so unsorted pruning starts to work. That threshold is about 1 / rows-per-group, or " +
+        (1 / rg).toExponential(0) + " here.");
+      lines.push("Which is worth noticing precisely because it is so tight. Loosen the filter by one step and the pruning collapses to reading everything, because a single matching row anywhere in a group forces it open.");
+    }
+    $("pr-note").textContent = lines.join("\n\n");
+  }
+
+  ["pr-sel", "pr-sorted", "pr-rg"].forEach(function (id) { $(id).addEventListener("change", render); });
+  render();
+})();
+
+initChapter("20-scale.html");
+</script>
+</body>
+</html>

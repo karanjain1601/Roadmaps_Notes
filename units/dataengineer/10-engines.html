@@ -1,0 +1,639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · OLTP, OLAP and the engine families — Data Engineer</title>
+<meta name="description" content="B-trees against LSM trees, read write and space amplification, and the five data models with what each one makes cheap or impossible.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">Data Engineer</a> <span>/</span> Chapter 10</p>
+    <p class="chnum">CHAPTER 10</p>
+    <h1>OLTP, OLAP and the engine families</h1>
+    <p class="lede">Databases are usually compared by their feature lists. It is far more useful to compare them by their physical structures, because a structure determines what is cheap and what is impossible, and no amount of engineering effort moves those limits. Two index structures and five data models cover almost the whole market.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~28 min</b> read</div>
+      <div><b>Part 3</b> Storage</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="two">
+      <p class="kicker">THE OLD DIVIDE</p>
+      <h2>Two workloads, described physically</h2>
+      <p class="sub">OLTP and OLAP are not categories of product. They are two clusters of access pattern, and every engine choice is a bet on which cluster you are in.</p>
+
+      <div class="tw">
+        <table>
+          <caption>The two workload shapes, by what they do rather than what they are called</caption>
+          <thead>
+            <tr><th></th><th>Transactional (OLTP)</th><th>Analytical (OLAP)</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Rows per query</td><td>One, or a handful</td><td>Millions</td></tr>
+            <tr><td>Columns per query</td><td>All of them</td><td>A few</td></tr>
+            <tr><td>Writes</td><td>Constant, small, in place</td><td>Bulk, append or replace</td></tr>
+            <tr><td>Latency target</td><td>Single-digit milliseconds</td><td>Seconds to minutes</td></tr>
+            <tr><td>Concurrency</td><td>Thousands of sessions</td><td>Tens</td></tr>
+            <tr><td>Correctness need</td><td>Serialisable transactions</td><td>A consistent snapshot</td></tr>
+            <tr><td>Implied layout</td><td>Row-oriented</td><td>Column-oriented</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The last row is the one <a href="08-file-formats.html">chapter 8</a> established, and it explains why the divide has persisted through several complete changes in hardware: it is grounded in a physical fact about contiguity rather than in a product decision.</p>
+
+      <div class="note key">
+        <b>HTAP, and why to be sceptical</b>
+        <p>A recurring product claim is that one engine can serve both, usually branded HTAP. The honest version is real and narrower than the marketing: several engines now maintain <em>two</em> representations of the same data &mdash; a row store for writes and a column store for scans &mdash; and keep them in sync. That genuinely works, and it is a good fit for operational dashboards over live data.</p>
+        <p>What it does not do is remove the trade. You are paying for two copies, the analytical side lags the transactional side by some interval, and heavy analytical queries still compete for the same machine. Treat HTAP as a convenience for moderate volumes rather than as a reason to skip a separate analytical store.</p>
+      </div>
+    </section>
+
+    <section id="amplification">
+      <p class="kicker">THE TWO INDEX STRUCTURES</p>
+      <h2>B-trees, LSM trees and the RUM trade</h2>
+      <p class="sub">Nearly every storage engine in use is one of these two. They make opposite bets, and the bet is visible in three measurable quantities.</p>
+
+      <p>A <strong>B-tree</strong> keeps keys sorted in fixed-size pages arranged as a shallow tree. A lookup walks a handful of levels; an update rewrites the leaf page in place. This is Postgres, MySQL's InnoDB, SQL Server, SQLite.</p>
+
+      <p>An <strong>LSM tree</strong> — log-structured merge tree — buffers writes in memory, flushes them to an immutable sorted file, and merges files together in the background. Nothing is ever updated in place. This is RocksDB, Cassandra, HBase, ScyllaDB, and the storage layer beneath a great many newer systems.</p>
+
+      <p>The comparison is best framed by the <strong>RUM conjecture</strong>: you can optimise for reads, updates or memory, and you get to pick two. Three amplification factors make it concrete:</p>
+
+      <div class="terms">
+        <dt>Write amplification</dt>
+        <dd>Bytes written to the device per byte of logical write. A B-tree writing a 100-byte row must eventually flush a whole 4 KB page. An LSM writes the row once, then rewrites it again at each compaction level.</dd>
+
+        <dt>Read amplification</dt>
+        <dd>Bytes read per byte returned. A B-tree point lookup reads one leaf page. An LSM may have to check several levels, which bloom filters mostly avoid for point lookups and cannot help with at all for range scans.</dd>
+
+        <dt>Space amplification</dt>
+        <dd>Bytes stored per byte of live data. B-tree pages sit partly empty; LSM levels hold superseded versions until compaction removes them.</dd>
+      </div>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Amplification and total I/O</b>
+          <span>three engines across a workload mix, weighted by sequential against random cost</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Write share of operations
+              <input type="range" id="am-wf" min="0" max="100" step="1" value="30">
+              <output id="am-wf-o">30%</output>
+            </label>
+            <label>Reads that are range scans
+              <input type="range" id="am-rf" min="0" max="100" step="10" value="20">
+              <output id="am-rf-o">20%</output>
+            </label>
+            <label>Device
+              <select id="am-dev">
+                <option value="1">NVMe SSD</option>
+                <option value="4" selected>SATA SSD</option>
+                <option value="50">Spinning disk</option>
+              </select>
+            </label>
+            <label>Write locality
+              <select id="am-coal">
+                <option value="1" selected>Random keys</option>
+                <option value="4">Somewhat clustered</option>
+                <option value="16">Append-mostly</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="am-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="am-t0"><i>B-TREE</i><b id="am-v0">0</b><s id="am-s0"></s></div>
+            <div class="tile" id="am-t1"><i>LSM LEVELED</i><b id="am-v1">0</b><s id="am-s1"></s></div>
+            <div class="tile" id="am-t2"><i>LSM TIERED</i><b id="am-v2">0</b><s id="am-s2"></s></div>
+            <div class="tile hi"><i>CHEAPEST HERE</i><b id="am-best">&mdash;</b><s id="am-best-sub"></s></div>
+          </div>
+
+          <p class="readout" id="am-note"></p>
+        </div>
+      </div>
+
+      <p>Three results, and the first one contradicts the summary you will usually be given.</p>
+
+      <ol>
+        <li><strong>Leveled compaction does not win on write amplification.</strong> On the default 100 GB dataset with random keys, a B-tree and a leveled LSM both come out around 42&times;. Set the device to NVMe, where random and sequential writes cost about the same, and leveled LSM <em>never</em> beats a B-tree at any write share, because the write amp is a tie and its reads are slightly worse. The LSM advantage is not the byte count.</li>
+        <li><strong>The advantage is sequential I/O and space.</strong> Move the device to SATA SSD, where a random write costs several times a sequential one, and leveled overtakes the B-tree at about a 1.3% write share — essentially immediately. Its space amplification is 1.10 against the B-tree's 1.50. Those are the real wins.</li>
+        <li><strong>Tiered compaction is the genuine write specialist, and it is expensive.</strong> Its write amplification is about 6&times; against 42&times;, but read amplification on range scans is 44&times; against 4.4&times;, and space amplification is 5.5&times;. So it overtakes a B-tree <em>later</em> than leveled does, despite writing far less, because it has to overcome a much larger read penalty first.</li>
+      </ol>
+
+      <div class="note tip">
+        <b>What to take from this practically</b>
+        <p>Leveled LSM is the sensible default for a write-heavy store, which is why RocksDB defaults to it. Tiered is for genuinely write-dominated ingestion where you accept slower reads &mdash; time-series and log workloads. And a B-tree remains excellent when writes have locality: switch write locality to append-mostly and its write amplification falls from 42&times; to about 3.6&times;, because many rows land in the same page before it is flushed. A B-tree on a monotonic key is not a write-amplification problem at all.</p>
+      </div>
+    </section>
+
+    <section id="families">
+      <p class="kicker">FIVE DATA MODELS</p>
+      <h2>What you are allowed to say</h2>
+      <p class="sub">Above the index structure sits the data model, which decides what queries you can express at all.</p>
+
+      <div class="terms">
+        <dt>Relational</dt>
+        <dd>Tables, rows, a declarative language, and a planner that chooses the strategy. The general-purpose default. Its distinguishing property is that <em>you did not have to anticipate the query</em> &mdash; a normalised schema answers questions nobody thought of when it was designed. Postgres, MySQL, and every warehouse.</dd>
+
+        <dt>Document</dt>
+        <dd>Self-contained nested records keyed by id. Excellent when an aggregate is genuinely read and written whole &mdash; a product listing, a user profile &mdash; because one read gets everything with no joins. Weak the moment you want to query across documents in a way the embedding did not anticipate. MongoDB, DynamoDB in document mode, Couchbase.</dd>
+
+        <dt>Key-value</dt>
+        <dd>Get and put an opaque blob by key. The narrowest interface and consequently the fastest and most scalable. Ideal for caching, sessions and counters; useless for any question that is not "give me this key". Redis, Memcached, DynamoDB.</dd>
+
+        <dt>Wide-column</dt>
+        <dd>Rows keyed by a partition key, with a sorted clustering key inside each partition. Effectively a distributed sorted map. Superb at "give me this partition's recent entries in order" at enormous write rates, and it requires you to design the table around the query in advance. Cassandra, HBase, Bigtable.</dd>
+
+        <dt>Graph</dt>
+        <dd>Nodes and edges as first-class entities, with edges stored as direct references. Its one structural advantage is index-free adjacency, which the next demo measures. Neo4j, Neptune.</dd>
+      </div>
+
+      <p>Worth noting explicitly: <strong>the data model and the index structure are independent choices.</strong> Cassandra is wide-column on an LSM; Postgres is relational on a B-tree; MongoDB is document on a B-tree (WiredTiger can do either); a warehouse is relational on columnar files. Do not infer one from the other.</p>
+    </section>
+
+    <section id="access">
+      <p class="kicker">MEASURING THE DIFFERENCE</p>
+      <h2>Where a data model changes the asymptotics</h2>
+      <p class="sub">Most model differences are matters of convenience. One of them changes the complexity class, and it is worth seeing why.</p>
+
+      <p>Relational databases follow relationships with an index lookup: given a user, find their friend rows by searching an index, which costs roughly <code>log&#8322;(N)</code> in the table size. A graph database stores each node's edges as direct pointers, so following one costs a dereference regardless of how large the database is. This is <strong>index-free adjacency</strong>, and it is the entire technical argument for graph engines.</p>
+
+      <p>For a single hop the difference is unremarkable. For multi-hop traversal it compounds, because the number of edges followed grows exponentially in the hop count while the per-edge penalty stays.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Cost of an access pattern across data models</b>
+          <span>edges followed, index lookups and round trips, computed per pattern</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Access pattern
+              <select id="ac-pat">
+                <option value="hops" selected>Traverse N hops of relationships</option>
+                <option value="agg">Aggregate 2 of 60 columns</option>
+                <option value="point">Point lookup by key</option>
+                <option value="partition">Recent entries for one entity</option>
+              </select>
+            </label>
+            <label>Dataset rows
+              <select id="ac-n">
+                <option value="1000000">1 million</option>
+                <option value="1000000000" selected>1 billion</option>
+                <option value="100000000000">100 billion</option>
+              </select>
+            </label>
+            <label>Hops
+              <input type="range" id="ac-hops" min="1" max="4" step="1" value="3">
+              <output id="ac-hops-o">3</output>
+            </label>
+            <label>Branching factor
+              <input type="range" id="ac-deg" min="5" max="100" step="5" value="30">
+              <output id="ac-deg-o">30</output>
+            </label>
+          </div>
+
+          <div class="canvas" id="ac-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="ac-t0"><i>RELATIONAL ROW</i><b id="ac-v0">0</b><s id="ac-s0"></s></div>
+            <div class="tile" id="ac-t1"><i>COLUMNAR</i><b id="ac-v1">0</b><s id="ac-s1"></s></div>
+            <div class="tile" id="ac-t2"><i>DOCUMENT / KV</i><b id="ac-v2">0</b><s id="ac-s2"></s></div>
+            <div class="tile" id="ac-t3"><i>WIDE-COLUMN</i><b id="ac-v3">0</b><s id="ac-s3"></s></div>
+            <div class="tile" id="ac-t4"><i>GRAPH</i><b id="ac-v4">0</b><s id="ac-s4"></s></div>
+          </div>
+
+          <p class="readout" id="ac-note"></p>
+        </div>
+      </div>
+
+      <p>The traversal result is the sharpest: at a billion nodes, three hops and a branching factor of thirty, a graph engine does about 28,000 pointer dereferences while a relational engine does the same 28,000 edge-follows but pays an index lookup for each, about thirty times the work. Raise the dataset to a hundred billion rows and <strong>the graph cost does not change at all</strong> while the relational cost rises with <code>log&#8322;(N)</code>. That independence from dataset size is the property being sold.</p>
+
+      <p>Switch the pattern to the aggregate and the ranking inverts completely: columnar touches about 1.6 GB where the row store touches 48 GB and the graph engine is worst of all. Neither result is a surprise once you know the structures, and together they make the point that <strong>there is no engine that wins everything</strong> — only engines matched or mismatched to a pattern.</p>
+    </section>
+
+    <section id="picking">
+      <p class="kicker">CHOOSING</p>
+      <h2>A decision order that works</h2>
+      <p class="sub">Start from the access pattern, not from the data.</p>
+
+      <div class="check">
+        <li><strong>Write down the three queries that must be fast.</strong> Not all queries &mdash; three. If you cannot name them, you are not ready to choose, and the answer is a relational database because it does not require you to know.</li>
+        <li><strong>Ask whether the pattern is known in advance and stable.</strong> If yes, a specialised model can be dramatically better. If no, relational, because every non-relational model asks you to design around the query.</li>
+        <li><strong>Check the write rate against the read pattern.</strong> Sustained heavy writes with sorted-range reads points at wide-column on an LSM; that combination is what Cassandra exists for.</li>
+        <li><strong>Check whether relationships are the subject.</strong> Multi-hop traversal as the core operation, not an occasional join, is the graph case. Two-table joins are not.</li>
+        <li><strong>Default to Postgres and be honest about why not.</strong> It does relational, JSON documents, key-value, full-text, geospatial and vectors adequately, and adequately in one system usually beats excellently in four. Chapter 3's arithmetic applies.</li>
+      </div>
+
+      <div class="note warn">
+        <b>The failure mode this order prevents</b>
+        <p>Choosing an engine from the shape of the <em>data</em> rather than the shape of the <em>queries</em>. Nested JSON does not imply a document database &mdash; Postgres handles JSONB well and lets you query across documents afterwards. Data with relationships does not imply a graph database. Large volume does not imply a distributed store; a single machine now handles terabytes. The question is always what you will ask, and how often.</p>
+      </div>
+    </section>
+
+    <section id="polyglot">
+      <p class="kicker">THE HONEST VERSION</p>
+      <h2>Polyglot persistence and what it costs</h2>
+      <p class="sub">Using the best engine for each job is correct in principle and frequently a mistake in practice.</p>
+
+      <p>The argument for polyglot persistence is sound as far as it goes: different patterns have different optimal structures, so use several. What the argument omits is that each additional engine carries a fixed cost that has nothing to do with data:</p>
+
+      <div class="cols">
+        <div>
+          <h4>Per-engine costs</h4>
+          <ul>
+            <li>Operational knowledge, upgrades, on-call</li>
+            <li>Backup, restore and disaster recovery, tested</li>
+            <li>Monitoring, access control, audit</li>
+            <li>A driver and idioms in every service that touches it</li>
+          </ul>
+        </div>
+        <div>
+          <h4>Cross-engine costs</h4>
+          <ul>
+            <li>Data must be kept in sync, which needs <a href="05-change-data-capture.html">CDC</a> and is eventually consistent</li>
+            <li>No transactions spanning engines</li>
+            <li>Two sources of truth for the same entity, which will diverge</li>
+            <li>Debugging spans systems with unrelated tooling</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>The version that works in practice is <strong>one primary store plus purpose-built derived stores</strong>. One engine is authoritative — usually relational. Others are populated <em>from</em> it and are explicitly disposable: a Redis cache, a search index, a warehouse copy. Each derived store can be rebuilt from the primary, so a divergence is a rebuild rather than an investigation, and there is never a question about which copy is right.</p>
+
+      <p>That framing also makes the cost visible in the right place. A derived store is a pipeline you now own, with the freshness and correctness obligations of every other pipeline in this unit.</p>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>OLTP and OLAP are access patterns, not products,</b> and the row-versus-column layout that follows is grounded in physical contiguity rather than product strategy.</li>
+          <li><b>HTAP is real and narrower than advertised:</b> two representations kept in sync, so you pay for two copies and still get a lag.</li>
+          <li><b>The RUM trade is the frame:</b> optimise reads, updates or memory, pick two.</li>
+          <li><b>Leveled LSM does not beat a B-tree on write amplification</b> &mdash; both about 42&times; on random keys. On NVMe it never overtakes at any write share.</li>
+          <li><b>The LSM advantage is sequential I/O and space.</b> Once a random write costs 4&times; a sequential one, leveled overtakes at roughly a 1.3% write share, and its space amplification is 1.10 against 1.50.</li>
+          <li><b>Tiered compaction writes far less and overtakes later,</b> because 44&times; range-read amplification and 5.5&times; space amplification are a large penalty to overcome first.</li>
+          <li><b>A B-tree with write locality is fine.</b> Append-mostly keys take its write amplification from 42&times; to about 3.6&times;.</li>
+          <li><b>Data model and index structure are independent.</b> Do not infer one from the other.</li>
+          <li><b>Index-free adjacency is the one asymptotic difference.</b> Graph traversal cost is independent of dataset size; relational grows as log&#8322;(N) &mdash; about 30&times; at a billion rows.</li>
+          <li><b>The ranking inverts completely by pattern.</b> Columnar touches 1.6 GB where a row store touches 48 GB on a two-of-sixty-column aggregate, and the graph engine is worst. No engine wins everything.</li>
+          <li><b>Choose from the queries, never from the shape of the data.</b> Nested JSON does not imply a document store; relationships do not imply a graph.</li>
+          <li><b>One authoritative store plus disposable derived stores</b> beats genuine polyglot persistence, because a divergence becomes a rebuild rather than an investigation.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="11-warehouse-lake.html">Chapter 11 &mdash; Warehouses, lakes and lakehouses</a>. Closing Part 3: Kimball and Inmon, the swamp, and the table formats that put transactions back onto object storage.</p>
+          </div>
+          <div class="fi">
+            <i>GO DEEPER</i>
+            <p>The <a href="../postgresqldba/index.html">PostgreSQL</a> unit covers B-tree internals, MVCC and the planner properly, and the <a href="../redis/index.html">Redis</a> and <a href="../mongodb/index.html">MongoDB</a> units do the same for key-value and document engines.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>For the most specialised datastore your organisation runs, write down the three queries that justified it. If nobody can name them, it is a candidate for consolidation.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Demo 1 — amplification and total I/O
+   ============================================================ */
+(function () {
+  var PAGE = 4096, ROWS = 1e9, ROWB = 100, T = 10, MEMTABLE_MB = 64, FPR = 0.01, OPS = 1e6;
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  function levels() {
+    return Math.max(1, Math.ceil(Math.log(ROWS * ROWB / (MEMTABLE_MB * 1048576)) / Math.log(T)));
+  }
+
+  function engines(coalesce) {
+    var L = levels(), ppr = PAGE / ROWB;
+    return [
+      { lab: "B-tree",      seq: false, writeAmp: 1 + ppr / coalesce,
+        pointRead: ppr, rangeRead: 1.5, spaceAmp: 1.5, col: "#20456A" },
+      { lab: "LSM leveled", seq: true,  writeAmp: 2 + T * L,
+        pointRead: ppr * (1 + FPR * L), rangeRead: 1.1 * L, spaceAmp: 1 + 1 / T, col: "#2E8B5F" },
+      { lab: "LSM tiered",  seq: true,  writeAmp: 2 + L,
+        pointRead: ppr * (1 + FPR * T * L), rangeRead: 1.1 * T * L, spaceAmp: T * 0.5 + 0.5, col: "#C0453A" }
+    ];
+  }
+
+  /* byte amplification alone understates LSM: its writes are sequential */
+  function totalIO(e, wf, rf, penalty) {
+    var w = OPS * wf, r = OPS * (1 - wf);
+    var readAmp = rf * e.rangeRead + (1 - rf) * e.pointRead;
+    var wCost = e.writeAmp * (e.seq ? 1 : penalty);
+    return (w * wCost + r * readAmp) * ROWB;
+  }
+
+  function crossover(es, rf, idx, penalty) {
+    if (totalIO(es[0], 1, rf, penalty) < totalIO(es[idx], 1, rf, penalty)) return null;
+    var lo = 0, hi = 1;
+    for (var i = 0; i < 50; i++) {
+      var m = (lo + hi) / 2;
+      if (totalIO(es[0], m, rf, penalty) < totalIO(es[idx], m, rf, penalty)) lo = m; else hi = m;
+    }
+    return (lo + hi) / 2;
+  }
+
+  function gb(b) {
+    if (b >= 1e12) return (b / 1e12).toFixed(2) + " TB";
+    if (b >= 1e9) return (b / 1e9).toFixed(2) + " GB";
+    return (b / 1e6).toFixed(0) + " MB";
+  }
+
+  function chart(es, rf, penalty, wf) {
+    var W = 700, H = 172, L = 46, B = 30;
+    var xOf = function (f) { return L + f * (W - L - 12); };
+    var max = 0;
+    es.forEach(function (e) {
+      for (var i = 0; i <= 20; i++) max = Math.max(max, totalIO(e, i / 20, rf, penalty));
+    });
+    var yOf = function (v) { return (H - B) - v / max * (H - B - 20); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Total device I/O against write share">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">TOTAL DEVICE I/O FOR 1M OPERATIONS, AGAINST WRITE SHARE</text>');
+    svg.push('<line x1="' + L + '" y1="' + (H - B) + '" x2="' + (W - 12) + '" y2="' + (H - B) + '" stroke="#CFD8E0"/>');
+    svg.push('<line x1="' + L + '" y1="18" x2="' + L + '" y2="' + (H - B) + '" stroke="#CFD8E0"/>');
+    [0, 0.5, 1].forEach(function (f) {
+      svg.push('<line x1="' + L + '" y1="' + yOf(max * f) + '" x2="' + (W - 12) + '" y2="' + yOf(max * f) + '" stroke="#E1E7EC" stroke-dasharray="3 3"/>');
+      svg.push('<text x="2" y="' + (yOf(max * f) + 4) + '" font-size="9.5" fill="#7C8B99">' + gb(max * f) + '</text>');
+    });
+    [0, 0.25, 0.5, 0.75, 1].forEach(function (f) {
+      svg.push('<text x="' + xOf(f) + '" y="' + (H - 16) + '" font-size="10" fill="#7C8B99" text-anchor="middle">' + Math.round(f * 100) + '%</text>');
+    });
+    es.forEach(function (e) {
+      var d = [];
+      for (var i = 0; i <= 40; i++) {
+        var f = i / 40;
+        d.push((i ? "L" : "M") + xOf(f).toFixed(1) + " " + yOf(totalIO(e, f, rf, penalty)).toFixed(1));
+      }
+      svg.push('<path d="' + d.join(" ") + '" fill="none" stroke="' + e.col + '" stroke-width="2"/>');
+      svg.push('<text x="' + (W - 14) + '" y="' + (yOf(totalIO(e, 1, rf, penalty)) - 5) + '" font-size="10.5" font-weight="700" fill="' + e.col + '" text-anchor="end">' + e.lab + '</text>');
+    });
+    svg.push('<line x1="' + xOf(wf) + '" y1="18" x2="' + xOf(wf) + '" y2="' + (H - B) + '" stroke="#E0699F" stroke-width="1.5" stroke-dasharray="4 3"/>');
+    svg.push('<text x="' + (W - 12) + '" y="' + (H - 4) + '" font-size="10" fill="#7C8B99" text-anchor="end">write share of operations</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var wf = +$("am-wf").value / 100, rf = +$("am-rf").value / 100;
+    var penalty = +$("am-dev").value, coal = +$("am-coal").value;
+    $("am-wf-o").textContent = Math.round(wf * 100) + "%";
+    $("am-rf-o").textContent = Math.round(rf * 100) + "%";
+
+    var es = engines(coal);
+    var totals = es.map(function (e) { return totalIO(e, wf, rf, penalty); });
+    var bestIdx = 0;
+    totals.forEach(function (v, i) { if (v < totals[bestIdx]) bestIdx = i; });
+
+    es.forEach(function (e, i) {
+      $("am-v" + i).textContent = gb(totals[i]);
+      $("am-s" + i).textContent = "W " + e.writeAmp.toFixed(0) + "x  R " +
+        (rf * e.rangeRead + (1 - rf) * e.pointRead).toFixed(0) + "x  S " + e.spaceAmp.toFixed(2) + "x";
+      $("am-t" + i).className = "tile " + (i === bestIdx ? "good" : "");
+    });
+    $("am-best").textContent = es[bestIdx].lab;
+    $("am-best-sub").textContent = totals.length > 1
+      ? (Math.max.apply(null, totals) / totals[bestIdx]).toFixed(1) + "x better than worst" : "";
+
+    $("am-canvas").innerHTML = chart(es, rf, penalty, wf);
+
+    var cl = crossover(es, rf, 1, penalty), ct = crossover(es, rf, 2, penalty);
+    var devName = penalty === 1 ? "NVMe" : penalty === 4 ? "SATA SSD" : "spinning disk";
+
+    var lines = [];
+    lines.push("100 GB across " + levels() + " LSM levels. Write amplification: B-tree " +
+      es[0].writeAmp.toFixed(0) + "x, leveled " + es[1].writeAmp.toFixed(0) + "x, tiered " +
+      es[2].writeAmp.toFixed(0) + "x. Space amplification: " + es[0].spaceAmp.toFixed(2) + "x, " +
+      es[1].spaceAmp.toFixed(2) + "x, " + es[2].spaceAmp.toFixed(2) + "x. At a " +
+      Math.round(wf * 100) + "% write share on " + devName + ", " + es[bestIdx].lab + " is cheapest.");
+
+    if (coal === 1 && Math.abs(es[0].writeAmp - es[1].writeAmp) < 2) {
+      lines.push("Note that the B-tree and leveled LSM have essentially the same write amplification here \u2014 " +
+        es[0].writeAmp.toFixed(0) + "x against " + es[1].writeAmp.toFixed(0) +
+        "x. The usual summary that LSMs write less is not true of leveled compaction on byte count. What differs is that LSM writes are sequential and B-tree writes are scattered.");
+    }
+
+    if (cl === null) {
+      lines.push("On " + devName + " a leveled LSM never overtakes the B-tree at any write share: the write amplification is a tie and its reads are slightly worse. Its remaining advantages are space (" +
+        es[1].spaceAmp.toFixed(2) + "x against " + es[0].spaceAmp.toFixed(2) +
+        "x) and predictable sequential I/O. Change the device and watch this flip immediately.");
+    } else {
+      lines.push("Leveled overtakes the B-tree at a " + (cl * 100).toFixed(1) + "% write share, and tiered only at " +
+        (ct === null ? "no point" : (ct * 100).toFixed(1) + "%") +
+        " \u2014 later, despite writing " + (es[0].writeAmp / es[2].writeAmp).toFixed(0) +
+        " times less, because it must first overcome a much larger read and space penalty. Writing less is not the same as costing less.");
+    }
+
+    if (coal > 1) {
+      lines.push("With " + (coal === 16 ? "append-mostly" : "somewhat clustered") +
+        " keys the B-tree's write amplification drops to " + es[0].writeAmp.toFixed(1) +
+        "x, because many rows land in the same page before it is flushed. A B-tree on a monotonic key has no write-amplification problem worth naming.");
+    }
+    $("am-note").textContent = lines.join("\n\n");
+  }
+
+  ["am-wf", "am-rf", "am-dev", "am-coal"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — access pattern cost across data models
+   ============================================================ */
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var NAMES = ["Relational row", "Columnar", "Document / KV", "Wide-column", "Graph"];
+
+  function costs(pattern, N, hops, deg) {
+    var idx = Math.log(N) / Math.log(2);
+    if (pattern === "hops") {
+      var visited = 0;
+      for (var h = 1; h <= hops; h++) visited += Math.pow(deg, h);
+      return {
+        unit: "work units",
+        v: [visited * idx, visited * idx * 3, visited * 50, visited * idx * 1.5, visited * 1],
+        note: [
+          "an index lookup per edge, log2(N) each",
+          "no adjacency at all; a join per hop over a scan",
+          "a round trip per node visited",
+          "an index lookup per edge, with partition overhead",
+          "a pointer dereference per edge, size-independent"
+        ],
+        detail: Math.round(visited).toLocaleString() + " edges followed"
+      };
+    }
+    if (pattern === "agg") {
+      return {
+        unit: "bytes touched",
+        v: [N * 60 * 4, N * 2 * 4, N * 60 * 4 * 1.3, N * 60 * 4, N * 60 * 4 * 1.4],
+        note: [
+          "reads all 60 columns to use 2",
+          "reads only the 2 columns named",
+          "whole documents deserialised",
+          "whole rows across partitions",
+          "whole nodes, plus edge overhead"
+        ],
+        detail: "2 of 60 columns over " + (N / 1e6).toFixed(0) + "M rows"
+      };
+    }
+    if (pattern === "point") {
+      return {
+        unit: "work units",
+        v: [idx, idx * 40, 1, idx * 0.6, 1],
+        note: [
+          "B-tree descent, log2(N)",
+          "no point index; a scan or a coarse skip",
+          "hash to the key directly",
+          "partition hash plus a small in-partition search",
+          "direct node lookup by id"
+        ],
+        detail: "one row by primary key"
+      };
+    }
+    /* the 0.1 factor on wide-column is the point of a clustering key: the
+       entries are contiguous, so each costs a fraction of a random read */
+    return {
+      unit: "work units",
+      v: [idx + 100, idx * 40, 100 * 50, 1 + 100 * 0.1, 100],
+      note: [
+        "index seek then 100 scattered row reads",
+        "scan-oriented; poor for one entity",
+        "a round trip per entry",
+        "one contiguous partition read, already sorted",
+        "a scattered dereference per edge"
+      ],
+      detail: "100 most recent entries for one entity"
+    };
+  }
+
+  function chart(c) {
+    var W = 700, H = 152, L = 124;
+    var max = Math.max.apply(null, c.v);
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Relative cost by data model, log scale">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">RELATIVE COST &middot; ' +
+      c.unit.toUpperCase() + ' &middot; LOG SCALE</text>');
+    var best = Math.min.apply(null, c.v);
+    c.v.forEach(function (v, i) {
+      var y = 20 + i * 26;
+      var frac = Math.log10(v + 1) / Math.log10(max + 1);
+      var w = Math.max(3, frac * (W - L - 128));
+      var isBest = v === best;
+      svg.push('<text x="0" y="' + (y + 14) + '" font-size="11" font-weight="' + (isBest ? 700 : 500) +
+        '" fill="' + (isBest ? "#166B47" : "#54677A") + '">' + NAMES[i] + '</text>');
+      svg.push('<rect x="' + L + '" y="' + y + '" width="' + w.toFixed(1) + '" height="18" rx="2" fill="' +
+        (isBest ? "#2E8B5F" : v === max ? "#C0453A" : "#7C8CF8") + '"/>');
+      svg.push('<text x="' + (L + w + 7) + '" y="' + (y + 13) + '" font-size="10.5" font-weight="600" fill="#54677A">' +
+        (v >= 1e9 ? (v / 1e9).toFixed(1) + "bn" : v >= 1e6 ? (v / 1e6).toFixed(1) + "m" :
+         v >= 1000 ? Math.round(v / 1000) + "k" : v.toFixed(0)) +
+        (isBest ? "" : "   " + (v / best).toFixed(0) + "\u00d7") + '</text>');
+    });
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var pat = $("ac-pat").value, N = +$("ac-n").value;
+    var hops = +$("ac-hops").value, deg = +$("ac-deg").value;
+    $("ac-hops-o").textContent = hops;
+    $("ac-deg-o").textContent = deg;
+
+    var c = costs(pat, N, hops, deg);
+    var best = Math.min.apply(null, c.v), worst = Math.max.apply(null, c.v);
+
+    c.v.forEach(function (v, i) {
+      $("ac-v" + i).textContent = v >= 1e9 ? (v / 1e9).toFixed(1) + "bn"
+        : v >= 1e6 ? (v / 1e6).toFixed(1) + "m"
+        : v >= 1000 ? Math.round(v / 1000) + "k" : v.toFixed(0);
+      $("ac-s" + i).textContent = v === best ? "best here" : (v / best).toFixed(0) + "x the best";
+      $("ac-t" + i).className = "tile " + (v === best ? "good" : v === worst ? "bad" : "");
+    });
+
+    $("ac-canvas").innerHTML = chart(c);
+
+    var bestIdx = c.v.indexOf(best);
+    var lines = [];
+    lines.push(c.detail + " over " + (N >= 1e11 ? "100 billion" : N >= 1e9 ? "1 billion" : "1 million") +
+      " rows. " + NAMES[bestIdx] + " is cheapest: " + c.note[bestIdx] + ". Worst is " +
+      NAMES[c.v.indexOf(worst)] + " at " + (worst / best).toFixed(0) + " times the cost.");
+
+    if (pat === "hops") {
+      var small = costs("hops", 1e6, hops, deg), large = costs("hops", 1e11, hops, deg);
+      lines.push("The graph engine's cost is a pointer dereference per edge, so it does not move when the dataset grows: " +
+        Math.round(small.v[4]).toLocaleString() + " work units at a million rows and " +
+        Math.round(large.v[4]).toLocaleString() +
+        " at a hundred billion. The relational cost pays log2(N) per edge, so the same traversal costs " +
+        (small.v[0] / small.v[4]).toFixed(0) + " times more at a million rows and " +
+        (large.v[0] / large.v[4]).toFixed(0) +
+        " times more at a hundred billion. That independence from size is the entire technical argument for graph databases.");
+      lines.push("Note also how fast the work grows in the hop count: " + hops +
+        " hops at a branching factor of " + deg + " follows " + c.detail +
+        ". Every model gets expensive eventually \u2014 the graph engine just gets there later.");
+    } else if (pat === "agg") {
+      lines.push("Now the ranking inverts entirely. Columnar reads the two columns named and skips the other fifty-eight; every row-oriented model reads whole records to use a thirtieth of them. The graph engine is worst, paying node and edge overhead for a query with no traversal in it.");
+      lines.push("Same five engines, opposite order. This is why \u201cwhich database is fastest\u201d has no answer, and why the decision order in the next section starts from the queries.");
+    } else if (pat === "partition") {
+      lines.push("Wide-column wins this one by construction: the entity is the partition key and the entries are already sorted by the clustering key, so the answer is a contiguous read of one partition. This is exactly the pattern Cassandra and Bigtable were designed for, and it requires knowing the query before you create the table.");
+    } else {
+      lines.push("A point lookup is the pattern where the narrow interfaces win: hashing straight to a key beats descending a tree, and columnar is badly placed because it has no row-level point index at all. This is why a cache in front of an analytical store is not optional if anything user-facing reads it.");
+    }
+    $("ac-note").textContent = lines.join("\n\n");
+  }
+
+  ["ac-pat", "ac-n", "ac-hops", "ac-deg"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+initChapter("10-engines.html");
+</script>
+</body>
+</html>

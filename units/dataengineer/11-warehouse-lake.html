@@ -1,0 +1,616 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Warehouses, lakes and lakehouses — Data Engineer</title>
+<meta name="description" content="Inmon and Kimball, the data swamp, and the table formats that put atomic commits and metadata pruning back onto object storage.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">Data Engineer</a> <span>/</span> Chapter 11</p>
+    <p class="chnum">CHAPTER 11</p>
+    <h1>Warehouses, lakes and lakehouses</h1>
+    <p class="lede">Chapter 7 showed that object storage gives you cheap, durable, immutable blobs and no atomicity across them. That single missing primitive is what turned data lakes into swamps, and closing it is the entire technical content of the lakehouse. This chapter measures the gap and then measures the fix.</p>
+    <div class="meta">
+      <div><b>8</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~28 min</b> read</div>
+      <div><b>Part 3</b> Storage</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="warehouse">
+      <p class="kicker">THE ORIGINAL</p>
+      <h2>Warehouses, and the two schools</h2>
+      <p class="sub">A warehouse is a database tuned for analysis with the modelling discipline of chapter 9 applied to it. The long-running argument is about where that discipline is applied.</p>
+
+      <p>Two architectures were proposed in the early 1990s and the disagreement has never quite ended, mostly because both are partly right.</p>
+
+      <div class="cols">
+        <div>
+          <h4>Inmon: normalised core first</h4>
+          <p>Integrate everything into a normalised, enterprise-wide model &mdash; the "corporate information factory" &mdash; then build dimensional marts <em>from</em> it. Top-down. The core is the single integrated truth; marts are derived views for particular audiences.</p>
+          <p><strong>Strength:</strong> genuinely consistent across the whole business. <strong>Weakness:</strong> nothing is delivered until the enterprise model exists, which historically took years and frequently never finished.</p>
+        </div>
+        <div>
+          <h4>Kimball: dimensional marts first</h4>
+          <p>Model one business process at a time as a star, and achieve consistency by sharing <em>conformed dimensions</em> across them. Bottom-up. The warehouse is the union of the marts, held together by shared dimensions rather than by a normalised core.</p>
+          <p><strong>Strength:</strong> value in weeks, and the increments are usable. <strong>Weakness:</strong> conformance requires ongoing discipline, and drifts without it.</p>
+        </div>
+      </div>
+
+      <div class="note key">
+        <b>How this resolved in practice</b>
+        <p>Kimball won the delivery argument and Inmon won the integration argument, and modern platforms do both in layers. The now-standard three-layer shape is recognisably a synthesis: a <strong>raw or bronze</strong> layer holding source data as it arrived, a <strong>staging or silver</strong> layer that is cleaned, conformed and lightly normalised, and a <strong>marts or gold</strong> layer of dimensional models per consumer.</p>
+        <p>The important property is that each layer is derivable from the one before it. That is what makes a modelling mistake a rebuild rather than a data-loss event, and it is the same reasoning as the replayability requirement in <a href="12-batch-ingestion.html">chapter 12</a>.</p>
+      </div>
+
+      <p>What a warehouse gives you beyond a database is not one feature but a bundle: columnar storage, a planner that understands star schemas, elastic compute separated from storage, transactions over multi-table loads, time travel, and access control at column and row level. The lake story is largely the story of discovering how much of that bundle mattered.</p>
+    </section>
+
+    <section id="lake">
+      <p class="kicker">THE DETOUR</p>
+      <h2>The lake, and how it silted up</h2>
+      <p class="sub">The idea was excellent and the first implementation was missing four things. Naming them precisely is more useful than the swamp metaphor.</p>
+
+      <p>The lake proposition was compelling around 2012. Object storage was twenty times cheaper than warehouse storage. Schema-on-write forced you to decide a schema before you knew what the data was for, and discarded anything that did not fit. So: land everything raw in cheap storage, impose schema at read time, and keep the optionality.</p>
+
+      <p>All of that is sound, and the optionality argument in particular was correct. What went wrong was not the concept but four specific absences:</p>
+
+      <div class="terms">
+        <dt>No atomicity</dt>
+        <dd>A write of fifty files followed by a metadata update is not one operation. Readers arriving in the middle see a partial dataset. This is the subject of the next section and it is the root cause of most of the rest.</dd>
+
+        <dt>No schema enforcement</dt>
+        <dd>Schema-on-read means nothing rejects a malformed file. Chapter 6's argument applies: with no gate, drift accumulates silently until a consumer breaks or, worse, quietly computes the wrong number.</dd>
+
+        <dt>No efficient updates or deletes</dt>
+        <dd>Objects are immutable, so "delete this customer's rows" means finding every file containing them and rewriting each whole. Which made GDPR erasure requests, when they arrived, an engineering project rather than a query.</dd>
+
+        <dt>No usable metadata</dt>
+        <dd>Finding which files belong to a table meant listing a prefix, which chapter 7 established is a slow paginated API call. At scale, query <em>planning</em> came to take longer than query execution. The second demo measures this.</dd>
+      </div>
+
+      <p>The consequence was predictable and widely experienced: data that nobody could be sure was complete, correct or current, in a store nobody could query quickly. The pejorative was earned, but it described an implementation gap rather than a flawed idea — which matters, because the fix turned out to be additive rather than a retreat to warehouses.</p>
+    </section>
+
+    <section id="atomic">
+      <p class="kicker">THE MISSING PRIMITIVE</p>
+      <h2>Atomicity, measured</h2>
+      <p class="sub">Replacing a partition means several object operations. Without a commit protocol, every reader arriving during those operations sees something that was never true.</p>
+
+      <p>Take a concrete case. A daily job replaces yesterday's partition: four existing files holding 250 rows each become six new files holding 200 rows each. The correct answer before the job is 1,000 rows and after it is 1,200. There is no correct answer of 250, or 2,000.</p>
+
+      <p>But a reader that discovers its files by listing a directory sees whatever objects happen to exist at that instant. The demo puts readers at random moments across the operation and counts how many get an answer that was never true.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>What readers see during a partition replacement</b>
+          <span>20,000 readers arriving at random moments, row counts computed from files present</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Write protocol
+              <select id="at-mode">
+                <option value="delete-first" selected>Delete old files, then write new</option>
+                <option value="write-first">Write new files, then delete old</option>
+                <option value="atomic">Write new files, then swap one pointer</option>
+              </select>
+            </label>
+            <label>Concurrent writers
+              <select id="at-conc">
+                <option value="one" selected>One writer</option>
+                <option value="two">Two writers, same partition</option>
+              </select>
+            </label>
+            <label>Optimistic concurrency
+              <select id="at-cas">
+                <option value="off" selected>No conflict check</option>
+                <option value="on">Compare-and-swap on the pointer</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="at-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="at-torn-tile"><i>READERS GIVEN A FALSE ANSWER</i><b id="at-torn">0</b><s id="at-torn-sub">of 20,000</s></div>
+            <div class="tile"><i>WORST ERROR</i><b id="at-worst">0%</b><s id="at-worst-sub">against the truth</s></div>
+            <div class="tile"><i>EXPOSED WINDOW</i><b id="at-win">0%</b><s>of the operation</s></div>
+            <div class="tile" id="at-cw-tile"><i>CONCURRENT OUTCOME</i><b id="at-cw">&mdash;</b><s id="at-cw-sub"></s></div>
+          </div>
+
+          <p class="readout" id="at-note"></p>
+        </div>
+      </div>
+
+      <p>Three results worth stating.</p>
+
+      <ol>
+        <li><strong>Both non-atomic orderings fail, in opposite directions.</strong> Deleting first makes rows vanish — the worst observed error is 100%, an empty partition. Writing first makes rows duplicate — up to 120% too many. Neither is safe; the choice is only between which wrong answer you prefer.</li>
+        <li><strong>The exposure is not the whole operation, and that makes it worse.</strong> The torn window measures about 79% of the operation rather than 100%, because at the very start and the very end the file set coincidentally produces a clean-looking count. So the bug is invisible at both ends, which is exactly where a hurried test would sample.</li>
+        <li><strong>An atomic pointer swap eliminates it entirely.</strong> Zero readers out of twenty thousand see a false answer, because the pointer moves from one complete file set to another in a single operation. Every reader gets either the old snapshot or the new one, and both were true at some moment.</li>
+      </ol>
+
+      <div class="note trap">
+        <b>Concurrent writers are the second half of the problem</b>
+        <p>Switch to two writers. With no conflict check, both replace the partition from the same starting point and both sets of files end up present &mdash; 2,400 rows where there should be 1,200. Nothing errors; the table is simply double-counted, permanently, and neither job's logs show anything wrong.</p>
+        <p>Turn on compare-and-swap and one writer commits while the other detects that the snapshot it started from is no longer current, and retries. That check &mdash; a conditional write on a single metadata object, which chapter 7 noted object stores now support &mdash; is the whole mechanism. It is why table formats do not need an external lock service.</p>
+      </div>
+    </section>
+
+    <section id="formats">
+      <p class="kicker">THE FIX</p>
+      <h2>Table formats</h2>
+      <p class="sub">A table format is a specification for a metadata layer over immutable files. It converts a directory of Parquet into something with transactions, schema and history.</p>
+
+      <p>The shape is the same in all three implementations. Data files stay ordinary Parquet. Above them sits metadata listing exactly which files constitute the table at each version, with statistics for each. A commit writes new data files, writes new metadata, and then atomically moves a single pointer. Readers resolve the pointer first, so they always see a consistent file set — the atomic case in the demo above.</p>
+
+      <div class="tw">
+        <table>
+          <caption>The three open table formats, on what genuinely differs</caption>
+          <thead>
+            <tr><th></th><th>Apache Iceberg</th><th>Delta Lake</th><th>Apache Hudi</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Metadata structure</td><td>Metadata file, manifest list, manifests</td><td>Ordered JSON transaction log with checkpoints</td><td>Timeline of commits plus indexes</td></tr>
+            <tr><td>Origin</td><td>Netflix</td><td>Databricks</td><td>Uber</td></tr>
+            <tr><td>Distinctive strength</td><td>Hidden partitioning and safe partition evolution</td><td>Tight Spark integration, mature tooling</td><td>Record-level upserts and incremental pulls</td></tr>
+            <tr><td>Schema evolution</td><td>Add, drop, rename, reorder, widen &mdash; by field id</td><td>Add, widen; rename with column mapping</td><td>Add, widen</td></tr>
+            <tr><td>Partition evolution</td><td>Yes, without rewriting data</td><td>Limited</td><td>Limited</td></tr>
+            <tr><td>Best fit</td><td>Multi-engine, long-lived tables</td><td>Spark-centric platforms</td><td>Heavy streaming upsert workloads</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>What all three give you, and what the plain lake did not:</p>
+
+      <div class="check">
+        <li><strong>ACID commits</strong> over many files, via the pointer swap and compare-and-swap measured above.</li>
+        <li><strong>Time travel</strong>, because old metadata versions still reference their file sets. Querying the table as of last Tuesday is a metadata lookup, not a restore.</li>
+        <li><strong>Schema evolution</strong> with the compatibility discipline of <a href="06-contracts.html">chapter 6</a>, enforced rather than hoped for.</li>
+        <li><strong>Row-level updates and deletes</strong>, by rewriting affected files or writing delete files that readers apply &mdash; the copy-on-write and merge-on-read trade below.</li>
+        <li><strong>File-level statistics</strong> in the metadata, which extends chapter 8's row-group pruning up a level and is the subject of the next demo.</li>
+      </div>
+
+      <div class="note tip">
+        <b>Copy-on-write against merge-on-read</b>
+        <p>Updating a row means either rewriting every file containing it (<strong>copy-on-write</strong>: expensive writes, fast reads) or writing a small delete or change file that readers merge at query time (<strong>merge-on-read</strong>: cheap writes, slower reads that degrade until compaction). This is precisely the read-write-space trade from <a href="10-engines.html">chapter 10</a>, reappearing one layer up. Copy-on-write for tables read far more than written; merge-on-read for streaming upserts, with compaction scheduled and monitored.</p>
+      </div>
+
+      <p>One feature deserves calling out because it fixes a real recurring failure. <strong>Iceberg's hidden partitioning</strong> stores the partition transform in metadata rather than in the directory path. So a table partitioned by day of an event timestamp does not require the query to say <code>WHERE dt = '2026-09-04'</code> alongside its timestamp filter — filtering on the timestamp is enough, and the engine derives the partitions. That removes an entire class of "the query silently scanned everything because the analyst did not know about the partition column".</p>
+    </section>
+
+    <section id="planning">
+      <p class="kicker">THE OTHER HALF</p>
+      <h2>Metadata at scale</h2>
+      <p class="sub">Atomicity was the correctness fix. Metadata was the performance fix, and at large table counts it is the more visible one.</p>
+
+      <p>Consider a table of ten years of daily partitions with twenty files each — 73,000 files — and a query wanting one week. Before any data is read, the engine has to work out which files it needs.</p>
+
+      <p>A Hive-style table has to <em>discover</em> that by listing object keys, a thousand at a time, and then open file footers to get statistics. An Iceberg-style table reads a metadata file, then a manifest list carrying partition ranges, and reads only the manifests that can contain matching partitions.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Query planning requests before any data is read</b>
+          <span>directory listing against manifest pruning, at 50 ms per object-store request</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Partitions
+              <select id="pl-parts">
+                <option value="365">365 (1 year daily)</option>
+                <option value="3650" selected>3,650 (10 years daily)</option>
+                <option value="36500">36,500 (10 years hourly-ish)</option>
+              </select>
+            </label>
+            <label>Files per partition
+              <input type="range" id="pl-fpp" min="1" max="60" step="1" value="20">
+              <output id="pl-fpp-o">20</output>
+            </label>
+            <label>Partitions the query needs
+              <input type="range" id="pl-sel" min="1" max="365" step="1" value="7">
+              <output id="pl-sel-o">7</output>
+            </label>
+          </div>
+
+          <div class="canvas" id="pl-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>FILES IN THE TABLE</i><b id="pl-files">0</b><s id="pl-files-sub"></s></div>
+            <div class="tile bad"><i>HIVE-STYLE PLANNING</i><b id="pl-hive">0</b><s id="pl-hive-sub"></s></div>
+            <div class="tile good"><i>MANIFEST PRUNING</i><b id="pl-ice">0</b><s id="pl-ice-sub"></s></div>
+            <div class="tile hi"><i>PLANNING LATENCY</i><b id="pl-lat">0</b><s id="pl-lat-sub"></s></div>
+          </div>
+
+          <p class="readout" id="pl-note"></p>
+        </div>
+      </div>
+
+      <p>The number that matters is not the ratio at one size but how each scales. Raise the partition count tenfold while asking the <em>same</em> seven-day question: Hive-style planning goes from 213 requests to 870, because it must enumerate the whole table to find out what is in it. Manifest-based planning stays at 3, because the manifest list tells it which manifests can possibly match and it reads only those. At 50 ms a request that is roughly 11 seconds becoming 44, against 0.15 seconds staying 0.15.</p>
+
+      <div class="note key">
+        <b>Why this was experienced as "the lake is slow"</b>
+        <p>Planning cost is paid before a single row is read, so it is a fixed floor under every query however selective. A dashboard tile wanting one day of data waited on a full table enumeration. Teams concluded object storage was slow, when the actual problem was that they were asking the object store to serve as a catalogue &mdash; which chapter 7 explained it is structurally bad at, because directories are not real.</p>
+        <p>There is a second effect the demo does not show: manifests carry per-file column statistics, so a table format can prune by a non-partition column too. Hive-style tables cannot, short of opening every footer, which is the expensive thing they were trying to avoid.</p>
+      </div>
+    </section>
+
+    <section id="mesh">
+      <p class="kicker">THE ORGANISATIONAL LAYER</p>
+      <h2>Mesh, fabric and hub, assessed</h2>
+      <p class="sub">Three terms that get sold as architectures. One is a genuine organisational idea, one is mostly a product category, and one is a pattern.</p>
+
+      <div class="terms">
+        <dt>Data mesh</dt>
+        <dd>A response to a real problem: a central data team becomes the bottleneck for every question in the company &mdash; the third row of chapter 1's maturity table. The proposal is domain ownership of data as a product, on a self-serve platform, with federated governance. <strong>It is an organisational design, not a technology</strong>, and the platform is a prerequisite rather than a consequence.</dd>
+
+        <dt>Data fabric</dt>
+        <dd>A metadata-driven integration layer that discovers, catalogues and connects data across systems, ideally with active metadata driving automation. Largely vendor-defined and vendor-shaped. The underlying capabilities &mdash; catalogue, lineage, discovery &mdash; are real and appear in <a href="21-observability.html">chapter 21</a>; the umbrella term adds little.</dd>
+
+        <dt>Data hub</dt>
+        <dd>A central point through which data flows between systems, with governance applied in transit. A pattern rather than a movement, and a sensible one at moderate integration counts.</dd>
+      </div>
+
+      <div class="note warn">
+        <b>The mesh prerequisite people skip</b>
+        <p>Domain ownership only works if a domain team can actually publish a governed, discoverable, contract-bearing dataset without needing the central team. That requires the platform &mdash; self-serve storage, orchestration, CI, contract enforcement, lineage, cost attribution &mdash; to exist and be genuinely usable first.</p>
+        <p>Adopting the org structure before the platform gives you the same silos with new vocabulary, plus the central team's expertise dispersed. Chapter 3 listed this as a named failure: adopting a pattern without its prerequisites. If you have fewer than a few hundred engineers, the honest answer is that a central team with good self-serve tooling is almost certainly better.</p>
+      </div>
+    </section>
+
+    <section id="picking">
+      <p class="kicker">CHOOSING</p>
+      <h2>Which of these you actually need</h2>
+
+      <div class="tw">
+        <table>
+          <caption>A defensible default per situation</caption>
+          <thead>
+            <tr><th>Situation</th><th>Choose</th><th>Why</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Under a few terabytes, one team, SQL analytics</td><td>Managed warehouse only</td><td>A lakehouse adds machinery for problems you do not have. Chapter 3's crossover applies.</td></tr>
+            <tr><td>Mixed SQL and Python or ML on the same data</td><td>Lakehouse with a table format</td><td>One copy readable by several engines is the specific thing this buys.</td></tr>
+            <tr><td>Very large volumes priced badly by a warehouse</td><td>Lakehouse</td><td>Object storage economics, and compute you can turn off.</td></tr>
+            <tr><td>Semi-structured data of uncertain future use</td><td>Object storage landing zone plus a warehouse</td><td>Keep the raw optionality; model what you actually need.</td></tr>
+            <tr><td>Hard requirement to avoid vendor storage lock-in</td><td>Open table format on your own bucket</td><td>The portable posture priced in chapter 3.</td></tr>
+            <tr><td>Several hundred engineers, central team is the bottleneck</td><td>Platform investment, then consider mesh</td><td>In that order, not the reverse.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Worth being clear that the warehouse-versus-lakehouse framing is largely obsolete as a choice. Warehouses now read and write open table formats on your storage; lakehouse engines now offer SQL, governance and elastic compute. The remaining question is mostly <em>where the authoritative copy lives and who can read it</em>, which is a portability question rather than an architecture one.</p>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>Kimball won delivery, Inmon won integration,</b> and the standard raw / staging / marts layering is the synthesis. Each layer must be derivable from the one before it.</li>
+          <li><b>The lake concept was sound; four things were missing</b> &mdash; atomicity, schema enforcement, efficient updates, and usable metadata.</li>
+          <li><b>Non-atomic writes give readers answers that were never true.</b> Deleting first makes rows vanish, up to a 100% error; writing first duplicates them, up to 120%.</li>
+          <li><b>The torn window is about 79% of the operation, not all of it,</b> because the very start and end coincidentally look clean &mdash; so the bug hides exactly where a quick test would sample.</li>
+          <li><b>An atomic pointer swap eliminates it completely:</b> zero false answers in twenty thousand readers.</li>
+          <li><b>Concurrent writers double-count silently without a conflict check.</b> Compare-and-swap on one metadata object is the whole mechanism, which is why no external lock service is needed.</li>
+          <li><b>A table format is a metadata layer over ordinary Parquet</b> giving ACID commits, time travel, enforced schema evolution, row-level deletes and file statistics.</li>
+          <li><b>Copy-on-write against merge-on-read is chapter 10's trade one layer up.</b> Cheap writes cost read performance until compaction runs.</li>
+          <li><b>Hive-style planning scales with the table; manifest planning does not.</b> Tenfold the partitions for the same seven-day query takes Hive from 213 requests to 870 while manifests stay at 3 &mdash; 11 seconds becoming 44, against 0.15 either way.</li>
+          <li><b>Planning cost is a fixed floor under every query,</b> which is why lakes were experienced as slow: the object store was being used as a catalogue.</li>
+          <li><b>Mesh is an organisational design and the platform is its prerequisite.</b> Adopting it first gives you the same silos with new vocabulary.</li>
+          <li><b>Warehouse against lakehouse is no longer the real question.</b> Where the authoritative copy lives and who can read it is.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="12-batch-ingestion.html">Chapter 12 &mdash; Batch ingestion, ETL and ELT</a>. Part 4 opens on moving data: extraction patterns, idempotency under retry, watermarks and late arrivals, and backfills that do not take production down.</p>
+          </div>
+          <div class="fi">
+            <i>PART 3 IS NOW COMPLETE</i>
+            <p>Chapters 7 to 11 covered the substrate, the file layout, the model, the engines and the table layer. Everything from here assumes storage is settled and asks how data gets in and out.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>On your largest table, time a query that selects one day and compare it against one that selects a year. If the two are closer than the data volumes suggest, you are paying a planning floor.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Demo 1 — what readers see during a partition replacement
+   ============================================================ */
+(function () {
+  var OLD_N = 4, OLD_ROWS = 250, NEW_N = 6, NEW_ROWS = 200;
+  var TRUE_OLD = OLD_N * OLD_ROWS, TRUE_NEW = NEW_N * NEW_ROWS;
+  var READERS = 20000, SPAN = 1.4;
+
+  var $ = function (id) { return document.getElementById(id); };
+  function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+
+  /* rows a directory-listing reader would count at time t */
+  function seen(mode, t) {
+    if (t <= 0) return TRUE_OLD;
+    if (t >= 1) return TRUE_NEW;
+    if (mode === "atomic") return TRUE_OLD;          /* pointer not yet swapped */
+    if (mode === "delete-first") {
+      var gone = Math.floor(t * 2 * OLD_N);
+      var made = Math.max(0, Math.floor((t - 0.5) * 2 * NEW_N));
+      return Math.max(0, OLD_N - gone) * OLD_ROWS + made * NEW_ROWS;
+    }
+    var made2 = Math.floor(Math.min(t / 0.5, 1) * NEW_N);
+    var gone2 = Math.max(0, Math.floor((t - 0.5) * 2 * OLD_N));
+    return Math.max(0, OLD_N - gone2) * OLD_ROWS + made2 * NEW_ROWS;
+  }
+
+  function survey(mode) {
+    var rnd = lcg(3), wrong = 0, worst = 0;
+    for (var i = 0; i < READERS; i++) {
+      var t = -0.2 + rnd() * SPAN;
+      var got = seen(mode, t);
+      if (got !== TRUE_OLD && got !== TRUE_NEW) {
+        wrong++;
+        var truth = t >= 1 ? TRUE_NEW : TRUE_OLD;
+        worst = Math.max(worst, Math.abs(got - truth) / truth);
+      }
+    }
+    return { wrong: wrong, worst: worst };
+  }
+
+  /* measure the torn interval rather than assuming it spans the operation */
+  function tornWindow(mode) {
+    var lo = null, hi = null;
+    for (var i = 0; i <= 2000; i++) {
+      var t = i / 2000, v = seen(mode, t);
+      if (v !== TRUE_OLD && v !== TRUE_NEW) { if (lo === null) lo = t; hi = t; }
+    }
+    return lo === null ? 0 : hi - lo;
+  }
+
+  function chart(mode) {
+    var W = 700, H = 158, L = 46, B = 28;
+    var xOf = function (t) { return L + (t + 0.2) / SPAN * (W - L - 12); };
+    var maxY = TRUE_NEW * 1.8;
+    var yOf = function (v) { return (H - B) - v / maxY * (H - B - 22); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Row count visible to a reader over time">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">ROWS A READER WOULD COUNT, ACROSS THE OPERATION</text>');
+
+    [[TRUE_OLD, "1000 (before)"], [TRUE_NEW, "1200 (after)"]].forEach(function (m) {
+      svg.push('<line x1="' + L + '" y1="' + yOf(m[0]) + '" x2="' + (W - 12) + '" y2="' + yOf(m[0]) +
+        '" stroke="#2E8B5F" stroke-width="1.2" stroke-dasharray="4 3"/>');
+      svg.push('<text x="2" y="' + (yOf(m[0]) + 4) + '" font-size="9" fill="#166B47">' + m[0] + '</text>');
+    });
+
+    svg.push('<rect x="' + xOf(0) + '" y="16" width="' + (xOf(1) - xOf(0)) + '" height="' + (H - B - 16) +
+      '" fill="#F3D3E2" opacity="0.4"/>');
+    svg.push('<text x="' + (xOf(0) + 4) + '" y="26" font-size="9.5" fill="#A8386B">operation in progress</text>');
+
+    var d = [];
+    for (var i = 0; i <= 280; i++) {
+      var t = -0.2 + (i / 280) * SPAN;
+      d.push((i ? "L" : "M") + xOf(t).toFixed(1) + " " + yOf(seen(mode, t)).toFixed(1));
+    }
+    svg.push('<path d="' + d.join(" ") + '" fill="none" stroke="' + (mode === "atomic" ? "#2E8B5F" : "#C0453A") + '" stroke-width="2.2"/>');
+
+    for (var j = 0; j <= 240; j++) {
+      var tt = -0.2 + (j / 240) * SPAN, vv = seen(mode, tt);
+      if (vv !== TRUE_OLD && vv !== TRUE_NEW) {
+        svg.push('<rect x="' + xOf(tt).toFixed(1) + '" y="' + (H - B) + '" width="3" height="5" fill="#C0453A"/>');
+      }
+    }
+    svg.push('<text x="' + L + '" y="' + (H - 6) + '" font-size="9.5" fill="#7C8B99">red ticks mark moments when the visible count was never true</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var mode = $("at-mode").value;
+    var conc = $("at-conc").value === "two";
+    var cas = $("at-cas").value === "on";
+
+    var s = survey(mode), tw = tornWindow(mode);
+
+    $("at-torn").textContent = s.wrong.toLocaleString();
+    $("at-torn-sub").textContent = (s.wrong / READERS * 100).toFixed(1) + "% of 20,000";
+    $("at-torn-tile").className = "tile " + (s.wrong === 0 ? "good" : "bad");
+    $("at-worst").textContent = (s.worst * 100).toFixed(0) + "%";
+    $("at-worst-sub").textContent = mode === "delete-first" ? "rows vanished"
+      : mode === "write-first" ? "rows duplicated" : "never wrong";
+    $("at-win").textContent = (tw * 100).toFixed(1) + "%";
+
+    var cw, cwSub, cwCls;
+    if (!conc) { cw = "n/a"; cwSub = "single writer"; cwCls = ""; }
+    else if (cas) { cw = TRUE_NEW + " rows"; cwSub = "conflict detected, one retried"; cwCls = "good"; }
+    else { cw = (TRUE_NEW * 2) + " rows"; cwSub = "both applied, double-counted"; cwCls = "bad"; }
+    $("at-cw").textContent = cw;
+    $("at-cw-sub").textContent = cwSub;
+    $("at-cw-tile").className = "tile " + cwCls;
+
+    $("at-canvas").innerHTML = chart(mode);
+
+    var lines = [];
+    if (mode === "atomic") {
+      lines.push("Not one of the " + READERS.toLocaleString() +
+        " readers sees a count that was never true. The new files are written while the pointer still references the old set, so the table reads as 1,000 rows throughout; the pointer then moves in a single operation and it reads as 1,200. Both answers were true at some moment, which is the entire definition of a consistent snapshot.");
+    } else {
+      lines.push(s.wrong.toLocaleString() + " of " + READERS.toLocaleString() + " readers (" +
+        (s.wrong / READERS * 100).toFixed(1) + "%) get a row count that was never correct, with a worst error of " +
+        (s.worst * 100).toFixed(0) + "%. " +
+        (mode === "delete-first"
+          ? "Deleting first makes rows disappear \u2014 at the midpoint the partition can read as low as " + seen("delete-first", 0.49) + " rows."
+          : "Writing first makes rows duplicate \u2014 at the midpoint the partition can read as high as " + seen("write-first", 0.49) + " rows against a true 1,000."));
+
+      lines.push("The exposed window is " + (tw * 100).toFixed(1) +
+        "% of the operation rather than 100%, because at the very beginning and very end the file set happens to add up to a clean-looking number. That is worse rather than better: the failure is invisible exactly where a quick manual check would look, and appears only in the middle.");
+    }
+
+    if (conc && !cas) {
+      lines.push("With two writers and no conflict check, both start from the same snapshot and both commit their files. The partition ends up with " +
+        (TRUE_NEW * 2) + " rows where it should have " + TRUE_NEW +
+        ". Nothing fails, nothing logs an error, and the table is permanently double-counted \u2014 the kind of defect that reconciles against nothing because no single job did anything wrong.");
+    } else if (conc && cas) {
+      lines.push("With compare-and-swap, the second writer finds that the snapshot it based its work on is no longer current and retries against the new one. One conditional write on a single metadata object is the whole concurrency-control mechanism, which is why table formats need no external lock service \u2014 chapter 7 noted that object stores now provide exactly this primitive.");
+    }
+    $("at-note").textContent = lines.join("\n\n");
+  }
+
+  ["at-mode", "at-conc", "at-cas"].forEach(function (id) { $(id).addEventListener("change", render); });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — query planning requests
+   ============================================================ */
+(function () {
+  var FILES_PER_MANIFEST = 8000, KEYS_PER_LIST = 1000, MS = 50;
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  function plan(parts, fpp, sel) {
+    var totalFiles = parts * fpp;
+    var hiveList = Math.ceil(totalFiles / KEYS_PER_LIST);
+    var hiveFooters = Math.min(sel, parts) * fpp;
+    var manifests = Math.ceil(totalFiles / FILES_PER_MANIFEST);
+    var touched = Math.max(1, Math.ceil(Math.min(sel, parts) / parts * manifests));
+    return {
+      totalFiles: totalFiles,
+      hive: hiveList + hiveFooters, hiveList: hiveList, hiveFooters: hiveFooters,
+      ice: 2 + touched, manifests: manifests, touched: touched
+    };
+  }
+
+  function big(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "m";
+    if (n >= 1000) return Math.round(n / 1000) + "k";
+    return String(n);
+  }
+  function secs(reqs) {
+    var s = reqs * MS / 1000;
+    return s < 1 ? s.toFixed(2) + "s" : s.toFixed(1) + "s";
+  }
+
+  function chart(parts, fpp, sel) {
+    var W = 700, H = 150, L = 46, B = 26;
+    var sizes = [365, 1095, 3650, 10950, 36500];
+    var xOf = function (i) { return L + i / (sizes.length - 1) * (W - L - 60); };
+    var maxY = Math.max.apply(null, sizes.map(function (p) { return plan(p, fpp, sel).hive; }));
+    var yOf = function (v) { return (H - B) - v / maxY * (H - B - 22); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Planning requests against table size">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">PLANNING REQUESTS AS THE TABLE GROWS, FOR THE SAME QUERY</text>');
+    svg.push('<line x1="' + L + '" y1="' + (H - B) + '" x2="' + (W - 56) + '" y2="' + (H - B) + '" stroke="#CFD8E0"/>');
+    [0, 0.5, 1].forEach(function (f) {
+      svg.push('<line x1="' + L + '" y1="' + yOf(maxY * f) + '" x2="' + (W - 56) + '" y2="' + yOf(maxY * f) + '" stroke="#E1E7EC" stroke-dasharray="3 3"/>');
+      svg.push('<text x="2" y="' + (yOf(maxY * f) + 4) + '" font-size="9.5" fill="#7C8B99">' + Math.round(maxY * f) + '</text>');
+    });
+    ["hive", "ice"].forEach(function (k, ki) {
+      var d = sizes.map(function (p, i) {
+        return (i ? "L" : "M") + xOf(i).toFixed(1) + " " + yOf(plan(p, fpp, sel)[k]).toFixed(1);
+      }).join(" ");
+      svg.push('<path d="' + d + '" fill="none" stroke="' + (ki ? "#2E8B5F" : "#C0453A") + '" stroke-width="2.2"/>');
+      sizes.forEach(function (p, i) {
+        svg.push('<circle cx="' + xOf(i).toFixed(1) + '" cy="' + yOf(plan(p, fpp, sel)[k]).toFixed(1) + '" r="3" fill="' + (ki ? "#2E8B5F" : "#C0453A") + '"/>');
+      });
+      svg.push('<text x="' + (W - 52) + '" y="' + (yOf(plan(sizes[sizes.length - 1], fpp, sel)[k]) + 4) +
+        '" font-size="10.5" font-weight="700" fill="' + (ki ? "#2E8B5F" : "#C0453A") + '">' + (ki ? "manifests" : "listing") + '</text>');
+    });
+    sizes.forEach(function (p, i) {
+      svg.push('<text x="' + xOf(i) + '" y="' + (H - 8) + '" font-size="9.5" fill="' +
+        (p === parts ? "#A8386B" : "#7C8B99") + '" font-weight="' + (p === parts ? 700 : 400) +
+        '" text-anchor="middle">' + big(p) + '</text>');
+    });
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var parts = +$("pl-parts").value, fpp = +$("pl-fpp").value;
+    var selRaw = +$("pl-sel").value, sel = Math.min(selRaw, parts);
+    $("pl-fpp-o").textContent = fpp;
+    $("pl-sel-o").textContent = sel;
+
+    var p = plan(parts, fpp, sel);
+    var ten = plan(Math.min(36500, parts * 10), fpp, sel);
+
+    $("pl-files").textContent = big(p.totalFiles);
+    $("pl-files-sub").textContent = p.manifests + " manifests";
+    $("pl-hive").textContent = p.hive.toLocaleString();
+    $("pl-hive-sub").textContent = p.hiveList + " list + " + p.hiveFooters + " footers";
+    $("pl-ice").textContent = p.ice.toLocaleString();
+    $("pl-ice-sub").textContent = "2 metadata + " + p.touched + " manifest" + (p.touched === 1 ? "" : "s");
+    $("pl-lat").textContent = secs(p.hive) + " \u2192 " + secs(p.ice);
+    $("pl-lat-sub").textContent = (p.hive / p.ice).toFixed(0) + "x fewer requests";
+
+    $("pl-canvas").innerHTML = chart(parts, fpp, sel);
+
+    var lines = [];
+    lines.push(big(p.totalFiles) + " files across " + parts.toLocaleString() +
+      " partitions, query needs " + sel + ". Listing-based planning costs " + p.hive.toLocaleString() +
+      " requests (" + p.hiveList + " list calls to enumerate the table, then " + p.hiveFooters +
+      " footer reads for statistics). Manifest-based planning costs " + p.ice +
+      " \u2014 the metadata pointer, the manifest list, and " + p.touched + " pruned manifest" +
+      (p.touched === 1 ? "" : "s") + ". At " + MS + " ms a request that is " + secs(p.hive) +
+      " against " + secs(p.ice) + ", before a single row of data is read.");
+
+    if (parts < 36500) {
+      lines.push("The ratio is not the interesting part; the scaling is. Ask the same " + sel +
+        "-partition question of a table with " + Math.min(36500, parts * 10).toLocaleString() +
+        " partitions and listing goes from " + p.hive.toLocaleString() + " requests to " +
+        ten.hive.toLocaleString() + ", because it has to enumerate the whole table to find out what is in it. Manifest planning goes from " +
+        p.ice + " to " + ten.ice + ": the manifest list says which manifests could possibly match, so the rest are never opened.");
+    } else {
+      lines.push("At this size listing-based planning is " + secs(p.hive) +
+        " of pure overhead on every query, however selective. That is a fixed floor: a dashboard tile asking for one day waits for the entire table to be enumerated first. This is what teams experienced as \u201cthe lake is slow\u201d, and the cause was using an object store as a catalogue.");
+    }
+
+    if (sel / parts < 0.05) {
+      lines.push("Note that manifests also carry per-file column statistics, so a table format can prune on a non-partition column as well \u2014 the same mechanism as chapter 8's row groups, one level up. A listing-based table cannot do that at all without opening every footer, which is the expense it was trying to avoid.");
+    }
+    $("pl-note").textContent = lines.join("\n\n");
+  }
+
+  ["pl-parts", "pl-fpp", "pl-sel"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+initChapter("11-warehouse-lake.html");
+</script>
+</body>
+</html>

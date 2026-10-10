@@ -26,11 +26,11 @@ const CHAPTERS = [
   { n: "16", f: "16-debugging.html",    t: "Debugging and profiling",   p: "Craft" },
   { n: "17", f: "17-performance.html",  t: "Performance",               p: "Craft" },
   { n: "18", f: "18-packaging.html",    t: "Packaging and dependencies",p: "Craft" },
-  { n: "19", f: "19-quality.html",      t: "Code quality and tooling",  p: "Craft" },
+  { n: "19", f: "19-tooling.html",      t: "Tooling and CI",            p: "Craft" },
   { n: "20", f: "20-practice.html",     t: "Practice and reference",    p: "Craft" }
 ];
 
-const LIVE = new Set(["index.html", "01-setup.html", "02-objects.html"]);
+const LIVE = new Set(["index.html", "01-setup.html", "02-objects.html", "03-control-flow.html", "04-data-structures.html", "05-functions.html", "06-modules.html", "07-classes.html", "08-exceptions.html", "09-iterators.html", "10-decorators.html", "11-typing.html", "12-stdlib.html", "13-files.html", "14-concurrency.html", "15-testing.html", "16-debugging.html", "17-performance.html", "18-packaging.html", "19-tooling.html", "20-practice.html"]);
 
 const here = (location.pathname.split("/").pop() || "index.html");
 const idx = CHAPTERS.findIndex(c => c.f === here);

@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Batch ingestion, ETL and ELT — Data Engineer</title>
+<meta name="description" content="Extraction patterns, ETL against ELT, idempotency under retry, watermarks and late-arriving data, and backfills that do not take production down.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">Data Engineer</a> <span>/</span> Chapter 12</p>
+    <p class="chnum">CHAPTER 12</p>
+    <h1>Batch ingestion, ETL and ELT</h1>
+    <p class="lede">Batch is unfashionable and it is how most data still moves, because a schedule is dramatically easier to reason about than a continuous stream. Two properties decide whether a batch pipeline is operable: whether re-running it is safe, and whether it can tell you what it has and has not yet seen. Almost everything else is detail.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~28 min</b> read</div>
+      <div><b>Part 4</b> Moving data</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="shape">
+      <p class="kicker">THE ANATOMY</p>
+      <h2>What a batch pipeline is made of</h2>
+      <p class="sub">Five stages, and each one has a decision attached that will matter later.</p>
+
+      <div class="terms">
+        <dt>Extract</dt>
+        <dd>Read from the source. <a href="04-source-systems.html">Chapter 4</a> established the options and the trap: full snapshot, incremental with a lookback, or log-based capture, and never a bare timestamp watermark.</dd>
+
+        <dt>Land</dt>
+        <dd>Write the extracted bytes somewhere durable, unmodified. The step people skip, and the one that makes everything after it recoverable. Covered in the final section.</dd>
+
+        <dt>Transform</dt>
+        <dd>Parse, clean, conform, join, aggregate. Where the modelling of <a href="09-modelling.html">chapter 9</a> gets applied.</dd>
+
+        <dt>Load</dt>
+        <dd>Write into the target table. The choice of write strategy here is what determines whether a retry is safe, and it is the subject of the first demo.</dd>
+
+        <dt>Verify</dt>
+        <dd>Check the result before anyone reads it: row counts, freshness, referential integrity, distribution. Frequently absent, which is why <a href="20-cicd-testing.html">chapter 20</a> exists.</dd>
+      </div>
+
+      <p>Around these sits the scheduling question. A pipeline runs on a <strong>clock</strong> ("every day at 02:00"), on <strong>completion</strong> of an upstream task, or on <strong>data arrival</strong> ("when the file lands"). <a href="02-lifecycle.html">Chapter 2</a> measured why this matters: clock scheduling contributes a full wait interval to end-to-end freshness at every hop, and 89% of the worst-case staleness in that model was waiting rather than computing. Completion-triggered chains remove most of it, which is <a href="16-orchestration.html">chapter 16</a>'s business.</p>
+    </section>
+
+    <section id="etlelt">
+      <p class="kicker">THE LETTERS</p>
+      <h2>ETL, ELT, and what actually changed</h2>
+      <p class="sub">The reordering of two letters describes a genuine architectural shift, driven by economics rather than by insight.</p>
+
+      <p><strong>ETL</strong> transforms data in a dedicated processing tier before loading it into the warehouse. <strong>ELT</strong> loads raw data into the warehouse first and transforms it there with SQL.</p>
+
+      <p>ETL was not a design preference; it was a necessity. Warehouse capacity was bought in advance, expensive and fixed, so you did not spend it on parsing JSON. A separate transformation tier — Informatica, Talend, hand-written Java — was cheaper than warehouse compute.</p>
+
+      <p>Two changes inverted that. Warehouse compute became elastic and billed by the second, so using it for transformation stopped being wasteful. And storage became cheap enough that keeping the raw data as well as the transformed data was no longer a real cost.</p>
+
+      <div class="tw">
+        <table>
+          <caption>The trade, on the axes that actually differ</caption>
+          <thead>
+            <tr><th></th><th>ETL</th><th>ELT</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Transformation language</td><td>Whatever the tool offers</td><td>SQL, which analysts already read</td></tr>
+            <tr><td>Raw data retained</td><td>Usually not</td><td>Yes, by construction</td></tr>
+            <tr><td>Reprocessing after a logic change</td><td>Re-extract from source</td><td>Re-run SQL over retained raw</td></tr>
+            <tr><td>Warehouse cost</td><td>Lower</td><td>Higher, and elastic</td></tr>
+            <tr><td>Sensitive data</td><td>Can be masked before landing</td><td>Lands raw, so governance must be inside</td></tr>
+            <tr><td>Who can change logic</td><td>The data engineering team</td><td>Anyone who writes SQL</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>The row that decides it</b>
+        <p>Reprocessing. Under ETL, discovering that your revenue logic has been wrong for three months means re-extracting three months from a source system that may no longer hold it &mdash; and <a href="04-source-systems.html">chapter 4</a> showed source systems discard history. Under ELT the raw data is still in your warehouse, so the fix is re-running SQL, which <a href="02-lifecycle.html">chapter 2</a> priced at seconds rather than hours given a sensible layout.</p>
+        <p>That is why ELT won, and it is the same argument as the raw layer in <a href="11-warehouse-lake.html">chapter 11</a>: keep the input, because your transformation logic is more likely to be wrong than your extraction.</p>
+      </div>
+
+      <p>Two honest qualifications. ELT lands raw data including personal data, so masking and access control have to be enforced inside the warehouse rather than before it — that is <a href="23-governance.html">chapter 23</a>, and it is a real obligation rather than a footnote. And "anyone who writes SQL can change the logic" is simultaneously ELT's greatest strength and the mechanism by which a warehouse accumulates four thousand undocumented models; the discipline in <a href="16-orchestration.html">chapter 16</a> is what keeps that from happening.</p>
+    </section>
+
+    <section id="idempotency">
+      <p class="kicker">THE FIRST PROPERTY</p>
+      <h2>Idempotency, and what readers see while you retry</h2>
+      <p class="sub">Every scheduled job fails eventually and gets re-run. Whether that is safe depends entirely on the write strategy, and the row count is only half the question.</p>
+
+      <p>A pipeline is <strong>idempotent</strong> if running it twice for the same input produces the same result as running it once. Without that property, every retry is a judgement call and every backfill is dangerous — which in practice means nobody re-runs anything and errors go uncorrected.</p>
+
+      <p>The demo reloads a partition that already holds a thousand rows from a previous run, fails partway, and retries. It tracks two things: the final state, and what a concurrent reader would see at each moment during the process.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Four write strategies under a failure and retry</b>
+          <span>per-key state tracked through both attempts</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Write strategy
+              <select id="id-strat">
+                <option value="append">INSERT, append</option>
+                <option value="delete-insert">DELETE then INSERT</option>
+                <option value="merge">MERGE on key</option>
+                <option value="atomic" selected>Atomic partition overwrite</option>
+              </select>
+            </label>
+            <label>First attempt fails at
+              <input type="range" id="id-fail" min="10" max="90" step="10" value="60">
+              <output id="id-fail-o">60%</output>
+            </label>
+          </div>
+
+          <div class="canvas" id="id-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="id-end-tile"><i>ROWS AFTER RETRY</i><b id="id-end">0</b><s id="id-end-sub">correct is 1,000</s></div>
+            <div class="tile" id="id-idem-tile"><i>IDEMPOTENT</i><b id="id-idem">&mdash;</b><s id="id-idem-sub"></s></div>
+            <div class="tile" id="id-min-tile"><i>FEWEST ROWS VISIBLE</i><b id="id-min">0</b><s>at any moment</s></div>
+            <div class="tile" id="id-torn-tile"><i>TORN STATE VISIBLE</i><b id="id-torn">&mdash;</b><s id="id-torn-sub"></s></div>
+          </div>
+
+          <p class="readout" id="id-note"></p>
+        </div>
+      </div>
+
+      <p>The four results separate along two independent axes, which is the point of tracking both.</p>
+
+      <ol>
+        <li><strong>Append is not idempotent and never can be.</strong> The 600 rows written before the failure remain, the retry writes 1,000 more, and the partition ends with 2,600 rows against a correct 1,000. Every retry makes it worse.</li>
+        <li><strong>Delete-then-insert ends correct and empties the table twice on the way.</strong> The final count is right, so a check after the run passes. But the delete commits on its own, so any reader arriving in that window sees zero rows &mdash; and a dashboard that happens to refresh then reports no revenue. Worse, if the retry never happens, the data is simply gone.</li>
+        <li><strong>Merge is idempotent and still shows a mixed state.</strong> Upserting on a key means the row count never changes &mdash; it stays at exactly 1,000 throughout &mdash; so count-based checks see nothing at all. But mid-run 600 keys hold new values and 400 hold old ones, which is a combination that was never correct. Any aggregate computed then is wrong in a way no row count reveals.</li>
+        <li><strong>Only the atomic overwrite is both idempotent and never observably torn.</strong> A failed attempt commits nothing, so readers see the old thousand rows throughout and then the new thousand. This is exactly the pointer-swap mechanism measured in <a href="11-warehouse-lake.html">chapter 11</a>, which is why a table format is an operational feature rather than a storage detail.</li>
+      </ol>
+
+      <div class="note tip">
+        <b>The practical rule</b>
+        <p>Make the unit of work a <strong>partition</strong>, and make the write an <strong>atomic replacement of that partition</strong>. Then re-running any day for any reason is safe, a backfill is a loop over days, and a failure leaves the previous good data in place. Every table format supports this directly; on a warehouse it is <code>INSERT OVERWRITE</code> for the partition inside a transaction, or a swap of a staging table.</p>
+        <p>Where atomic partition replacement genuinely is not available, merge on a stable key is the fallback: idempotent, though not transactional. Reach for delete-then-insert only if neither exists, and know that you have an outage window on every run.</p>
+      </div>
+    </section>
+
+    <section id="late">
+      <p class="kicker">THE SECOND PROPERTY</p>
+      <h2>Late data and the lookback window</h2>
+      <p class="sub">A batch job for "yesterday" runs once and declares yesterday finished. Data does not agree, and the gap is much larger than most people expect.</p>
+
+      <p>Two timestamps matter and they are frequently conflated. <strong>Event time</strong> is when the thing happened. <strong>Arrival time</strong> is when it reached you. They differ because of mobile devices going offline, retries, queue backlogs, third-party batch feeds and timezone handling.</p>
+
+      <p>So a job that runs at 02:00 to process yesterday's events by event time will miss every event from yesterday that arrives after 02:00. If it never revisits that day, those events are permanently absent — and unlike <a href="04-source-systems.html">chapter 4</a>'s extraction loss, the data is sitting right there in your landing zone, unprocessed.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Completeness against the lookback window</b>
+          <span>simulated arrival lateness, with each day's completeness measured after the last run that covers it</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Mean lateness
+              <select id="la-mean">
+                <option value="1">1 hour</option>
+                <option value="6">6 hours</option>
+                <option value="24" selected>24 hours</option>
+                <option value="72">72 hours</option>
+              </select>
+            </label>
+            <label>Lookback window
+              <input type="range" id="la-lb" min="0" max="10" step="1" value="0">
+              <output id="la-lb-o">none</output>
+            </label>
+            <label>Events per day
+              <select id="la-per">
+                <option value="200">200</option>
+                <option value="400" selected>400</option>
+                <option value="1000">1,000</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="la-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="la-comp-tile"><i>COMPLETENESS</i><b id="la-comp">0%</b><s>of events captured</s></div>
+            <div class="tile"><i>EVENTS MISSED</i><b id="la-miss">0</b><s id="la-miss-sub"></s></div>
+            <div class="tile"><i>WORK MULTIPLIER</i><b id="la-work">1&times;</b><s>days reprocessed per run</s></div>
+            <div class="tile hi"><i>LOOKBACK FOR 99%</i><b id="la-need">0</b><s id="la-need-sub"></s></div>
+          </div>
+
+          <p class="readout" id="la-note"></p>
+        </div>
+      </div>
+
+      <p>The numbers are worse than intuition suggests. With a mean lateness of 24 hours and no lookback, a naive daily job captures about <strong>36%</strong> of each day's events. That is not a rounding error; it is a majority of the data missing, in a pipeline that runs green every morning.</p>
+
+      <p>A one-day lookback takes it to about 76%, two days to 90%, three days to 96%, seven days to 98%. The curve is the tail of the lateness distribution, and it flattens — which is the useful part, because it means there is a defensible stopping point rather than an argument.</p>
+
+      <div class="note trap">
+        <b>Why the daily figure looks fine</b>
+        <p>Set the lookback to zero and note that the job never errors. It processes the events it can see, writes a partition, and reports success. Row counts are plausible because they are a consistent fraction of the truth, and comparing today against yesterday shows nothing because both are equally incomplete.</p>
+        <p>The failure only becomes visible if you compare a recent day against the same day recomputed a week later &mdash; which is exactly the check almost nobody runs, and which <a href="21-observability.html">chapter 21</a> argues should be automatic.</p>
+      </div>
+
+      <p>Two implementation notes on lookback windows. <strong>They require the idempotency from the previous section</strong>: reprocessing the last three days every night is only safe if re-running a day replaces it rather than appending to it, which is the atomic-partition pattern. And <strong>the window should be derived from measurement</strong>, not chosen: instrument the distribution of arrival minus event time, pick the percentile you are willing to lose, and set the window from that. Then re-measure, because a new mobile client or a changed third-party feed moves the distribution without telling you.</p>
+    </section>
+
+    <section id="backfill">
+      <p class="kicker">THE OPERATION EVERYONE FEARS</p>
+      <h2>Backfills</h2>
+      <p class="sub">Reprocessing history is routine if the design allows it and an incident if it does not. Chapter 2 priced the layout; this is the procedure.</p>
+
+      <p>A backfill runs when transformation logic changes, when a bug is found, when a new column is added, or when an upstream source is corrected. The scale is set by <a href="02-lifecycle.html">chapter 2</a>'s arithmetic: the same fourteen-day correction was 8.8 seconds on a partitioned columnar table and 6.8 hours on an unpartitioned row-oriented one.</p>
+
+      <div class="check">
+        <li><strong>Backfill into a separate target first.</strong> Write to a shadow table, compare it against production for a period that should be unchanged, and only then swap. This catches the case where your fix breaks something else, which is common.</li>
+        <li><strong>Go newest-first if consumers care about recency.</strong> Backfilling 2019 forward means the useful data arrives last. Backfilling backwards from today means each completed chunk is immediately valuable and you can stop early if the older history turns out not to matter.</li>
+        <li><strong>Rate-limit deliberately.</strong> A backfill is an unbounded amount of work submitted at once, and it will consume every slot in a shared warehouse. Cap concurrency, and prefer a lower priority queue &mdash; a backfill that finishes in six hours instead of two but does not delay the daily load is the better outcome.</li>
+        <li><strong>Never let a backfill share a schedule with production.</strong> Same code, different concurrency, different priority, different alerting. Otherwise a stalled backfill pages whoever is on call for the nightly run.</li>
+        <li><strong>Record what you did.</strong> Which days, which code version, when, and why. Six months later somebody will ask why March 2026 disagrees with the numbers in a board deck, and the answer is in that log or nowhere.</li>
+      </div>
+
+      <div class="note warn">
+        <b>The specific failure to plan for</b>
+        <p>A backfill of two years of daily partitions rewrites every one of them, which under a table format creates two years of new file versions and a very large amount of metadata churn. On merge-on-read tables it can leave the table slower than it started until compaction catches up. Budget for the compaction, and check the table's file count before and after &mdash; chapter 7's request arithmetic is why.</p>
+      </div>
+    </section>
+
+    <section id="landing">
+      <p class="kicker">THE STEP PEOPLE SKIP</p>
+      <h2>The landing zone</h2>
+      <p class="sub">Write the bytes down before you touch them. Almost every recovery in this chapter depends on having done so.</p>
+
+      <p>A landing zone is immutable storage holding source data exactly as extracted, partitioned by ingestion time, retained for a defined period. Not parsed, not cleaned, not deduplicated — as it arrived, including the malformed records.</p>
+
+      <p>The reason is that it makes your pipeline <strong>replayable</strong>. Every recovery scenario in this chapter reduces to re-running transformation over retained input:</p>
+
+      <div class="tw">
+        <table>
+          <caption>What a landing zone buys, per failure</caption>
+          <thead>
+            <tr><th>Situation</th><th>With a landing zone</th><th>Without</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Transformation bug found</td><td>Re-run transforms over retained raw</td><td>Re-extract from source, if it still has the data</td></tr>
+            <tr><td>Late data arrived</td><td>Reprocess the affected days from raw</td><td>The events are lost with the extract</td></tr>
+            <tr><td>New column needed retroactively</td><td>It is already in the raw payload</td><td>History starts today</td></tr>
+            <tr><td>Consumer disputes a number</td><td>Show them the input that produced it</td><td>Argue from memory</td></tr>
+            <tr><td>Source system loses data</td><td>You are the backup</td><td>Both copies gone</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Three practical points. <strong>Partition by ingestion time, not event time</strong>, because ingestion time is knowable at write time and never changes, whereas event time can arrive late and would force you to rewrite an existing partition — the exact thing you are trying to avoid. <a href="08-file-formats.html">Chapter 8</a> also measured that ingestion order gives you clustering for free.</p>
+
+      <p><strong>Land in a format that suits writing, and compact to one that suits reading.</strong> Avro or JSON on arrival, since records come one at a time; Parquet after compaction. That was chapter 8's row-versus-columnar conclusion applied to the ingest path.</p>
+
+      <p><strong>Set retention deliberately and write it down.</strong> Raw data is cheap but not free, and it contains personal data subject to the deletion obligations in <a href="23-governance.html">chapter 23</a>. "Keep everything forever" is not a policy, it is the absence of one.</p>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>ELT won on the reprocessing argument.</b> Keeping raw data means a logic error is a re-run rather than a re-extraction from a source that has discarded its history.</li>
+          <li><b>ELT's cost is that raw personal data lands in your warehouse,</b> so masking and access control move inside it rather than in front of it.</li>
+          <li><b>Append is never idempotent.</b> A failure at 60% then a retry leaves 2,600 rows where 1,000 is correct, and every further retry is worse.</li>
+          <li><b>Delete-then-insert ends correct and empties the table twice on the way,</b> so a post-run check passes while readers during the window saw zero rows.</li>
+          <li><b>Merge is idempotent and still shows a state that was never true.</b> The row count stays at exactly 1,000 throughout, so count-based checks detect nothing while 600 keys hold new values and 400 hold old ones.</li>
+          <li><b>Only atomic partition replacement is both idempotent and never observably torn.</b> Make the partition the unit of work and re-running any day becomes routine.</li>
+          <li><b>Event time and arrival time are different, and the gap is large.</b> At 24 hours mean lateness a naive daily job captures about 36% of each day.</li>
+          <li><b>The completeness curve flattens:</b> roughly 36%, 76%, 90%, 96%, 98% at zero to seven days of lookback, so there is a defensible stopping point.</li>
+          <li><b>A zero-lookback job never errors,</b> and counts look plausible because they are a consistent fraction of the truth. Only comparing a day against itself recomputed later reveals it.</li>
+          <li><b>Derive the lookback from a measured lateness distribution,</b> and re-measure, because a new client or feed moves it silently.</li>
+          <li><b>Backfill into a shadow target, newest-first, rate-limited, on a separate schedule, and log it.</b></li>
+          <li><b>Land the raw bytes, partitioned by ingestion time.</b> Every recovery in this chapter reduces to re-running transforms over retained input.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="13-messaging.html">Chapter 13 &mdash; Messaging and streaming logs</a>. Queues against logs, Kafka's partitions and offsets, and what at-least-once, at-most-once and exactly-once actually promise.</p>
+          </div>
+          <div class="fi">
+            <i>BUILDS ON</i>
+            <p>The atomic write strategy here is <a href="11-warehouse-lake.html">chapter 11</a>'s pointer swap, and the reprocessing arithmetic is <a href="02-lifecycle.html">chapter 2</a>'s. The extraction correctness the pipeline depends on is <a href="04-source-systems.html">chapter 4</a>.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>Pick a daily table and recompute one day from a fortnight ago. If the new count differs from the stored one, you have a late-data gap and no lookback window.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Demo 1 — write strategies under failure and retry
+   ============================================================ */
+(function () {
+  var ROWS = 1000;
+  var $ = function (id) { return document.getElementById(id); };
+
+  /* Explicit per-key state: each key is "old", "new" or absent.
+     Appends add duplicate rows alongside, which is the whole problem. */
+  function simulate(strategy, failAt) {
+    var slot = [], dup = 0, timeline = [];
+    for (var i = 0; i < ROWS; i++) slot.push("old");
+
+    function counts() {
+      var o = 0, n = 0;
+      for (var i = 0; i < ROWS; i++) { if (slot[i] === "old") o++; else if (slot[i] === "new") n++; }
+      return { old: o, neu: n, dup: dup };
+    }
+    function snap() { timeline.push(counts()); }
+    snap();
+
+    function attempt(stopAt) {
+      var target = Math.floor(ROWS * stopAt);
+      if (strategy === "append") {
+        for (var i = 1; i <= target; i++) { dup++; if (i % 50 === 0) snap(); }
+      } else if (strategy === "delete-insert") {
+        for (var d = 0; d < ROWS; d++) slot[d] = "absent";
+        dup = 0; snap();                                 /* the delete commits alone */
+        for (var j = 0; j < target; j++) { slot[j] = "new"; if (j % 50 === 0) snap(); }
+      } else if (strategy === "merge") {
+        for (var k = 0; k < target; k++) { slot[k] = "new"; if (k % 50 === 0) snap(); }
+      } else {
+        if (stopAt >= 1) { for (var m = 0; m < ROWS; m++) slot[m] = "new"; dup = 0; }
+      }
+      snap();
+    }
+
+    attempt(failAt);      /* first attempt stops early */
+    attempt(1);           /* retry completes */
+
+    var minRows = Infinity, torn = false;
+    timeline.forEach(function (p) {
+      var tot = p.old + p.neu + p.dup;
+      minRows = Math.min(minRows, tot);
+      if ((p.old > 0 && p.neu > 0) || p.dup > 0 || (tot !== ROWS && tot !== 0)) torn = true;
+    });
+    var e = timeline[timeline.length - 1];
+    return { timeline: timeline, rows: e.old + e.neu + e.dup,
+             allNew: e.neu === ROWS && e.old === 0 && e.dup === 0,
+             minRows: minRows === Infinity ? 0 : minRows, torn: torn };
+  }
+
+  function chart(res) {
+    var W = 700, H = 156, L = 46, B = 30;
+    var n = res.timeline.length;
+    var maxY = ROWS * 2.8;
+    var xOf = function (i) { return L + i / (n - 1) * (W - L - 12); };
+    var yOf = function (v) { return (H - B) - v / maxY * (H - B - 20); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Rows visible over the course of the run and retry">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">ROWS VISIBLE TO A READER: OLD VALUES, NEW VALUES, DUPLICATES</text>');
+    svg.push('<line x1="' + L + '" y1="' + yOf(ROWS) + '" x2="' + (W - 12) + '" y2="' + yOf(ROWS) +
+      '" stroke="#2E8B5F" stroke-width="1.3" stroke-dasharray="4 3"/>');
+    svg.push('<text x="2" y="' + (yOf(ROWS) + 4) + '" font-size="9.5" fill="#166B47">1000</text>');
+
+    /* stacked area: old at the bottom, then new, then duplicates */
+    var layers = [
+      { key: function (p) { return p.old; }, col: "#9BB0C2", lab: "old" },
+      { key: function (p) { return p.old + p.neu; }, col: "#2E8B5F", lab: "new" },
+      { key: function (p) { return p.old + p.neu + p.dup; }, col: "#C0453A", lab: "duplicates" }
+    ];
+    layers.slice().reverse().forEach(function (ly) {
+      var d = res.timeline.map(function (p, i) {
+        return (i ? "L" : "M") + xOf(i).toFixed(1) + " " + yOf(ly.key(p)).toFixed(1);
+      }).join(" ");
+      svg.push('<path d="' + d + ' L' + xOf(n - 1).toFixed(1) + ' ' + yOf(0) + ' L' + xOf(0).toFixed(1) + ' ' + yOf(0) +
+        ' Z" fill="' + ly.col + '" opacity="0.85"/>');
+    });
+
+    var mid = Math.floor(n / 2);
+    svg.push('<line x1="' + xOf(mid) + '" y1="16" x2="' + xOf(mid) + '" y2="' + (H - B) +
+      '" stroke="#0C1D30" stroke-width="1.4" stroke-dasharray="3 2"/>');
+    svg.push('<text x="' + (xOf(mid) + 4) + '" y="26" font-size="9.5" fill="#0C1D30">failure, then retry</text>');
+
+    var lx = L;
+    layers.forEach(function (ly) {
+      svg.push('<rect x="' + lx + '" y="' + (H - 15) + '" width="9" height="9" fill="' + ly.col + '"/>');
+      svg.push('<text x="' + (lx + 12) + '" y="' + (H - 7) + '" font-size="10" fill="#54677A">' + ly.lab + '</text>');
+      lx += 30 + ly.lab.length * 5.6;
+    });
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var strat = $("id-strat").value, failAt = +$("id-fail").value / 100;
+    $("id-fail-o").textContent = Math.round(failAt * 100) + "%";
+
+    var r = simulate(strat, failAt);
+    var ok = r.rows === ROWS && r.allNew;
+
+    $("id-end").textContent = r.rows.toLocaleString();
+    $("id-end-sub").textContent = ok ? "correct" : (r.rows > ROWS ? "+" : "") + (r.rows - ROWS) + " wrong";
+    $("id-end-tile").className = "tile " + (ok ? "good" : "bad");
+    $("id-idem").textContent = ok ? "Yes" : "No";
+    $("id-idem-sub").textContent = ok ? "retry is safe" : "retry corrupts";
+    $("id-idem-tile").className = "tile " + (ok ? "good" : "bad");
+    $("id-min").textContent = r.minRows.toLocaleString();
+    $("id-min-tile").className = "tile " + (r.minRows === ROWS ? "good" : "bad");
+    $("id-torn").textContent = r.torn ? "Yes" : "No";
+    $("id-torn-sub").textContent = r.torn ? "readers saw a false state" : "always a valid snapshot";
+    $("id-torn-tile").className = "tile " + (r.torn ? "bad" : "good");
+
+    $("id-canvas").innerHTML = chart(r);
+
+    var lines = [];
+    if (strat === "append") {
+      lines.push("The first attempt appended " + Math.floor(ROWS * failAt) +
+        " rows before failing, and those rows stayed. The retry appended a further 1,000, so the partition holds " +
+        r.rows.toLocaleString() + " rows against a correct 1,000. Run it a third time and it gets worse again \u2014 an append can never be idempotent, because it has no way to know what it already wrote.");
+    } else if (strat === "delete-insert") {
+      lines.push("The end state is correct at 1,000 rows, so any check that runs after the job passes. But the delete commits on its own, twice, and the fewest rows visible at any moment was " +
+        r.minRows + ". A dashboard refreshing in that window reports nothing at all, and if the retry never happens the data is simply gone.");
+      lines.push("This is the strategy to avoid where anything else is available. Its failure is not in the final count but in the window, and windows are invisible to after-the-fact validation.");
+    } else if (strat === "merge") {
+      lines.push("Idempotent and correct at the end, and note the row count: it never leaves 1,000. Upserting on a key replaces rather than adds, so every count-based check passes at every moment during the run.");
+      lines.push("But mid-run " + Math.floor(ROWS * failAt) + " keys hold new values and " +
+        (ROWS - Math.floor(ROWS * failAt)) +
+        " still hold old ones, which is a combination that was never true. Any aggregate computed then is wrong, and no row count reveals it. Merge fixes retry safety and does not fix visibility.");
+    } else {
+      lines.push("The failed attempt commits nothing, so readers see the previous 1,000 rows throughout and then the new 1,000 the moment the retry commits. Idempotent, and never a torn state \u2014 the only strategy here that achieves both.");
+      lines.push("This is the pointer swap measured in chapter 11, which is why a table format is an operational capability rather than a storage detail. Make the partition the unit of work and re-running any day for any reason becomes routine rather than a decision.");
+    }
+    $("id-note").textContent = lines.join("\n\n");
+  }
+
+  ["id-strat", "id-fail"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — completeness against the lookback window
+   ============================================================ */
+(function () {
+  var DAYS = 60;
+  var $ = function (id) { return document.getElementById(id); };
+  function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+
+  var cache = {};
+  function events(meanLate, perDay) {
+    var k = meanLate + "|" + perDay;
+    if (cache[k]) return cache[k];
+    var rnd = lcg(9), byDay = [];
+    for (var d = 0; d < DAYS; d++) byDay.push([]);
+    for (var d2 = 0; d2 < DAYS; d2++) {
+      for (var i = 0; i < perDay; i++) {
+        var et = d2 + rnd();
+        /* exponential lateness, expressed in days */
+        var late = -Math.log(1 - rnd() * 0.999) * meanLate / 24;
+        byDay[d2].push(et + late);
+      }
+    }
+    cache[k] = byDay;
+    return byDay;
+  }
+
+  function completeness(meanLate, lookback, perDay) {
+    var byDay = events(meanLate, perDay);
+    var captured = 0, total = 0, perDayPct = [];
+    for (var d = 0; d < DAYS; d++) {
+      var list = byDay[d];
+      /* the last run that still covers day d */
+      var lastRun = Math.min(DAYS, d + 1 + lookback);
+      var got = 0;
+      for (var i = 0; i < list.length; i++) if (list[i] <= lastRun) got++;
+      captured += got; total += list.length;
+      perDayPct.push(got / list.length * 100);
+    }
+    return { pct: captured / total * 100, missed: total - captured, total: total, perDay: perDayPct };
+  }
+
+  function needFor(meanLate, perDay, target) {
+    for (var lb = 0; lb <= 30; lb++) if (completeness(meanLate, lb, perDay).pct >= target) return lb;
+    return null;
+  }
+
+  function chart(meanLate, lookback, perDay) {
+    var W = 700, H = 158, L = 40, B = 28;
+    var xOf = function (lb) { return L + lb / 10 * (W - L - 60); };
+    var yOf = function (p) { return (H - B) - p / 100 * (H - B - 20); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Completeness against lookback window">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">COMPLETENESS AGAINST LOOKBACK WINDOW, BY LATENESS TAIL</text>');
+    svg.push('<line x1="' + L + '" y1="' + (H - B) + '" x2="' + (W - 56) + '" y2="' + (H - B) + '" stroke="#CFD8E0"/>');
+    [50, 90, 99].forEach(function (p) {
+      svg.push('<line x1="' + L + '" y1="' + yOf(p) + '" x2="' + (W - 56) + '" y2="' + yOf(p) + '" stroke="#E1E7EC" stroke-dasharray="3 3"/>');
+      svg.push('<text x="2" y="' + (yOf(p) + 4) + '" font-size="9.5" fill="#7C8B99">' + p + '%</text>');
+    });
+    var series = [[1, "#2E8B5F"], [6, "#7C8CF8"], [24, "#E0699F"], [72, "#C0453A"]];
+    series.forEach(function (s) {
+      var d = [];
+      for (var lb = 0; lb <= 10; lb++) {
+        d.push((lb ? "L" : "M") + xOf(lb).toFixed(1) + " " + yOf(completeness(s[0], lb, perDay).pct).toFixed(1));
+      }
+      var on = s[0] === meanLate;
+      svg.push('<path d="' + d.join(" ") + '" fill="none" stroke="' + s[1] + '" stroke-width="' + (on ? 2.6 : 1.2) +
+        '" opacity="' + (on ? 1 : 0.45) + '"/>');
+      svg.push('<text x="' + (W - 52) + '" y="' + (yOf(completeness(s[0], 10, perDay).pct) + 4) +
+        '" font-size="10" font-weight="' + (on ? 700 : 400) + '" fill="' + s[1] + '">' + s[0] + 'h</text>');
+    });
+    svg.push('<circle cx="' + xOf(lookback) + '" cy="' + yOf(completeness(meanLate, lookback, perDay).pct) + '" r="4.5" fill="#0C1D30"/>');
+    [0, 2, 4, 6, 8, 10].forEach(function (lb) {
+      svg.push('<text x="' + xOf(lb) + '" y="' + (H - 9) + '" font-size="9.5" fill="#7C8B99" text-anchor="middle">' + lb + 'd</text>');
+    });
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var meanLate = +$("la-mean").value, lb = +$("la-lb").value, perDay = +$("la-per").value;
+    $("la-lb-o").textContent = lb === 0 ? "none" : lb + " day" + (lb === 1 ? "" : "s");
+
+    var c = completeness(meanLate, lb, perDay);
+    var need = needFor(meanLate, perDay, 99);
+
+    $("la-comp").textContent = c.pct.toFixed(1) + "%";
+    $("la-comp-tile").className = "tile " + (c.pct >= 99 ? "good" : c.pct < 80 ? "bad" : "");
+    $("la-miss").textContent = c.missed.toLocaleString();
+    $("la-miss-sub").textContent = "of " + c.total.toLocaleString() + " events";
+    $("la-work").textContent = (1 + lb) + "\u00d7";
+    $("la-need").textContent = need === null ? ">30d" : need + " days";
+    $("la-need-sub").textContent = need === null ? "tail too long" : (1 + need) + "x the work";
+
+    $("la-canvas").innerHTML = chart(meanLate, lb, perDay);
+
+    var z = completeness(meanLate, 0, perDay).pct;
+    var lines = [];
+    lines.push("With a mean lateness of " + meanLate + " hours and a " +
+      (lb === 0 ? "no lookback" : lb + "-day lookback") + ", the pipeline captures " +
+      c.pct.toFixed(1) + "% of events and permanently misses " + c.missed.toLocaleString() +
+      " of " + c.total.toLocaleString() + ". Reaching 99% needs a " +
+      (need === null ? "window longer than 30 days" : need + "-day window, which is " + (1 + need) + " times the nightly work") + ".");
+
+    if (lb === 0) {
+      lines.push("Note that this job never fails. It processes what it can see, writes its partition and reports success. The count is plausible because it is a consistent fraction of the truth, and comparing today against yesterday shows nothing because both are equally incomplete. Only recomputing an old day and comparing it against the stored value exposes it.");
+    } else {
+      lines.push("Going from no lookback to " + lb + " day" + (lb === 1 ? "" : "s") +
+        " took completeness from " + z.toFixed(1) + "% to " + c.pct.toFixed(1) +
+        " at " + (1 + lb) + " times the nightly compute. The curve flattens, which is the useful property: there is a defensible stopping point rather than an argument about how paranoid to be.");
+    }
+
+    lines.push("Reprocessing the last " + Math.max(1, lb) + " day" + (Math.max(1, lb) === 1 ? "" : "s") +
+      " every night is only safe because a day can be replaced rather than appended to. Without the atomic partition write from the previous section, a lookback window would multiply your rows instead of correcting them.");
+
+    $("la-note").textContent = lines.join("\n\n");
+  }
+
+  ["la-mean", "la-lb", "la-per"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+initChapter("12-batch-ingestion.html");
+</script>
+</body>
+</html>

@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · The shell and scripting — DevOps</title>
+<meta name="description" content="Streams and exit codes, why set -e is not enough without pipefail, the quoting rules behind most shell bugs, the text-processing toolkit, and scripts that are safe to run twice.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%237C8CF8' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">DevOps</a><span class="sep">/</span><span>Chapter 03</span></p>
+    <p class="chno">Chapter 03 · Foundations</p>
+    <h1>The shell and scripting</h1>
+    <p class="lede">Every CI pipeline, container entrypoint, health check and deploy hook eventually bottoms out in a shell command. The shell is also the most quietly dangerous language most engineers use daily: it has no types, its default error handling is to keep going, and its most common bug — an unquoted variable — is invisible until the day the input contains a space. This chapter is about driving it deliberately.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapter 02</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="streams">
+<h2>Streams, redirection and exit codes</h2><div class="h2rule"></div>
+
+<p class="lead">A Unix process starts with three file descriptors already open: 0 for standard input, 1 for standard output, 2 for standard error. That is the entire interface, and the discipline that makes the toolkit compose is that <strong>output is the data and standard error is the commentary</strong>. A program that prints its progress messages to stdout cannot be put in a pipeline; one that prints them to stderr can.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Form</th><th>Effect</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><code>&gt; f</code></td><td>stdout to <code>f</code>, truncating</td><td>The file is truncated <em>before</em> the command runs, which is why <code>sort f &gt; f</code> destroys <code>f</code></td></tr>
+<tr><td><code>&gt;&gt; f</code></td><td>stdout appended</td><td>Atomic for writes under <code>PIPE_BUF</code>, which is why several processes can append to one log</td></tr>
+<tr><td><code>2&gt; f</code></td><td>stderr to <code>f</code></td><td></td></tr>
+<tr><td><code>&gt; f 2&gt;&amp;1</code></td><td>Both to <code>f</code></td><td class="yes">Order matters. <code>2&gt;&amp;1 &gt; f</code> sends stderr to the <em>old</em> stdout — the terminal — and only stdout to the file</td></tr>
+<tr><td><code>&amp;&gt; f</code></td><td>Both to <code>f</code></td><td>bash shorthand for the above, not POSIX</td></tr>
+<tr><td><code>&lt; f</code></td><td><code>f</code> becomes stdin</td><td></td></tr>
+<tr><td><code>&lt;&lt;&lt; "str"</code></td><td>A string becomes stdin</td><td>Here-string. Avoids <code>echo "str" |</code> and the subshell it creates</td></tr>
+<tr><td><code>&lt;&lt;'EOF'</code></td><td>A block becomes stdin</td><td>Here-doc. Quoting <code>EOF</code> disables variable expansion inside — usually what you want for embedded config</td></tr>
+<tr><td><code>2&gt;/dev/null</code></td><td>Discard stderr</td><td class="no">The most over-used redirect in existence. You have just discarded the reason it failed</td></tr>
+<tr><td><code>\| tee f</code></td><td>Copy the stream to <code>f</code> and onward</td><td><code>tee -a</code> to append; <code>sudo tee</code> is how you write to a root-owned file from a pipeline</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Every command returns an integer when it exits. Zero means success and anything else means a failure whose meaning is the command's own. This is inverted relative to most languages' truthiness and it catches people constantly: in the shell, <strong>0 is true</strong>.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Code</th><th>Convention</th><th>Where you will actually see it</th></tr></thead>
+<tbody>
+<tr><td><code>0</code></td><td>Success</td><td>The only code any orchestrator treats as "it worked"</td></tr>
+<tr><td><code>1</code></td><td>General failure</td><td><code>grep</code> returns 1 for "no lines matched", which is not an error and breaks naive <code>set -e</code> scripts constantly</td></tr>
+<tr><td><code>2</code></td><td>Misuse — bad arguments</td><td><code>grep</code>, <code>diff</code> and most GNU tools distinguish this from 1</td></tr>
+<tr><td><code>126</code></td><td>Found, not executable</td><td>Missing execute bit, or a script on a <code>noexec</code> mount</td></tr>
+<tr><td><code>127</code></td><td>Command not found</td><td class="yes">The single most useful code in CI. It means <code>PATH</code>, not your logic</td></tr>
+<tr><td><code>128+n</code></td><td>Killed by signal <em>n</em></td><td><code>130</code> = Ctrl-C (SIGINT), <code>143</code> = SIGTERM, <code>137</code> = SIGKILL — which in Kubernetes almost always means OOMKilled</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box tip"><b class="tag">137 and 143 are worth memorising</b>
+<p style="margin-bottom:0">A container exiting <code>143</code> was asked politely to stop and complied — a normal rolling update. A container exiting <code>137</code> was killed outright: either it ignored <code>SIGTERM</code> through the whole grace period (chapter 2's PID 1 problem), or the cgroup OOM killer took it. Those two causes have completely different fixes and the exit code alone does not separate them; check the container's <code>lastState.terminated.reason</code> or the kernel log.</p>
+</div>
+</section>
+
+<section id="pipefail">
+<h2>Strict mode, and why <code>set -e</code> alone is a trap</h2><div class="h2rule"></div>
+
+<p>Almost every guide tells you to start scripts with <code>set -euo pipefail</code>. Far fewer explain what each flag does, and the gap matters because the flags interact in ways that decide whether your script stops on an error or deploys an empty artefact.</p>
+
+<div class="kv">
+<dt><code>set -e</code> — errexit</dt><dd>Exit immediately if a command returns non-zero. With large exceptions: it does not fire for a command in an <code>if</code> or <code>while</code> condition, for the left side of <code>&amp;&amp;</code> or <code>||</code>, for anything preceded by <code>!</code>, and — crucially — it judges a <em>pipeline</em> only by its final command.</dd>
+<dt><code>set -u</code> — nounset</dt><dd>Treat expansion of an unset variable as an error. This is the flag that prevents <code>rm -rf "$PREFIX/"</code> from becoming <code>rm -rf /</code>. Use <code>${VAR:-default}</code> where empty is legitimate.</dd>
+<dt><code>set -o pipefail</code></dt><dd>A pipeline's status becomes the rightmost non-zero status rather than the last command's. Without it, <code>failing_command | tee log</code> reports success, because <code>tee</code> succeeded.</dd>
+<dt><code>set -x</code> — xtrace</dt><dd>Print each command after expansion, before running it. The single best debugging tool in the shell. <code>PS4='+ ${BASH_SOURCE}:${LINENO}: '</code> makes the output far more useful.</dd>
+</div>
+
+<p>The demo below runs a small deploy script under whatever combination of flags you choose. It is worth spending a minute on, because the default combination — <code>set -e</code> without <code>pipefail</code> — produces a failure mode that looks exactly like success.</p>
+
+<div class="demo" id="d-strict">
+  <div class="demo-top"><div class="demo-title">A deploy script under strict mode</div><div class="demo-hint">Fail the <code>curl</code> with only <code>set -e</code> on, then add pipefail</div></div>
+  <div class="demo-body">
+    <canvas id="cStrict" aria-label="A five-line shell script showing which lines execute under the chosen shell options"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Which stage fails</label><select id="stF">
+        <option value="-1">nothing fails</option>
+        <option value="0" selected>curl — the API is down (exit 22)</option>
+        <option value="1">jq — no such field (exit 5)</option>
+        <option value="2">tee — disk full (exit 1)</option>
+      </select></div>
+      <div class="ctrl"><label><input type="checkbox" id="stE" checked> <code>set -e</code></label></div>
+      <div class="ctrl"><label><input type="checkbox" id="stP"> <code>set -o pipefail</code></label></div>
+      <div class="ctrl"><label><input type="checkbox" id="stU"> <code>set -u</code></label></div>
+      <div class="ctrl"><label><input type="checkbox" id="stR"> <code>RELEASE_DIR</code> is set</label></div>
+      <div class="ctrl"><label><input type="checkbox" id="stI"> wrap line 2 in <code>if</code></label></div>
+    </div>
+    <div class="rgrid" id="stOut"></div>
+    <div class="readout" id="stNote"></div>
+  </div>
+</div>
+
+<div class="box trap"><b class="tag">The two failures the demo is built around</b>
+<p style="margin-bottom:6px"><strong>A pipeline hides the failure of everything except its last stage.</strong> When <code>curl</code> exits 22 because the API returned 404, <code>jq</code> reads an empty stream and emits nothing, <code>tee</code> writes an empty file and exits 0 — so the pipeline's status is 0, <code>set -e</code> sees nothing wrong, and the script proceeds to deploy an empty version string. Adding <code>pipefail</code> turns that into an immediate abort. This is why the three flags are always quoted together.</p>
+<p style="margin-bottom:0"><strong>An unset variable expands to nothing, silently.</strong> <code>rm -rf "$RELEASE_DIR"/*</code> with <code>RELEASE_DIR</code> unset is <code>rm -rf /*</code>. The quotes do not help — they prevent word splitting, not emptiness. <code>set -u</code> is the only thing standing between a typo in a variable name and that command. This has taken down real production systems more than once.</p>
+</div>
+
+<div class="box warn"><b class="tag">Where <code>set -e</code> quietly does not apply</b>
+<p style="margin-bottom:0">Three cases are worth committing to memory because each looks protected and is not. Inside a function called in a condition — <code>if my_func; then</code> — errexit is disabled for the <em>entire</em> function body, not just the call. In <code>local var=$(cmd)</code> the exit status is that of <code>local</code>, which always succeeds, so a failing command substitution is invisible; declare and assign on separate lines. And in a command substitution used as an argument, <code>echo "$(false)"</code>, the failure is discarded. If a script absolutely must not continue past an error, check explicitly with <code>|| exit 1</code> rather than relying on the flag.</p>
+</div>
+</section>
+
+<section id="quoting">
+<h2>Quoting, which is where most shell bugs live</h2><div class="h2rule"></div>
+
+<p>After a variable is expanded, the shell performs <strong>word splitting</strong> on the result — using the characters in <code>IFS</code>, by default space, tab and newline — and then <strong>glob expansion</strong> on each resulting word. Both happen to the <em>value</em>, after substitution, and both are disabled by double quotes. That one sentence explains nearly every quoting bug.</p>
+
+<div class="code"><div class="code-top"><span class="code-lang">bash — the same command, with and without quotes</span><button class="code-copy">Copy</button></div><pre>file=<span class="s">"my report.pdf"</span>
+
+rm $file                 <span class="c">← becomes: rm my report.pdf     (TWO arguments — deletes neither,</span>
+                         <span class="c">  or deletes a file called `my` if one exists)</span>
+rm <span class="s">"$file"</span>               <span class="c">← becomes: rm "my report.pdf"   (one argument) ✓</span>
+
+<span class="c"># and glob expansion, which quoting also suppresses</span>
+pattern=<span class="s">"*.log"</span>
+ls $pattern              <span class="c">← the shell expands * against the CWD before ls ever runs</span>
+ls <span class="s">"$pattern"</span>            <span class="c">← ls receives the literal string *.log ✓</span>
+
+<span class="c"># arrays: the difference between "$@" and "$*" is not stylistic</span>
+args=(--tag <span class="s">"v1.2"</span> --note <span class="s">"first release"</span>)
+cmd <span class="s">"${args[@]}"</span>          <span class="c">← 4 arguments, spaces preserved ✓</span>
+cmd <span class="s">"${args[*]}"</span>          <span class="c">← ONE argument: "--tag v1.2 --note first release"</span>
+cmd ${args[@]}           <span class="c">← 5 arguments — "first" and "release" split apart</span></pre></div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Form</th><th>Expands variables</th><th>Word splitting</th><th>Globbing</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>"$var"</code></td><td class="yes">Yes</td><td class="yes">No</td><td class="yes">No</td><td><strong>The default. Quote every expansion unless you have a specific reason not to</strong></td></tr>
+<tr><td><code>$var</code></td><td class="yes">Yes</td><td class="no">Yes</td><td class="no">Yes</td><td>Deliberately splitting a known-safe list, and almost nothing else</td></tr>
+<tr><td><code>'$var'</code></td><td class="no">No</td><td class="yes">No</td><td class="yes">No</td><td>Literal text: regexes, awk programs, passwords, JSON templates</td></tr>
+<tr><td><code>"${arr[@]}"</code></td><td class="yes">Yes</td><td>Per element</td><td class="yes">No</td><td class="yes">Passing an argument list through intact</td></tr>
+<tr><td><code>$(cmd)</code></td><td>—</td><td class="no">Yes, if unquoted</td><td class="no">Yes</td><td>Always quote it: <code>"$(cmd)"</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Parameter expansion is the other half — a small string-processing language that saves a subprocess every time you use it instead of <code>sed</code>.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Expansion</th><th>Meaning</th><th>Example given <code>p=/var/log/app.log</code></th></tr></thead>
+<tbody>
+<tr><td><code>${v:-d}</code></td><td>Value, or <code>d</code> if unset or empty</td><td class="yes">The <code>set -u</code>-safe default</td></tr>
+<tr><td><code>${v:=d}</code></td><td>As above and assign it</td><td></td></tr>
+<tr><td><code>${v:?msg}</code></td><td>Error out with <code>msg</code> if unset</td><td class="yes">Best way to demand a required argument at the top of a script</td></tr>
+<tr><td><code>${v:+x}</code></td><td><code>x</code> only if <code>v</code> is set</td><td>Conditionally adding a flag: <code>${VERBOSE:+--verbose}</code></td></tr>
+<tr><td><code>${#v}</code></td><td>Length</td><td><code>16</code></td></tr>
+<tr><td><code>${v##*/}</code></td><td>Strip longest leading match</td><td><code>app.log</code> — this is <code>basename</code> without a subprocess</td></tr>
+<tr><td><code>${v%/*}</code></td><td>Strip shortest trailing match</td><td><code>/var/log</code> — <code>dirname</code></td></tr>
+<tr><td><code>${v%.log}</code></td><td>Strip a known suffix</td><td><code>/var/log/app</code></td></tr>
+<tr><td><code>${v/log/txt}</code></td><td>Replace first</td><td><code>/var/txt/app.log</code> — note it hit the directory</td></tr>
+<tr><td><code>${v//o/0}</code></td><td>Replace all</td><td><code>/var/l0g/app.l0g</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box tip"><b class="tag">Run ShellCheck; it finds all of this automatically</b>
+<p style="margin-bottom:0">ShellCheck is a static analyser for shell scripts and it catches unquoted expansions, useless <code>cat</code>, <code>[ ]</code> versus <code>[[ ]]</code> mistakes, <code>set -e</code> blind spots and about two hundred other patterns. It takes one line in CI and it is the single highest-return tool in this chapter. Anything in a repository that ends in <code>.sh</code> should be passing it before this discussion is worth having by hand.</p>
+</div>
+</section>
+
+<section id="text">
+<h2>The text-processing toolkit</h2><div class="h2rule"></div>
+
+<p>The classic Unix argument is that a small set of single-purpose filters, composed with pipes, beats one large program. That is still true for the thing operators do most: turning a log file into an answer. Here is the standard set, and then a pipeline built out of it one stage at a time.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Tool</th><th>Job</th><th>The flag worth knowing</th></tr></thead>
+<tbody>
+<tr><td><code>grep</code></td><td>Select lines matching a pattern</td><td><code>-c</code> count, <code>-v</code> invert, <code>-o</code> print just the match, <code>-E</code> extended regex, <code>-F</code> fixed string (much faster)</td></tr>
+<tr><td><code>awk</code></td><td>Split each line into fields and act on them</td><td>A whole language. <code>awk '$9&gt;=500 {print $7}'</code> replaces grep plus cut and is more precise than either</td></tr>
+<tr><td><code>sed</code></td><td>Stream editing, mostly substitution</td><td><code>-i</code> edit in place, <code>-n 'Np'</code> print line N, <code>'s/x/y/g'</code></td></tr>
+<tr><td><code>cut</code></td><td>Select fields by delimiter</td><td><code>-d: -f1</code>. Cannot cope with runs of spaces — use <code>awk</code> for whitespace-separated data</td></tr>
+<tr><td><code>sort</code></td><td>Order lines</td><td><code>-n</code> numeric, <code>-r</code> reverse, <code>-u</code> dedupe, <code>-k2</code> by field, <code>-h</code> human sizes (pairs with <code>du -h</code>)</td></tr>
+<tr><td><code>uniq</code></td><td>Collapse <em>adjacent</em> duplicates</td><td class="no"><code>-c</code> to count. Useless without <code>sort</code> first — it only ever compares neighbours</td></tr>
+<tr><td><code>tr</code></td><td>Translate or delete characters</td><td><code>tr -d '\r'</code> for files that came from Windows</td></tr>
+<tr><td><code>jq</code></td><td>The same idea for JSON</td><td><code>-r</code> raw output, <code>-e</code> exit non-zero when the result is null — essential in scripts</td></tr>
+<tr><td><code>xargs</code></td><td>Turn lines into arguments</td><td><code>-0</code> with <code>find -print0</code> for filenames with spaces, <code>-P</code> for parallelism, <code>-n1</code> one at a time</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="demo" id="d-pipe">
+  <div class="demo-top"><div class="demo-title">Which endpoint is throwing 5xx? Built one stage at a time</div><div class="demo-hint">Turn off <code>sort</code> and watch <code>uniq -c</code> give the wrong answer</div></div>
+  <div class="demo-body">
+    <canvas id="cPipe" aria-label="A funnel showing how many records survive each stage of the pipeline"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Stages <b id="pgSo">7</b> of 7</label><input type="range" id="pgS" min="1" max="7" value="7"></div>
+      <div class="ctrl"><label><input type="checkbox" id="pgNoSort"> omit the <code>sort</code> before <code>uniq</code></label></div>
+    </div>
+    <div class="rgrid" id="pgOut"></div>
+    <div class="code" style="margin-top:13px"><div class="code-top"><span class="code-lang" id="pgCmd">pipeline</span><button class="code-copy">Copy</button></div><pre id="pgPre"></pre></div>
+    <div class="readout" id="pgNote"></div>
+  </div>
+</div>
+
+<div class="box intu"><b class="tag">The <code>sort | uniq -c | sort -rn</code> idiom is worth internalising</b>
+<p style="margin-bottom:0">"Count occurrences of each distinct value and show me the biggest" is the single most common question anyone asks a log file, and those three commands answer it for any data you can reduce to one item per line. Top talkers by IP, most frequent error message, busiest endpoint, most common user agent — all the same pipeline with a different field extracted. The one thing you must not omit is the first <code>sort</code>: <code>uniq</code> compares only adjacent lines, so on unsorted input it reports every run separately and the counts are silently wrong rather than obviously wrong.</p>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">bash — the same shape, applied to five different questions</span><button class="code-copy">Copy</button></div><pre><span class="c"># busiest endpoints</span>
+awk <span class="s">'{print $7}'</span> access.log | sort | uniq -c | sort -rn | head
+
+<span class="c"># top talkers, 5xx only — awk does the filtering AND the extraction</span>
+awk <span class="s">'$9 &gt;= 500 {print $1}'</span> access.log | sort | uniq -c | sort -rn | head
+
+<span class="c"># status code distribution, as percentages</span>
+awk <span class="s">'{c[$9]++} END {for (k in c) printf "%-5s %6d %5.1f%%\n", k, c[k], 100*c[k]/NR}'</span> access.log | sort -k2 -rn
+
+<span class="c"># p95 response time, when field 11 is the duration</span>
+awk <span class="s">'{print $11}'</span> access.log | sort -n | awk <span class="s">'{a[NR]=$1} END {print a[int(NR*0.95)]}'</span>
+
+<span class="c"># requests per minute, to find the spike</span>
+awk -F<span class="s">'[:[]'</span> <span class="s">'{print $2":"$3":"$4}'</span> access.log | sort | uniq -c
+
+<span class="c"># the same shape over JSON logs</span>
+jq -r <span class="s">'select(.status &gt;= 500) | .path'</span> app.jsonl | sort | uniq -c | sort -rn | head</pre></div>
+</section>
+
+<section id="scripting">
+<h2>Writing a script rather than a sequence of commands</h2><div class="h2rule"></div>
+
+<p>The difference between a command history and a script is that a script has to survive being run by someone else, at an unexpected time, in a state you did not anticipate. Four constructs carry most of that weight.</p>
+
+<div class="code"><div class="code-top"><span class="code-lang">bash — a script skeleton worth copying</span><button class="code-copy">Copy</button></div><pre><span class="c">#!/usr/bin/env bash</span>
+set -euo pipefail
+IFS=$<span class="s">'\n\t'</span>                      <span class="c">← removes space from the split set. Stops filenames</span>
+                                 <span class="c">  with spaces exploding on any expansion you missed</span>
+
+readonly SCRIPT_DIR=<span class="s">"$(cd "</span>$(dirname <span class="s">"${BASH_SOURCE[0]}"</span>)<span class="s">" &amp;&amp; pwd)"</span>
+readonly LOG_TAG=<span class="s">"${0##*/}"</span>
+
+<span class="c"># required inputs fail loudly at the top, not halfway through</span>
+: <span class="s">"${TARGET_ENV:?must be set}"</span>
+readonly DRY_RUN=<span class="s">"${DRY_RUN:-0}"</span>
+
+log() { printf <span class="s">'%s [%s] %s\n'</span> <span class="s">"$(date -Is)"</span> <span class="s">"$LOG_TAG"</span> <span class="s">"$*"</span> &gt;&amp;2; }
+die() { log <span class="s">"FATAL: $*"</span>; exit 1; }
+run() {                          <span class="c">← every mutating command goes through this.</span>
+  log <span class="s">"+ $*"</span>                    <span class="c">  DRY_RUN=1 then shows the whole plan without doing it</span>
+  [[ <span class="s">"$DRY_RUN"</span> == 1 ]] || <span class="s">"$@"</span>
+}
+
+<span class="c"># cleanup runs on ANY exit — success, failure, or Ctrl-C</span>
+readonly TMP=<span class="s">"$(mktemp -d)"</span>
+cleanup() { rm -rf <span class="s">"$TMP"</span>; }
+trap cleanup EXIT
+trap <span class="s">'die "interrupted"'</span> INT TERM
+
+<span class="c"># refuse to run twice at once. flock is atomic; a lockfile check is not</span>
+exec 9&gt;/var/lock/<span class="s">"$LOG_TAG"</span>.lock
+flock -n 9 || die <span class="s">"another run is in progress"</span>
+
+main() {
+  local -a targets=()
+  while IFS= read -r line; do targets+=(<span class="s">"$line"</span>); done &lt; <span class="s">"$1"</span>
+                                 <span class="c">← the only correct way to read a file line by line.</span>
+                                 <span class="c">  `for l in $(cat f)` splits on spaces and globs</span>
+  (( ${#targets[@]} )) || die <span class="s">"no targets"</span>
+  for t in <span class="s">"${targets[@]}"</span>; do run deploy --host <span class="s">"$t"</span>; done
+}
+
+main <span class="s">"$@"</span></pre></div>
+
+<div class="kv">
+<dt><code>trap … EXIT</code> is the only reliable cleanup</dt><dd>It fires on normal exit, on <code>set -e</code> aborting, and on an explicit <code>exit</code> anywhere in the script. Trapping only <code>INT TERM</code> leaves temp directories behind whenever the script simply fails, which is most of the time.</dd>
+<dt><code>flock</code> rather than a lockfile</dt><dd>Checking whether a file exists and then creating it is two operations with a race between them, so two cron runs that start together both proceed. <code>flock</code> is a single kernel operation and the lock is released automatically when the process dies — including if it is killed, which a manually removed lockfile is not.</dd>
+<dt><code>while read</code> rather than <code>for … in $(cat)</code></dt><dd><code>for</code> over a command substitution splits on whitespace and then globs each piece, so a line containing a space becomes two items and a line containing <code>*</code> becomes a directory listing. <code>while IFS= read -r</code> preserves the line exactly; <code>-r</code> stops backslashes being interpreted and <code>IFS=</code> stops leading whitespace being trimmed.</dd>
+<dt>A <code>run()</code> wrapper buys dry-run for free</dt><dd>Routing every mutating command through one function means <code>DRY_RUN=1</code> prints the complete plan without executing any of it. For anything that touches production this is the difference between a review and a hope, and it costs four lines.</dd>
+</div>
+
+<div class="box warn"><b class="tag">Idempotency is a requirement, not a nicety</b>
+<p style="margin-bottom:0">Any script that a pipeline, a cron or a human might re-run must produce the same end state when run twice. That means <code>mkdir -p</code> rather than <code>mkdir</code>, <code>ln -sfn</code> rather than <code>ln -s</code>, <code>useradd … || true</code> guarded by an existence check, appending to a config file only after grepping for the line, and <code>rm -f</code> rather than <code>rm</code>. The test is simple and worth actually performing: run it twice in a row and diff the results. Chapter 15 makes this the central idea of configuration management, and chapter 19 builds an entire delivery model on it.</p>
+</div>
+</section>
+
+<section id="whenpython">
+<h2>When to stop writing bash</h2><div class="h2rule"></div>
+
+<p>Bash is unbeatable for gluing programs together and genuinely bad at everything else. The switching point is not a matter of taste, and there are reasonably objective signals.</p>
+
+<div class="cards">
+<div>
+<h5>Stay in bash</h5>
+<p>The script is mostly invoking other programs and wiring their streams together. It is under roughly 100 lines with no nested data. It must run somewhere with nothing else installed — a container entrypoint, a minimal image, a bootstrap on a fresh host. Or it is a thin wrapper around a CLI that already does the work.</p>
+</div>
+<div>
+<h5>Switch to Python or Go</h5>
+<p>You need a data structure more complicated than a flat list of strings. You are parsing JSON, YAML or XML beyond one <code>jq</code> expression. You need real error handling, retries with backoff, or partial-failure semantics. You want tests — bash can be tested and almost nobody does. It calls HTTP APIs and reacts to the responses. Or you are reaching for <code>eval</code>.</p>
+</div>
+</div>
+
+<div class="box tip"><b class="tag">Go where the operator has to install nothing</b>
+<p style="margin-bottom:0">The reason bash survives in operations is not that it is good — it is that it is already there. Any replacement inherits that requirement. Python is present on most Linux distributions but its dependencies are not, which is why operational Python should stick to the standard library or ship as a container. Go compiles to a single static binary with no runtime, which is exactly why so much of the tooling in the rest of this unit — Docker, Kubernetes, Terraform, Prometheus — is written in it.</p>
+</div>
+</section>
+
+<section id="close">
+<h2>Check yourself</h2><div class="h2rule"></div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>A CI job runs <code>set -e</code> and then <code>curl -sf "$URL" | jq -r .version &gt; version.txt</code>. The API returns 404 and the job passes. Explain, and give the one-word fix.
+<button class="reveal">Show answer</button><div class="ans">A pipeline's exit status is the status of its <em>last</em> command. <code>curl -sf</code> exits 22 on a 404, but <code>jq</code> reads an empty stream and exits 0, so the pipeline reports 0 and <code>set -e</code> has nothing to act on. The job passes with an empty <code>version.txt</code>, and whatever consumes that file downstream now has a bug that is a long way from its cause. The fix is <code>set -o pipefail</code>, which makes the pipeline report the rightmost non-zero status. Belt and braces: <code>jq -e</code> exits non-zero when the result is null or false, so it fails on its own even without pipefail.</div></li>
+
+<li>Why does <code>rm -rf "$BUILD_DIR"/*</code> not protect you when <code>BUILD_DIR</code> is unset, given that it is quoted?
+<button class="reveal">Show answer</button><div class="ans">Quoting prevents word splitting and glob expansion of the <em>value</em>. It does not prevent the value from being empty. An unset variable expands to the empty string, so the argument becomes <code>/*</code> and the command is <code>rm -rf /*</code>. The only thing that stops it is <code>set -u</code>, which makes expanding an unset variable a fatal error, or an explicit guard such as <code>: "${BUILD_DIR:?}"</code> at the top of the script. Both are one line, and the difference between having them and not having them is the difference between a typo and an outage.</div></li>
+
+<li><code>if grep -q ERROR log; then …</code> is inside a script with <code>set -e</code>. Why does the script not exit when the pattern is absent?
+<button class="reveal">Show answer</button><div class="ans">Because errexit is deliberately suppressed for commands in a condition context: an <code>if</code> or <code>while</code> test, the left operand of <code>&amp;&amp;</code> or <code>||</code>, and anything negated with <code>!</code>. If it were not, you could never test for a condition that might be false. <code>grep</code> exits 1 for "no match", which is a legitimate answer rather than an error, so this is the behaviour you want. The trap is the reverse case: <code>count=$(grep -c ERROR log)</code> outside a condition <em>will</em> abort the script when there are no matches, which is almost never what the author intended. Guard it with <code>|| true</code>, or use <code>grep -c ERROR log || echo 0</code>.</div></li>
+
+<li>Your pipeline is <code>awk '{print $7}' access.log | uniq -c | sort -rn | head</code> and the counts look implausibly fragmented. What is wrong?
+<button class="reveal">Show answer</button><div class="ans">There is no <code>sort</code> before <code>uniq</code>. <code>uniq</code> only collapses <em>adjacent</em> identical lines, so on log data — where the same endpoint appears repeatedly but not consecutively — each run of identical neighbours is counted separately and one endpoint appears many times with small counts. The output is wrong rather than empty, which is what makes it dangerous: nothing errors and the numbers look like data. Insert <code>| sort |</code> before <code>uniq -c</code>. The demo above lets you toggle exactly this and shows the group count going from 8 to 12 on 12 records.</div></li>
+
+<li>What is the difference between <code>"${args[@]}"</code> and <code>"${args[*]}"</code>, and when does it break something?
+<button class="reveal">Show answer</button><div class="ans"><code>"${args[@]}"</code> expands to one quoted word per element, preserving spaces inside each. <code>"${args[*]}"</code> joins every element with the first character of <code>IFS</code> and produces a single word. So passing <code>"${args[*]}"</code> to a command hands it one long argument instead of several, and the command usually reports an unrecognised option containing the entire list. Unquoted <code>${args[@]}</code> is a third case: it splits on whitespace <em>inside</em> elements too, so an element like <code>"first release"</code> becomes two arguments. Use <code>"${args[@]}"</code> essentially always; <code>"${args[*]}"</code> only when you genuinely want a joined string, such as for logging.</div></li>
+
+<li>A cron job occasionally runs twice concurrently and corrupts its output. The script already checks for a lockfile and exits if it exists. Why is that not enough?
+<button class="reveal">Show answer</button><div class="ans">Because "check whether the file exists" and "create the file" are two separate operations, and two processes can both pass the check before either performs the creation. It is a classic time-of-check-to-time-of-use race, and it fires precisely when two runs start simultaneously — which is the case the lock exists for. There is a second problem: if the script is killed, the lockfile survives and every later run refuses to start. <code>flock</code> solves both. Acquiring the lock is a single atomic kernel operation with no window, and the kernel releases it when the file descriptor closes, including on an unexpected death.</div></li>
+
+<li>Your container exits with code 137. What does that mean, and what are the two possible causes?
+<button class="reveal">Show answer</button><div class="ans">128 + 9, so the process was terminated by <code>SIGKILL</code>. Two causes produce it, with different fixes. Either the cgroup OOM killer fired because the container exceeded its memory limit — check <code>lastState.terminated.reason</code> for <code>OOMKilled</code>, and the fix is to raise the limit or reduce usage — or the runtime sent <code>SIGTERM</code>, the process ignored it for the whole grace period, and the runtime escalated to <code>SIGKILL</code>. That second case means the process has no signal handler or is running behind a shell that does not forward signals, and the fix is in chapter 2. The exit code alone does not distinguish them, which is why the termination reason and the timing relative to the grace period both matter: an instant 137 is usually OOM, a 137 exactly at the grace period is usually a missing handler.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin-bottom:0">Chapter 4 covers the network these commands run over: addressing and subnets you will have to plan yourself, what TCP guarantees and what it costs, the port exhaustion that takes down busy services, and a layer-by-layer diagnostic ladder.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 03</h2><p>The shell and scripting. Part of the DevOps unit — <a href="index.html">all 24 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 10 (entrypoints and exec form), 15 (idempotency as a design rule), 17 (pipeline steps are shell), 23 (triage under pressure).</p></div>
+    <div><h2>Going deeper</h2><p>The Shell &amp; Bash unit on this site covers the language itself in full. Greg's Wiki (the Bash FAQ and Pitfalls pages) is the reference for every edge case here.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: strict mode and pipeline status ============ */
+(function(){
+  const cv=document.getElementById("cStrict"); if(!cv) return;
+  const fEl=document.getElementById("stF"), eEl=document.getElementById("stE"),
+        pEl=document.getElementById("stP"), uEl=document.getElementById("stU"),
+        rEl=document.getElementById("stR"), iEl=document.getElementById("stI");
+  const out=document.getElementById("stOut"), note=document.getElementById("stNote");
+
+  const STAGES=[["curl -sf \"$API/version\"",22],["jq -r .tag",5],["tee version.txt",1]];
+
+  function run(){
+    const failIdx=+fEl.value, errexit=eEl.checked, pipefail=pEl.checked,
+          nounset=uEl.checked, relSet=rEl.checked, inCond=iEl.checked;
+    /* stage exit codes */
+    const codes=STAGES.map((s,i)=> i===failIdx ? s[1] : 0);
+    /* bash: $? of a pipeline is the LAST stage; with pipefail, the rightmost non-zero */
+    const last=codes[codes.length-1];
+    let status=last;
+    if(pipefail){ for(let i=codes.length-1;i>=0;i--){ if(codes[i]!==0){ status=codes[i]; break; } } }
+    const aborted2 = errexit && status!==0 && !inCond;
+
+    /* version is empty whenever curl or jq failed */
+    const version = (failIdx===0||failIdx===1) ? "" : "v2.14.3";
+
+    /* line-by-line execution trace */
+    const lines=[], reached=[];
+    let stop=null, outcome=null;
+    lines.push(["1", "set -"+(errexit?"e":"")+(nounset?"u":"")+(pipefail?"o pipefail":"")||"set +e", true]);
+    lines.push(["2", (inCond?"if ":"")+"version=$(curl -sf \"$API/version\" | jq -r .tag | tee version.txt)"+(inCond?"; then :; fi":""), true]);
+    if(aborted2){ stop=2; outcome=["aborted at line 2","#2E9E6B"]; }
+    lines.push(["3", 'echo "deploying $version"', stop===null]);
+    if(stop===null && nounset && !relSet){ stop=4; outcome=["aborted at line 4 — unset variable","#2E9E6B"]; }
+    lines.push(["4", relSet ? 'rm -rf "$RELEASE_DIR"/*   → rm -rf /srv/app/releases/*'
+                            : (nounset ? 'rm -rf "$RELEASE_DIR"/*   → RELEASE_DIR: unbound variable'
+                                       : 'rm -rf "$RELEASE_DIR"/*   → rm -rf /*'), stop===null||stop===4]);
+    if(stop===null && !relSet && !nounset){ outcome=["DELETED THE ROOT FILESYSTEM","#D9534F"]; }
+    lines.push(["5", 'deploy --tag "'+(version||"")+'"', stop===null]);
+    if(!outcome){
+      outcome = version==="" ? ["deployed an EMPTY version","#D9534F"] : ["clean run","#2E9E6B"];
+    }
+    return {codes,status,aborted2,version,lines,stop,outcome,failIdx,pipefail,errexit,nounset,relSet,inCond};
+  }
+
+  function draw(){
+    const m=run();
+    const w=cv.clientWidth||660, h=86+m.lines.length*21+10, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+
+    /* the three pipeline stages */
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("line 2 pipeline — each stage reports its own exit code", 14, 12);
+    const bw=Math.min(178,(w-28-2*26)/3);
+    STAGES.forEach((s,i)=>{
+      const x=14+i*(bw+26), bad=m.codes[i]!==0;
+      ctx.fillStyle= bad?"#FBE9E8":"#FFFFFF";
+      ctx.strokeStyle= bad?PC.bad:"#D5DDE4"; ctx.lineWidth=bad?1.6:1;
+      ctx.fillRect(x,22,bw,30); ctx.strokeRect(x+.5,22.5,bw,30);
+      ctx.fillStyle=bad?PC.bad:PC.ink; ctx.font="10.5px ui-monospace, monospace"; ctx.textAlign="left";
+      const label=s[0].length>Math.floor(bw/6.1)?s[0].slice(0,Math.floor(bw/6.1)-1)+"…":s[0];
+      ctx.fillText(label, x+7, 32);
+      ctx.font="700 10px Archivo, Arial"; ctx.fillStyle=bad?PC.bad:PC.ok;
+      ctx.fillText("exit "+m.codes[i], x+7, 45);
+      if(i<2){ ctx.strokeStyle="#B9C4CE"; ctx.lineWidth=1.4; ctx.beginPath();
+        ctx.moveTo(x+bw+5,37); ctx.lineTo(x+bw+21,37); ctx.stroke();
+        ctx.fillStyle="#8195A6"; ctx.font="600 11px Archivo, Arial"; ctx.textAlign="center";
+        ctx.fillText("|", x+bw+13, 30); }
+    });
+    /* what the shell concluded */
+    ctx.textAlign="left"; ctx.font="600 9.5px Archivo, Arial"; ctx.fillStyle=PC.text;
+    ctx.fillText("PIPESTATUS=("+m.codes.join(" ")+")   $?="+m.status+
+                 (m.pipefail?"   (pipefail: rightmost non-zero)":"   (no pipefail: last stage only)"), 14, 66);
+
+    /* the script trace */
+    m.lines.forEach((ln,i)=>{
+      const y=86+i*21, ran=ln[2];
+      ctx.font="10.5px ui-monospace, monospace"; ctx.textAlign="right";
+      ctx.fillStyle= ran?PC.text:"#C3CCD5"; ctx.fillText(ln[0], 28, y+8);
+      ctx.textAlign="left";
+      const danger = ran && /rm -rf \/\*/.test(ln[1]);
+      ctx.fillStyle = danger?PC.bad : ran?PC.ink : "#C3CCD5";
+      ctx.font=(danger?"700 ":"")+"10.5px ui-monospace, monospace";
+      const maxc=Math.floor((w-56)/6.05);
+      ctx.fillText(ln[1].length>maxc?ln[1].slice(0,maxc-1)+"…":ln[1], 38, y+8);
+      if(!ran){ ctx.strokeStyle="#DCE3E9"; ctx.lineWidth=1; ctx.beginPath();
+        ctx.moveTo(38,y+8); ctx.lineTo(Math.min(w-14,38+ln[1].length*6.05),y+8); ctx.stroke(); }
+    });
+
+    out.innerHTML=
+      '<div><span>PIPESTATUS</span><b style="font-size:13px">('+m.codes.join(" ")+')</b></div>'+
+      '<div><span>$? after line 2</span><b style="color:'+(m.status?PC.bad:PC.ok)+'">'+m.status+'</b></div>'+
+      '<div><span>errexit fires</span><b style="font-size:12px;color:'+(m.aborted2?PC.ok:PC.warn)+'">'+(m.aborted2?"yes":"no")+'</b></div>'+
+      '<div><span>version captured</span><b style="font-size:12px;color:'+(m.version?PC.ok:PC.bad)+'">'+(m.version||"(empty)")+'</b></div>'+
+      '<div><span>lines executed</span><b>'+m.lines.filter(l=>l[2]).length+' / 5</b></div>'+
+      '<div><span>outcome</span><b style="font-size:11px;color:'+m.outcome[1]+'">'+m.outcome[0]+'</b></div>';
+
+    let msg;
+    if(m.failIdx<0) msg='Nothing failed, so every path is equivalent. Set a stage to fail and the flags start to matter.';
+    else if(m.inCond) msg='Line 2 is inside an <code>if</code>, so errexit is suppressed for it entirely — that is deliberate, because a condition is allowed to be false. The script continues regardless of <code>$?</code>.';
+    else if(m.status===0 && m.codes.some(c=>c!==0))
+      msg='<b>Stage '+(m.failIdx+1)+' failed with exit '+m.codes[m.failIdx]+', and the shell reports success.</b> '+
+          'Without <code>pipefail</code>, <code>$?</code> is just <code>'+STAGES[2][0].split(" ")[0]+'</code>\u2019s status, and <code>tee</code> was perfectly happy to write an empty file. '+
+          '<code>set -e</code> has nothing to trigger on. Tick pipefail and watch the script stop instead.';
+    else if(m.aborted2)
+      msg='<code>pipefail</code> surfaced exit '+m.status+' from stage '+(m.codes.indexOf(m.status)+1)+', <code>set -e</code> saw a non-zero status and the script stopped at line 2 — before anything was deleted or deployed. This is the intended behaviour.';
+    else msg='Line 2 failed with <code>$?='+m.status+'</code> but <code>set -e</code> is off, so execution continues.';
+
+    if(!m.relSet && !m.nounset && m.lines[3][2])
+      msg+=' <b style="color:#D9534F">Line 4 is the real disaster:</b> <code>RELEASE_DIR</code> is unset, so <code>"$RELEASE_DIR"/*</code> expands to <code>/*</code>. The quotes did their job — they stopped word splitting — but nothing stops an empty value. Only <code>set -u</code> does.';
+    else if(!m.relSet && m.nounset)
+      msg+=' <code>set -u</code> caught the unset <code>RELEASE_DIR</code> at line 4 and aborted rather than expanding it to nothing.';
+    note.innerHTML=msg;
+  }
+  [fEl,eEl,pEl,uEl,rEl,iEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+
+/* ============ demo 2: the log pipeline, stage by stage ============ */
+(function(){
+  const cv=document.getElementById("cPipe"); if(!cv) return;
+  const sEl=document.getElementById("pgS"), nEl=document.getElementById("pgNoSort");
+  const out=document.getElementById("pgOut"), note=document.getElementById("pgNote");
+  const pre=document.getElementById("pgPre"), cmd=document.getElementById("pgCmd");
+
+  const LOG=[
+"10.2.4.11 - - [12/Sep/2026:09:14:02 +0000] \"GET /api/orders HTTP/1.1\" 200 4213 \"-\" \"curl/8.4.0\"",
+"10.2.4.19 - - [12/Sep/2026:09:14:03 +0000] \"GET /api/orders/8821 HTTP/1.1\" 500 214 \"-\" \"Go-http-client/2.0\"",
+"10.2.7.3 - - [12/Sep/2026:09:14:04 +0000] \"POST /api/checkout HTTP/1.1\" 502 173 \"-\" \"Mozilla/5.0\"",
+"10.2.4.11 - - [12/Sep/2026:09:14:05 +0000] \"GET /healthz HTTP/1.1\" 200 2 \"-\" \"kube-probe/1.29\"",
+"10.2.9.44 - - [12/Sep/2026:09:14:06 +0000] \"GET /api/orders/8822 HTTP/1.1\" 500 214 \"-\" \"Go-http-client/2.0\"",
+"10.2.4.11 - - [12/Sep/2026:09:14:07 +0000] \"GET /static/app.js HTTP/1.1\" 304 0 \"-\" \"Mozilla/5.0\"",
+"10.2.7.3 - - [12/Sep/2026:09:14:08 +0000] \"POST /api/checkout HTTP/1.1\" 502 173 \"-\" \"Mozilla/5.0\"",
+"10.2.9.44 - - [12/Sep/2026:09:14:09 +0000] \"GET /api/orders/8823 HTTP/1.1\" 500 214 \"-\" \"Go-http-client/2.0\"",
+"10.2.4.11 - - [12/Sep/2026:09:14:10 +0000] \"GET /healthz HTTP/1.1\" 200 2 \"-\" \"kube-probe/1.29\"",
+"10.2.3.8 - - [12/Sep/2026:09:14:11 +0000] \"GET /api/search?q=shoes HTTP/1.1\" 200 8841 \"-\" \"Mozilla/5.0\"",
+"10.2.7.3 - - [12/Sep/2026:09:14:12 +0000] \"POST /api/checkout HTTP/1.1\" 502 173 \"-\" \"Mozilla/5.0\"",
+"10.2.9.44 - - [12/Sep/2026:09:14:13 +0000] \"GET /api/orders/8824 HTTP/1.1\" 500 214 \"-\" \"Go-http-client/2.0\"",
+"10.2.3.8 - - [12/Sep/2026:09:14:14 +0000] \"GET /api/search?q=boots HTTP/1.1\" 200 6120 \"-\" \"Mozilla/5.0\"",
+"10.2.4.11 - - [12/Sep/2026:09:14:15 +0000] \"GET /healthz HTTP/1.1\" 200 2 \"-\" \"kube-probe/1.29\"",
+"10.2.5.2 - - [12/Sep/2026:09:14:16 +0000] \"GET /api/cart HTTP/1.1\" 503 88 \"-\" \"Mozilla/5.0\"",
+"10.2.9.44 - - [12/Sep/2026:09:14:17 +0000] \"GET /api/orders/8825 HTTP/1.1\" 500 214 \"-\" \"Go-http-client/2.0\"",
+"10.2.7.3 - - [12/Sep/2026:09:14:18 +0000] \"POST /api/checkout HTTP/1.1\" 200 902 \"-\" \"Mozilla/5.0\"",
+"10.2.5.2 - - [12/Sep/2026:09:14:19 +0000] \"GET /api/cart HTTP/1.1\" 503 88 \"-\" \"Mozilla/5.0\"",
+"10.2.4.11 - - [12/Sep/2026:09:14:20 +0000] \"GET /healthz HTTP/1.1\" 200 2 \"-\" \"kube-probe/1.29\"",
+"10.2.3.8 - - [12/Sep/2026:09:14:21 +0000] \"GET /static/app.css HTTP/1.1\" 200 1204 \"-\" \"Mozilla/5.0\"",
+"10.2.9.44 - - [12/Sep/2026:09:14:22 +0000] \"GET /api/orders/8826 HTTP/1.1\" 500 214 \"-\" \"Go-http-client/2.0\"",
+"10.2.6.7 - - [12/Sep/2026:09:14:23 +0000] \"DELETE /api/orders/771 HTTP/1.1\" 404 62 \"-\" \"curl/8.4.0\"",
+"10.2.7.3 - - [12/Sep/2026:09:14:24 +0000] \"POST /api/checkout HTTP/1.1\" 502 173 \"-\" \"Mozilla/5.0\"",
+"10.2.4.11 - - [12/Sep/2026:09:14:25 +0000] \"GET /healthz HTTP/1.1\" 200 2 \"-\" \"kube-probe/1.29\""];
+
+  const F=l=>l.split(/\s+/);
+  const OPS=[
+    ["cat access.log",                 ls=>ls],
+    ["grep -E ' 5[0-9]{2} '",          ls=>ls.filter(l=>/ 5\d\d /.test(l))],
+    ["awk '{print $7}'",               ls=>ls.map(l=>F(l)[6])],
+    ["sort",                           ls=>ls.slice().sort()],
+    ["uniq -c",                        ls=>{const o=[];for(const l of ls){const t=o[o.length-1];
+                                          if(t&&t.v===l) t.n++; else o.push({v:l,n:1});}
+                                          return o.map(x=>String(x.n).padStart(6)+" "+x.v);}],
+    ["sort -rn",                       ls=>ls.slice().sort((a,b)=>parseInt(b)-parseInt(a))],
+    ["head -5",                        ls=>ls.slice(0,5)]
+  ];
+
+  function draw(){
+    const noSort=nEl.checked;
+    const ops=OPS.filter((o,i)=>!(noSort&&i===3));
+    const n=Math.max(1,Math.min(Math.round(+sEl.value), ops.length));
+    document.getElementById("pgSo").textContent=n;
+    sEl.max=String(ops.length);
+
+    let cur=LOG, counts=[];
+    for(let i=0;i<n;i++){ cur=ops[i][1](cur); counts.push(cur.length); }
+
+    /* funnel */
+    const w=cv.clientWidth||660, h=34+ops.length*22+12, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("records surviving each stage", 14, 12);
+
+    const L=170, R=w-70, span=R-L, max=LOG.length;
+    ops.forEach((o,i)=>{
+      const y=26+i*22, on=i<n;
+      ctx.textAlign="right"; ctx.font=(i===n-1?"700 ":"")+"10.5px ui-monospace, monospace";
+      ctx.fillStyle= on?(i===n-1?PC.ink:PC.text):"#C3CCD5";
+      const lab=o[0]; ctx.fillText(lab.length>26?lab.slice(0,25)+"…":lab, L-10, y+9);
+      const c= on?counts[i]:0, bw=Math.max(on?2:0,(c/max)*span);
+      ctx.fillStyle="#EDF1F4"; ctx.fillRect(L,y+2,span,15);
+      if(on){ ctx.fillStyle= i===n-1?PC.line:"#C7CEFB"; ctx.fillRect(L,y+2,bw,15); }
+      ctx.textAlign="left"; ctx.font="10px ui-monospace, monospace"; ctx.fillStyle= on?PC.ink:"#C3CCD5";
+      ctx.fillText(on?String(c):"—", R+8, y+9);
+    });
+
+    cmd.textContent = ops.slice(0,n).map(o=>o[0]).join(" | ");
+    pre.textContent = cur.length ? cur.slice(0,14).join("\n")+(cur.length>14?"\n… "+(cur.length-14)+" more":"") : "(no output)";
+
+    const groups = n>=ops.findIndex(o=>o[0]==="uniq -c")+1 && ops.findIndex(o=>o[0]==="uniq -c")>=0
+      ? counts[ops.findIndex(o=>o[0]==="uniq -c")] : null;
+    out.innerHTML=
+      '<div><span>input lines</span><b>'+LOG.length+'</b></div>'+
+      '<div><span>after the 5xx filter</span><b>'+(n>=2?counts[1]:"—")+'</b></div>'+
+      '<div><span>distinct groups</span><b style="color:'+(noSort?PC.bad:PC.ink)+'">'+(groups!==null?groups:"—")+'</b></div>'+
+      '<div><span>output lines</span><b>'+cur.length+'</b></div>'+
+      '<div><span>sort before uniq</span><b style="font-size:12px;color:'+(noSort?PC.bad:PC.ok)+'">'+(noSort?"omitted":"present")+'</b></div>';
+
+    note.innerHTML = noSort
+      ? '<b>Without the <code>sort</code>, <code>uniq -c</code> reports 12 groups from 12 records instead of 8.</b> '+
+        'It only ever compares a line with the one immediately before it, so the four <code>/api/checkout</code> hits — which are scattered through the file rather than adjacent — are counted as four separate runs of one. '+
+        'The output is not empty and nothing errors; the numbers are simply wrong. Re-enable the sort and the counts collapse correctly.'
+      : 'Twelve of the twenty-four lines are 5xx. <code>awk</code> takes field 7, the request path; <code>sort</code> brings identical paths together so that <code>uniq -c</code> can collapse them into <b>8</b> distinct endpoints; '+
+        '<code>sort -rn</code> orders by the count that <code>uniq</code> prepended, and <code>head -5</code> keeps the worst. '+
+        'The answer is <b>/api/checkout</b> with 4 failures and <b>/api/cart</b> with 2 — the rest are one apiece, which is the signature of a genuinely broken endpoint versus scattered noise.';
+  }
+  [sEl,nEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+</script>
+</body>
+</html>

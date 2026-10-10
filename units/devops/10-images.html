@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Building images — DevOps</title>
+<meta name="description" content="Layer cache invalidation and why instruction order decides build time, multi-stage builds, what actually drives image size, base image choice, reproducibility and the security checks worth running.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%237C8CF8' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">DevOps</a><span class="sep">/</span><span>Chapter 10</span></p>
+    <p class="chno">Chapter 10 · Containers</p>
+    <h1>Building images</h1>
+    <p class="lede">A Dockerfile is a cache key generator that happens to also produce a filesystem. Almost every complaint about container builds — they are slow, the images are huge, the registry bill is absurd, CI takes eleven minutes — traces back to two facts about layers that are easy to state and easy to violate. This chapter is those two facts and what follows from them.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapter 09</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="cache">
+<h2>Fact one: a layer's cache is invalid if anything above it changed</h2><div class="h2rule"></div>
+
+<p class="lead">Each instruction produces a layer whose cache key is derived from the instruction itself <em>and</em> the key of the layer beneath it. So a cache miss is not local — once one layer misses, every layer after it rebuilds regardless of whether its own inputs changed. That single rule determines your build time, and it means the ordering of instructions is a performance decision rather than a matter of taste.</p>
+
+<p>The classic mistake is one line:</p>
+
+<div class="cards">
+<div>
+<h5>The ordering that destroys the cache</h5>
+<p><code>COPY . .</code> before <code>RUN npm ci</code>. The copy's key depends on every source file, so editing one line of application code invalidates it — and therefore invalidates the dependency install beneath it, even though no dependency changed.</p>
+</div>
+<div>
+<h5>The ordering that preserves it</h5>
+<p>Copy only the manifest and lockfile, install, <em>then</em> copy the source. Now a source edit misses only the layers after the copy, and the expensive install is a cache hit on every build where dependencies did not change — which is most of them.</p>
+</div>
+</div>
+
+<div class="demo" id="d-cache">
+  <div class="demo-top"><div class="demo-title">Which layers rebuild, and what it costs</div><div class="demo-hint">Change the source, then switch the ordering</div></div>
+  <div class="demo-body">
+    <canvas id="cCache" aria-label="Each Dockerfile instruction with its cache hit or miss and the time it costs"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Instruction order</label><select id="lcO">
+        <option value="bad" selected>COPY . . then RUN npm ci</option>
+        <option value="good">COPY manifests, RUN npm ci, then COPY . .</option>
+      </select></div>
+      <div class="ctrl"><label>What changed since the last build</label><select id="lcC">
+        <option value="">nothing</option>
+        <option value="src" selected>one line of application source</option>
+        <option value="deps">package.json and the lockfile</option>
+        <option value="Dockerfile">the Dockerfile itself</option>
+      </select></div>
+      <div class="ctrl"><label>Builds per day <b id="lcNo">40</b></label><input type="range" id="lcN" min="1" max="200" value="40"></div>
+    </div>
+    <div class="rgrid" id="lcOut"></div>
+    <div class="readout" id="lcNote"></div>
+  </div>
+</div>
+
+<p>The numbers are worth stating plainly. A one-line source change costs <b>131 seconds</b> and pushes <b>370&nbsp;MB</b> in the bad ordering, against <b>36 seconds</b> and <b>30&nbsp;MB</b> in the good one — for an identical image. Across forty builds a day that is well over an hour of CI time and thirteen gigabytes of registry traffic, every day, produced by the position of one line.</p>
+
+<p>Note also what the reordering does <em>not</em> buy: when the dependencies themselves change, both orderings cost the same. Layer ordering is not a general optimisation, it is specifically about putting the things that change often <em>after</em> the things that are expensive, so the expensive work is skipped in the common case.</p>
+
+<div class="box tip"><b class="tag">The rule, and the four things that violate it silently</b>
+<p style="margin-bottom:6px"><strong>Order instructions from least to most frequently changing.</strong> Base image, system packages, language dependencies, then application source. Everything else follows.</p>
+<p style="margin-bottom:0">The silent violations: a <code>COPY . .</code> with no <code>.dockerignore</code>, so <code>.git</code> and <code>node_modules</code> are part of the cache key and every commit changes it; an <code>ARG</code> declared before the expensive layers, since redefining it busts everything after it; a <code>RUN apt-get update</code> in its own layer, which caches an ever-staler package index and then breaks the install months later; and any <code>ADD</code> from a URL, whose key is the URL rather than the content, so it caches something that has since changed. A <code>.dockerignore</code> is the highest-value file in this section and takes two minutes to write.</p>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">dockerfile — the same build, ordered properly, with BuildKit caching</span><button class="code-copy">Copy</button></div><pre><span class="c"># syntax=docker/dockerfile:1</span>
+FROM node:20-slim AS build
+WORKDIR /app
+
+<span class="c"># manifests only — this layer's key depends on two files, not on your source</span>
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
+    <span class="c">← a BuildKit cache mount. the downloaded packages persist across builds</span>
+    <span class="c">  WITHOUT becoming a layer, so even a cache MISS is fast and the image</span>
+    <span class="c">  does not carry the npm cache</span>
+
+<span class="c"># source last: a change here misses only from this point down</span>
+COPY . .
+RUN npm run build
+
+<span class="c"># ---- runtime stage: nothing above this line ships ----</span>
+FROM gcr.io/distroless/nodejs20-debian12
+WORKDIR /app
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/node_modules ./node_modules
+USER nonroot
+CMD ["dist/main.js"]</pre></div>
+</section>
+
+<section id="size">
+<h2>Fact two: deleting a file in a later layer does not remove it</h2><div class="h2rule"></div>
+
+<p>Layers are stacked, not merged. Removing a file from a lower layer writes a <em>whiteout</em> entry in the upper one that hides it from the assembled view. The bytes remain in the image, are stored in the registry, and are transferred on every pull. So this saves nothing at all:</p>
+
+<div class="code"><div class="code-top"><span class="code-lang">dockerfile — the difference is which layer the deletion lands in</span><button class="code-copy">Copy</button></div><pre><span class="c"># WRONG — two layers. the apt lists are in layer 1 forever; layer 2 just hides them</span>
+RUN apt-get update &amp;&amp; apt-get install -y build-essential
+RUN rm -rf /var/lib/apt/lists/*
+
+<span class="c"># RIGHT — one layer. the deletion happens before the layer is committed,</span>
+<span class="c"># so the bytes were never written into it</span>
+RUN apt-get update \
+ &amp;&amp; apt-get install -y --no-install-recommends build-essential \
+ &amp;&amp; rm -rf /var/lib/apt/lists/*
+    <span class="c">← --no-install-recommends is usually worth as much again</span></pre></div>
+
+<p>The other half of the size story is that a build needs a compiler and a runtime does not. A <strong>multi-stage build</strong> uses one stage to compile and a second to assemble the runtime image, copying only the artefacts across. Everything in the build stage — toolchain, headers, caches, source, intermediate objects — is discarded rather than hidden.</p>
+
+<div class="demo" id="d-size">
+  <div class="demo-top"><div class="demo-title">Where the megabytes are</div><div class="demo-hint">Move the cleanup into the same RUN, then enable multi-stage, then change the base</div></div>
+  <div class="demo-body">
+    <canvas id="cSize" aria-label="A stacked bar of image size by component, with pull time"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Base image</label><select id="szB">
+        <option value="node:20-slim" selected>node:20-slim — 210 MB</option>
+        <option value="ubuntu:24.04">ubuntu:24.04 — 78 MB</option>
+        <option value="debian:12-slim">debian:12-slim — 74 MB</option>
+        <option value="alpine:3.20">alpine:3.20 — 8 MB</option>
+        <option value="distroless">gcr.io/distroless — 22 MB</option>
+        <option value="scratch">scratch — 0 MB</option>
+      </select></div>
+      <div class="ctrl"><label>Dependencies <b id="szDo">340</b> MB</label><input type="range" id="szD" min="10" max="800" step="10" value="340"></div>
+      <div class="ctrl"><label>Application code <b id="szAo">30</b> MB</label><input type="range" id="szA" min="1" max="200" value="30"></div>
+      <div class="ctrl"><label><input type="checkbox" id="szC"> clean up in the <em>same</em> RUN layer</label></div>
+      <div class="ctrl"><label><input type="checkbox" id="szM"> multi-stage build</label></div>
+      <div class="ctrl"><label>Replicas pulling <b id="szRo">30</b></label><input type="range" id="szR" min="1" max="500" value="30"></div>
+    </div>
+    <div class="rgrid" id="szOut"></div>
+    <div class="readout" id="szNote"></div>
+  </div>
+</div>
+
+<div class="kv">
+<dt>Same-layer cleanup saves what the caches weigh</dt><dd>Moving the identical <code>rm -rf</code> into the same <code>RUN</code> takes the example image from <b>879&nbsp;MB to 760&nbsp;MB</b>. The command did not change; only the layer it landed in did.</dd>
+<dt>Multi-stage saves the whole toolchain</dt><dd>Down to <b>580&nbsp;MB</b>, because compilers, headers and build caches never enter the runtime image. This is usually the single largest available reduction and it costs a few lines.</dd>
+<dt>Base image choice does the rest</dt><dd>Onto distroless, <b>392&nbsp;MB</b> — 2.2× smaller than where we started, and pull time from 35 to 16 seconds. Small bases also carry fewer packages, and therefore fewer CVEs to triage.</dd>
+<dt>But shared layers are only paid once</dt><dd>Twenty images on one host sharing a base pull it once and store it once. This is why standardising on two or three base images across an organisation reduces real bytes more than shrinking any single image, and why the number to watch is the size of the layers that are <em>unique</em> to your image rather than the total.</dd>
+</div>
+
+<div class="box warn"><b class="tag">Where image size actually costs you</b>
+<p style="margin-bottom:0">It is not disk, which is cheap. It is the moments when the image must move: a scale-up event during a traffic spike, where every new node pulls before it can serve; a rolling deployment across a hundred replicas; a cold node after an autoscaler event; a CI job pulling on every run. In those moments pull time is directly in your critical path — the 20-second difference above becomes several minutes of unavailable capacity when you needed it most. It is also why registry proximity matters: pulling from a registry in another region can cost more than the size reduction saves.</p>
+</div>
+</section>
+
+<section id="bases">
+<h2>Choosing a base, and the alpine question</h2><div class="h2rule"></div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Base</th><th>Size</th><th>Has</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><td><code>scratch</code></td><td class="yes">0</td><td>Nothing. No shell, no libc, no CA certificates</td><td>A statically linked binary — Go or Rust. You must add CA certs yourself or every HTTPS call fails</td></tr>
+<tr><td><code>distroless</code></td><td class="yes">~20 MB</td><td>libc, CA certs, timezone data, optionally a language runtime</td><td class="yes">The sensible default for compiled and most interpreted apps. No shell means no shell for an attacker either</td></tr>
+<tr><td><code>alpine</code></td><td class="yes">~8 MB</td><td>musl libc, busybox, apk</td><td>Small and complete — but see below</td></tr>
+<tr><td><code>debian:slim</code></td><td>~74 MB</td><td>glibc, a real shell, apt</td><td class="yes">When you need to install system packages or debug in place. The boring, reliable choice</td></tr>
+<tr><td>Language images (<code>node:20-slim</code>)</td><td>~200 MB</td><td>The runtime, a package manager, build tools</td><td>Build stages. Rarely the right runtime base once you have multi-stage</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box trap"><b class="tag">Alpine uses musl, and that is not a detail</b>
+<p style="margin-bottom:6px">Alpine is not "Debian but smaller" — it uses musl libc rather than glibc, and the difference surfaces in specific, expensive ways. Any dependency shipping a precompiled glibc binary wheel or native module will not load, so Python and Node builds fall back to compiling from source, which frequently makes the <em>build</em> far slower and larger than the size you saved. DNS resolution differs: musl historically did not read <code>search</code> domains the same way and queries A and AAAA in parallel, which interacts badly with some resolvers. And musl's malloc has markedly different performance characteristics under multi-threaded allocation-heavy load, which has produced well-documented latency regressions in real services.</p>
+<p style="margin-bottom:0">None of that makes alpine wrong; it makes it a choice with consequences. If you want small, distroless gets you most of the way with glibc and no surprises. If you want alpine, adopt it deliberately, test the actual workload under load, and do not let the 8&nbsp;MB number be the whole argument.</p>
+</div>
+</section>
+
+<section id="repro">
+<h2>Reproducibility, and what a tag does not promise</h2><div class="h2rule"></div>
+
+<p>A tag is a mutable pointer. <code>node:20-slim</code> means something different this month than last, and <code>:latest</code> means whatever was pushed most recently. Builds that pin only by tag are not reproducible, and neither are deployments.</p>
+
+<div class="kv">
+<dt>Pin base images by digest</dt><dd><code>FROM node:20-slim@sha256:...</code>. The tag stays for readability and the digest is what is actually resolved. Renovate or Dependabot can bump the digest in a pull request, which turns "our base image silently changed" into a reviewable event.</dd>
+<dt>Deploy by digest, not by tag</dt><dd>Otherwise two replicas started an hour apart can be running different code with no record of it, and a rollback to <code>:v1.4</code> may not return the bits that were there before. Chapter 20 makes this the basis of the whole supply-chain argument.</dd>
+<dt>Pin what the build installs, too</dt><dd><code>apt-get install nginx=1.24.0-1</code> and a committed lockfile. Without them the same Dockerfile produces different images on different days, and a build that succeeded in CI can fail on a rebuild months later for reasons unrelated to your change.</dd>
+<dt>Expect timestamps to differ</dt><dd>Byte-identical rebuilds need <code>SOURCE_DATE_EPOCH</code> and BuildKit's reproducible mode. Worth doing if you are signing images and want independent verification; not necessary for most teams, and it is fine to stop at "same inputs produce functionally identical images".</dd>
+</div>
+
+<div class="box tip"><b class="tag">The build-time controls worth knowing</b>
+<p style="margin-bottom:0">BuildKit is the default builder now and three of its features matter. <strong>Cache mounts</strong> — <code>RUN --mount=type=cache,target=/root/.npm</code> — persist a package cache between builds without it becoming a layer, so even a cache miss downloads little and the image stays clean. <strong>Secret mounts</strong> — <code>RUN --mount=type=secret,id=npmrc</code> — expose a credential to one instruction without writing it into any layer, which is the correct replacement for the <code>ARG NPM_TOKEN</code> pattern that leaks the token into image history forever. And <strong>registry-backed cache</strong> — <code>--cache-from type=registry,ref=...</code> — lets an ephemeral CI runner reuse the previous build's layers, which is what makes the ordering work in this chapter pay off in CI rather than only on a developer's laptop.</p>
+</div>
+</section>
+
+<section id="security">
+<h2>The checks worth running on every build</h2><div class="h2rule"></div>
+
+<ol class="steps">
+<li><strong>Run as a non-root user.</strong> <code>USER nonroot</code>, and make sure the application does not need to write to paths it no longer owns. Combined with chapter 9's point about the missing user namespace, this is the difference between a compromise starting as root on the host and starting as nobody.</li>
+<li><strong>Drop capabilities at run time and declare it in the manifest.</strong> <code>--cap-drop=ALL</code> plus whatever is genuinely needed, and <code>no-new-privileges</code> so a setuid binary cannot escalate.</li>
+<li><strong>Scan for known vulnerabilities</strong> with Trivy or Grype, in CI, failing on high and critical for anything reachable. Expect noise: most CVEs in a base image are in packages your application never invokes, so triage matters more than the raw count — which is another argument for a base image that contains less.</li>
+<li><strong>Scan for secrets in the build context and in the layers.</strong> A token in an <code>ARG</code>, in a copied <code>.env</code>, or in <code>.git</code> is in the image history permanently, and <code>docker history</code> will show it to anyone who pulls.</li>
+<li><strong>Generate an SBOM and sign the image.</strong> <code>docker buildx --sbom=true</code>, then Cosign for the signature. This is what makes it possible to answer "are we affected by this CVE" in minutes rather than days, and chapter 20 covers verifying it at deployment.</li>
+<li><strong>Add a <code>HEALTHCHECK</code> or its platform equivalent</strong>, and make sure it is the readiness kind from chapter 6 rather than something that queries the database.</li>
+</ol>
+
+<div class="box intu"><b class="tag">The smallest image is also the most secure one, for a boring reason</b>
+<p style="margin-bottom:0">A distroless image has no shell, no package manager, no <code>curl</code> and no <code>wget</code>. An attacker who achieves code execution in it has none of the tools that the next stage of an intrusion normally depends on — they cannot download a payload, cannot spawn a reverse shell in the usual way, and cannot install anything. It is not a boundary, and a determined attacker can bring their own tooling, but it removes a great deal of the convenience that opportunistic automated attacks rely on. The trade is that you cannot <code>exec</code> into it to debug either, which is a genuine cost and is what ephemeral debug containers exist to solve.</p>
+</div>
+</section>
+
+<section id="close">
+<h2>Check yourself</h2><div class="h2rule"></div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>CI takes eleven minutes on every commit and most commits change one file. The Dockerfile does <code>COPY . .</code> and then <code>RUN npm ci</code>. What is happening and what is the fix worth?
+<button class="reveal">Show answer</button><div class="ans">A layer's cache key incorporates the key of the layer beneath it, so once a layer misses, everything after it rebuilds. <code>COPY . .</code> has a key derived from every source file, so any commit invalidates it — and therefore invalidates the dependency install underneath, even though no dependency changed. Reordering to copy only <code>package.json</code> and the lockfile, install, and then copy the source means a source edit misses only the layers after the copy. In the model this takes a one-line change from 131 seconds and 370&nbsp;MB pushed to 36 seconds and 30&nbsp;MB, for an identical image. Across forty builds a day that is over an hour of CI time and about thirteen gigabytes of registry traffic saved daily by moving one line. Add a <code>.dockerignore</code> at the same time, or <code>.git</code> and <code>node_modules</code> are part of the cache key too and every commit invalidates it regardless of ordering.</div></li>
+
+<li>Your Dockerfile ends with <code>RUN rm -rf /var/lib/apt/lists/* /tmp/build</code> and the image is still 900&nbsp;MB. Why?
+<button class="reveal">Show answer</button><div class="ans">Because the deletion is in its own layer. Layers are stacked rather than merged, so removing a file that exists in a lower layer writes a whiteout entry that hides it from the assembled view — the bytes stay in the lower layer, stay in the registry, and are transferred on every pull. The image is the sum of all layers, not the size of the final filesystem. The fix is to perform the deletion in the <em>same</em> <code>RUN</code> instruction that created the files, using <code>&amp;&amp;</code>, so the files never enter a committed layer at all. In the model that single change takes the image from 879&nbsp;MB to 760&nbsp;MB with an identical command. For build tooling the better answer is a multi-stage build, which discards the entire build stage rather than trying to clean it up.</div></li>
+
+<li>Someone proposes moving from <code>debian:12-slim</code> to <code>alpine</code> to save 66&nbsp;MB. What should you check first?
+<button class="reveal">Show answer</button><div class="ans">That the workload still works and still performs, because alpine uses musl libc rather than glibc and that is a behavioural change rather than a size change. Three specific things to check: whether any dependency ships precompiled glibc binaries — Python wheels, Node native modules — since those will not load and the build will fall back to compiling from source, often making the build slower and the image larger than the saving; whether DNS resolution still behaves, since musl handles search domains and parallel A/AAAA queries differently and interacts badly with some resolvers, which matters a great deal given chapter 7's <code>ndots</code> discussion; and whether latency holds under realistic multi-threaded load, since musl's malloc has produced documented regressions in allocation-heavy services. If the goal is simply a small image, distroless gets you to roughly 20&nbsp;MB with glibc and none of these questions. And 66&nbsp;MB of a shared base layer is pulled once per host regardless, so the saving is often smaller in practice than it appears.</div></li>
+
+<li>Your build uses <code>ARG NPM_TOKEN</code> to install from a private registry. Why is this a problem and what replaces it?
+<button class="reveal">Show answer</button><div class="ans">Build arguments are recorded in the image's layer history, so the token is visible to anyone who can pull the image — <code>docker history</code> prints it, and it is present in the registry permanently. Squashing does not reliably remove it and neither does deleting the file it was written to, for the whiteout reason above. The replacement is a BuildKit secret mount: <code>RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci</code>, where the file is available to that one instruction and never becomes part of any layer. As with chapter 5's discussion of secrets in git history, the first action if this has already been pushed is to rotate the token, because it must be assumed compromised — cleaning the image is remediation of the artefact, not of the credential.</div></li>
+
+<li>An autoscaler adds nodes during a traffic spike and it takes four minutes before they serve traffic. The image is 1.2&nbsp;GB. Explain the connection and give two mitigations.
+<button class="reveal">Show answer</button><div class="ans">A new node has no layers cached, so it must pull the entire image before the container can start, and that pull is directly in the critical path of adding capacity — precisely when you need capacity most. Image size is cheap on disk and expensive at exactly these moments: scale-up, rolling deployment, cold nodes, and CI. The mitigations are to shrink what is unique to the image — multi-stage to drop the toolchain, same-layer cleanup, a smaller base — and to remove the pull from the critical path, by pre-pulling images onto nodes, keeping a warm pool of nodes, or using a registry in the same region so that bandwidth is not the constraint. Worth checking too whether the size is in layers shared with other images already on the node, since those cost nothing on a warm node but everything on a cold one; the number to optimise is the unique portion.</div></li>
+
+<li>Why is pinning <code>FROM node:20-slim</code> insufficient, and what does pinning the digest change?
+<button class="reveal">Show answer</button><div class="ans">A tag is a mutable pointer to a manifest, so <code>node:20-slim</code> resolves to different content over time as the upstream publishes patch updates. Two builds of the same commit, weeks apart, can therefore produce different images — with different packages, different CVEs and potentially different behaviour — and neither the Dockerfile nor the commit records which. Pinning by digest, <code>FROM node:20-slim@sha256:...</code>, makes the base content-addressed and therefore fixed: the same inputs give the same base every time, and an upgrade becomes an explicit change to a line in the file. That is better rather than worse for security, because updates arrive as a reviewable pull request from Renovate or Dependabot rather than silently, and you can tell exactly which builds contain which base. The same argument extends to deploying by digest rather than by tag, which chapter 20 builds on.</div></li>
+
+<li>Your scanner reports 240 vulnerabilities in the base image and nobody looks at the report any more. What went wrong and what would you change?
+<button class="reveal">Show answer</button><div class="ans">The signal-to-noise ratio made the control useless — which is a worse outcome than not scanning, because it creates the appearance of coverage. Most of those CVEs are in packages the application never invokes, present only because the base image includes a full distribution userland. Two changes help. Reduce the surface: a distroless or scratch base contains a fraction of the packages and therefore a fraction of the findings, so the remaining ones are plausibly relevant — this is the strongest argument for a minimal base and it is about triage cost rather than bytes. And make the gate meaningful: fail the build only on high and critical severity with a known fix available, allow documented time-bounded exceptions, and pair it with an SBOM so that when a genuine incident happens you can answer "which of our images contain this package" in minutes. A gate that is always red teaches everyone to override it.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin-bottom:0">Chapter 11 takes these images and asks who decides where they run: the reconciliation loop at the heart of every orchestrator, the scheduler's filter-and-score pass, and what requests and limits actually do to placement and eviction.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 10</h2><p>Building images. Part of the DevOps unit — <a href="index.html">all 24 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 11 (image pull as part of scheduling), 17 (build caching in CI), 18 (pull time in a rollout), 20 (digests, SBOMs and signing), 21 (secrets that must not enter a layer).</p></div>
+    <div><h2>Going deeper</h2><p>The Docker unit on this site covers the tooling in full. The BuildKit documentation on cache and secret mounts is short and repays reading directly.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: layer cache invalidation ============ */
+(function(){
+  const cv=document.getElementById("cCache"); if(!cv) return;
+  const oEl=document.getElementById("lcO"), cEl=document.getElementById("lcC"), nEl=document.getElementById("lcN");
+  const out=document.getElementById("lcOut"), note=document.getElementById("lcNote");
+
+  const S={
+    from:    {text:"FROM node:20-slim",               sec:0,  mb:210, inputs:["Dockerfile"]},
+    workdir: {text:"WORKDIR /app",                    sec:0,  mb:0,   inputs:["Dockerfile"]},
+    copyman: {text:"COPY package.json lockfile ./",   sec:1,  mb:1,   inputs:["Dockerfile","deps"]},
+    install: {text:"RUN npm ci",                      sec:95, mb:340, inputs:[]},
+    copyall: {text:"COPY . .",                        sec:2,  mb:12,  inputs:["Dockerfile","deps","src"]},
+    build:   {text:"RUN npm run build",               sec:34, mb:18,  inputs:[]},
+    cmd:     {text:'CMD ["node","dist/main.js"]',     sec:0,  mb:0,   inputs:["Dockerfile"]}
+  };
+  const ORDER={
+    good:["from","workdir","copyman","install","copyall","build","cmd"],
+    bad: ["from","workdir","copyall","install","build","cmd"]
+  };
+  function plan(order,changed){
+    let busted=false, sec=0, mb=0;
+    const rows=ORDER[order].map(k=>{
+      const s=S[k];
+      if(s.inputs.some(i=>changed.includes(i))) busted=true;
+      const miss=busted;
+      if(miss){ sec+=s.sec; mb+=s.mb; }
+      return {key:k,text:s.text,sec:s.sec,mb:s.mb,miss};
+    });
+    return {rows,sec,mb,hits:rows.filter(r=>!r.miss).length,total:rows.length};
+  }
+
+  function draw(){
+    const order=oEl.value;
+    const changed = cEl.value ? (cEl.value==="deps"?["deps"]:[cEl.value]) : [];
+    const perDay=Math.max(1,Math.round(+nEl.value));
+    document.getElementById("lcNo").textContent=perDay;
+    const m=plan(order,changed);
+    const other=plan(order==="good"?"bad":"good",changed);
+
+    const w=cv.clientWidth||660, h=26+m.rows.length*21+8, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("instruction", 46, 12);
+    ctx.textAlign="right"; ctx.fillText("build time", w-84, 12); ctx.fillText("pushed", w-14, 12);
+
+    m.rows.forEach((r,i)=>{
+      const y=22+i*21;
+      ctx.textAlign="left"; ctx.font="700 8.5px Archivo, Arial";
+      ctx.fillStyle= r.miss?PC.bad:PC.ok;
+      ctx.fillText(r.miss?"MISS":"HIT", 14, y+9);
+      ctx.font=(r.miss?"":"")+"10.5px ui-monospace, monospace";
+      ctx.fillStyle= r.miss?PC.ink:"#9AA8B5";
+      const room=Math.floor((w-180)/6.05);
+      ctx.fillText(r.text.length>room?r.text.slice(0,room-1)+"…":r.text, 46, y+9);
+      ctx.textAlign="right"; ctx.font="10px ui-monospace, monospace";
+      ctx.fillStyle= r.miss&&r.sec>10?PC.bad : r.miss?PC.ink : "#C3CCD5";
+      ctx.fillText(r.miss?r.sec+" s":"—", w-84, y+9);
+      ctx.fillStyle= r.miss&&r.mb>100?PC.bad : r.miss?PC.ink : "#C3CCD5";
+      ctx.fillText(r.miss?r.mb+" MB":"—", w-14, y+9);
+    });
+
+    const dayMin=(m.sec*perDay/60), dayGb=(m.mb*perDay/1024);
+    out.innerHTML=
+      '<div><span>layers cached</span><b style="color:'+(m.hits===m.total?PC.ok:m.hits?PC.warn:PC.bad)+'">'+m.hits+' / '+m.total+'</b></div>'+
+      '<div><span>rebuild time</span><b style="color:'+(m.sec>60?PC.bad:m.sec>10?PC.warn:PC.ok)+'">'+m.sec+' s</b></div>'+
+      '<div><span>pushed to registry</span><b>'+m.mb+' MB</b></div>'+
+      '<div><span>other ordering</span><b>'+other.sec+' s</b></div>'+
+      '<div><span>per day, CI time</span><b>'+dayMin.toFixed(0)+' min</b></div>'+
+      '<div><span>per day, traffic</span><b>'+dayGb.toFixed(1)+' GB</b></div>';
+
+    let msg;
+    if(!changed.length)
+      msg='Nothing changed, so every layer is a cache hit and the build is instantaneous in either ordering. Change something to see where the orderings diverge.';
+    else if(changed[0]==="src")
+      msg = order==="bad"
+        ? '<b>This is the mistake.</b> <code>COPY . .</code> has a cache key derived from every source file, so a one-line edit invalidates it — and because a layer\u2019s key includes the key beneath it, <code>RUN npm ci</code> rebuilds too even though no dependency changed. '+
+          '<b>'+m.sec+' s</b> and <b>'+m.mb+' MB</b> for a one-line change. The other ordering costs <b>'+other.sec+' s</b> and <b>'+other.mb+' MB</b>.'
+        : 'Copying the manifests first means <code>RUN npm ci</code> sits <em>above</em> the source copy, so a source edit cannot invalidate it. Only the layers after <code>COPY . .</code> rebuild: <b>'+m.sec+
+          ' s</b> against <b>'+other.sec+' s</b> for the other ordering, and <b>'+m.mb+' MB</b> pushed against <b>'+other.mb+' MB</b>.';
+    else if(changed[0]==="deps")
+      msg='A dependency change costs <b>'+m.sec+' s</b> here and <b>'+other.sec+
+          ' s</b> in the other ordering — essentially the same. <b>Ordering is not a general speed-up</b>; it only helps when the thing that changed sits below the expensive step. Dependencies change rarely, source changes constantly, which is why the ordering is worth getting right.';
+    else
+      msg='Editing the Dockerfile changes the first instruction\u2019s key, so <b>every</b> layer rebuilds in both orderings — <b>'+m.hits+' of '+m.total+
+          '</b> cached. This is also why an <code>ARG</code> declared near the top invalidates everything beneath it whenever its value changes.';
+    note.innerHTML=msg;
+  }
+  [oEl,cEl,nEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+
+/* ============ demo 2: image size composition ============ */
+(function(){
+  const cv=document.getElementById("cSize"); if(!cv) return;
+  const bEl=document.getElementById("szB"), dEl=document.getElementById("szD"), aEl=document.getElementById("szA"),
+        cEl=document.getElementById("szC"), mEl=document.getElementById("szM"), rEl=document.getElementById("szR");
+  const out=document.getElementById("szOut"), note=document.getElementById("szNote");
+  const BASES={"node:20-slim":210,"ubuntu:24.04":78,"debian:12-slim":74,"alpine:3.20":8,"distroless":22,"scratch":0};
+  const TOOLS=180, BW=200;   /* build toolchain MB, and MB/s-equivalent link (200 Mbps) */
+
+  function model(){
+    const base=BASES[bEl.value];
+    const deps=Math.round(+dEl.value), app=Math.round(+aEl.value);
+    const sameLayer=cEl.checked, multi=mEl.checked, replicas=Math.max(1,Math.round(+rEl.value));
+    const tools = multi?0:TOOLS;
+    const cacheMb = Math.round(deps*0.35);           /* apt/npm caches left behind */
+    const cacheCost = multi?0:(sameLayer?0:cacheMb);
+    const total = base+tools+deps+app+cacheCost;
+    const pullSec = total*8/BW;
+    return {base,deps,app,tools,cacheMb,cacheCost,total,pullSec,replicas,
+            unique: total-base, coldPullSec: pullSec*1, warmPullSec:(total-base)*8/BW,
+            fleetGb: total*replicas/1024};
+  }
+
+  function draw(){
+    const m=model();
+    document.getElementById("szDo").textContent=m.deps;
+    document.getElementById("szAo").textContent=m.app;
+    document.getElementById("szRo").textContent=m.replicas;
+
+    const w=cv.clientWidth||660, h=96, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+
+    const L=14,R=w-14,span=R-L;
+    const ref=Math.max(m.total, 900);
+    const scale=span/ref;
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("image size — "+m.total+" MB", L, 12);
+
+    const bands=[
+      ["base (shared)", m.base, "#8195A6"],
+      ["build tooling", m.tools, PC.bad],
+      ["dependencies", m.deps, PC.line],
+      ["app code", m.app, "#C7CEFB"],
+      ["caches left behind", m.cacheCost, "#E8B4AF"]
+    ];
+    let x=L;
+    bands.forEach(([lab,mb,col])=>{
+      if(mb<=0) return;
+      const bw=mb*scale;
+      ctx.fillStyle=col; ctx.fillRect(x,22,bw,26);
+      if(bw>56){ ctx.fillStyle=(col==="#C7CEFB")?PC.ink:"#fff"; ctx.font="600 9px Archivo, Arial"; ctx.textAlign="left";
+        ctx.fillText(mb+" MB", x+5, 35); }
+      x+=bw;
+    });
+    ctx.strokeStyle="#D5DDE4"; ctx.lineWidth=1; ctx.strokeRect(L+.5,22.5,m.total*scale,26);
+
+    /* legend */
+    let lx=L; ctx.font="9px Archivo, Arial"; ctx.textBaseline="middle";
+    bands.forEach(([lab,mb,col])=>{
+      if(mb<=0) return;
+      ctx.fillStyle=col; ctx.fillRect(lx,56,11,7);
+      ctx.fillStyle=PC.text; ctx.textAlign="left"; ctx.fillText(lab, lx+15, 60);
+      lx+=15+ctx.measureText(lab).width+14;
+    });
+
+    ctx.textAlign="left"; ctx.font="600 10px Archivo, Arial"; ctx.fillStyle=PC.ink;
+    ctx.fillText("cold node pull "+m.pullSec.toFixed(1)+" s   ·   warm node (base already present) "+
+                 m.warmPullSec.toFixed(1)+" s   ·   "+m.replicas+" replicas = "+m.fleetGb.toFixed(1)+" GB", L, 80);
+
+    out.innerHTML=
+      '<div><span>total</span><b style="color:'+(m.total>700?PC.bad:m.total>400?PC.warn:PC.ok)+'">'+m.total+' MB</b></div>'+
+      '<div><span>unique to you</span><b>'+m.unique+' MB</b></div>'+
+      '<div><span>caches carried</span><b style="color:'+(m.cacheCost?PC.bad:PC.ok)+'">'+m.cacheCost+' MB</b></div>'+
+      '<div><span>build tooling</span><b style="color:'+(m.tools?PC.bad:PC.ok)+'">'+m.tools+' MB</b></div>'+
+      '<div><span>cold pull</span><b>'+m.pullSec.toFixed(1)+' s</b></div>'+
+      '<div><span>'+m.replicas+' replicas</span><b>'+m.fleetGb.toFixed(1)+' GB</b></div>';
+
+    let msg='';
+    if(!m.cacheMb) msg='';
+    if(m.cacheCost>0)
+      msg+='<b>'+m.cacheCost+' MB of package caches are still in the image.</b> The <code>rm -rf</code> ran in a later layer, which writes a whiteout entry hiding the files rather than removing the bytes — they are stored in the registry and transferred on every pull. Tick the same-layer box and the identical command saves all of it. ';
+    else
+      msg+='The cleanup happens inside the same <code>RUN</code>, so the caches never entered a committed layer. ';
+    if(m.tools>0)
+      msg+='<b>'+m.tools+' MB of build tooling</b> — compilers, headers, intermediate objects — is shipping to production, where nothing uses it. A multi-stage build discards the entire build stage rather than trying to clean it up. ';
+    else
+      msg+='Multi-stage keeps the toolchain out entirely: only the built artefacts cross into the runtime stage. ';
+    msg+='Of the '+m.total+' MB, <b>'+m.base+' MB is the shared base</b> — pulled once per host no matter how many images use it — so the number worth optimising is the <b>'+
+         m.unique+' MB unique to this image</b>. On a cold node the full pull is <b>'+m.pullSec.toFixed(1)+
+         ' s</b> of unavailable capacity, which is exactly the moment an autoscaler needs the node.';
+    note.innerHTML=msg;
+  }
+  [bEl,dEl,aEl,cEl,mEl,rEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+</script>
+</body>
+</html>

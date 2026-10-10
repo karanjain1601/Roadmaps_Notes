@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Source systems — Data Engineer</title>
+<meta name="description" content="The shapes data arrives in, what each source guarantees, why the standard incremental extraction pattern silently loses rows, and how to read from production safely.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">Data Engineer</a> <span>/</span> Chapter 04</p>
+    <p class="chnum">CHAPTER 04</p>
+    <h1>Source systems</h1>
+    <p class="lede">This is the stage you do not control, and the one that will hurt you most. The central result of this chapter is uncomfortable: the incremental extraction pattern that almost every team writes first — select rows where updated_at is greater than last time — loses data silently, and no amount of care in the code that follows can recover it.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~26 min</b> read</div>
+      <div><b>Part 2</b> Where data comes from</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="shapes">
+      <p class="kicker">WHAT YOU WILL MEET</p>
+      <h2>Five shapes of source</h2>
+      <p class="sub">Almost everything you ingest is one of these, and the shape determines which extraction problems you inherit.</p>
+
+      <div class="terms">
+        <dt>Transactional databases</dt>
+        <dd>Postgres, MySQL, SQL Server, Oracle and their managed equivalents behind an application. Rich, authoritative, current &mdash; and mutable, which is the source of every difficulty in this chapter. A row can change or vanish with no record that it ever looked different.</dd>
+
+        <dt>APIs</dt>
+        <dd>Third-party SaaS, internal services, partner endpoints. You get whatever the vendor decided to expose, paginated, rate-limited, and occasionally changed without notice. The second demo shows why the rate limit rather than the data volume usually decides whether an ingestion is even feasible.</dd>
+
+        <dt>Event streams and logs</dt>
+        <dd>Clickstream, application logs, message topics, IoT telemetry. Structurally the nicest source you will ever get: append-only, immutable, ordered within a partition. Nothing is ever updated, so there is nothing to miss. High volume and frequently low quality, but the extraction problem is close to trivial.</dd>
+
+        <dt>Files</dt>
+        <dd>CSVs on SFTP, exports dropped in a bucket, spreadsheets emailed monthly. Universally derided and universally present. The characteristic problems are schema drift with no announcement, partial or duplicated deliveries, and encoding.</dd>
+
+        <dt>Third-party and public data</dt>
+        <dd>Data vendors, open government data, scraped sources. You control neither the schema, the schedule, the quality nor the availability, and the terms of use are a genuine constraint rather than a formality.</dd>
+      </div>
+
+      <div class="note key">
+        <b>The distinction that matters more than the list</b>
+        <p>Sources divide into <strong>mutable state</strong> and <strong>immutable events</strong>. A database table is state: it tells you what is true now and forgets what was true before. An event log is history: it tells you what happened and never changes. Every hard extraction problem in this chapter comes from state, and every one of them disappears if the source emits events instead. That is the deep reason <a href="05-change-data-capture.html">change data capture</a> works &mdash; it converts state back into the event log the database was keeping anyway.</p>
+      </div>
+    </section>
+
+    <section id="guarantees">
+      <p class="kicker">READ THE SMALL PRINT</p>
+      <h2>What each source actually promises</h2>
+      <p class="sub">Most ingestion bugs are a mismatch between what you assumed a source guaranteed and what it does.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Guarantees by source shape, and the failure each omission produces</caption>
+          <thead>
+            <tr><th>Property</th><th>OLTP database</th><th>API</th><th>Event log</th><th>Files</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Sees deletes</td><td>No, unless soft-deleted</td><td>Rarely</td><td>Yes, as an event</td><td>Only by comparing</td></tr>
+            <tr><td>Sees intermediate states</td><td>No &mdash; last write only</td><td>No</td><td>Yes, all of them</td><td>No</td></tr>
+            <tr><td>Reliable modification time</td><td>Only if the app maintains it</td><td>Vendor-dependent</td><td>Not needed</td><td>File mtime, not row-level</td></tr>
+            <tr><td>Ordering</td><td>By commit, not by timestamp</td><td>Usually unspecified</td><td>Per partition</td><td>None</td></tr>
+            <tr><td>Replayable</td><td>No</td><td>Within a retention window</td><td>Yes, to retention</td><td>If you keep the files</td></tr>
+            <tr><td>Schema announced</td><td>No</td><td>Sometimes versioned</td><td>Registry, if you run one</td><td>No</td></tr>
+            <tr><td>Backpressure safe</td><td>No &mdash; you can hurt it</td><td>Rate-limited for you</td><td>Yes</td><td>Yes</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Two rows in that table cause a disproportionate share of real incidents.</p>
+
+      <p><strong>"Only if the app maintains it".</strong> An <code>updated_at</code> column is application convention, not a database guarantee. It is set correctly by the ORM on normal writes, and then somebody runs a bulk correction with raw SQL, or a migration touches a million rows, or a trigger updates a denormalised counter without touching the timestamp. Every one of those rows is now invisible to timestamp-based extraction, permanently. Ask whether the column is maintained by a database trigger rather than by application code; the answer changes how much you can trust it.</p>
+
+      <p><strong>"By commit, not by timestamp".</strong> This is the subtle one, and it is the subject of the next section. The order in which rows become <em>visible</em> to a reader is not the order of their timestamps, because a transaction that started earlier can commit later. Every timestamp-based incremental extraction assumes those two orders agree, and they do not.</p>
+    </section>
+
+    <section id="extract">
+      <p class="kicker">THE CENTRAL RESULT</p>
+      <h2>Why incremental extraction loses rows</h2>
+      <p class="sub">Not an edge case, not a misconfiguration. A structural property of reading committed state with a timestamp filter.</p>
+
+      <p>Here is the pattern nearly everyone writes first, and it is entirely reasonable on inspection:</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">incremental.sql</span><button class="code-copy">Copy</button></div>
+        <pre><code data-lang="sql">-- run every 60 seconds, remembering the previous high-water mark
+SELECT *
+FROM   orders
+WHERE  updated_at &gt; :last_watermark
+  AND  updated_at &lt;= :now;
+
+-- then: last_watermark := :now</code></pre>
+      </div>
+
+      <p>Now consider what a database actually does. A transaction sets <code>updated_at</code> at the moment the statement runs. The row does not become visible to any other reader until the transaction <em>commits</em>, which may be milliseconds later, or seconds, or &mdash; if the transaction is doing other work, waiting on a lock, or blocked on a slow external call &mdash; minutes later.</p>
+
+      <p>So a row can have <code>updated_at = 10:00:59</code> and become visible at <code>10:01:30</code>. The extraction that ran at <code>10:01:00</code> could not see it: uncommitted. The extraction that runs at <code>10:02:00</code> will not look for it: its watermark has already advanced past <code>10:01:00</code>. The row is never extracted, by any run, ever. It is not late; it is gone.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Rows lost by timestamp-based incremental extraction</b>
+          <span>simulated writes with realistic commit delay, evaluated against four strategies</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Extract every
+              <select id="ex-int">
+                <option value="30">30 seconds</option>
+                <option value="60" selected>60 seconds</option>
+                <option value="300">5 minutes</option>
+                <option value="3600">1 hour</option>
+              </select>
+            </label>
+            <label>Mean transaction duration
+              <input type="range" id="ex-txn" min="0" max="60" step="1" value="20">
+              <output id="ex-txn-o">20s</output>
+            </label>
+            <label>Lookback window
+              <select id="ex-look">
+                <option value="0" selected>none</option>
+                <option value="30">30 seconds</option>
+                <option value="60">1 minute</option>
+                <option value="120">2 minutes</option>
+                <option value="600">10 minutes</option>
+              </select>
+            </label>
+            <label>Deletes
+              <input type="range" id="ex-del" min="0" max="30" step="1" value="0">
+              <output id="ex-del-o">0%</output>
+            </label>
+          </div>
+
+          <div class="canvas" id="ex-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>ROWS WRITTEN</i><b id="ex-total">0</b><s>committed in window</s></div>
+            <div class="tile"><i>COMMIT AFTER WINDOW</i><b id="ex-late">0</b><s>at risk</s></div>
+            <div class="tile bad"><i>LOST FOREVER</i><b id="ex-lost">0</b><s id="ex-lost-sub">timestamp incremental</s></div>
+            <div class="tile good"><i>LOG-BASED CDC</i><b id="ex-cdc">0</b><s>lost</s></div>
+            <div class="tile hi"><i>LOSS RATE</i><b id="ex-rate">0%</b><s>silently wrong</s></div>
+          </div>
+
+          <p class="readout" id="ex-note"></p>
+        </div>
+      </div>
+
+      <p>Work through the controls in this order, because each one isolates a separate lesson.</p>
+
+      <ol>
+        <li><strong>Set the transaction duration to zero.</strong> Loss goes to zero. If every transaction committed instantly the pattern would be correct, which is precisely why it survives code review &mdash; it is correct in the mental model where writes are instantaneous.</li>
+        <li><strong>Raise it to 20 seconds against a 60-second interval.</strong> Roughly a third of rows are lost. Not delayed. Lost.</li>
+        <li><strong>Add a lookback window.</strong> Re-reading the previous couple of minutes recovers nearly everything, because it gives late-committing rows a second and third chance to be selected. This is the standard mitigation and it works.</li>
+        <li><strong>Now add deletes.</strong> Watch what the lookback does: nothing. A query filtering on <code>updated_at</code> cannot return a row that is no longer in the table, at any lookback, ever. Set the lookback to ten minutes and the deletes are still all lost.</li>
+      </ol>
+
+      <div class="note trap">
+        <b>The three ways this stays hidden</b>
+        <p>Row counts look plausible, because you are losing a small percentage rather than a block. Every individual row present is correct, so spot checks pass. And the loss is not reproducible &mdash; re-running the pipeline over the same period recovers nothing, because the watermark has moved and the rows were never marked as missing. Teams typically discover it when a total fails to reconcile against the source and somebody counts both sides.</p>
+      </div>
+
+      <h3>The four strategies, honestly compared</h3>
+
+      <div class="tw">
+        <table>
+          <caption>Extraction strategies against correctness and cost</caption>
+          <thead>
+            <tr><th>Strategy</th><th>Loses late commits</th><th>Sees deletes</th><th>Cost per run</th><th>Load on source</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Full snapshot</td><td>No</td><td>Yes, by absence</td><td>Whole table, every time</td><td>Heavy, and grows forever</td></tr>
+            <tr><td>Incremental, no lookback</td><td><strong>Yes</strong></td><td>No</td><td>Changed rows only</td><td>Light</td></tr>
+            <tr><td>Incremental with lookback</td><td>Mostly no</td><td>No</td><td>Changed rows plus overlap</td><td>Light</td></tr>
+            <tr><td>Log-based CDC</td><td>No</td><td>Yes, explicitly</td><td>Changes only, no queries</td><td>Minimal &mdash; reads the log</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The full snapshot is worth defending, because it is unfashionable and frequently correct. It is trivially right, it handles deletes, it needs no state, and for a table of a few million rows it costs almost nothing. A great deal of complexity has been added to platforms in pursuit of incremental extraction for tables that could simply be copied whole every night. Reach for incremental when the snapshot genuinely stops fitting in its window, not before.</p>
+
+      <p>Log-based CDC is the correct answer at scale, and it works precisely because it stops asking the question this chapter is about. Rather than querying state and inferring change, it reads the database's own write-ahead log in commit order. Late commits cannot be missed because the log <em>is</em> the commit order, and deletes appear as explicit events. <a href="05-change-data-capture.html">Chapter 5</a> is entirely about it.</p>
+    </section>
+
+    <section id="apis">
+      <p class="kicker">A DIFFERENT CONSTRAINT</p>
+      <h2>APIs, pagination and the catch-up trap</h2>
+      <p class="sub">With an API the binding constraint is usually not data volume or network speed. It is the vendor's rate limit, and it can make an ingestion mathematically impossible.</p>
+
+      <p>An API extraction is a loop: request a page, get some records, follow the cursor, repeat. The arithmetic is simple and the conclusion is often surprising, because the failure is not "slow" but "never finishes".</p>
+
+      <p>There are two independent ceilings. The <strong>rate ceiling</strong> is requests per minute the vendor allows. The <strong>latency ceiling</strong> is how fast you can issue requests given round-trip time and how many you run in parallel. Your throughput is the lower of the two, and which one binds determines what to do about it &mdash; parallelism helps only if latency is binding, and a larger page size helps in both cases.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>API backfill feasibility</b>
+          <span>rate limit against concurrency, and whether incremental loading can keep up</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Records to backfill
+              <select id="ap-total">
+                <option value="100000">100 thousand</option>
+                <option value="1000000">1 million</option>
+                <option value="5000000" selected>5 million</option>
+                <option value="50000000">50 million</option>
+              </select>
+            </label>
+            <label>Page size
+              <select id="ap-page">
+                <option value="25">25</option>
+                <option value="100" selected>100</option>
+                <option value="500">500</option>
+                <option value="1000">1000</option>
+              </select>
+            </label>
+            <label>Rate limit
+              <input type="range" id="ap-rate" min="30" max="3000" step="30" value="300">
+              <output id="ap-rate-o">300 req/min</output>
+            </label>
+            <label>Concurrency
+              <input type="range" id="ap-conc" min="1" max="32" step="1" value="8">
+              <output id="ap-conc-o">8</output>
+            </label>
+            <label>New records per day
+              <input type="range" id="ap-daily" min="1000" max="2000000" step="1000" value="200000">
+              <output id="ap-daily-o">200k</output>
+            </label>
+          </div>
+
+          <div class="canvas" id="ap-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>REQUESTS NEEDED</i><b id="ap-reqs">0</b><s>including retries</s></div>
+            <div class="tile"><i>BINDING LIMIT</i><b id="ap-bind">&mdash;</b><s id="ap-bind-sub"></s></div>
+            <div class="tile hi"><i>BACKFILL TIME</i><b id="ap-time">0</b><s>wall clock</s></div>
+            <div class="tile" id="ap-keep-tile"><i>DAILY LOAD</i><b id="ap-keep">&mdash;</b><s id="ap-keep-sub">against 24 h</s></div>
+          </div>
+
+          <p class="readout" id="ap-note"></p>
+        </div>
+      </div>
+
+      <p>The last tile is the one that matters operationally. A backfill that takes a week is annoying but survivable &mdash; you run it once. A <em>daily incremental</em> load that takes more than a day is a platform that can never be current, and will fall further behind every day it runs. That is a design error rather than a performance problem, and no amount of tuning fixes it; you need a larger page size, a higher rate limit, a bulk export endpoint, or a different integration entirely.</p>
+
+      <div class="note tip">
+        <b>Ask for the bulk endpoint before building the loop</b>
+        <p>Many vendors offer a bulk or export API, an S3 drop, or a webhook subscription alongside the paginated REST interface, and it is frequently undocumented or buried. A bulk export sidesteps the rate ceiling completely. It is worth one email to the vendor before writing several weeks of pagination and retry logic.</p>
+      </div>
+
+      <p>Two more API realities worth building for from the start. <strong>Rate limits are usually enforced with 429 responses</strong>, and the correct response is exponential backoff with jitter, honouring <code>Retry-After</code> when present &mdash; retrying immediately turns a slowdown into a ban. And <strong>cursor pagination is safe where offset pagination is not</strong>: with <code>LIMIT 100 OFFSET 5000</code>, rows inserted or deleted during your walk shift the window, so you silently skip and duplicate records. If a vendor offers a cursor or a keyset, use it.</p>
+    </section>
+
+    <section id="reading-prod">
+      <p class="kicker">DOING IT SAFELY</p>
+      <h2>Reading from production without causing an incident</h2>
+      <p class="sub">Chapter 1 showed what analytical load does to a transactional database. Here is the practical version.</p>
+
+      <div class="terms">
+        <dt>Never read from the primary</dt>
+        <dd>Read from a replica. It is the single highest-value thing on this list, it is usually a configuration change rather than a project, and it converts a potential outage into a lag problem.</dd>
+
+        <dt>Know your replica's lag, and that it is not constant</dt>
+        <dd>Replication lag is small until the primary is under load, at which point it grows &mdash; exactly when your data matters most. A watermark taken from the replica's clock while reading lagged data is a subtle way to lose rows for the same reason as the section above.</dd>
+
+        <dt>Prefer a snapshot to a long-running query</dt>
+        <dd>On Postgres, a long analytical read holds back vacuum and can bloat the primary even from a replica, depending on configuration. Exporting to object storage and querying there is kinder and usually faster.</dd>
+
+        <dt>Bound everything</dt>
+        <dd>Statement timeouts, row limits, a separate connection pool with a low ceiling and its own credentials. If the extraction misbehaves it should fail rather than consume the database.</dd>
+
+        <dt>Read from the fewest tables you can</dt>
+        <dd>Every table you extract is a dependency on someone else's schema, and <a href="01-what-it-is.html">chapter 1</a> showed what that costs. Extract what a consumer actually needs, not the whole schema because it was easier to write.</dd>
+
+        <dt>Talk to the owning team before you start</dt>
+        <dd>Unglamorous and the highest-leverage item here. Teams generally do not mind being read from; they mind finding out during an incident. This conversation is also where the <a href="06-contracts.html">data contract</a> in chapter 6 begins.</dd>
+      </div>
+    </section>
+
+    <section id="drift">
+      <p class="kicker">WHAT CHANGES UNDERNEATH YOU</p>
+      <h2>Drift, and which kinds hurt</h2>
+      <p class="sub">The source will change. Sorting changes by whether they are detectable and whether they are breaking tells you where to spend defensive effort.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Classes of upstream change, ordered by how much trouble they cause</caption>
+          <thead>
+            <tr><th>Change</th><th>Breaks the pipeline</th><th>How you find out</th><th>Danger</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Column added</td><td>No</td><td>Never, unless you look</td><td>Low &mdash; you miss new data, nothing is wrong</td></tr>
+            <tr><td>Column renamed or dropped</td><td>Yes</td><td>Next run, loudly</td><td>Low &mdash; loud failures are cheap</td></tr>
+            <tr><td>Type widened, int to bigint</td><td>Sometimes</td><td>On overflow, possibly months later</td><td>Medium</td></tr>
+            <tr><td>Meaning changed, same type</td><td>No</td><td>A human notices</td><td><strong>Severe</strong></td></tr>
+            <tr><td>Enum gains a value</td><td>No</td><td>Rows fall through a CASE into a default</td><td><strong>Severe</strong></td></tr>
+            <tr><td>Timezone or precision change</td><td>No</td><td>Aggregates shift slightly</td><td><strong>Severe</strong></td></tr>
+            <tr><td>Soft delete introduced</td><td>No</td><td>Deleted rows keep appearing</td><td><strong>Severe</strong></td></tr>
+            <tr><td>Backfill run upstream</td><td>No</td><td>Volume spike, or nothing at all</td><td>Medium</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The pattern is consistent with the blast-radius result in chapter 1 and worth stating as a rule: <strong>the changes that break loudly are the safe ones</strong>. A pipeline that fails on a dropped column has cost you an hour. A pipeline that keeps running while an enum quietly gains a seventh value that your <code>CASE</code> statement buckets as "other" has cost you every decision made on that number since.</p>
+
+      <p>This is why the defensive work in this unit concentrates on the silent classes: schema registries and compatibility rules in <a href="06-contracts.html">chapter 6</a>, distribution and volume tests in <a href="20-cicd-testing.html">chapter 20</a>, and freshness and anomaly monitoring in <a href="21-observability.html">chapter 21</a>. None of those catch a dropped column, because a dropped column does not need catching.</p>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>Sources are either mutable state or immutable events.</b> Every hard extraction problem comes from state; event logs have almost none of them.</li>
+          <li><b>Timestamp-based incremental extraction loses rows permanently.</b> A transaction sets <code>updated_at</code> when the statement runs but becomes visible at commit. Rows committing after the watermark advances are never selected by any run. At a 20-second mean transaction against a 60-second interval, roughly a third are lost.</li>
+          <li><b>A lookback window fixes late commits and nothing else.</b> Re-reading the previous few minutes recovers almost all of them, for the cost of some duplicate reads.</li>
+          <li><b>No lookback recovers a delete.</b> A query filtering on <code>updated_at</code> cannot return a row that is gone. If deletes matter you need snapshots or CDC; there is no third option.</li>
+          <li><b><code>updated_at</code> is application convention, not a guarantee.</b> Bulk updates, migrations and triggers routinely bypass it. Ask whether a database trigger maintains it.</li>
+          <li><b>Full snapshots are underrated.</b> Trivially correct, delete-aware, stateless. Use them until they genuinely stop fitting the window.</li>
+          <li><b>For APIs the rate limit usually binds, not the volume.</b> Parallelism helps only when latency is the ceiling; page size helps either way.</li>
+          <li><b>If a daily load takes more than a day, it is a design error.</b> No tuning fixes a pipeline that falls further behind every time it runs.</li>
+          <li><b>Use cursor pagination, never offset.</b> Concurrent writes shift an offset window, so you skip and duplicate rows.</li>
+          <li><b>Loud breakage is cheap; silent drift is expensive.</b> A dropped column costs an hour. A new enum value bucketed as "other" costs every decision since.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="05-change-data-capture.html">Chapter 5 &mdash; Change data capture</a>. Reading the write-ahead log directly: how Debezium and its relatives work, snapshot-plus-stream handover, tombstones, and the ordering guarantees you do and do not get.</p>
+          </div>
+          <div class="fi">
+            <i>THE UNDERLYING MECHANISM</i>
+            <p>The commit-versus-statement-time gap is transaction isolation showing through. The <a href="../postgresqldba/index.html">PostgreSQL</a> unit covers MVCC and the visibility rules that produce it.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>On a pipeline you own that uses a timestamp watermark, count rows in the source for a past day and compare against your copy. Any gap is this chapter. Most teams have never run the comparison.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Demo 1 — rows lost by timestamp-based incremental extraction
+   ============================================================ */
+(function () {
+  var INTERVALS = 24;      /* extraction cycles simulated */
+  var PER_INTERVAL = 40;   /* writes per cycle */
+  var SEED = 12345;
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  function lcg(seed) {
+    var s = seed >>> 0;
+    return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+  }
+
+  function generate(interval, txnMean, deleteRate) {
+    var rnd = lcg(SEED), rows = [];
+    for (var k = 0; k < INTERVALS; k++) {
+      for (var i = 0; i < PER_INTERVAL; i++) {
+        var u = k * interval + rnd() * interval;
+        /* exponential commit delay with the requested mean */
+        var c = u + (txnMean > 0 ? -Math.log(1 - rnd() * 0.999) * txnMean : 0);
+        rows.push({ u: u, c: c, del: rnd() < deleteRate });
+      }
+    }
+    return rows;
+  }
+
+  function evaluate(rows, interval, lookback) {
+    var horizon = INTERVALS * interval;
+    var r = { total: 0, deletes: 0, late: 0, lost: 0, lostLate: 0, lostDel: 0 };
+    rows.forEach(function (row) {
+      if (row.c > horizon) return;          /* still uncommitted when we stop */
+      r.total++;
+      if (row.del) r.deletes++;
+      if (row.c > Math.ceil(row.u / interval) * interval) r.late++;
+
+      var caught = false;
+      for (var k = Math.ceil(row.u / interval); k <= INTERVALS; k++) {
+        var lo = (k - 1) * interval - lookback, hi = k * interval;
+        if (row.u > lo && row.u <= hi && row.c <= hi) { caught = true; break; }
+      }
+      /* a filter on updated_at can never return a row that is gone */
+      if (row.del) caught = false;
+      if (!caught) {
+        r.lost++;
+        if (row.del) r.lostDel++; else r.lostLate++;
+      }
+    });
+    return r;
+  }
+
+  function strip(rows, interval, lookback) {
+    var W = 700, H = 118, L = 8, span = 4 * interval;   /* show four cycles */
+    var shown = rows.filter(function (r) { return r.u < span && r.c < span * 1.3; });
+    var xOf = function (t) { return L + t / span * (W - L - 12); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Write and commit times across four extraction cycles">'];
+    svg.push('<text x="' + L + '" y="10" font-size="10" font-weight="700" fill="#7C8B99">FOUR CYCLES. BAR RUNS FROM updated_at TO COMMIT. RED BARS CROSS A BOUNDARY AND ARE LOST.</text>');
+
+    for (var k = 1; k <= 4; k++) {
+      var x = xOf(k * interval);
+      svg.push('<line x1="' + x + '" y1="18" x2="' + x + '" y2="' + (H - 16) + '" stroke="#20456A" stroke-width="1.5"/>');
+      svg.push('<text x="' + (x - 2) + '" y="' + (H - 4) + '" font-size="9.5" fill="#54677A" text-anchor="end">extract ' + k + '</text>');
+    }
+    if (lookback > 0) {
+      for (var k2 = 1; k2 <= 4; k2++) {
+        var xa = xOf(Math.max(0, (k2 - 1) * interval - lookback)), xb = xOf(k2 * interval);
+        svg.push('<rect x="' + xa.toFixed(1) + '" y="18" width="' + Math.max(0, xb - xa).toFixed(1) + '" height="4" fill="#E0699F" opacity="0.28"/>');
+      }
+    }
+
+    var lanes = 11, used = 0;
+    shown.slice(0, 130).forEach(function (r) {
+      var y = 26 + (used % lanes) * 6.6; used++;
+      var lost = false;
+      var caught = false;
+      for (var k = Math.ceil(r.u / interval); k <= INTERVALS; k++) {
+        var lo = (k - 1) * interval - lookback, hi = k * interval;
+        if (r.u > lo && r.u <= hi && r.c <= hi) { caught = true; break; }
+      }
+      if (r.del) caught = false;
+      lost = !caught;
+      var x1 = xOf(r.u), x2 = Math.max(xOf(r.c), x1 + 1.5);
+      var col = lost ? (r.del ? "#8B2E8B" : "#C0453A") : "#9BB0C2";
+      svg.push('<line x1="' + x1.toFixed(1) + '" y1="' + y.toFixed(1) + '" x2="' + x2.toFixed(1) + '" y2="' + y.toFixed(1) +
+        '" stroke="' + col + '" stroke-width="' + (lost ? 2.6 : 1.6) + '" stroke-linecap="round"/>');
+    });
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var interval = +$("ex-int").value;
+    var txn = +$("ex-txn").value;
+    var lookback = +$("ex-look").value;
+    var delRate = +$("ex-del").value / 100;
+
+    $("ex-txn-o").textContent = txn + "s";
+    $("ex-del-o").textContent = Math.round(delRate * 100) + "%";
+
+    var rows = generate(interval, txn, delRate);
+    var r = evaluate(rows, interval, lookback);
+
+    $("ex-total").textContent = r.total;
+    $("ex-late").textContent = r.late;
+    $("ex-lost").textContent = r.lost;
+    $("ex-lost-sub").textContent = r.lostLate + " late, " + r.lostDel + " deleted";
+    $("ex-cdc").textContent = "0";
+    $("ex-rate").textContent = (r.lost / r.total * 100).toFixed(1) + "%";
+
+    $("ex-canvas").innerHTML = strip(rows, interval, lookback);
+
+    var lines = [];
+    lines.push(r.total + " rows committed across " + INTERVALS + " extraction cycles. " + r.late +
+      " of them committed after the boundary of the cycle their updated_at falls in \u2014 those are the ones at risk. " +
+      "Timestamp-based extraction lost " + r.lost + " (" + (r.lost / r.total * 100).toFixed(1) +
+      "%); log-based CDC lost none, because it reads the commit log in commit order and never has to guess.");
+
+    if (txn === 0) {
+      lines.push("With instant commits there is nothing to lose: statement time and commit time coincide, so the watermark is safe. This is the world the query is correct in, and it is the world nobody has.");
+    } else if (r.lostLate > 0 && lookback === 0) {
+      lines.push("All " + r.lostLate + " late-commit losses are recoverable. A lookback window re-reads the tail of the previous cycle, giving a row that committed slowly a second chance to be selected. Try 2 minutes.");
+    } else if (r.lostLate === 0 && lookback > 0) {
+      lines.push("A " + lookback + "-second lookback has absorbed every late commit: the window is now longer than the transaction tail, so no row commits after its last chance to be selected. The cost is re-reading and re-writing the overlap each cycle, which is why the window should be sized to the tail rather than made arbitrarily large.");
+    }
+
+    if (r.lostDel > 0) {
+      lines.push(r.lostDel + " deleted rows are lost and the lookback is irrelevant to them \u2014 raise it to 10 minutes and the number will not move. " +
+        "A WHERE clause on updated_at is evaluated against rows that exist; a deleted row has nothing to match. Only a full snapshot (which notices the absence) or CDC (which emits an explicit delete event) will ever see these.");
+    }
+    $("ex-note").textContent = lines.join("\n\n");
+  }
+
+  ["ex-int", "ex-txn", "ex-look", "ex-del"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — API backfill feasibility
+   ============================================================ */
+(function () {
+  var LATENCY = 0.5;     /* seconds per request */
+  var RETRY = 0.04;      /* fraction of requests retried */
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  function dur(s) {
+    if (s < 90) return s.toFixed(0) + " sec";
+    if (s < 5400) return (s / 60).toFixed(1) + " min";
+    if (s < 172800) return (s / 3600).toFixed(1) + " hr";
+    return (s / 86400).toFixed(1) + " days";
+  }
+  function big(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(0) + "k";
+    return String(Math.round(n));
+  }
+
+  function model(total, page, ratePerMin, conc) {
+    var reqs = Math.ceil(total / page) * (1 + RETRY);
+    var rateBound = reqs / (ratePerMin / 60);   /* seconds */
+    var latBound = reqs * LATENCY / conc;       /* seconds */
+    return { reqs: reqs, rateBound: rateBound, latBound: latBound,
+             time: Math.max(rateBound, latBound),
+             binding: rateBound >= latBound ? "Rate limit" : "Latency" };
+  }
+
+  function gauge(daily, secs) {
+    var W = 700, H = 74, L = 8, day = 86400;
+    var frac = Math.min(secs / day, 1.35);
+    var xOf = function (f) { return L + f / 1.35 * (W - L - 12); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Daily incremental load against the 24 hour budget">'];
+    svg.push('<text x="' + L + '" y="11" font-size="10" font-weight="700" fill="#7C8B99">TIME TO LOAD ONE DAY OF NEW RECORDS, AGAINST THE 24 HOUR BUDGET</text>');
+    svg.push('<rect x="' + L + '" y="20" width="' + (W - L - 12) + '" height="24" rx="3" fill="#E4E9ED"/>');
+    var over = secs > day;
+    svg.push('<rect x="' + L + '" y="20" width="' + Math.max(2, xOf(frac) - L).toFixed(1) + '" height="24" rx="3" fill="' + (over ? "#C0453A" : "#2E8B5F") + '"/>');
+    var xd = xOf(1);
+    svg.push('<line x1="' + xd + '" y1="14" x2="' + xd + '" y2="50" stroke="#0C1D30" stroke-width="2"/>');
+    svg.push('<text x="' + (xd + 5) + '" y="60" font-size="10" font-weight="700" fill="#0C1D30">24 h</text>');
+    svg.push('<text x="' + (L + 8) + '" y="37" font-size="11.5" font-weight="700" fill="#fff">' + dur(secs) + ' for ' + big(daily) + ' records</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var total = +$("ap-total").value;
+    var page = +$("ap-page").value;
+    var rate = +$("ap-rate").value;
+    var conc = +$("ap-conc").value;
+    var daily = +$("ap-daily").value;
+
+    $("ap-rate-o").textContent = rate + " req/min";
+    $("ap-conc-o").textContent = conc;
+    $("ap-daily-o").textContent = big(daily);
+
+    var back = model(total, page, rate, conc);
+    var day = model(daily, page, rate, conc);
+    var keeps = day.time <= 86400;
+
+    $("ap-reqs").textContent = big(back.reqs);
+    $("ap-bind").textContent = back.binding;
+    $("ap-bind-sub").textContent = back.binding === "Rate limit"
+      ? "concurrency will not help"
+      : "more concurrency would help";
+    $("ap-time").textContent = dur(back.time);
+    $("ap-keep").textContent = keeps ? dur(day.time) : "Impossible";
+    $("ap-keep-sub").textContent = keeps
+      ? Math.round(day.time / 86400 * 100) + "% of the day"
+      : "falls behind " + dur(day.time - 86400) + "/day";
+    $("ap-keep-tile").className = "tile " + (keeps ? (day.time / 86400 > 0.5 ? "" : "good") : "bad");
+
+    $("ap-canvas").innerHTML = gauge(daily, day.time);
+
+    var lines = [];
+    lines.push(big(total) + " records at " + page + " per page is " + big(back.reqs) +
+      " requests including retries. At " + rate + " req/min that is " + dur(back.rateBound) +
+      "; at " + LATENCY + "s latency across " + conc + " parallel workers it is " + dur(back.latBound) +
+      ". The slower of the two wins, so the backfill takes " + dur(back.time) + " and the binding constraint is the " +
+      back.binding.toLowerCase() + ".");
+
+    if (back.binding === "Rate limit") {
+      lines.push("Adding workers will not help at all \u2014 you are already allowed only " + rate +
+        " requests a minute and more parallelism just means waiting in a different place. The levers that do work are a larger page size (" +
+        page + " to " + (page < 1000 ? page * 10 : page) + " would cut requests by the same factor), a negotiated higher limit, or a bulk export endpoint.");
+    } else {
+      lines.push("You are latency-bound rather than rate-bound, so there is headroom: raising concurrency reduces the time proportionally until you hit the " +
+        rate + " req/min ceiling at " + Math.ceil(rate / 60 * LATENCY) + " workers.");
+    }
+
+    if (!keeps) {
+      lines.push("The daily load is the real problem. " + big(daily) + " new records a day need " + dur(day.time) +
+        " to ingest, which exceeds the 24 hours available. This pipeline can never be current: every day it runs it falls " +
+        dur(day.time - 86400) + " further behind, and the backlog grows without limit. No tuning fixes this \u2014 it needs a structural change to the integration.");
+    } else {
+      lines.push("The daily incremental load takes " + dur(day.time) + ", or " + Math.round(day.time / 86400 * 100) +
+        "% of the 24 hours available, so the pipeline can stay current" +
+        (day.time / 86400 > 0.5 ? " \u2014 but with little margin. A traffic spike or a slow day at the vendor will push it over." : " with comfortable margin.")); 
+    }
+    $("ap-note").textContent = lines.join("\n\n");
+  }
+
+  ["ap-total", "ap-page", "ap-rate", "ap-conc", "ap-daily"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+initChapter("04-source-systems.html");
+</script>
+</body>
+</html>

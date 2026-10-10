@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>9. Memory management — Computer Science</title>
+<meta name="description" content="Stack and heap, virtual memory and multi-level page tables, the TLB, demand paging, allocators and fragmentation, memory bugs and garbage collection.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span class="sep">/</span> <a href="index.html">Computer Science</a> <span class="sep">/</span> Chapter 9</p>
+    <p class="chapter">Chapter 9 <span class="part">· The operating system</span></p>
+    <h1>Memory management</h1>
+    <p class="lede">Your program's addresses are fiction. Between the pointer you hold and the DRAM chip that answers sits a four-level lookup table, a cache of that table, a page fault handler and an allocator — and every one of them can be the reason a program is slow or wrong.</p>
+    <div class="meta">
+      <span><b>8</b> sections</span>
+      <span><b>2</b> demos</span>
+      <span><b>7</b> self-check questions</span>
+      <span>Roughly <b>35</b> minutes</span>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page">
+    <h2>On this page</h2>
+    <div data-sections></div>
+    <h2>Nearby chapters</h2>
+    <div data-nearby></div>
+  </nav>
+
+  <main>
+
+    <!-- ==================================================== -->
+    <section id="s-stack-heap">
+      <h2>Two allocators with different rules</h2>
+      <div class="h2rule"></div>
+
+      <p>Every process gets two places to put data at runtime, and they differ in exactly one respect that explains everything else: whether the lifetime is known at compile time.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Stack and heap compared</caption>
+          <thead><tr><th></th><th>Stack</th><th>Heap</th></tr></thead>
+          <tbody>
+            <tr><td>Allocation</td><td>Move one register</td><td>Search a data structure for a suitable hole</td></tr>
+            <tr><td>Cost</td><td>Effectively free, a few cycles</td><td>Tens to hundreds of cycles, sometimes a system call</td></tr>
+            <tr><td>Lifetime</td><td>Ends when the function returns</td><td>Until you free it, or a collector proves nothing points at it</td></tr>
+            <tr><td>Size</td><td>Fixed at thread creation, typically 8 MiB</td><td>Grows on demand up to available memory</td></tr>
+            <tr><td>Locality</td><td>Excellent — the top of the stack is always in L1</td><td>Depends entirely on the allocator and the access pattern</td></tr>
+            <tr><td>Fragmentation</td><td>Impossible</td><td>The central problem</td></tr>
+            <tr><td>Thread safety</td><td>Private per thread, no locking</td><td>Shared, needs locks or per-thread arenas</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>A stack allocation is one subtraction from the stack pointer because deallocation is guaranteed to happen in exactly the reverse order. That single guarantee removes the need for any bookkeeping at all: there is nothing to search, nothing to coalesce, nothing to fragment. The heap gives up the guarantee, and pays for it with everything in the rest of this chapter.</p>
+
+      <div class="note trap">
+        <b class="tag">Stack overflow is not a heap problem</b>
+        <p>An 8 MiB stack sounds enormous until you recurse. Each frame holds saved registers, the return address and locals, so a recursive function with a 1 KiB local array overflows after roughly 8,000 levels; deep recursion over a linked list of a million nodes has no chance. The failure mode is also worse than running out of heap: instead of a null return you get a guard-page fault and the process dies. Threads make it worse again, since each one reserves its own stack. This is why converting recursion to iteration, or using an explicit stack on the heap, is a real technique rather than a style preference.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-virtual">
+      <h2>Virtual memory and the page table</h2>
+      <div class="h2rule"></div>
+
+      <p>Chapter 6 asserted that every process sees its own address space. This is how. Memory is divided into fixed-size <strong>pages</strong>, almost always 4 KiB, and physical memory into <strong>frames</strong> of the same size. A page table maps one to the other, and the hardware consults it on every single memory access.</p>
+
+      <p>A flat table would be absurd: 2<sup>48</sup> addresses ÷ 4 KiB = 64 billion entries, 512 GiB of table per process. So the table is a sparse tree. On x86-64, four levels of 9 bits each index four tables of 512 entries, with the low 12 bits as the offset within the page.</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">how a 48-bit virtual address is carved up</span><button class="code-copy">Copy</button></div>
+<pre> 47      39 38      30 29      21 20      12 11         0
+┌──────────┬──────────┬──────────┬──────────┬────────────┐
+│   PML4   │   PDPT   │    PD    │    PT    │   offset   │
+│  9 bits  │  9 bits  │  9 bits  │  9 bits  │  12 bits   │
+└──────────┴──────────┴──────────┴──────────┴────────────┘
+
+each level: 512 entries × 8 bytes = 4096 bytes = exactly one page
+one PML4 entry covers 512 GiB   one PDPT entry covers 1 GiB
+one PD entry covers 2 MiB       one PT entry covers 4 KiB
+
+<span class="c">a 2 MiB huge page stops at the PD level and uses a 21-bit offset:</span>
+<span class="c">9 + 9 + 9 + 21 = 48, one fewer level to walk</span></pre>
+      </div>
+
+      <p>Each entry holds a frame number plus flags: present, writable, user-accessible, accessed, dirty, no-execute. Those flags are not decoration. <em>Present</em> is what makes demand paging and swapping possible. <em>Writable</em> is what makes copy-on-write work. <em>Accessed</em> and <em>dirty</em> are what page replacement algorithms read. <em>No-execute</em> is what stops a buffer overflow from running data as code.</p>
+
+      <h3>The TLB</h3>
+
+      <p>Walking four levels means four memory accesses before you even touch the data you wanted — a fivefold slowdown on every single access. The <strong>translation lookaside buffer</strong> caches recent translations so the common case is one access. It is small, fully associative, and typically holds a few hundred to a couple of thousand entries.</p>
+
+      <!-- ------------- DEMO 1 ------------- -->
+      <div class="demo" id="demo-vm">
+        <div class="demo-top">
+          <h3>Demo 1 — translate an address by hand</h3>
+          <p>Type a virtual address and watch it decompose into page-table indices, walk a sparse table with only three regions mapped, and hit or miss a real 16-entry LRU TLB.</p>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Virtual address (hex) <input type="text" id="vm-addr" value="1000000" size="16"></label>
+            <label>Page size
+              <span class="seg" id="vm-size">
+                <button type="button" data-h="0" aria-pressed="true">4 KiB</button>
+                <button type="button" data-h="1" aria-pressed="false">2 MiB</button>
+              </span>
+            </label>
+          </div>
+          <div class="ctrl">
+            <button class="btn ghost" data-a="410000">text</button>
+            <button class="btn ghost" data-a="1000000">heap</button>
+            <button class="btn ghost" data-a="7ffffffde000">stack</button>
+            <button class="btn ghost" data-a="800000">unmapped</button>
+            <button class="btn" id="vm-walk12">Touch 12 pages, twice</button>
+            <button class="btn" id="vm-walk20">Touch 20 pages, twice</button>
+            <button class="btn ghost" id="vm-reset">Flush TLB</button>
+          </div>
+
+          <div class="stage">
+            <p style="margin:0 0 8px;font-size:12.5px;color:#54677A">Address decomposition</p>
+            <div id="vm-fields" style="display:flex;gap:4px;flex-wrap:wrap"></div>
+            <p style="margin:14px 0 8px;font-size:12.5px;color:#54677A">The walk</p>
+            <div id="vm-walk" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"></div>
+          </div>
+
+          <div class="rgrid">
+            <div class="tile"><span class="k">Region</span><span class="v sm" id="vm-region">—</span></div>
+            <div class="tile"><span class="k">Physical address</span><span class="v sm" id="vm-phys">—</span></div>
+            <div class="tile"><span class="k">TLB</span><span class="v sm" id="vm-tlb">—</span></div>
+            <div class="tile"><span class="k">Memory accesses</span><span class="v" id="vm-acc">—</span></div>
+            <div class="tile"><span class="k">TLB hits / misses</span><span class="v sm" id="vm-hm">0 / 0</span></div>
+            <div class="tile"><span class="k">TLB reach</span><span class="v sm" id="vm-reach">—</span></div>
+          </div>
+
+          <p class="readout" id="vm-out"></p>
+        </div>
+      </div>
+
+      <p>The first touch of a page misses and costs <strong>five</strong> memory accesses: four to walk the table, one for the data. The second touch hits and costs <strong>one</strong>. Switch to 2 MiB pages and even a miss costs four, because there is one level fewer to walk.</p>
+
+      <p>The two "touch pages" buttons show why TLB <em>reach</em> matters more than hit rate arithmetic. Twelve pages fit in a sixteen-entry TLB, so a second pass over them hits every time — 12 misses, 36 hits. Twenty pages do not fit, and because the walk is a loop, each entry has been evicted by the time you come back to it: <strong>every single access misses</strong>, on every pass. This is the same capacity-versus-thrashing cliff as chapter 5's cache, one level up.</p>
+
+      <div class="note key">
+        <b class="tag">Why huge pages exist</b>
+        <p>A 1,536-entry TLB with 4 KiB pages reaches 6 MiB of address space. With 2 MiB pages the same TLB reaches <strong>3 GiB</strong>, five hundred and twelve times more. Any workload with a large, randomly accessed structure — a database buffer pool, a big hash table, a JVM heap — can spend more time on page-table walks than on data cache misses, and huge pages are the fix. The cost is coarser granularity: a 2 MiB page is either resident or not, so sparse access wastes memory, and transparent huge pages can cause latency spikes when the kernel compacts memory to produce one.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-paging">
+      <h2>Page faults and what they are for</h2>
+      <div class="h2rule"></div>
+
+      <p>A page fault is not an error. It is the mechanism by which almost every interesting memory feature is implemented: the hardware finds the present bit clear, traps to the kernel, and the kernel decides what that absence meant.</p>
+
+      <div class="tw">
+        <table>
+          <caption>The kinds of fault, and what the kernel does about each</caption>
+          <thead><tr><th>Kind</th><th>Cause</th><th>Resolution</th><th>Cost</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Minor</strong></td><td>The page is in memory but not mapped in this table — shared library already loaded, or a page in the free list</td><td>Fix the entry and resume</td><td>~1 µs</td></tr>
+            <tr><td><strong>Major</strong></td><td>The page must be read from disk — a mapped file, or swapped-out memory</td><td>Start I/O, block the thread, resume when it lands</td><td>100 µs to 10 ms</td></tr>
+            <tr><td><strong>Copy-on-write</strong></td><td>A write to a page shared read-only after <code>fork</code></td><td>Copy 4 KiB, remap, resume</td><td>~1–2 µs</td></tr>
+            <tr><td><strong>Demand zero</strong></td><td>First touch of freshly allocated heap or BSS</td><td>Hand over a zeroed frame</td><td>~1 µs</td></tr>
+            <tr><td><strong>Invalid</strong></td><td>The address is not mapped at all</td><td><code>SIGSEGV</code></td><td>Usually fatal</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Demand-zero faults explain a result that surprises people: <code>malloc(1_000_000_000)</code> succeeds instantly and uses almost no memory, because it only reserves address space. The memory materialises page by page as you touch it. This is also why a container can be killed by the out-of-memory killer long after the allocation that "succeeded", and why <code>calloc</code> of a huge block can be faster than <code>malloc</code> plus <code>memset</code> — the kernel can hand over pages that are already zero.</p>
+
+      <div class="note warn">
+        <b class="tag">Thrashing</b>
+        <p>When the working set exceeds physical memory, every page that gets evicted is needed again immediately, and the system spends its time swapping instead of computing. Throughput collapses by orders of magnitude while CPU utilisation looks low and disk utilisation looks pinned. The only fixes are more memory, a smaller working set, or fewer concurrent processes — adding load makes it worse, which is why a thrashing server does not recover on its own. Modern Linux prefers to invoke the OOM killer rather than thrash indefinitely, on the grounds that a dead process is more useful than a live one making no progress.</p>
+      </div>
+
+      <p>Which page to evict is a cache replacement question, and chapter 23 covers the policies in general. The practical note here is that true LRU is impossible in a kernel — you cannot afford to update a timestamp on every memory access — so real systems approximate it with the hardware <em>accessed</em> bit and a clock algorithm that sweeps through pages clearing bits and evicting the ones still clear on the second pass.</p>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-allocator">
+      <h2>What <code>malloc</code> actually does</h2>
+      <div class="h2rule"></div>
+
+      <p>The kernel deals in pages. An allocator sits between that and your 37-byte request, and its job is to hand out and reclaim arbitrary sizes from a much smaller number of large regions obtained with <code>mmap</code> or <code>brk</code>.</p>
+
+      <p>The classic design keeps a free list and a placement policy:</p>
+
+      <dl class="terms">
+        <dt>First fit</dt>
+        <dd>Take the first hole big enough. Fast, and tends to leave small fragments near the start of the list.</dd>
+
+        <dt>Best fit</dt>
+        <dd>Take the smallest hole that fits. Wastes the least per allocation and produces many tiny unusable slivers.</dd>
+
+        <dt>Worst fit</dt>
+        <dd>Take the largest hole, on the theory that the leftover will still be usable. In practice it destroys the large blocks you will later need.</dd>
+
+        <dt>Next fit</dt>
+        <dd>First fit, but resume from where the last search stopped. Spreads allocations out and avoids re-scanning the same crowded prefix.</dd>
+      </dl>
+
+      <!-- ------------- DEMO 2 ------------- -->
+      <div class="demo" id="demo-heap">
+        <div class="demo-top">
+          <h3>Demo 2 — fragmentation, made visible</h3>
+          <p>A 1,024-byte heap with a real free list, splitting and coalescing. Allocate, click a block to free it, or run a fixed workload through all four policies and compare what each one leaves behind.</p>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Policy
+              <select id="hp-pol">
+                <option value="first" selected>First fit</option>
+                <option value="best">Best fit</option>
+                <option value="worst">Worst fit</option>
+                <option value="next">Next fit</option>
+              </select>
+            </label>
+            <label>Size <input type="number" id="hp-size" value="128" min="8" max="1024" step="8"></label>
+            <button class="btn go" id="hp-alloc">Allocate</button>
+            <button class="btn" id="hp-frag">Build a fragmented heap</button>
+            <button class="btn ghost" id="hp-reset">Reset</button>
+          </div>
+
+          <div class="legend">
+            <span><i style="background:#20456A"></i>allocated — click to free</span>
+            <span><i style="background:#F4F6F8"></i>free</span>
+            <span><i style="background:#E2574C"></i>just placed</span>
+          </div>
+
+          <div class="stage">
+            <div id="hp-map" style="display:flex;height:38px;border:1px solid #CFD8E0;border-radius:3px;overflow:hidden"></div>
+            <div id="hp-list" style="margin-top:10px;font-family:var(--mono);font-size:11.5px;line-height:1.7;max-height:120px;overflow-y:auto"></div>
+          </div>
+
+          <div class="rgrid">
+            <div class="tile"><span class="k">Used</span><span class="v sm" id="hp-used">0 B</span></div>
+            <div class="tile"><span class="k">Free</span><span class="v sm" id="hp-free">1024 B</span></div>
+            <div class="tile"><span class="k">Largest free block</span><span class="v sm" id="hp-largest">1024 B</span></div>
+            <div class="tile"><span class="k">Free blocks</span><span class="v" id="hp-blocks">1</span></div>
+            <div class="tile"><span class="k">External fragmentation</span><span class="v" id="hp-ext">0%</span></div>
+            <div class="tile"><span class="k">Failed requests</span><span class="v" id="hp-fail">0</span></div>
+          </div>
+
+          <p style="margin:0 0 6px;font-size:12.5px;color:#54677A">Same workload, all four policies</p>
+          <div class="stage"><div id="hp-cmp"></div></div>
+
+          <p class="readout" id="hp-out"></p>
+        </div>
+      </div>
+
+      <p>Press <strong>Build a fragmented heap</strong> and then ask for 256 bytes. The request fails with <strong>512 bytes free</strong>, because the free space is eight alternating 128-byte holes and no two are adjacent. External fragmentation is 75%: three quarters of the free memory is outside the largest usable block. This is the failure mode people mean when they say a long-running process "leaks" memory that no leak detector can find.</p>
+
+      <p>The policy comparison shows that the obvious ranking is wrong. On the fixed workload, first fit, best fit and next fit all satisfy 4 of 4 later requests, while <strong>worst fit satisfies only 3</strong> — and it fails despite leaving 304 bytes free against the others' 104, because by always splitting the biggest hole it destroys the one block large enough for the final request. Leaving more free memory and being less able to use it is the whole of fragmentation in one result.</p>
+
+      <div class="tw">
+        <table>
+          <caption>The two fragmentations, which are often confused</caption>
+          <thead><tr><th></th><th>External</th><th>Internal</th></tr></thead>
+          <tbody>
+            <tr><td>What</td><td>Free memory split into pieces too small to use</td><td>Memory handed out but not requested</td></tr>
+            <tr><td>Cause</td><td>Allocation and free in different orders</td><td>Rounding up to a size class or alignment</td></tr>
+            <tr><td>Example</td><td>512 B free, largest hole 128 B, a 256 B request fails</td><td>A 33-byte request occupies a 48-byte class: 31% wasted</td></tr>
+            <tr><td>Fix</td><td>Coalescing, compaction, size-segregated pools, arenas</td><td>Finer size classes, at the cost of more of them</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>What real allocators do instead</h3>
+
+      <p>Modern allocators — glibc's ptmalloc, jemalloc, tcmalloc, mimalloc — barely resemble the free list above. They share a few ideas:</p>
+
+      <ul>
+        <li><strong>Size classes.</strong> Round every small request up to one of a few dozen fixed sizes and keep a separate free list per class, so allocation is a pop off a list rather than a search. This trades external fragmentation for internal.</li>
+        <li><strong>Per-thread caches.</strong> Each thread gets its own arena, so the common path needs no lock at all. This is the single biggest reason modern allocators outperform older ones under concurrency.</li>
+        <li><strong>Separate handling for large requests.</strong> Anything above roughly 128 KiB goes straight to <code>mmap</code> and is returned to the kernel on free, so it cannot fragment the main heap.</li>
+        <li><strong>Coalescing with boundary tags.</strong> A size header before and a footer after each block, so a freed block can find its neighbours in constant time and merge with them.</li>
+      </ul>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-bugs">
+      <h2>The classic memory bugs</h2>
+      <div class="h2rule"></div>
+
+      <div class="tw">
+        <table>
+          <caption>What goes wrong when lifetime is managed by hand</caption>
+          <thead><tr><th>Bug</th><th>What happens</th><th>Symptom</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Leak</strong></td><td>Allocated, never freed, no longer reachable</td><td>Slow growth, eventual OOM. Harmless in a short-lived process, fatal in a server</td></tr>
+            <tr><td><strong>Dangling pointer</strong></td><td>The pointer outlives what it points to</td><td>Anything. Reads return whatever now occupies the memory</td></tr>
+            <tr><td><strong>Use-after-free</strong></td><td>Dereferencing a freed pointer</td><td>Corruption, and a large fraction of real exploits</td></tr>
+            <tr><td><strong>Double free</strong></td><td>Freeing the same block twice</td><td>Free-list corruption; often exploitable</td></tr>
+            <tr><td><strong>Buffer overflow</strong></td><td>Writing past the end of a block</td><td>Overwrites the next block's header, or a return address on the stack</td></tr>
+            <tr><td><strong>Uninitialised read</strong></td><td>Reading memory before writing it</td><td>Non-deterministic behaviour; sometimes leaks previous contents</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>A use-after-free is the most dangerous of these because it is not merely wrong, it is <em>controllable</em>. An attacker who can get the allocator to hand the freed block to some other part of the program can choose what the stale pointer now sees. Microsoft and Google have both reported that memory-safety issues account for around 70% of their serious security vulnerabilities, and use-after-free is a large slice of that.</p>
+
+      <div class="note key">
+        <b class="tag">The three answers</b>
+        <p><strong>Discipline plus tooling:</strong> C and C++ with AddressSanitizer, Valgrind and MemorySanitizer in CI. Catches most bugs on paths you actually execute. <strong>Ownership in the type system:</strong> Rust's borrow checker, or C++ smart pointers and RAII used rigorously — the compiler rejects the program rather than the sanitizer catching it at runtime. <strong>Automatic memory management:</strong> a garbage collector removes the class of bug entirely, at the cost of pauses and memory overhead. All three are legitimate; what does not work is discipline alone.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-gc">
+      <h2>Garbage collection</h2>
+      <div class="h2rule"></div>
+
+      <p>A collector's job is to decide which objects are still needed. It cannot know that, so it approximates: an object is kept if it is <strong>reachable</strong> from a set of roots — the stack, registers, globals. Unreachable is a safe proxy for unneeded; the reverse is not true, which is why a reachable-but-forgotten cache entry is a leak even in a garbage-collected language.</p>
+
+      <h3>Reference counting</h3>
+
+      <p>Keep a count per object; free it when the count hits zero. Deallocation is immediate and predictable, which is why Python, Swift and C++'s <code>shared_ptr</code> use it. Three costs: every pointer assignment updates counters, those updates must be atomic if threads share objects, and <strong>cycles are never collected</strong> — two objects pointing at each other keep each other alive with nothing else pointing at either. Python bolts a cycle detector on top; Swift makes you break cycles by hand with <code>weak</code> references.</p>
+
+      <h3>Tracing</h3>
+
+      <p>Periodically start from the roots and mark everything reachable, then reclaim the rest. Handles cycles naturally and costs nothing on ordinary pointer writes, but has to stop or coordinate with the program to get a consistent view.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Tracing strategies</caption>
+          <thead><tr><th>Strategy</th><th>How</th><th>Trade</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Mark and sweep</strong></td><td>Mark reachable, sweep the rest into free lists</td><td>Simple; leaves the heap fragmented</td></tr>
+            <tr><td><strong>Mark and compact</strong></td><td>Mark, then slide survivors together</td><td>Removes fragmentation; must update every pointer</td></tr>
+            <tr><td><strong>Copying</strong></td><td>Copy survivors to a second space, then swap</td><td>Allocation becomes a pointer bump; needs twice the address space</td></tr>
+            <tr><td><strong>Generational</strong></td><td>Collect a small young space often, the old space rarely</td><td>Exploits the fact that most objects die young; needs write barriers</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The generational hypothesis — most objects die very young, and old objects rarely point to young ones — is the single most productive observation in the field. Collecting only the young generation means touching a small fraction of the heap, which is why a modern JVM or .NET minor collection can take under a millisecond on a multi-gigabyte heap. The bookkeeping cost is a <strong>write barrier</strong>: a small check on every pointer store to record old-to-young references, so the young collection knows about them without scanning the old space.</p>
+
+      <div class="note trap">
+        <b class="tag">"No pauses" usually means "shorter pauses"</b>
+        <p>Concurrent collectors such as Go's, ZGC and Shenandoah do most of their work alongside the program, but they still need brief stop-the-world points to scan roots, and they pay for concurrency with barriers on reads or writes and with higher allocation rates. The real trade is a three-way one between pause time, throughput and memory footprint, and you can pick any two. A collector given twice the heap will nearly always be faster, because it collects half as often — which is why "the GC is slow" is very often "the heap is too small".</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-practice">
+      <h2>What to do about all of this</h2>
+      <div class="h2rule"></div>
+
+      <ol>
+        <li><strong>Allocate less.</strong> The fastest allocation is the one that does not happen. Reuse buffers, allocate in bulk, keep short-lived data on the stack.</li>
+        <li><strong>Use arenas for phase-structured work.</strong> If a request, frame or parse produces many objects that all die together, allocate them from one region and release the whole region at once. Allocation becomes a pointer bump and deallocation becomes free.</li>
+        <li><strong>Use object pools for uniform, hot objects</strong> — connections, buffers, particles. Fixed-size pools cannot fragment.</li>
+        <li><strong>Let ownership be explicit.</strong> RAII in C++, ownership in Rust, <code>defer</code> in Go, context managers in Python. Every construct that ties a lifetime to a scope removes an opportunity to get it wrong.</li>
+        <li><strong>Size the heap deliberately</strong> in managed languages. Too small and you collect constantly; too large and pauses grow and the working set exceeds cache.</li>
+        <li><strong>Measure the right number.</strong> RSS, PSS and heap-profile totals answer different questions; chapter 6 covered why. <code>valgrind --tool=massif</code>, <code>heaptrack</code>, <code>pprof</code> and JFR show where the bytes went rather than how many there were.</li>
+      </ol>
+
+      <div class="note tip">
+        <b class="tag">Arenas in one sentence</b>
+        <p>Group allocations by lifetime rather than by type, and the hardest problem in memory management — deciding when to free — disappears for that group.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-check">
+      <h2>Check yourself</h2>
+      <div class="h2rule"></div>
+
+      <div class="check">
+        <details>
+          <summary>Why is a stack allocation a single instruction while a heap allocation is a search?</summary>
+          <div class="ans">
+            <p>Because the stack guarantees that deallocation happens in exactly the reverse order of allocation. That makes the free region always one contiguous block above the stack pointer, so allocating is subtracting from a register and freeing is adding back. No metadata, no search, no fragmentation. The heap allows objects to die in any order, so the free space becomes a set of holes that has to be tracked, searched, split and merged — and that data structure is the entire cost.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Why is the page table a four-level tree instead of a flat array?</summary>
+          <div class="ans">
+            <p>A flat table for a 48-bit space with 4 KiB pages needs 2<sup>36</sup> entries — about 64 billion — at 8 bytes each, which is 512 GiB of table per process. A tree is sparse: a level is only allocated if something below it is mapped, so a process using a few megabytes needs a handful of 4 KiB tables. The cost is that translation takes four dependent memory accesses instead of one, which is exactly why the TLB exists.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>A loop over 20 pages runs far slower than a loop over 12, on a 16-entry TLB. Explain.</summary>
+          <div class="ans">
+            <p>Twelve translations fit, so after the first pass every access hits: 12 misses and 36 hits over four passes. Twenty do not fit, and because the loop returns to page 0 only after touching 19 others, each entry has already been evicted by the time it is needed again — LRU is the worst possible policy for a cyclic scan slightly larger than the cache. Every access misses on every pass. Confirm it with the two buttons in demo 1. The fix is the same as for data caches: shrink the working set, or use larger pages so fewer entries cover it.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary><code>malloc(1_000_000_000)</code> returns instantly and the process's RSS barely moves. Why?</summary>
+          <div class="ans">
+            <p>The allocator reserved a gigabyte of <em>address space</em> via <code>mmap</code>, but no physical frames were allocated. The page table entries are marked not-present, and the first write to each page triggers a demand-zero fault that hands over one zeroed frame at a time. RSS grows only as you touch pages. This is also why an allocation can "succeed" and the process still be killed later by the OOM killer when it actually writes, and why <code>calloc</code> of a large block can beat <code>malloc</code> plus <code>memset</code>: the kernel's frames are already zero.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>512 bytes are free but a 256-byte request fails. What is the state of the heap, and what would fix it?</summary>
+          <div class="ans">
+            <p>External fragmentation: the free space exists as several non-adjacent holes, none of which is 256 bytes. In the demo it is eight 128-byte holes alternating with eight allocated blocks, giving 75% external fragmentation. Coalescing does not help because no two free blocks are adjacent. The fixes are compaction (impossible in C, since pointers would move), size-segregated pools so blocks of one size share a region, arenas so related allocations are freed together, or going to the kernel for a fresh region and accepting the waste.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Worst fit leaves more free memory than best fit but satisfies fewer requests. How?</summary>
+          <div class="ans">
+            <p>Because usable free memory is not total free memory. Worst fit always splits the largest hole, so the largest hole shrinks with every allocation and the heap ends up with many medium holes and no big one. In the demo it leaves 304 bytes free against the others' 104, and still fails a 200-byte request because its largest hole is 130. External fragmentation is the right metric — free bytes outside the largest usable block — and by that measure worst fit is worse (57.2%) despite having more free bytes.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Your Python service's memory grows steadily. The objects are unreachable from your code. What could be happening?</summary>
+          <div class="ans">
+            <p>Several candidates. Reference cycles: CPython frees on refcount zero, and two objects referring to each other never reach zero, so they wait for the cycle detector — which can be disabled, or defeated by objects with <code>__del__</code> in older versions. Something is still reachable that you have forgotten: a module-level cache, a logging handler holding formatted records, a closure capturing a large object, an exception traceback holding an entire frame stack. Or it is not a leak at all but heap fragmentation — CPython returns memory to the OS only when whole arenas become empty, so a transient spike can permanently raise RSS. <code>tracemalloc</code>, <code>objgraph</code> and <code>gc.get_referrers</code> distinguish these.</p>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-recap">
+      <div class="recap">
+        <h2>Ten things to carry forward</h2>
+        <ol>
+          <li><b>The stack is cheap because its lifetimes are ordered.</b> Everything the heap costs comes from giving that guarantee up.</li>
+          <li><b>Virtual addresses are translated on every access</b> through a sparse multi-level tree, four levels deep on x86-64.</li>
+          <li><b>A TLB miss costs four extra memory accesses;</b> a hit costs none. That is the whole reason the TLB exists.</li>
+          <li><b>TLB reach, not hit rate, is the number that matters.</b> A working set slightly larger than the TLB misses on every access, and huge pages multiply reach by 512.</li>
+          <li><b>Page faults are a mechanism, not an error.</b> Demand paging, copy-on-write, memory-mapped files and swapping are all built on the present bit.</li>
+          <li><b>Allocation reserves address space; touching it commits memory.</b> This is why a huge <code>malloc</code> is instant and free.</li>
+          <li><b>External fragmentation means free memory you cannot use.</b> Half a heap can be free and a quarter-heap request still fail.</li>
+          <li><b>More free memory is not better memory.</b> Worst fit leaves the most and satisfies the fewest.</li>
+          <li><b>Real allocators use size classes and per-thread arenas,</b> trading external fragmentation for internal and removing the lock from the fast path.</li>
+          <li><b>Collectors free the unreachable, not the unneeded.</b> A forgotten reference is still a leak, and a bigger heap usually means a faster collector.</li>
+        </ol>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<footer>
+  <div class="foot-inner">
+    <div class="fi-grid">
+      <div class="fi">
+        <h3>What comes next</h3>
+        <p>Part 2 is done. Chapter 10 starts Part 3 by giving you the vocabulary for cost: Big-O, Θ and Ω, the runtimes you meet in practice, amortised analysis, and an honest account of what the notation deliberately ignores.</p>
+      </div>
+      <div class="fi">
+        <h3>If you want to go deeper</h3>
+        <p><em>Operating Systems: Three Easy Pieces</em> has an excellent free virtualisation section covering paging, TLBs and swapping. For allocators, the jemalloc and mimalloc papers are readable and show how far real designs have moved from the textbook free list.</p>
+      </div>
+      <div class="fi">
+        <h3>Connections</h3>
+        <p>Chapter 5 explains why the TLB is a cache with the same three Cs. Chapter 6 covers the copy-on-write faults this chapter classifies. Chapter 23 covers page replacement as a general policy problem.</p>
+      </div>
+    </div>
+    <div class="pager" data-pager></div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">&uarr;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* =============================================================
+   Demo 1 — address translation and the TLB
+   ============================================================= */
+(function(){
+  const MAPPED = [
+    {name:"text",  lo:0x400000n,       hi:0x420000n,       frame:0x1000n},
+    {name:"heap",  lo:0x1000000n,      hi:0x1400000n,      frame:0x4000n},
+    {name:"stack", lo:0x7ffffffde000n, hi:0x7ffffffff000n, frame:0x9000n}
+  ];
+  const TLB_SIZE = 16;
+  let huge = false, tlb = {order:[], hits:0, misses:0}, last = null;
+
+  const hx = v => "0x" + v.toString(16).toUpperCase();
+
+  function decode(v){
+    const idx = n => Number((v >> BigInt(n)) & 0x1FFn);
+    if (huge) return {levels:[{name:"PML4", bits:"47–39", i:idx(39)},
+                              {name:"PDPT", bits:"38–30", i:idx(30)},
+                              {name:"PD",   bits:"29–21", i:idx(21)}],
+                      offset:Number(v & 0x1FFFFFn), offsetBits:21};
+    return {levels:[{name:"PML4", bits:"47–39", i:idx(39)},
+                    {name:"PDPT", bits:"38–30", i:idx(30)},
+                    {name:"PD",   bits:"29–21", i:idx(21)},
+                    {name:"PT",   bits:"20–12", i:idx(12)}],
+            offset:Number(v & 0xFFFn), offsetBits:12};
+  }
+  const region = v => MAPPED.find(m => v >= m.lo && v < m.hi) || null;
+
+  function touch(v, record){
+    const pageSize = huge ? 0x200000n : 0x1000n;
+    const vpn = String(v / pageSize);
+    const r = region(v);
+    const i = tlb.order.indexOf(vpn);
+    const hit = i >= 0;
+    if (hit){ tlb.order.splice(i, 1); tlb.order.unshift(vpn); tlb.hits++; }
+    else {
+      tlb.misses++;
+      if (r){ tlb.order.unshift(vpn); if (tlb.order.length > TLB_SIZE) tlb.order.pop(); }
+    }
+    const d = decode(v);
+    const res = {v, d, r, hit, accesses:(hit ? 0 : d.levels.length) + 1,
+                 phys: r ? (r.frame * pageSize + (v - r.lo)) : null, pageSize};
+    if (record) last = res;
+    return res;
+  }
+
+  function draw(){
+    if (!last) return;
+    const {v, d, r, hit, accesses, phys, pageSize} = last;
+
+    const f = document.getElementById("vm-fields");
+    f.innerHTML = "";
+    const parts = d.levels.map(l => ({label:l.name, sub:"bits " + l.bits, val:l.i, cls:"cool"}))
+      .concat([{label:"offset", sub:d.offsetBits + " bits", val:d.offset, cls:"warm"}]);
+    parts.forEach(p => {
+      const box = document.createElement("div");
+      box.className = "cell " + p.cls;
+      box.style.cssText += ";min-width:88px;padding:7px 6px";
+      box.innerHTML = "<div style='font-size:10.5px;color:#54677A'>" + p.label + "</div>" +
+                      "<div style='font-size:17px;font-weight:700'>" + p.val + "</div>" +
+                      "<div style='font-size:9.5px;color:#7D8EA0'>" + p.sub + "</div>";
+      f.appendChild(box);
+    });
+
+    const w = document.getElementById("vm-walk");
+    w.innerHTML = "";
+    if (hit){
+      const box = document.createElement("div");
+      box.className = "cell hot";
+      box.style.cssText += ";padding:10px 14px";
+      box.textContent = "TLB hit — the walk is skipped entirely";
+      w.appendChild(box);
+    } else {
+      d.levels.forEach((l, i) => {
+        const box = document.createElement("div");
+        box.className = "cell " + (r ? "warm" : (i === d.levels.length - 1 ? "hot" : "warm"));
+        box.style.cssText += ";padding:7px 10px;min-width:92px";
+        box.innerHTML = "<div style='font-size:10.5px'>" + l.name + "[" + l.i + "]</div>" +
+                        "<div style='font-size:10.5px;color:" + (r ? "#166B47" : "#B8362C") + "'>" +
+                        (r ? "present" : (i === d.levels.length - 1 ? "NOT present" : "present")) + "</div>";
+        w.appendChild(box);
+        const arrow = document.createElement("span");
+        arrow.style.cssText = "color:#7D8EA0";
+        arrow.textContent = "→";
+        w.appendChild(arrow);
+      });
+      const endBox = document.createElement("div");
+      endBox.className = "cell " + (r ? "cool" : "dim");
+      endBox.style.cssText += ";padding:7px 10px";
+      endBox.textContent = r ? "frame " + hx(r.frame) : "page fault";
+      w.appendChild(endBox);
+    }
+
+    setTile("vm-region", r ? r.name : "unmapped");
+    setTile("vm-phys", phys === null ? "SIGSEGV" : hx(phys));
+    setTile("vm-tlb", hit ? "hit" : "miss");
+    setTile("vm-acc", accesses);
+    setTile("vm-hm", tlb.hits + " / " + tlb.misses);
+    const reach = TLB_SIZE * Number(pageSize);
+    setTile("vm-reach", reach >= 1048576 ? (reach / 1048576) + " MiB" : (reach / 1024) + " KiB");
+
+    let msg;
+    if (!r){
+      msg = "Nothing maps " + hx(v) + ". The walk reaches the last level and finds the present bit clear with no " +
+            "backing anywhere, so the kernel delivers <b>SIGSEGV</b> rather than resolving the fault.";
+    } else if (hit){
+      msg = "The translation was already in the TLB, so the four-level walk is skipped and this access costs <b>one " +
+            "memory reference</b> instead of five. This is the case that has to be common for virtual memory to be affordable.";
+    } else {
+      msg = "TLB miss. The hardware walks " + d.levels.length + " levels — " +
+            d.levels.map(l => l.name + "[" + l.i + "]").join(" → ") +
+            " — then adds the " + d.offsetBits + "-bit offset, for <b>" + accesses +
+            " memory accesses</b> in total. The translation is now cached, so touching this page again costs one." +
+            (huge ? " With 2 MiB pages there is one level fewer to walk." : "");
+    }
+    document.getElementById("vm-out").innerHTML = msg;
+  }
+
+  function parseAddr(){
+    const raw = document.getElementById("vm-addr").value.trim().replace(/^0x/i, "").replace(/[^0-9a-fA-F]/g, "");
+    if (!raw) return 0n;
+    let v = BigInt("0x" + raw);
+    if (v > 0xFFFFFFFFFFFFn) v = v & 0xFFFFFFFFFFFFn;
+    return v;
+  }
+  const go = () => { touch(parseAddr(), true); draw(); };
+
+  document.getElementById("vm-addr").addEventListener("input", go);
+  document.getElementById("vm-size").addEventListener("click", e => {
+    const b = e.target.closest("button[data-h]");
+    if (!b) return;
+    huge = b.dataset.h === "1";
+    [...e.currentTarget.querySelectorAll("button")].forEach(x => x.setAttribute("aria-pressed", String(x === b)));
+    tlb = {order:[], hits:0, misses:0};
+    go();
+  });
+  [...document.querySelectorAll("#demo-vm button[data-a]")].forEach(b =>
+    b.addEventListener("click", () => { document.getElementById("vm-addr").value = b.dataset.a; go(); }));
+
+  function sweep(pages){
+    tlb = {order:[], hits:0, misses:0};
+    const step = huge ? 0x200000n : 0x1000n;
+    for (let pass = 0; pass < 2; pass++)
+      for (let p = 0; p < pages; p++) touch(0x1000000n + BigInt(p) * step, true);
+    draw();
+    const total = tlb.hits + tlb.misses;
+    document.getElementById("vm-out").innerHTML =
+      "Touched <b>" + pages + " pages twice</b> through a " + TLB_SIZE + "-entry TLB: <b>" + tlb.hits +
+      " hits and " + tlb.misses + " misses</b> out of " + total + ". " +
+      (pages <= TLB_SIZE
+        ? "They all fit, so the second pass hits every time and only the first pass pays for a walk."
+        : "They do not fit. Because the sweep is cyclic, LRU evicts each entry just before it is needed again, so " +
+          "<b>every access misses on every pass</b> — the working set is only " + (pages - TLB_SIZE) +
+          " pages too large and the hit rate is zero, not merely reduced.");
+  }
+  document.getElementById("vm-walk12").addEventListener("click", () => sweep(12));
+  document.getElementById("vm-walk20").addEventListener("click", () => sweep(20));
+  document.getElementById("vm-reset").addEventListener("click", () => {
+    tlb = {order:[], hits:0, misses:0}; go();
+  });
+
+  go();
+})();
+
+/* =============================================================
+   Demo 2 — heap allocator and fragmentation
+   ============================================================= */
+(function(){
+  const SIZE = 1024;
+  let heap, state, fails, lastId;
+
+  function reset(){
+    heap = {size:SIZE, blocks:[{start:0, size:SIZE, free:true, id:null}]};
+    state = {nextId:1, next:0};
+    fails = 0; lastId = null;
+    draw();
+  }
+
+  function alloc(h, size, policy, st){
+    const free = h.blocks.map((b, i) => ({b, i})).filter(x => x.b.free && x.b.size >= size);
+    if (!free.length) return null;
+    let chosen;
+    if (policy === "first") chosen = free[0];
+    else if (policy === "best") chosen = free.reduce((m, x) => x.b.size < m.b.size ? x : m);
+    else if (policy === "worst") chosen = free.reduce((m, x) => x.b.size > m.b.size ? x : m);
+    else chosen = free.find(x => x.i >= (st.next || 0)) || free[0];
+    st.next = chosen.i;
+    const b = chosen.b, id = st.nextId++;
+    if (b.size === size){ b.free = false; b.id = id; }
+    else {
+      h.blocks.splice(chosen.i, 0, {start:b.start, size, free:false, id});
+      b.start += size; b.size -= size;
+    }
+    return id;
+  }
+  function release(h, id){
+    const i = h.blocks.findIndex(b => b.id === id);
+    if (i === -1) return false;
+    h.blocks[i].free = true; h.blocks[i].id = null;
+    if (i + 1 < h.blocks.length && h.blocks[i+1].free){
+      h.blocks[i].size += h.blocks[i+1].size; h.blocks.splice(i+1, 1);
+    }
+    if (i > 0 && h.blocks[i-1].free){
+      h.blocks[i-1].size += h.blocks[i].size; h.blocks.splice(i, 1);
+    }
+    return true;
+  }
+  function stats(h){
+    const free = h.blocks.filter(b => b.free);
+    const freeBytes = free.reduce((n, b) => n + b.size, 0);
+    const largest = free.length ? Math.max(...free.map(b => b.size)) : 0;
+    return {freeBytes, largest, freeBlocks:free.length, used:h.size - freeBytes,
+            external: freeBytes === 0 ? 0 : 1 - largest / freeBytes};
+  }
+
+  /* the fixed comparison workload, run fresh for each policy */
+  function compare(policy){
+    const h = {size:SIZE, blocks:[{start:0, size:SIZE, free:true, id:null}]};
+    const st = {nextId:1, next:0};
+    const ids = [100, 150, 100, 250, 100, 200, 100].map(s => alloc(h, s, policy, st));
+    [1, 3, 5].forEach(i => release(h, ids[i]));
+    const granted = [120, 140, 60, 200].map(r => alloc(h, r, policy, st) !== null).filter(Boolean).length;
+    const s = stats(h);
+    return {granted, of:4, freeBytes:s.freeBytes, largest:s.largest,
+            freeBlocks:s.freeBlocks, external:s.external};
+  }
+
+  function draw(){
+    const policy = document.getElementById("hp-pol").value;
+    const map = document.getElementById("hp-map");
+    map.innerHTML = "";
+    heap.blocks.forEach(b => {
+      const seg = document.createElement("div");
+      const isLast = !b.free && b.id === lastId;
+      seg.style.cssText = "flex:" + b.size + ";background:" +
+        (b.free ? "#F4F6F8" : isLast ? "#E2574C" : "#20456A") +
+        ";color:" + (b.free ? "#54677A" : "#fff") +
+        ";font-size:10px;display:flex;align-items:center;justify-content:center;" +
+        "border-right:1px solid #CFD8E0;overflow:hidden;white-space:nowrap;" +
+        (b.free ? "" : "cursor:pointer");
+      seg.textContent = b.size;
+      seg.title = (b.free ? "free" : "block #" + b.id) + ", " + b.size + " B at offset " + b.start;
+      if (!b.free) seg.addEventListener("click", () => { release(heap, b.id); lastId = null; draw(); });
+      map.appendChild(seg);
+    });
+
+    const list = document.getElementById("hp-list");
+    list.innerHTML = heap.blocks.map(b =>
+      "<div><span style='color:#7D8EA0'>@" + String(b.start).padStart(4) + "</span> " +
+      String(b.size).padStart(4) + " B  " +
+      (b.free ? "<span style='color:#166B47'>free</span>" : "<span style='color:#20456A'>block #" + b.id + "</span>") +
+      "</div>").join("");
+
+    const s = stats(heap);
+    setTile("hp-used", s.used + " B");
+    setTile("hp-free", s.freeBytes + " B");
+    setTile("hp-largest", s.largest + " B");
+    setTile("hp-blocks", s.freeBlocks);
+    setTile("hp-ext", (s.external * 100).toFixed(0) + "%");
+    setTile("hp-fail", fails);
+
+    const cmp = document.getElementById("hp-cmp");
+    const tbl = document.createElement("table");
+    tbl.style.cssText = "border-collapse:collapse;width:100%;font-size:13px;min-width:440px";
+    tbl.innerHTML = "<tr style='background:#0C1D30;color:#E9F0F6'>" +
+      ["Policy","Requests granted","Free bytes","Largest hole","Holes","External frag"]
+        .map((h, i) => "<th style='padding:6px 10px;text-align:" + (i ? "right" : "left") + ";font-weight:600'>" + h + "</th>").join("") + "</tr>";
+    ["first","best","worst","next"].forEach(p => {
+      const r = compare(p);
+      const tr = document.createElement("tr");
+      const worst = r.granted < 4;
+      tr.style.cssText = "border-bottom:1px solid #E1E7EC;background:" +
+        (p === policy ? "#FDEEEC" : worst ? "#FBF1DA" : "#fff");
+      tr.innerHTML = "<td style='padding:6px 10px'>" + p + " fit</td>" +
+        [r.granted + " of " + r.of, r.freeBytes + " B", r.largest + " B", r.freeBlocks,
+         (r.external * 100).toFixed(1) + "%"]
+          .map(v => "<td style='padding:6px 10px;text-align:right;font-variant-numeric:tabular-nums'>" + v + "</td>").join("");
+      tbl.appendChild(tr);
+    });
+    cmp.innerHTML = "";
+    cmp.appendChild(tbl);
+
+    let msg;
+    if (s.freeBlocks === 1 && s.used === 0){
+      msg = "An empty 1,024-byte heap: one free block, no fragmentation. Allocate a few things and free alternate " +
+            "ones to see how quickly that changes.";
+    } else if (s.external > 0.5){
+      msg = "<b>" + s.freeBytes + " bytes are free</b>, but the largest single hole is only <b>" + s.largest +
+            " bytes</b> — external fragmentation of " + (s.external * 100).toFixed(0) + "%. Any request larger than " +
+            s.largest + " bytes will fail even though there is plenty of free memory, and coalescing cannot help " +
+            "because no two free blocks are adjacent.";
+    } else {
+      msg = "<b>" + s.used + " bytes allocated</b>, " + s.freeBytes + " free across " + s.freeBlocks +
+            " hole" + (s.freeBlocks === 1 ? "" : "s") + ", largest " + s.largest + " B. " +
+            "The comparison table below reruns a fixed workload from an empty heap under all four policies — note " +
+            "that worst fit leaves the most free memory and satisfies the fewest requests.";
+    }
+    document.getElementById("hp-out").innerHTML = msg;
+  }
+
+  document.getElementById("hp-alloc").addEventListener("click", () => {
+    const size = Math.max(8, Math.min(SIZE, +document.getElementById("hp-size").value || 8));
+    const id = alloc(heap, size, document.getElementById("hp-pol").value, state);
+    if (id === null){ fails++; lastId = null; } else lastId = id;
+    draw();
+  });
+  document.getElementById("hp-frag").addEventListener("click", () => {
+    heap = {size:SIZE, blocks:[{start:0, size:SIZE, free:true, id:null}]};
+    state = {nextId:1, next:0}; fails = 0;
+    const ids = [];
+    for (let i = 0; i < 8; i++) ids.push(alloc(heap, 128, "first", state));
+    ids.filter((_, i) => i % 2 === 0).forEach(id => release(heap, id));
+    lastId = null;
+    draw();
+    document.getElementById("hp-out").innerHTML =
+      "Eight 128-byte blocks allocated, then every other one freed. <b>512 bytes are free</b> — half the heap — " +
+      "in eight separate 128-byte holes, none of them adjacent. Ask for 256 bytes and it will fail. External " +
+      "fragmentation is <b>75%</b>.";
+  });
+  document.getElementById("hp-reset").addEventListener("click", reset);
+  document.getElementById("hp-pol").addEventListener("change", draw);
+
+  reset();
+})();
+
+initChapter("ch09-memory-management.html");
+</script>
+</body>
+</html>

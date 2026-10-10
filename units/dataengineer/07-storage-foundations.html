@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Storage foundations — Data Engineer</title>
+<meta name="description" content="Block, file and object storage; durability against availability; consistency models; and why object storage restructured data engineering.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">Data Engineer</a> <span>/</span> Chapter 07</p>
+    <p class="chnum">CHAPTER 07</p>
+    <h1>Storage foundations</h1>
+    <p class="lede">One economic fact reorganised this entire field: storage on a remote object store became so cheap, so durable and so elastic that keeping compute and storage in the same box stopped making sense. Almost every architecture in the rest of this unit is a consequence of that, so it is worth understanding what object storage actually gives you and what it charges for.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~26 min</b> read</div>
+      <div><b>Part 3</b> Storage</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="hierarchy">
+      <p class="kicker">ORDERS OF MAGNITUDE</p>
+      <h2>The hierarchy, in numbers worth memorising</h2>
+      <p class="sub">Every storage decision is a trade between latency, throughput, durability and cost. The ratios between the levels are large enough that intuition is useless without the figures.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Approximate figures for a 2020s server and cloud. Orders of magnitude matter, not the digits</caption>
+          <thead>
+            <tr><th>Level</th><th>Latency</th><th>Throughput</th><th>Cost per TB-month</th><th>Survives</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>CPU cache</td><td>~1 ns</td><td>TB/s</td><td>&mdash;</td><td>Nothing</td></tr>
+            <tr><td>RAM</td><td>~100 ns</td><td>~50 GB/s</td><td>~&pound;3,000</td><td>Nothing</td></tr>
+            <tr><td>Local NVMe SSD</td><td>~100 &micro;s</td><td>~3 GB/s</td><td>~&pound;100</td><td>Process crash</td></tr>
+            <tr><td>Network block store</td><td>~1 ms</td><td>~0.5 GB/s</td><td>~&pound;80</td><td>Instance loss</td></tr>
+            <tr><td>Object storage</td><td>~50&ndash;200 ms</td><td>Unlimited in parallel</td><td>~&pound;20</td><td>Datacentre loss</td></tr>
+            <tr><td>Archive tier</td><td>Minutes to hours</td><td>Throttled</td><td>~&pound;2</td><td>Datacentre loss</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Three things in that table drive most of the rest of the unit.</p>
+
+      <p><strong>Object storage latency is terrible and its throughput is unlimited.</strong> A single read takes 50 to 200 milliseconds, which is a thousand times slower than local disk — so object storage is hopeless for one small random read and superb for a thousand concurrent large ones. The design consequence is everywhere in this unit: read <em>big contiguous chunks in parallel</em>, never small scattered ones. That single sentence explains file formats, partitioning strategy, and why the small-files problem in <a href="15-distributed-processing.html">chapter 15</a> is so damaging.</p>
+
+      <p><strong>RAM is roughly 150 times the price of object storage</strong> and about 30 times the price of SSD. This is why the "just keep it in memory" instinct is expensive at scale, and equally why a machine with 512 GB of RAM can hold a dataset most people would reach for a cluster to process.</p>
+
+      <p><strong>The archive tier is ten times cheaper and comes with a latency of minutes.</strong> That is not a small inconvenience; it changes what the data can be used for, which is the subject of the second demo.</p>
+    </section>
+
+    <section id="three">
+      <p class="kicker">THE THREE ABSTRACTIONS</p>
+      <h2>Block, file, object</h2>
+      <p class="sub">These are not three products. They are three different things you are allowed to say to a storage system, and the vocabulary determines what is possible.</p>
+
+      <div class="terms">
+        <dt>Block storage</dt>
+        <dd>A flat array of fixed-size blocks, addressed by number. It has no idea what a file is. You get to overwrite block 4,182 in place, which is what a database needs to update a page. Attached to exactly one machine at a time. Examples: a disk, an EBS volume, a Persistent Disk.</dd>
+
+        <dt>File storage</dt>
+        <dd>Directories, filenames, byte ranges, permissions, and the ability to append to or seek within a file. Mountable by many machines at once, which is its point. Examples: NFS, EFS, HDFS. Convenient and, over a network, hard to scale — the directory tree is shared mutable state.</dd>
+
+        <dt>Object storage</dt>
+        <dd>A flat key-value store where the values are large blobs of bytes and the keys are strings. No directories — the slashes in <code>events/2026/09/04/part-0001.parquet</code> are just characters in the key, and the "folder" is a prefix rather than a thing. <strong>Objects are immutable</strong>: you replace one whole, you do not edit it. Examples: S3, GCS, Azure Blob.</dd>
+      </div>
+
+      <div class="note key">
+        <b>Immutability is the constraint that buys everything else</b>
+        <p>Because an object cannot be partially modified, the system never has to coordinate concurrent writers to a byte range, never needs a distributed lock manager, and can replicate freely without worrying about a replica being mid-edit. That is what makes object storage scale to exabytes at that price with those durability guarantees.</p>
+        <p>It is also the source of every awkward thing about working with it. You cannot append a row to a Parquet file. You cannot update one record. Deleting "a directory" means listing and deleting every key with that prefix. The table formats in <a href="11-warehouse-lake.html">chapter 11</a> exist entirely to reconstruct mutability on top of an immutable substrate.</p>
+      </div>
+
+      <p>One practical trap that follows from "directories are not real": listing a prefix with millions of keys is a paginated API call returning a thousand at a time, not a directory read. A job that begins by listing a large prefix can spend minutes doing so before reading a byte, which is why mature table formats keep their own file manifests rather than asking the store what exists.</p>
+    </section>
+
+    <section id="object">
+      <p class="kicker">THE ECONOMIC SHIFT</p>
+      <h2>Why this restructured the field</h2>
+      <p class="sub">Separating storage from compute is the single most consequential architectural change in data engineering, and it is a consequence of pricing rather than of cleverness.</p>
+
+      <p>The older model — Hadoop, and every shared-nothing database — put data on the disks of the machines that processed it. This was correct when networks were slow relative to disks: you moved the computation to the data because moving the data was prohibitive. It produced a hard coupling. Needing more storage meant buying more compute, and needing more compute meant rebalancing data across new nodes.</p>
+
+      <p>Two things changed. Datacentre networks got fast enough that reading from a remote store at 10 Gbit/s stopped being the bottleneck, and object storage got cheap enough that keeping one authoritative copy there beat replicating it across compute nodes.</p>
+
+      <div class="cols">
+        <div>
+          <h4>What separation buys</h4>
+          <ul>
+            <li>Scale storage and compute independently, which is what you actually want since they grow at different rates.</li>
+            <li>Compute becomes disposable: start a cluster, run a job, destroy it. You pay for the minutes.</li>
+            <li>Many engines over one copy of the data &mdash; SQL, Spark, Python, all reading the same files.</li>
+            <li>No rebalancing. Adding capacity is not a data-movement project.</li>
+          </ul>
+        </div>
+        <div>
+          <h4>What it costs</h4>
+          <ul>
+            <li>Every read crosses a network with 50&ndash;200 ms of latency, so small reads are punished severely.</li>
+            <li>You must think about file layout yourself, because the engine no longer owns the storage.</li>
+            <li>Request charges become a real line item, sometimes the dominant one.</li>
+            <li>Transactions, updates and deletes have to be rebuilt in a layer above.</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>Note that this is a genuine trade rather than a free win, and the industry re-learned the cost side the hard way. The first generation of data lakes put files in object storage and discovered they had lost transactions, schema enforcement and efficient updates — producing the "data swamp" of the mid-2010s. The lakehouse table formats were the correction, and they are the subject of <a href="11-warehouse-lake.html">chapter 11</a>.</p>
+    </section>
+
+    <section id="durability">
+      <p class="kicker">THE HEADLINE NUMBER</p>
+      <h2>Durability, and why erasure coding wins</h2>
+      <p class="sub">Eleven nines is a real claim with real arithmetic behind it. Working through it explains why nobody serious uses three-way replication any more.</p>
+
+      <p>First, two words people use interchangeably and should not:</p>
+
+      <div class="terms">
+        <dt>Durability</dt>
+        <dd>The probability that data you stored still exists. Losing it is permanent and unrecoverable. Quoted in nines: eleven nines means a one in a hundred billion annual chance of losing a given object.</dd>
+
+        <dt>Availability</dt>
+        <dd>The probability that you can reach it right now. An outage is temporary and annoying. Object stores typically offer four nines of availability alongside eleven of durability &mdash; roughly an hour of unreachability a year, and effectively never losing anything.</dd>
+      </div>
+
+      <p>The mechanism is redundancy, and there are two ways to buy it. <strong>Replication</strong> keeps <em>n</em> whole copies. <strong>Erasure coding</strong> splits an object into <em>k</em> data shards, computes <em>m</em> parity shards, and can reconstruct the original from any <em>k</em> of the <em>k+m</em> — the same idea as RAID, generalised.</p>
+
+      <p>The model below uses the standard first-order approximation: one disk fails, and loss requires enough further failures to land inside the repair window before the system has rebuilt.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Durability arithmetic</b>
+          <span>replication against erasure coding, on durability and on overhead</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Annual disk failure rate
+              <input type="range" id="du-afr" min="5" max="80" step="5" value="20">
+              <output id="du-afr-o">2.0%</output>
+            </label>
+            <label>Repair window
+              <select id="du-rep">
+                <option value="1">1 hour</option>
+                <option value="6" selected>6 hours</option>
+                <option value="24">24 hours</option>
+                <option value="72">72 hours</option>
+              </select>
+            </label>
+            <label>Objects stored
+              <select id="du-obj">
+                <option value="1000000">1 million</option>
+                <option value="1000000000" selected>1 billion</option>
+                <option value="1000000000000">1 trillion</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="du-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>2&times; REPLICATION</i><b id="du-r2">0</b><s>nines &middot; 2.00&times; overhead</s></div>
+            <div class="tile"><i>3&times; REPLICATION</i><b id="du-r3">0</b><s>nines &middot; 3.00&times; overhead</s></div>
+            <div class="tile good"><i>ERASURE 6+3</i><b id="du-e63">0</b><s>nines &middot; 1.50&times; overhead</s></div>
+            <div class="tile good"><i>ERASURE 10+4</i><b id="du-e104">0</b><s>nines &middot; 1.40&times; overhead</s></div>
+            <div class="tile hi"><i>OBJECTS LOST/YEAR</i><b id="du-lost">0</b><s id="du-lost-sub">at 10+4</s></div>
+          </div>
+
+          <p class="readout" id="du-note"></p>
+        </div>
+      </div>
+
+      <p>The result is the one that matters: <strong>erasure coding is simultaneously more durable and cheaper than replication.</strong> At a 2% failure rate and a six-hour repair, three-way replication gives about eleven nines for 3.00&times; the raw bytes, while 10+4 erasure coding gives about seventeen nines for 1.40&times;. That is six extra nines at less than half the storage cost, which is why every large object store uses erasure coding internally and why the "just keep three copies" heuristic is obsolete.</p>
+
+      <div class="note warn">
+        <b>What the repair window does, and what the arithmetic ignores</b>
+        <p>Move the repair slider: 6 hours to 72 hours costs 10+4 coding several nines, because a longer rebuild leaves a wider period of reduced redundancy. This is why a store's rebuild speed is as important as its coding scheme, and why a nearly-full system is dangerous &mdash; there is nowhere to rebuild into.</p>
+        <p>The model also assumes <em>independent</em> failures, and the real risks are correlated: a firmware bug across a whole batch of drives, a datacentre losing power, a botched software deploy, or an engineer running a delete with the wrong prefix. Eleven nines describes hardware failure only. It offers no protection whatsoever against the most common cause of real data loss, which is somebody deleting it on purpose. That is what versioning, object locks and a separate backup account are for &mdash; see <a href="22-reliability.html">chapter 22</a>.</p>
+      </div>
+    </section>
+
+    <section id="consistency">
+      <p class="kicker">A HISTORICAL TRAP</p>
+      <h2>Consistency, and one piece of stale advice</h2>
+      <p class="sub">A large body of writing about data lakes is built on a limitation that no longer exists, and following it now costs you real complexity.</p>
+
+      <p>Until December 2020, S3 offered only <em>eventual</em> consistency for some operations: you could write an object, immediately list its prefix, and not see it. Whole layers of software existed to work around this — S3Guard kept a consistent file index in DynamoDB, and much advice about "commit protocols" for Spark descends from it.</p>
+
+      <p>S3 now provides strong read-after-write consistency for PUTs, DELETEs and LISTs, at no cost and with no configuration. GCS and Azure Blob offer the equivalent. So the workaround layers are unnecessary on new systems, and advice recommending them should be read with its date in mind.</p>
+
+      <div class="note tip">
+        <b>What remains true</b>
+        <p>Strong consistency for a single object is not <em>transactional</em> consistency across many. Writing fifty Parquet files and then a manifest is still not atomic: a reader can arrive between file forty and the manifest and see a partial dataset. Every object store has this property, and closing that gap is precisely what the table formats in chapter 11 do, by making the final act of a write a single atomic pointer swap.</p>
+      </div>
+
+      <p>Two other properties worth knowing. <strong>Versioning</strong> retains previous versions of a key, converting an overwrite or delete into something recoverable — the single most valuable protective setting on a bucket, and it costs storage for the retained versions. And <strong>conditional writes</strong> (write only if the key does not exist, or only if the ETag matches) give you enough primitive to build a compare-and-swap, which is how modern table formats commit without an external lock service.</p>
+    </section>
+
+    <section id="cost">
+      <p class="kicker">THE BILL</p>
+      <h2>The cost model, and the number people forget</h2>
+      <p class="sub">Everyone compares price per terabyte. On a real workload it is frequently not the largest line, and the thing that decides is average object size.</p>
+
+      <p>An object store charges on four axes: bytes stored per month, requests made, bytes transferred out of the cloud, and for cold tiers, bytes retrieved. Only the first is what people compare, and requests are charged <em>per object</em> regardless of size — so the same volume of data costs wildly different amounts depending on how it is chopped up.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Monthly object storage cost</b>
+          <span>storage, requests, retrieval and egress, driven by average object size</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Data stored
+              <input type="range" id="co-tb" min="1" max="500" step="1" value="10">
+              <output id="co-tb-o">10 TB</output>
+            </label>
+            <label>Average object size
+              <select id="co-size">
+                <option value="0.004">4 KB</option>
+                <option value="0.256">256 KB</option>
+                <option value="8">8 MB</option>
+                <option value="128" selected>128 MB</option>
+                <option value="512">512 MB</option>
+              </select>
+            </label>
+            <label>Full reads per month
+              <input type="range" id="co-reads" min="0" max="30" step="1" value="4">
+              <output id="co-reads-o">4</output>
+            </label>
+            <label>Storage tier
+              <select id="co-tier">
+                <option value="hot" selected>Hot</option>
+                <option value="cool">Cool</option>
+                <option value="archive">Archive</option>
+              </select>
+            </label>
+            <label>Read data leaving the cloud
+              <input type="range" id="co-egress" min="0" max="100" step="5" value="0">
+              <output id="co-egress-o">0%</output>
+            </label>
+          </div>
+
+          <div class="canvas" id="co-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>OBJECTS</i><b id="co-n">0</b><s id="co-nsub"></s></div>
+            <div class="tile"><i>STORAGE</i><b id="co-store">0</b><s id="co-store-sub"></s></div>
+            <div class="tile" id="co-req-tile"><i>REQUESTS</i><b id="co-req">0</b><s id="co-req-sub"></s></div>
+            <div class="tile" id="co-out-tile"><i>RETRIEVAL + EGRESS</i><b id="co-out">0</b><s id="co-out-sub"></s></div>
+            <div class="tile hi"><i>MONTHLY TOTAL</i><b id="co-tot">0</b><s id="co-tot-sub"></s></div>
+          </div>
+
+          <p class="readout" id="co-note"></p>
+        </div>
+      </div>
+
+      <p>Three conclusions, each of which has cost somebody a great deal of money.</p>
+
+      <ol>
+        <li><strong>Small files are the expensive failure.</strong> Ten terabytes in 128 MB objects costs a few hundred pounds a month, essentially all storage. The same ten terabytes in 4 KB objects costs tens of thousands, essentially all requests. The stored bytes are identical. This is the strongest argument for the compaction jobs in <a href="16-orchestration.html">chapter 16</a>, and it is a cost argument before it is a performance one.</li>
+        <li><strong>Archive tiers are cheap to hold and expensive to read.</strong> Move the tier to archive with several reads a month and watch retrieval overtake the storage saving. Archive is for data you are keeping because you must, not data you query occasionally.</li>
+        <li><strong>Egress dominates everything once it appears.</strong> At roughly four times the monthly storage price <em>per gigabyte moved</em>, sending data out of the cloud is the most expensive thing on the bill, and it is the mechanism behind the data lock-in priced in <a href="03-choosing.html">chapter 3</a>.</li>
+      </ol>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>Object storage has terrible latency and unlimited parallel throughput.</b> Read big contiguous chunks concurrently; never small scattered ones. Most of this unit's file-layout advice follows from that one sentence.</li>
+          <li><b>Objects are immutable, and that constraint buys the scale.</b> No byte-range coordination, no distributed locks, free replication &mdash; at the cost of not being able to append or update anything.</li>
+          <li><b>Directories are not real.</b> A prefix is a string match, and listing a large one is a slow paginated API call, which is why table formats keep their own manifests.</li>
+          <li><b>Separating storage from compute followed from pricing, not cleverness,</b> and it is a trade: independent scaling and disposable clusters, paid for in latency, request charges and having to rebuild transactions above.</li>
+          <li><b>Erasure coding beats replication on both axes.</b> Roughly seventeen nines at 1.40&times; overhead for 10+4, against eleven nines at 3.00&times; for triple replication.</li>
+          <li><b>The repair window is a first-class durability parameter.</b> Six hours to seventy-two costs several nines, which is why rebuild speed and spare capacity matter.</li>
+          <li><b>Nines describe uncorrelated hardware failure only.</b> They say nothing about a bad deploy or a mistaken delete, which is what versioning and object locks are for.</li>
+          <li><b>S3 has been strongly consistent since 2020.</b> Advice about consistency workarounds predates that. Cross-object atomicity is still absent, which is what table formats provide.</li>
+          <li><b>Average object size can dominate your bill.</b> The same ten terabytes costs a few hundred pounds in 128 MB objects and tens of thousands in 4 KB objects, because requests are priced per object.</li>
+          <li><b>Egress is the most expensive line on the bill,</b> at several times the monthly storage price per gigabyte moved.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="08-file-formats.html">Chapter 8 &mdash; File formats and columnar layout</a>. The chapter that measures rather than asserts: a real encoder run on real data, and the compression and pruning figures chapter 2 took on trust.</p>
+          </div>
+          <div class="fi">
+            <i>ADJACENT</i>
+            <p>Availability arithmetic, failover and the parallel-versus-sequential composition of nines are covered properly in the <a href="../systemdesign/index.html">System Design</a> unit.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>Find the request-count line on your own cloud bill and compare it against the storage line. If requests are more than a fifth of storage, you have a small-files problem worth measuring.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Demo 1 — durability arithmetic
+   ============================================================ */
+(function () {
+  var SCHEMES = [
+    { id: "r2",   lab: "2x replication", n: 2,  m: 1, over: 2 / 1,  col: "#C0453A" },
+    { id: "r3",   lab: "3x replication", n: 3,  m: 2, over: 3 / 1,  col: "#D9A24A" },
+    { id: "e42",  lab: "erasure 4+2",    n: 6,  m: 2, over: 6 / 4,  col: "#7C8CF8" },
+    { id: "e63",  lab: "erasure 6+3",    n: 9,  m: 3, over: 9 / 6,  col: "#2E8B5F" },
+    { id: "e104", lab: "erasure 10+4",   n: 14, m: 4, over: 14 / 10, col: "#20456A" }
+  ];
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  function choose(n, k) { var r = 1; for (var i = 0; i < k; i++) r = r * (n - i) / (i + 1); return r; }
+
+  /* first-order: one disk fails, then m more must fail inside the repair window */
+  function lossProb(n, m, afr, repairHours) {
+    var p = afr * repairHours / 8760;
+    return n * afr * choose(n - 1, m) * Math.pow(p, m);
+  }
+  function nines(p) { return p <= 0 ? 99 : -Math.log(p) / Math.LN10; }
+
+  function chart(afr, rep) {
+    var W = 700, H = 168, L = 128, B = 24;
+    var rows = SCHEMES.map(function (s) {
+      return { s: s, nines: nines(lossProb(s.n, s.m, afr, rep)) };
+    });
+    var max = Math.max.apply(null, rows.map(function (r) { return r.nines; })) * 1.12;
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Durability in nines against storage overhead">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">NINES OF DURABILITY &middot; BAR WIDTH IS DURABILITY, LABEL SHOWS STORAGE OVERHEAD</text>');
+    rows.forEach(function (r, i) {
+      var y = 22 + i * 27;
+      var w = r.nines / max * (W - L - 108);
+      svg.push('<text x="0" y="' + (y + 14) + '" font-size="11" font-weight="600" fill="#16232F">' + r.s.lab + '</text>');
+      svg.push('<rect x="' + L + '" y="' + y + '" width="' + Math.max(2, w).toFixed(1) + '" height="19" rx="2" fill="' + r.s.col + '"/>');
+      svg.push('<text x="' + (L + w + 8) + '" y="' + (y + 14) + '" font-size="11" font-weight="700" fill="#54677A">' +
+        r.nines.toFixed(1) + ' nines</text>');
+      svg.push('<text x="' + (W - 4) + '" y="' + (y + 14) + '" font-size="10.5" fill="#7C8B99" text-anchor="end">' +
+        r.s.over.toFixed(2) + 'x bytes</text>');
+    });
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var afr = +$("du-afr").value / 1000;
+    var rep = +$("du-rep").value;
+    var objects = +$("du-obj").value;
+
+    $("du-afr-o").textContent = (afr * 100).toFixed(1) + "%";
+
+    var get = function (id) {
+      var s = SCHEMES.filter(function (x) { return x.id === id; })[0];
+      return { p: lossProb(s.n, s.m, afr, rep), s: s };
+    };
+    var r2 = get("r2"), r3 = get("r3"), e63 = get("e63"), e104 = get("e104");
+
+    $("du-r2").textContent = nines(r2.p).toFixed(1);
+    $("du-r3").textContent = nines(r3.p).toFixed(1);
+    $("du-e63").textContent = nines(e63.p).toFixed(1);
+    $("du-e104").textContent = nines(e104.p).toFixed(1);
+
+    var lost = objects * e104.p;
+    $("du-lost").textContent = lost < 0.000001 ? "~0" : lost < 1 ? lost.toExponential(1) : lost.toFixed(1);
+    $("du-lost-sub").textContent = "of " + (objects >= 1e12 ? "1 trillion" : objects >= 1e9 ? "1 billion" : "1 million") + " at 10+4";
+
+    $("du-canvas").innerHTML = chart(afr, rep);
+
+    var lines = [];
+    lines.push("At a " + (afr * 100).toFixed(1) + "% annual failure rate and a " + rep +
+      "-hour repair window, three-way replication reaches " + nines(r3.p).toFixed(1) +
+      " nines for 3.00x the raw bytes, while 10+4 erasure coding reaches " + nines(e104.p).toFixed(1) +
+      " nines for 1.40x. That is " + (nines(e104.p) - nines(r3.p)).toFixed(1) +
+      " extra nines at " + Math.round((1 - 1.4 / 3) * 100) + "% less storage.");
+
+    lines.push("Erasure coding wins because parity is shared. Three copies survive two failures out of three disks; 10+4 survives four failures out of fourteen, and it takes only four extra disks to protect ten rather than twenty extra to protect ten. The cost is CPU on write and a read that must gather several shards \u2014 which is exactly the wrong trade for low-latency random access and the right one for large sequential objects.");
+
+    if (rep >= 24) {
+      lines.push("Note what the " + rep + "-hour repair window has done: 10+4 has dropped to " +
+        nines(e104.p).toFixed(1) + " nines from " + nines(lossProb(14, 4, afr, 1)).toFixed(1) +
+        " at a one-hour rebuild. Redundancy is only worth what your rebuild speed makes it worth, and a nearly-full cluster has nowhere to rebuild into.");
+    }
+    $("du-note").textContent = lines.join("\n\n");
+  }
+
+  ["du-afr", "du-rep", "du-obj"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — monthly object storage cost
+   ============================================================ */
+(function () {
+  /* representative published rates, not any one vendor's price list */
+  var TIERS = {
+    hot:     { lab: "Hot",     store: 0.021,  put: 0.005, get: 0.0004, retrieve: 0,    minDays: 0 },
+    cool:    { lab: "Cool",    store: 0.010,  put: 0.010, get: 0.0010, retrieve: 0.01, minDays: 30 },
+    archive: { lab: "Archive", store: 0.0018, put: 0.050, get: 0.0004, retrieve: 0.02, minDays: 180 }
+  };
+  var EGRESS = 0.08;
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  function money(v) {
+    if (v >= 1e6) return "\u00a3" + (v / 1e6).toFixed(2) + "m";
+    if (v >= 1000) return "\u00a3" + Math.round(v / 1000) + "k";
+    if (v >= 1) return "\u00a3" + v.toFixed(0);
+    return "\u00a3" + v.toFixed(2);
+  }
+  function big(n) {
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + "bn";
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "m";
+    if (n >= 1e3) return Math.round(n / 1000) + "k";
+    return String(Math.round(n));
+  }
+
+  function model(tb, objMB, reads, tierKey, egressFrac) {
+    var t = TIERS[tierKey];
+    var gb = tb * 1024;
+    var objects = gb * 1024 / objMB;
+    var store = gb * t.store;
+    var puts = objects / 1000 * t.put;
+    var gets = objects * reads / 1000 * t.get;
+    var bytesRead = gb * reads;
+    var retrieve = bytesRead * t.retrieve;
+    var egress = bytesRead * egressFrac * EGRESS;
+    return { objects: objects, store: store, req: puts + gets, puts: puts, gets: gets,
+             retrieve: retrieve, egress: egress, out: retrieve + egress,
+             total: store + puts + gets + retrieve + egress };
+  }
+
+  function bars(m) {
+    var W = 700, H = 96, L = 8;
+    var segs = [
+      { v: m.store,    c: "#20456A", n: "storage" },
+      { v: m.req,      c: "#C0453A", n: "requests" },
+      { v: m.retrieve, c: "#D9A24A", n: "retrieval" },
+      { v: m.egress,   c: "#E0699F", n: "egress" }
+    ].filter(function (s) { return s.v > 0; });
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Monthly cost split by charge type">'];
+    svg.push('<text x="' + L + '" y="11" font-size="10" font-weight="700" fill="#7C8B99">WHERE THE MONTHLY BILL ACTUALLY GOES</text>');
+    var x = L, avail = W - L - 12;
+    segs.forEach(function (s) {
+      var w = s.v / m.total * avail;
+      svg.push('<rect x="' + x.toFixed(1) + '" y="20" width="' + Math.max(1, w).toFixed(1) + '" height="26" fill="' + s.c + '"/>');
+      if (w > 66) {
+        svg.push('<text x="' + (x + 6) + '" y="37" font-size="11" font-weight="700" fill="#fff">' +
+          Math.round(s.v / m.total * 100) + '%</text>');
+      }
+      x += w;
+    });
+    var lx = L;
+    segs.forEach(function (s) {
+      svg.push('<rect x="' + lx + '" y="58" width="9" height="9" fill="' + s.c + '"/>');
+      svg.push('<text x="' + (lx + 13) + '" y="67" font-size="10.5" fill="#54677A">' + s.n + '  ' + money(s.v) + '</text>');
+      lx += 30 + s.n.length * 6 + money(s.v).length * 6.5;
+    });
+    svg.push('<text x="' + L + '" y="' + (H - 4) + '" font-size="10" fill="#7C8B99">total ' + money(m.total) + ' per month</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var tb = +$("co-tb").value;
+    var objMB = +$("co-size").value;
+    var reads = +$("co-reads").value;
+    var tier = $("co-tier").value;
+    var eg = +$("co-egress").value / 100;
+
+    $("co-tb-o").textContent = tb + " TB";
+    $("co-reads-o").textContent = reads;
+    $("co-egress-o").textContent = Math.round(eg * 100) + "%";
+
+    var m = model(tb, objMB, reads, tier, eg);
+    var big128 = model(tb, 128, reads, tier, eg);
+
+    $("co-n").textContent = big(m.objects);
+    $("co-nsub").textContent = objMB < 1 ? (objMB * 1024) + " KB each" : objMB + " MB each";
+    $("co-store").textContent = money(m.store);
+    $("co-store-sub").textContent = Math.round(m.store / m.total * 100) + "% of the bill";
+    $("co-req").textContent = money(m.req);
+    $("co-req-sub").textContent = Math.round(m.req / m.total * 100) + "% of the bill";
+    $("co-req-tile").className = "tile" + (m.req > m.store ? " bad" : "");
+    $("co-out").textContent = money(m.out);
+    $("co-out-sub").textContent = Math.round(m.out / m.total * 100) + "% of the bill";
+    $("co-out-tile").className = "tile" + (m.out > m.store ? " bad" : "");
+    $("co-tot").textContent = money(m.total);
+    $("co-tot-sub").textContent = money(m.total * 12) + " a year";
+
+    $("co-canvas").innerHTML = bars(m);
+
+    var lines = [];
+    lines.push(tb + " TB in " + (objMB < 1 ? (objMB * 1024) + " KB" : objMB + " MB") + " objects is " +
+      big(m.objects) + " objects. Storage costs " + money(m.store) + ", requests " + money(m.req) +
+      ", retrieval and egress " + money(m.out) + " \u2014 " + money(m.total) + " a month in total.");
+
+    if (m.req > m.store * 1.5) {
+      lines.push("Requests are now " + (m.req / m.store).toFixed(0) +
+        " times the storage cost, because they are priced per object and the objects are tiny. The identical " +
+        tb + " TB in 128 MB objects would cost " + money(big128.total) + " rather than " + money(m.total) +
+        ", a saving of " + money(m.total - big128.total) +
+        " a month for exactly the same bytes. Compaction is a cost decision before it is a performance one.");
+    } else if (objMB >= 128) {
+      lines.push("At this object size requests are negligible \u2014 " + Math.round(m.req / m.total * 100) +
+        "% of the bill \u2014 and you are essentially paying for bytes, which is the position you want to be in. Drop the object size to 4 KB to see what the same data costs when it is badly laid out.");
+    }
+
+    if (tier === "archive" && reads > 0) {
+      var hot = model(tb, objMB, reads, "hot", eg);
+      lines.push("Archive saves " + money(model(tb, objMB, 0, "hot", 0).store - m.store) +
+        " a month on storage, but " + reads + " full reads add " + money(m.retrieve) +
+        " in retrieval charges. Total against the hot tier: " + money(m.total) + " versus " + money(hot.total) +
+        " \u2014 archive is " + (m.total > hot.total ? "the more expensive option here" : "still cheaper here") +
+        ". Cold tiers price the assumption that you will not read the data, and charge you for being wrong. They also carry a " +
+        TIERS[tier].minDays + "-day minimum, so deleting early does not save you anything.");
+    }
+
+    if (eg > 0) {
+      lines.push("Egress at " + Math.round(eg * 100) + "% of reads adds " + money(m.egress) +
+        ", which is " + (m.egress / m.store).toFixed(1) +
+        " times the entire storage bill. Moving a gigabyte out costs roughly four times what storing it for a month costs \u2014 the pricing asymmetry that makes data the most expensive form of lock-in.");
+    }
+    $("co-note").textContent = lines.join("\n\n");
+  }
+
+  ["co-tb", "co-size", "co-reads", "co-tier", "co-egress"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+initChapter("07-storage-foundations.html");
+</script>
+</body>
+</html>

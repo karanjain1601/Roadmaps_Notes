@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Distributed processing — Data Engineer</title>
+<meta name="description" content="MapReduce and Spark's execution model, the shuffle, join strategies, skew and stragglers, and the four things that actually make a job slow.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">Data Engineer</a> <span>/</span> Chapter 15</p>
+    <p class="chnum">CHAPTER 15</p>
+    <h1>Distributed processing</h1>
+    <p class="lede">A distributed job has one interesting operation and everything else is bookkeeping. That operation is the shuffle — moving data between machines so that related rows meet — and it is where the time, the money and the failures are. Understanding it turns cluster tuning from folklore into arithmetic.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~28 min</b> read</div>
+      <div><b>Part 4</b> Moving data</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="when">
+      <p class="kicker">FIRST, A CHECK</p>
+      <h2>When one machine stops being enough</h2>
+      <p class="sub">Later than almost everyone assumes, and the assumption is expensive.</p>
+
+      <p>A cluster costs you more than money. It costs a scheduler, a shuffle, partial failure, serialisation, a web UI to interpret, and a class of bug that does not exist on one machine. So the first question is whether you need one, and the honest answer is frequently no.</p>
+
+      <p>A single cloud instance today can have 128 cores and 2 TB of memory. <a href="08-file-formats.html">Chapter 8</a> measured Parquet at roughly five times smaller than CSV, so a 2 TB machine comfortably holds tens of terabytes of raw-equivalent data. Single-node engines — DuckDB, Polars, a well-written pandas or Postgres query — routinely beat a small Spark cluster on datasets under a few hundred gigabytes, because they skip the coordination entirely.</p>
+
+      <div class="note key">
+        <b>The test worth applying before reaching for a cluster</b>
+        <p>Not "is the dataset big" but <strong>"does the working set of this particular query fit in one machine's memory?"</strong> A 40 TB table where every query touches one day and three columns has a working set of a few gigabytes, which chapter 8's pruning demo showed directly. Distributing that is paying coordination costs to process data you could have held in RAM.</p>
+        <p>Reach for a cluster when the working set genuinely exceeds one machine, when you need more aggregate I/O bandwidth than one machine has, or when the job must finish faster than one machine's cores allow. Those are real reasons. "We have a lot of data" is not one.</p>
+      </div>
+    </section>
+
+    <section id="model">
+      <p class="kicker">THE EXECUTION MODEL</p>
+      <h2>From MapReduce to what you use now</h2>
+      <p class="sub">One idea from 2004, and the two things later systems changed about it.</p>
+
+      <p>MapReduce's contribution was not the two functions; it was noticing that if you constrain computation to a shape where every step is independent and deterministic, you get fault tolerance for free. A failed task is simply re-run, because its input still exists and its output depends on nothing else.</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">model.txt</span><button class="code-copy">Copy</button></div>
+        <pre><code data-lang="python">map     each input split -> zero or more (key, value)   # independent, parallel
+shuffle rows with the same key are moved to the same node   # the expensive bit
+reduce  all values for one key -> output                 # independent, parallel</code></pre>
+      </div>
+
+      <p>Two changes since then account for most of the performance difference in modern engines.</p>
+
+      <div class="terms">
+        <dt>Stop writing to disk between every step</dt>
+        <dd>MapReduce materialised to HDFS after every map and reduce, so a five-step pipeline paid five round trips to disk with triple replication. Spark keeps intermediate results in memory where it can, and chains narrow operations into one pass. This is where the often-quoted order-of-magnitude speedup came from, and it is a change in I/O rather than in algorithm.</dd>
+
+        <dt>Plan the whole job before running it</dt>
+        <dd>MapReduce ran what you wrote. A modern engine builds a logical plan, applies rules &mdash; push filters down to the scan, prune unused columns, reorder joins &mdash; and only then produces physical stages. The pruning of <a href="08-file-formats.html">chapter 8</a> is the planner and the file format cooperating, and it is why a declarative query frequently beats hand-written code.</dd>
+      </div>
+
+      <p>The vocabulary you need to read an execution plan:</p>
+
+      <div class="tw">
+        <table>
+          <caption>Five words, and what each actually is</caption>
+          <thead>
+            <tr><th>Term</th><th>What it is</th><th>Why it matters</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>Partition</strong></td><td>A slice of the data one task processes</td><td>The unit of parallelism, exactly as in <a href="13-messaging.html">chapter 13</a></td></tr>
+            <tr><td><strong>Task</strong></td><td>One partition being processed by one core</td><td>The unit of scheduling and of retry</td></tr>
+            <tr><td><strong>Stage</strong></td><td>A run of tasks with no shuffle between them</td><td>Stage boundaries are shuffle boundaries. Counting stages counts shuffles</td></tr>
+            <tr><td><strong>Narrow dependency</strong></td><td>Each output partition reads one input partition</td><td>Free: map, filter, projection. Fused into one pass</td></tr>
+            <tr><td><strong>Wide dependency</strong></td><td>Each output partition reads many input partitions</td><td>Requires a shuffle: groupBy, join, distinct, sort, repartition</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>That last distinction is the one to internalise. <strong>Reading a plan is mostly counting wide dependencies</strong>, because each one is a full redistribution of the data across the network, and everything else is comparatively free.</p>
+    </section>
+
+    <section id="shuffle">
+      <p class="kicker">THE EXPENSIVE OPERATION</p>
+      <h2>What a shuffle costs</h2>
+      <p class="sub">Every mapper potentially writes a block for every reducer. The block count is the product, and the product gets large quickly.</p>
+
+      <p>A shuffle does three things: each map task partitions its output by the shuffle key and writes those partitions to local disk; the data crosses the network; each reduce task fetches its partition from every map task. So the cost has three components — disk writes, network transfer, and a number of separate fetches equal to <code>map tasks &times; shuffle partitions</code>.</p>
+
+      <p>That last number is the one people miss. The demo compares a shuffle join against the alternative that avoids it entirely.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Shuffle join against broadcast join</b>
+          <span>bytes across the network, shuffle blocks, and which constraint binds</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Fact table
+              <select id="sh-big">
+                <option value="50">50 GB</option>
+                <option value="500" selected>500 GB</option>
+                <option value="5000">5 TB</option>
+              </select>
+            </label>
+            <label>Dimension table
+              <select id="sh-small">
+                <option value="8">8 MB</option>
+                <option value="64" selected>64 MB</option>
+                <option value="512">512 MB</option>
+                <option value="4096">4 GB</option>
+                <option value="16384">16 GB</option>
+              </select>
+            </label>
+            <label>Executors
+              <input type="range" id="sh-exec" min="4" max="200" step="4" value="40">
+              <output id="sh-exec-o">40</output>
+            </label>
+            <label>Memory per executor
+              <select id="sh-mem">
+                <option value="8">8 GB</option>
+                <option value="16" selected>16 GB</option>
+                <option value="64">64 GB</option>
+              </select>
+            </label>
+            <label>Shuffle partitions
+              <select id="sh-parts">
+                <option value="200">200</option>
+                <option value="400" selected>400</option>
+                <option value="2000">2,000</option>
+                <option value="10000">10,000</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="sh-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>SHUFFLE JOIN</i><b id="sh-sn">0</b><s id="sh-sn-sub"></s></div>
+            <div class="tile" id="sh-bn-tile"><i>BROADCAST JOIN</i><b id="sh-bn">0</b><s id="sh-bn-sub"></s></div>
+            <div class="tile"><i>SHUFFLE BLOCKS</i><b id="sh-blocks">0</b><s id="sh-blocks-sub"></s></div>
+            <div class="tile hi"><i>BROADCAST CEILING</i><b id="sh-ceil">0</b><s id="sh-ceil-sub"></s></div>
+          </div>
+
+          <p class="readout" id="sh-note"></p>
+        </div>
+      </div>
+
+      <p>Two results.</p>
+
+      <ol>
+        <li><strong>Shuffle blocks are the product, and the product explodes.</strong> A 500 GB fact table is 4,000 map tasks at the default block size; against 400 shuffle partitions that is <strong>1.6 million</strong> separate fetches, and at 10,000 partitions it is 40 million. Each is a small network request with its own overhead, which is why raising the partition count past a point makes a job slower rather than faster — the same small-request penalty <a href="07-storage-foundations.html">chapter 7</a> priced for object storage.</li>
+        <li><strong>Two different limits govern broadcasting, and the tighter one is memory.</strong> On network bytes alone, broadcasting beats shuffling right up to about 12.8 GB of dimension table. But every executor must hold the whole broadcast in memory, which caps it at about 6.4 GB — <strong>memory binds twice as early</strong>. That is why the automatic broadcast threshold in a real engine is set in megabytes and tied to executor memory rather than to bandwidth.</li>
+      </ol>
+
+      <div class="note tip">
+        <b>The shuffle you can delete</b>
+        <p>The cheapest shuffle is one that does not happen, and there are three reliable ways to remove one. <strong>Broadcast</strong> the small side of a join, as above. <strong>Filter and project before the shuffle</strong>, so you move less &mdash; a filter pushed below a join can remove most of the data. And <strong>reuse an existing partitioning</strong>: if a table is already bucketed or sorted on the join key, the engine can skip the exchange entirely, which is what bucketing is for.</p>
+        <p>Pre-aggregation is the fourth. A <code>groupBy</code> that can combine on the map side sends one partial result per key per mapper rather than every row, which for a high-cardinality-reduction aggregate cuts shuffle volume by orders of magnitude.</p>
+      </div>
+    </section>
+
+    <section id="joins">
+      <p class="kicker">STRATEGIES</p>
+      <h2>How a join is actually executed</h2>
+      <p class="sub">Three physical strategies. The planner picks one, usually from statistics, and it is worth knowing when it will pick wrong.</p>
+
+      <div class="terms">
+        <dt>Broadcast hash join</dt>
+        <dd>Send the small side to every executor, build a hash table, stream the large side past it. No shuffle of the big table at all. Fastest by a wide margin when the small side fits, and the memory ceiling above is the whole constraint.</dd>
+
+        <dt>Shuffle hash join</dt>
+        <dd>Shuffle both sides by the join key, then build a hash table on the smaller side of each partition pair. Needs one partition's worth of the smaller side to fit in memory, and fails or spills badly when a partition is skewed.</dd>
+
+        <dt>Sort-merge join</dt>
+        <dd>Shuffle both sides, sort each partition, then walk the two in step. No requirement that anything fits in memory, because sorting can spill to disk. The safe default for two large tables, and the reason most big joins are sort-merge.</dd>
+      </div>
+
+      <p>The planner chooses using table statistics, and the common failure is that <strong>the statistics are wrong or missing</strong>. A table written without statistics, or one whose size the planner cannot estimate through a chain of filters, gets treated as large and joined with a sort-merge when a broadcast would have been dramatically faster. This is the single most common cause of "the same query is fast on one table and slow on an identical one".</p>
+
+      <p>Modern engines mitigate it with <strong>adaptive execution</strong>: run the first stage, look at the actual sizes produced, and re-plan. That converts a wrong estimate into a correct decision at the cost of one materialisation, and it is worth having enabled — it also handles the skew case in the next section.</p>
+    </section>
+
+    <section id="skew">
+      <p class="kicker">THE THING THAT WASTES CLUSTERS</p>
+      <h2>Skew and stragglers</h2>
+      <p class="sub">A job takes as long as its slowest task. If one partition holds a hundred times the rows of the others, you have bought a cluster and are using one core of it.</p>
+
+      <p>This is the same phenomenon as the hot partition in <a href="13-messaging.html">chapter 13</a>, appearing in a different system for the same reason: work is divided by a key, and keys are not evenly distributed. Here the consequence is measurable in money, because the idle cores are still billed.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Skew, stragglers and cluster utilisation</b>
+          <span>2 billion rows over 200 slots, with tasks scheduled longest-first</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Key skew
+              <input type="range" id="sk-skew" min="0" max="24" step="2" value="12">
+              <output id="sk-skew-o">1.2</output>
+            </label>
+            <label>Shuffle partitions
+              <select id="sk-parts">
+                <option value="400" selected>400</option>
+                <option value="2000">2,000</option>
+                <option value="10000">10,000</option>
+                <option value="50000">50,000</option>
+              </select>
+            </label>
+            <label>Salt the hot keys into
+              <select id="sk-salt">
+                <option value="1" selected>1 (no salting)</option>
+                <option value="4">4 parts</option>
+                <option value="16">16 parts</option>
+                <option value="64">64 parts</option>
+              </select>
+            </label>
+            <label>Executor slots
+              <input type="range" id="sk-slots" min="20" max="400" step="20" value="200">
+              <output id="sk-slots-o">200</output>
+            </label>
+          </div>
+
+          <div class="canvas" id="sk-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>LONGEST TASK</i><b id="sk-max">0</b><s id="sk-max-sub"></s></div>
+            <div class="tile" id="sk-str-tile"><i>STRAGGLER RATIO</i><b id="sk-str">0</b><s>longest over mean</s></div>
+            <div class="tile"><i>WALL CLOCK</i><b id="sk-wall">0</b><s id="sk-wall-sub"></s></div>
+            <div class="tile" id="sk-util-tile"><i>CLUSTER UTILISATION</i><b id="sk-util">0%</b><s id="sk-util-sub"></s></div>
+          </div>
+
+          <p class="readout" id="sk-note"></p>
+        </div>
+      </div>
+
+      <p>The numbers are stark and they are all about the same total work.</p>
+
+      <ol>
+        <li><strong>Skew converts utilisation directly into waste.</strong> With evenly distributed keys the job uses <strong>100%</strong> of the cluster and finishes in 5 seconds. At high skew the longest task runs 608 seconds — 243 times the mean — the job takes 608 seconds, and utilisation is <strong>1%</strong>. Identical work, two hundred times the wall clock, and you are billed for two hundred idle cores throughout.</li>
+        <li><strong>More partitions does nothing whatsoever.</strong> 400 partitions and 50,000 partitions both give a 608-second longest task, because the hottest key is one partition's worth of work by definition and cannot be divided. This is exactly the result from chapter 13, arriving through a different door.</li>
+        <li><strong>Salting is the fix that partition count is not.</strong> Splitting keys across 64 salts takes the longest task from 608 seconds to 10 and utilisation from 1% to 51%. The cost is a second aggregation pass to combine the salted groups, and — as in chapter 13 — the loss of any per-key ordering.</li>
+      </ol>
+
+      <div class="note trap">
+        <b>Skew is invisible in the summary</b>
+        <p>Total rows processed, total bytes shuffled and average task duration all look perfectly normal in a skewed job. The only place it shows is the <em>distribution</em> of task durations, which is why the first thing to open on a slow job is the task-duration histogram rather than the summary. A p50 of two seconds and a max of ten minutes is a diagnosis, not a mystery.</p>
+        <p>The other tell is a job whose wall clock barely improves when you add executors. If utilisation is 1%, more cores are more idle cores.</p>
+      </div>
+
+      <p>Two mitigations beyond salting. <strong>Adaptive skew join splitting</strong> detects an oversized partition at runtime and divides it across several tasks, replicating the matching side — this is automatic in current engines and handles the common case without code changes. And <strong>separating the hot key</strong>: filter it out, process it with a broadcast join or a dedicated path, and union the results. Uglier, and sometimes the only thing that works when one key is genuinely most of the data.</p>
+    </section>
+
+    <section id="slow">
+      <p class="kicker">DIAGNOSIS</p>
+      <h2>Four things that make a job slow</h2>
+      <p class="sub">In the order you should check them, because the order is roughly how often each is the answer.</p>
+
+      <div class="terms">
+        <dt>1. Skew</dt>
+        <dd>Check the task-duration distribution first. A max far above the p95 is skew, and nothing else you do will matter until it is fixed.</dd>
+
+        <dt>2. Small files</dt>
+        <dd>One task per file means ten thousand tiny files becomes ten thousand tasks each doing almost nothing, dominated by scheduling overhead and object-store requests. <a href="07-storage-foundations.html">Chapter 7</a> priced the request side; here it also costs a task launch each. The symptom is a huge task count with a tiny median duration. Compaction is the fix, and it is the same fix as chapter 7's.</dd>
+
+        <dt>3. Spill</dt>
+        <dd>A task whose partition does not fit in memory writes to disk and reads it back, which can be an order of magnitude slower. Shown explicitly as spilled bytes in the metrics. Caused by too few partitions, skew, or genuinely insufficient memory &mdash; and note the tension: too few partitions causes spill, too many causes the block explosion above.</dd>
+
+        <dt>4. Unnecessary shuffles</dt>
+        <dd>Count the stages. Each boundary is a redistribution. A repartition nobody needed, a sort before an operation that does not require order, an aggregation that could have been combined on the map side, or a broadcast the planner declined because statistics were missing.</dd>
+      </div>
+
+      <p>A useful ordering heuristic: skew and small files are <em>data layout</em> problems and are fixed upstream, in how the table was written. Spill and unnecessary shuffles are <em>query</em> problems and are fixed in the job. If several jobs over the same table are all slow, look at the table; if one job is slow over tables that serve others well, look at the job.</p>
+
+      <div class="note tip">
+        <b>Sizing, as a starting point rather than a rule</b>
+        <p>Aim for partitions of roughly 128 MB to 1 GB after the shuffle, which usually means setting the shuffle partition count from the expected shuffle volume rather than leaving the default. Aim for files in the same range, per <a href="08-file-formats.html">chapter 8</a>. Give each executor a handful of cores rather than one or thirty &mdash; too few wastes the shared broadcast and JVM overhead, too many contend on memory. Then measure, because every one of these depends on the data.</p>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>Ask whether the working set fits in one machine,</b> not whether the dataset is big. A 40 TB table queried one day at a time has a working set of gigabytes.</li>
+          <li><b>MapReduce's real contribution was fault tolerance through determinism.</b> Later engines changed two things: stop materialising between steps, and plan before running.</li>
+          <li><b>Reading a plan is counting wide dependencies.</b> Stage boundaries are shuffle boundaries; everything else is comparatively free.</li>
+          <li><b>Shuffle blocks are map tasks times shuffle partitions,</b> and the product explodes: 1.6 million at 400 partitions on a 500 GB table, 40 million at 10,000.</li>
+          <li><b>Broadcasting is limited by memory long before bandwidth.</b> Network bytes allow about 12.8 GB; executor memory allows about 6.4 GB &mdash; twice as tight, which is why thresholds are set in megabytes.</li>
+          <li><b>The cheapest shuffle is one you delete:</b> broadcast, filter before it, reuse an existing partitioning, or combine on the map side.</li>
+          <li><b>Missing statistics cause the wrong join strategy,</b> which is the usual explanation for two identical-looking tables performing differently. Adaptive execution re-plans from real sizes.</li>
+          <li><b>Skew turns 100% cluster utilisation into 1%</b> on identical total work &mdash; a 243&times; straggler, 608 seconds against 5, with two hundred cores billed and idle.</li>
+          <li><b>More partitions does not help skew at all.</b> 400 and 50,000 give the same 608-second task, exactly as partition count could not help a hot Kafka key.</li>
+          <li><b>Salting is the fix:</b> 64 salts took the longest task from 608 seconds to 10 and utilisation from 1% to 51%, at the cost of a second aggregation pass.</li>
+          <li><b>Skew is invisible in summary metrics.</b> Open the task-duration distribution first; a p50 of seconds with a max of minutes is a diagnosis.</li>
+          <li><b>Check in order: skew, small files, spill, unnecessary shuffles.</b> The first two are layout problems fixed upstream; the last two are query problems fixed in the job.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="16-orchestration.html">Chapter 16 &mdash; Orchestration</a>. Closing Part 4: DAGs, the three triggering models and what they do to freshness, retries across wide graphs, and the tools.</p>
+          </div>
+          <div class="fi">
+            <i>THE SAME RESULT TWICE</i>
+            <p>Key skew capping throughput regardless of partition count appeared in <a href="13-messaging.html">chapter 13</a> for Kafka and again here for Spark. It is one property of hashing work by key, not two coincidences.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>Open the slowest stage of your slowest job and look at the task-duration histogram rather than the total. If the maximum is more than about five times the median, stop tuning anything else.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Demo 1 — shuffle join against broadcast join
+   ============================================================ */
+(function () {
+  var GB = 1073741824, MB = 1048576, BLOCK = 128 * MB;
+  var $ = function (id) { return document.getElementById(id); };
+
+  function plan(bigGB, smallMB, execs, execMemGB, shufflePartitions) {
+    var bigB = bigGB * GB, smallB = smallMB * MB;
+    var mapTasks = Math.ceil(bigB / BLOCK);
+    var perExecBudget = execMemGB * GB * 0.4;      /* a fraction is usable for a broadcast */
+    return {
+      mapTasks: mapTasks, bigB: bigB, smallB: smallB,
+      shuffleNet: bigB + smallB,
+      shuffleBlocks: mapTasks * shufflePartitions,
+      bcastNet: smallB * execs,
+      bcastFits: smallB <= perExecBudget,
+      memCeiling: perExecBudget,
+      netCeiling: execs > 1 ? bigB / (execs - 1) : Infinity
+    };
+  }
+
+  function sz(b) {
+    if (b >= 1e12) return (b / 1099511627776).toFixed(2) + " TB";
+    if (b >= GB) return (b / GB).toFixed(2) + " GB";
+    return Math.round(b / MB) + " MB";
+  }
+  function big(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "m";
+    if (n >= 1000) return Math.round(n / 1000) + "k";
+    return String(n);
+  }
+
+  function chart(p, execs) {
+    var W = 700, H = 128, L = 118;
+    var max = Math.max(p.shuffleNet, p.bcastNet);
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Bytes crossing the network by join strategy">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">BYTES CROSSING THE NETWORK, LOG SCALE</text>');
+    [{ n: "shuffle join", v: p.shuffleNet, c: "#C0453A", sub: big(p.shuffleBlocks) + " blocks" },
+     { n: "broadcast join", v: p.bcastNet, c: p.bcastFits ? "#2E8B5F" : "#9BB0C2", sub: execs + " transfers" }]
+    .forEach(function (r, i) {
+      var y = 24 + i * 36;
+      var frac = Math.log10(r.v + 1) / Math.log10(max + 1);
+      var w = Math.max(4, frac * (W - L - 168));
+      svg.push('<text x="0" y="' + (y + 14) + '" font-size="11.5" font-weight="600" fill="#16232F">' + r.n + '</text>');
+      svg.push('<rect x="' + L + '" y="' + y + '" width="' + w.toFixed(1) + '" height="20" rx="2" fill="' + r.c + '"/>');
+      svg.push('<text x="' + (L + w + 8) + '" y="' + (y + 14) + '" font-size="11" font-weight="600" fill="#54677A">' +
+        sz(r.v) + '  \u00b7  ' + r.sub + '</text>');
+    });
+    if (!p.bcastFits) {
+      svg.push('<text x="' + L + '" y="' + (H - 6) + '" font-size="10.5" font-weight="700" fill="#C0453A">broadcast is not possible: the dimension exceeds ' +
+        sz(p.memCeiling) + ' of executor memory</text>');
+    } else {
+      svg.push('<text x="' + L + '" y="' + (H - 6) + '" font-size="10" fill="#7C8B99">broadcast fits within the ' +
+        sz(p.memCeiling) + ' each executor can hold</text>');
+    }
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var bigGB = +$("sh-big").value, smallMB = +$("sh-small").value;
+    var execs = +$("sh-exec").value, mem = +$("sh-mem").value, parts = +$("sh-parts").value;
+    $("sh-exec-o").textContent = execs;
+
+    var p = plan(bigGB, smallMB, execs, mem, parts);
+
+    $("sh-sn").textContent = sz(p.shuffleNet);
+    $("sh-sn-sub").textContent = "both sides move";
+    $("sh-bn").textContent = p.bcastFits ? sz(p.bcastNet) : "n/a";
+    $("sh-bn-sub").textContent = p.bcastFits ? "small side \u00d7 " + execs : "does not fit in memory";
+    $("sh-bn-tile").className = "tile " + (p.bcastFits ? "good" : "bad");
+    $("sh-blocks").textContent = big(p.shuffleBlocks);
+    $("sh-blocks-sub").textContent = big(p.mapTasks) + " tasks \u00d7 " + parts;
+    $("sh-ceil").textContent = sz(p.memCeiling);
+    $("sh-ceil-sub").textContent = "network allows " + sz(p.netCeiling);
+
+    $("sh-canvas").innerHTML = chart(p, execs);
+
+    var lines = [];
+    lines.push("A " + sz(p.bigB) + " fact table is " + big(p.mapTasks) +
+      " map tasks at the default block size. Shuffling it against a " + sz(p.smallB) +
+      " dimension moves " + sz(p.shuffleNet) + " and requires " + big(p.shuffleBlocks) +
+      " separate block fetches \u2014 " + big(p.mapTasks) + " tasks each writing a partition for all " +
+      parts + " reducers.");
+
+    if (p.bcastFits) {
+      lines.push("Broadcasting the dimension instead moves " + sz(p.bcastNet) + " in " + execs +
+        " transfers and shuffles the fact table not at all. That is " +
+        (p.shuffleNet / p.bcastNet).toFixed(0) + " times less data and " +
+        (p.shuffleBlocks / execs).toFixed(0) + " times fewer network operations.");
+    } else {
+      lines.push("Broadcasting is off the table: at " + sz(p.smallB) +
+        " the dimension exceeds the " + sz(p.memCeiling) +
+        " each executor can devote to it, so every executor would fail to build the hash table. Note that on network bytes alone broadcasting would still win up to " +
+        sz(p.netCeiling) + " \u2014 memory is the binding constraint, not bandwidth.");
+    }
+
+    lines.push("The two ceilings sit far apart: bandwidth would permit broadcasting up to " +
+      sz(p.netCeiling) + ", memory permits " + sz(p.memCeiling) + " \u2014 " +
+      (p.netCeiling / p.memCeiling).toFixed(1) +
+      " times tighter. That gap is why an engine's automatic broadcast threshold is expressed in megabytes and tied to executor memory rather than derived from network capacity.");
+
+    if (parts >= 2000) {
+      lines.push("Note also what the partition count is doing to the block count: " + big(p.shuffleBlocks) +
+        " fetches, each a small network request with its own overhead. Past a point, raising shuffle partitions makes the job slower rather than faster \u2014 the same small-request penalty chapter 7 priced for object storage.");
+    }
+    $("sh-note").textContent = lines.join("\n\n");
+  }
+
+  ["sh-big", "sh-small", "sh-exec", "sh-mem", "sh-parts"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — skew, stragglers and utilisation
+   ============================================================ */
+(function () {
+  var KEYS = 4000, ROWS = 2e9, ROWS_PER_SEC = 2e6;
+  var $ = function (id) { return document.getElementById(id); };
+
+  function loads(skew, parts, salts) {
+    var w = [], sum = 0;
+    for (var i = 1; i <= KEYS; i++) { var v = 1 / Math.pow(i, skew); w.push(v); sum += v; }
+    var load = [];
+    for (var p = 0; p < parts; p++) load.push(0);
+    w.forEach(function (v, i) {
+      var rows = ROWS * v / sum;
+      for (var s = 0; s < salts; s++) load[(i * salts + s) % parts] += rows / salts;
+    });
+    return load;
+  }
+
+  /* longest-first onto free slots: a fair model of a real scheduler */
+  function stats(load, slots) {
+    var times = load.map(function (r) { return r / ROWS_PER_SEC; });
+    var order = times.slice().sort(function (a, b) { return b - a; });
+    var slotEnd = [];
+    for (var i = 0; i < slots; i++) slotEnd.push(0);
+    order.forEach(function (t) {
+      var m = 0;
+      for (var j = 1; j < slots; j++) if (slotEnd[j] < slotEnd[m]) m = j;
+      slotEnd[m] += t;
+    });
+    var wall = Math.max.apply(null, slotEnd);
+    var work = times.reduce(function (a, b) { return a + b; }, 0);
+    return { times: times, wall: wall, work: work,
+             util: wall > 0 ? work / (wall * slots) : 1,
+             maxTask: Math.max.apply(null, times), meanTask: work / times.length };
+  }
+
+  function dur(s) {
+    if (s < 90) return s.toFixed(0) + "s";
+    return (s / 60).toFixed(1) + "m";
+  }
+
+  function chart(st) {
+    var W = 700, H = 138, L = 8;
+    var sorted = st.times.slice().sort(function (a, b) { return b - a; });
+    var shown = Math.min(sorted.length, 200);
+    var bw = (W - L - 12) / shown;
+    var max = sorted[0] || 1;
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Task durations sorted longest first">'];
+    svg.push('<text x="' + L + '" y="11" font-size="10" font-weight="700" fill="#7C8B99">TASK DURATIONS, LONGEST FIRST' +
+      (st.times.length > shown ? ' (TOP ' + shown + ' OF ' + st.times.length.toLocaleString() + ')' : '') + '</text>');
+    var yOf = function (v) { return (H - 26) - v / max * (H - 26 - 18); };
+    svg.push('<line x1="' + L + '" y1="' + yOf(st.meanTask) + '" x2="' + (W - 12) + '" y2="' + yOf(st.meanTask) +
+      '" stroke="#2E8B5F" stroke-width="1.4" stroke-dasharray="4 3"/>');
+    svg.push('<text x="' + (W - 14) + '" y="' + (yOf(st.meanTask) - 4) + '" font-size="9.5" fill="#166B47" text-anchor="end">mean ' +
+      dur(st.meanTask) + '</text>');
+    for (var i = 0; i < shown; i++) {
+      var x = L + i * bw, y = yOf(sorted[i]);
+      var hot = sorted[i] > st.meanTask * 3;
+      svg.push('<rect x="' + (x + 0.3).toFixed(1) + '" y="' + y.toFixed(1) + '" width="' + Math.max(0.8, bw - 0.6).toFixed(1) +
+        '" height="' + ((H - 26) - y).toFixed(1) + '" fill="' + (hot ? "#C0453A" : "#20456A") + '"/>');
+    }
+    svg.push('<text x="' + L + '" y="' + (H - 4) + '" font-size="9.5" fill="#7C8B99">the job cannot finish before the leftmost bar does &mdash; ' +
+      dur(st.maxTask) + '</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var skew = +$("sk-skew").value / 10, parts = +$("sk-parts").value;
+    var salts = +$("sk-salt").value, slots = +$("sk-slots").value;
+    $("sk-skew-o").textContent = skew === 0 ? "even" : skew.toFixed(1);
+    $("sk-slots-o").textContent = slots;
+
+    var st = stats(loads(skew, parts, salts), slots);
+    var ratio = st.maxTask / st.meanTask;
+
+    $("sk-max").textContent = dur(st.maxTask);
+    $("sk-max-sub").textContent = "mean " + dur(st.meanTask);
+    $("sk-str").textContent = ratio.toFixed(1) + "\u00d7";
+    $("sk-str-tile").className = "tile " + (ratio > 5 ? "bad" : ratio < 1.5 ? "good" : "");
+    $("sk-wall").textContent = dur(st.wall);
+    $("sk-wall-sub").textContent = dur(st.work / slots) + " if perfectly balanced";
+    $("sk-util").textContent = (st.util * 100).toFixed(0) + "%";
+    $("sk-util-sub").textContent = Math.round(slots * (1 - st.util)) + " slots idle on average";
+    $("sk-util-tile").className = "tile " + (st.util > 0.8 ? "good" : st.util < 0.3 ? "bad" : "");
+
+    $("sk-canvas").innerHTML = chart(st);
+
+    var even = stats(loads(0, parts, 1), slots);
+    var lines = [];
+    lines.push("The longest task runs " + dur(st.maxTask) + " against a mean of " + dur(st.meanTask) +
+      " \u2014 a straggler ratio of " + ratio.toFixed(1) + ". The job finishes in " + dur(st.wall) +
+      " where perfectly balanced work would take " + dur(st.work / slots) + ", so cluster utilisation is " +
+      (st.util * 100).toFixed(0) + "% and roughly " + Math.round(slots * (1 - st.util)) +
+      " of the " + slots + " slots are idle at any moment \u2014 and billed.");
+
+    if (skew === 0) {
+      lines.push("With evenly distributed keys there is no straggler and the cluster is fully used. Raise the skew and watch the total work stay identical while the wall clock and the bill both multiply.");
+    } else if (salts === 1) {
+      var big = stats(loads(skew, 50000, 1), slots);
+      lines.push("Adding partitions will not help. At " + parts.toLocaleString() +
+        " partitions the longest task is " + dur(st.maxTask) + "; at 50,000 partitions it is " +
+        dur(big.maxTask) + ". The hottest key is one partition's worth of work by definition and cannot be subdivided by the partitioner \u2014 which is precisely the result chapter 13 found for a hot Kafka key.");
+      var salted = stats(loads(skew, parts, 64), slots);
+      lines.push("Salting does help: splitting keys across 64 parts takes the longest task to " +
+        dur(salted.maxTask) + " and utilisation to " + (salted.util * 100).toFixed(0) +
+        "%. The price is a second aggregation pass to recombine the salted groups, and the loss of any per-key ordering \u2014 the same trade as chapter 13's.");
+    } else {
+      var unsalted = stats(loads(skew, parts, 1), slots);
+      lines.push("Salting into " + salts + " parts has taken the longest task from " + dur(unsalted.maxTask) +
+        " to " + dur(st.maxTask) + " and utilisation from " + (unsalted.util * 100).toFixed(0) + "% to " +
+        (st.util * 100).toFixed(0) + "%. Same data, same total work, " +
+        (unsalted.wall / st.wall).toFixed(1) + " times faster.");
+      lines.push("What it costs: the salted groups have to be combined in a second aggregation, and any guarantee about per-key ordering is gone. Salt only the keys that need it \u2014 detecting the heavy hitters first and leaving the rest alone keeps the extra pass small.");
+    }
+
+    if (st.util < 0.3) {
+      lines.push("Note the shape of the diagnosis. Total rows, total bytes shuffled and mean task duration all look entirely normal here \u2014 " +
+        dur(st.meanTask) + " a task. Only the distribution shows the problem, which is why the task-duration histogram is the first thing to open on a slow job rather than the summary.");
+    }
+    $("sk-note").textContent = lines.join("\n\n");
+  }
+
+  ["sk-skew", "sk-parts", "sk-salt", "sk-slots"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+initChapter("15-distributed-processing.html");
+</script>
+</body>
+</html>

@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Features and the feature store — MLOps</title>
+<meta name="description" content="Training-serving skew measured, why a point-in-time error makes a model actively inverted in production, and what a feature store actually buys.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">MLOps</a> <span>/</span> Chapter 7</p>
+    <p class="chnum">CHAPTER 07</p>
+    <h1>Features and the feature store</h1>
+    <p class="lede">Four small differences between the batch pipeline and the serving code — a rounding, a null fill, a stale value, an off-by-one window — cost <strong>6.3% of decisions</strong> while the offline AUC does not move by a single digit. And a training set joined to today's feature values scores <strong>0.9487 offline and 0.3805 in production</strong>, which is worse than random.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~28 min</b> read</div>
+      <div><b>Part 2</b> The pipeline</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="two-paths">
+      <p class="kicker">THE STRUCTURE</p>
+      <h2>Two paths to the same number</h2>
+      <p class="sub">A feature is computed once for training and again for serving, usually by different code with different constraints.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Why the two implementations diverge</caption>
+          <thead>
+            <tr><th></th><th>Training path</th><th>Serving path</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>Written in</strong></td><td>SQL or Spark, over history</td><td>Application code, one row at a time</td></tr>
+            <tr><td><strong>Latency budget</strong></td><td>Minutes</td><td><strong>Milliseconds</strong></td></tr>
+            <tr><td><strong>Sees</strong></td><td>The whole table</td><td>One entity, plus a cache</td></tr>
+            <tr><td><strong>Missing values</strong></td><td>Imputed from the column</td><td>Whatever is at hand</td></tr>
+            <tr><td><strong>Time window</strong></td><td>Whatever the query says</td><td>Whatever the cache holds</td></tr>
+            <tr><td><strong>Owner</strong></td><td>Usually the data scientist</td><td>Usually a different team</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>None of the differences are mistakes</b>
+        <p>The serving path fills a null with zero because it has no column to average over. It rounds because the value arrived as a float32. It uses a value from the last cache refresh because recomputing would blow the latency budget. Each choice is locally correct, and every one of them makes the number different from what the model was trained on.</p>
+        <p>That is what makes skew hard: there is no bug to find, and the first demo shows the offline evaluation cannot see any of it.</p>
+      </div>
+    </section>
+
+    <section id="skew">
+      <p class="kicker">MEASUREMENT</p>
+      <h2>What skew costs</h2>
+      <p class="sub">One model, one test set, and two ways of computing the features it is scored on.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>The batch path against the serving path</b>
+          <span>4,000 training rows, 4,000 test rows, 12 replications</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Difference in the serving path
+              <select id="sk-case">
+                <option value="0">None &mdash; the same code</option>
+                <option value="1">Rounds to one decimal</option>
+                <option value="2">Fills missing values with 0</option>
+                <option value="3">Uses a 24-hour-old value</option>
+                <option value="4">Off-by-one window boundary</option>
+                <option value="5" selected>All four</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="sk-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile good" id="sk-off-tile"><i>OFFLINE AUC</i><b id="sk-off">0</b><s>what the report says</s></div>
+            <div class="tile" id="sk-on-tile"><i>ONLINE AUC</i><b id="sk-on">0</b><s id="sk-on-sub"></s></div>
+            <div class="tile" id="sk-flip-tile"><i>DECISIONS CHANGED</i><b id="sk-flip">0%</b><s>against the offline path</s></div>
+            <div class="tile hi" id="sk-verd-tile"><i>VISIBLE OFFLINE?</i><b id="sk-verd">&mdash;</b><s id="sk-verd-sub"></s></div>
+          </div>
+
+          <p class="readout" id="sk-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>The same trained model throughout. Only the serving-side computation changes</caption>
+          <thead>
+            <tr><th>Difference</th><th>Offline AUC</th><th>Online AUC</th><th>Lost</th><th>Decisions changed</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>None</td><td>0.8396</td><td>0.8396</td><td>0.0000</td><td>0.00%</td></tr>
+            <tr><td>Rounds to one decimal</td><td>0.8396</td><td>0.8396</td><td>0.0000</td><td>0.34%</td></tr>
+            <tr><td><strong>Fills missing values with 0</strong></td><td>0.8396</td><td>0.8238</td><td><strong>0.0158</strong></td><td><strong>4.11%</strong></td></tr>
+            <tr><td>Uses a 24-hour-old value</td><td>0.8396</td><td>0.8360</td><td>0.0036</td><td>2.30%</td></tr>
+            <tr><td>Off-by-one window boundary</td><td>0.8396</td><td>0.8395</td><td>0.0001</td><td>0.33%</td></tr>
+            <tr><td><strong>All four</strong></td><td><strong>0.8396</strong></td><td>0.8201</td><td>0.0195</td><td><strong>6.25%</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <b>The offline column never moves</b>
+        <p><strong>0.8396 in every row.</strong> Not approximately — identically, because skew lives in the serving path and the offline evaluation never executes it. There is no amount of offline testing, cross-validation or holdout discipline that detects any of this.</p>
+        <p>Meanwhile the combination costs 0.0195 of AUC — about 5.7% of the model's skill above chance — and decides <strong>6.25% of cases differently</strong>. Neither number appears anywhere in a model report.</p>
+        <p>Note also which difference dominates. Rounding costs essentially nothing and the null fill costs <strong>0.0158</strong>, twelve times more than the stale value. The intuition that "a day-old feature is the risky one" is not what the arithmetic says here.</p>
+      </div>
+
+      <div class="note key">
+        <b>How skew is actually found</b>
+        <p><strong>Log the served features.</strong> Not the prediction — the input vector the model actually received. Then recompute the same rows through the batch path and compare. Any difference is skew, and this is the only check that finds it directly.</p>
+        <p><strong>Score the logged features offline.</strong> Once you have the served vectors and eventually the labels, the online AUC in the table above becomes measurable rather than hypothetical.</p>
+        <p><strong>Or remove the second implementation entirely,</strong> which is what the rest of this chapter is about.</p>
+      </div>
+    </section>
+
+    <section id="pit">
+      <p class="kicker">THE OTHER FAILURE</p>
+      <h2>Point-in-time correctness</h2>
+      <p class="sub">Building a training set means joining features to labels. The join has to happen at the right moment, and the wrong moment is the default.</p>
+
+      <p>A churn model with two features: how many purchases a user has made, and their rate. Labels come from events scattered through the past. The question is which value of "purchases so far" gets joined to a label from three months ago.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>As of the event, or as of today</b>
+          <span>6,000 users, half held out, 12 replications</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>How the training set was built
+              <select id="pt-mode">
+                <option value="pit">Point-in-time correct &mdash; the value as of the event</option>
+                <option value="naive" selected>Joined to today's feature table</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="pt-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="pt-off-tile"><i>OFFLINE AUC</i><b id="pt-off">0</b><s>what you would report</s></div>
+            <div class="tile" id="pt-on-tile"><i>ONLINE AUC</i><b id="pt-on">0</b><s>what production gets</s></div>
+            <div class="tile" id="pt-gap-tile"><i>THE GAP</i><b id="pt-gap">0</b><s>promised minus delivered</s></div>
+            <div class="tile hi" id="pt-verd-tile"><i>VERDICT</i><b id="pt-verd">&mdash;</b><s id="pt-verd-sub"></s></div>
+          </div>
+
+          <p class="readout" id="pt-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>The same model class, the same features, the same labels</caption>
+          <thead>
+            <tr><th>How the training set was built</th><th>Offline AUC</th><th>Online AUC</th><th>The gap</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>Point-in-time correct</strong></td><td>0.7363</td><td><strong>0.7363</strong></td><td><strong>0.0000</strong></td></tr>
+            <tr><td>Joined to today's values</td><td><strong>0.9487</strong></td><td><strong>0.3805</strong></td><td>0.5682</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <b>The leaky model is inverted, not merely useless</b>
+        <p>It scores <strong>0.9487 offline</strong> — the better of the two by a wide margin, and the one that wins a model bake-off. In production it scores <strong>0.3805</strong>, which is <em>below</em> 0.5.</p>
+        <p>The mechanism: a user who churned stopped accumulating purchases, so their count today is low. The model learned that a low count today means churn. At serving time it sees the count <em>as of now</em>, when the future churners have not yet stopped, and their counts look perfectly healthy. The relationship it learned runs backwards from the one it faces.</p>
+        <p>Nothing was joined wrongly. No key was duplicated, no row was dropped, and every value in the training set was a true value of that feature. It was simply read at the wrong <strong>moment</strong>.</p>
+      </div>
+
+      <div class="note key">
+        <b>The point-in-time row is the tell</b>
+        <p>The correct build has an offline-online gap of <strong>0.0000</strong>, and that is not luck — it is structural. If the training set is assembled from exactly the values serving would have seen, then offline evaluation <em>is</em> a simulation of production, and there is no gap to have.</p>
+        <p>So the diagnostic for this whole class of problem is a single question: <strong>is your offline number a prediction of your online number, or just a number?</strong> A pipeline that answers "prediction" has solved point-in-time correctness, and one that cannot answer has not.</p>
+      </div>
+
+      <div class="note warn">
+        <b>Why the default is wrong</b>
+        <p>Feature tables are usually kept as "current state per entity" — one row per user, updated in place. That table is the easy thing to join against and it has no history, so joining it to a label from March gives you the March label next to today's features.</p>
+        <p>Getting this right needs the feature table to be a <em>log</em> rather than a snapshot: one row per entity per time, joined with an as-of condition. That is more storage and a more awkward query, and it is the single most important thing a feature store does.</p>
+      </div>
+    </section>
+
+    <section id="store">
+      <p class="kicker">THE COMPONENT</p>
+      <h2>What a feature store actually is</h2>
+      <p class="sub">Four things wearing one name, and you may need only one of them.</p>
+
+      <div class="terms">
+        <dt>A definition registry</dt>
+        <dd>Feature logic written once, with an owner, a description and a schema. Solves discovery and duplication &mdash; three teams computing "sessions in the last 7 days" three slightly different ways.</dd>
+
+        <dt>An offline store with history</dt>
+        <dd>The feature log, supporting as-of joins. This is what makes point-in-time correctness the default rather than an achievement, and it is the piece the demo above is about.</dd>
+
+        <dt>An online store</dt>
+        <dd>A low-latency key-value lookup for serving. Solves the millisecond budget, and by itself does nothing about skew.</dd>
+
+        <dt>One transformation, both paths</dt>
+        <dd>The same code populating both stores. This is the piece that removes skew, and it is the hardest to retrofit &mdash; and the reason a store that only provides the two lookups is only half the product.</dd>
+      </div>
+
+      <div class="note key">
+        <b>Which pieces solve which problem</b>
+        <p>The first demo's <strong>6.25% of changed decisions</strong> is solved by the fourth item and nothing else. Adding an online store to an existing serving implementation gives you fast lookups of a feature that is still computed twice.</p>
+        <p>The second demo's <strong>0.5682 gap</strong> is solved by the second item. An offline store with proper as-of semantics makes the leaky join hard to write by accident, which is a much better guarantee than remembering not to write it.</p>
+        <p>If you take one thing from this chapter, take the pairing: <strong>skew needs shared computation, leakage needs history.</strong> A product that provides one and not the other has solved one of your two problems.</p>
+      </div>
+    </section>
+
+    <section id="when">
+      <p class="kicker">CALIBRATION</p>
+      <h2>When you do not need one</h2>
+      <p class="sub">Feature stores are among the most over-adopted components in this unit.</p>
+
+      <div class="tw">
+        <table>
+          <caption>What the problem actually is, and the cheapest thing that fixes it</caption>
+          <thead>
+            <tr><th>Your situation</th><th>The real problem</th><th>Cheapest fix</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>One model, batch scoring only</td><td>None &mdash; there is one path</td><td><strong>Nothing</strong></td></tr>
+            <tr><td>One model, online serving</td><td>Skew</td><td>One shared library, called by both</td></tr>
+            <tr><td>Point-in-time joins are wrong</td><td>Leakage</td><td>An append-only feature log plus as-of joins</td></tr>
+            <tr><td>Teams rebuild the same features</td><td>Discovery</td><td>A registry, which can be a repository</td></tr>
+            <tr><td>All of the above, several teams</td><td>All of the above</td><td>A feature store</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note tip">
+        <b>Batch-only scoring has no skew by construction</b>
+        <p>If both training and inference run the same query over the same warehouse, there is one code path and the first demo's entire subject does not exist. A great many teams adopt a feature store to solve a problem they do not have, and inherit an online store they do not need to keep populated.</p>
+        <p>The honest test is the first demo's method: log what serving computed, recompute it through the batch path, and see whether they match. If they match, you have no skew and no reason to buy anything.</p>
+      </div>
+    </section>
+
+    <section id="reading">
+      <p class="kicker">JUDGEMENT</p>
+      <h2>Five questions about a feature setup</h2>
+
+      <div class="check">
+        <li><strong>Is any feature computed by two pieces of code?</strong> If yes, they have diverged; the only question is by how much, and the offline AUC will not tell you.</li>
+        <li><strong>Are the served feature vectors logged?</strong> Without them, skew is unmeasurable rather than merely unmeasured.</li>
+        <li><strong>Does the feature table have history, or only current state?</strong> Current state makes the leaky join the path of least resistance.</li>
+        <li><strong>Is your offline AUC a prediction of your online AUC?</strong> A point-in-time correct pipeline has a gap of 0.0000 by construction.</li>
+        <li><strong>Which of the four components do you actually need?</strong> Batch-only scoring needs none of them.</li>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>A feature is computed twice, by different code with different constraints,</b> and none of the differences are bugs.</li>
+          <li><b>The offline AUC is 0.8396 under every skew tested</b> &mdash; identically, because offline never runs the serving path.</li>
+          <li><b>All four differences together cost 0.0195 of AUC and 6.25% of decisions.</b></li>
+          <li><b>The null fill costs 0.0158 and rounding costs nothing,</b> which is not the intuitive ordering.</li>
+          <li><b>Skew is found by logging the served feature vectors</b> and recomputing them through the batch path.</li>
+          <li><b>A training set joined to today's values scores 0.9487 offline</b> &mdash; the better model in any bake-off.</li>
+          <li><b>In production it scores 0.3805, which is below random.</b></li>
+          <li><b>It is inverted, not useless:</b> churners stopped accumulating, so a low count today means churn, and at serving time it does not.</li>
+          <li><b>Nothing was joined wrongly.</b> The value was read at the wrong moment.</li>
+          <li><b>The point-in-time correct build has a gap of 0.0000,</b> and that is structural rather than lucky.</li>
+          <li><b>So ask whether your offline number is a prediction of your online number.</b></li>
+          <li><b>Current-state feature tables make the leaky join the default;</b> a feature log makes it hard to write.</li>
+          <li><b>A feature store is four things:</b> registry, offline store with history, online store, shared transformation.</li>
+          <li><b>Skew needs shared computation; leakage needs history.</b> An online store alone solves neither.</li>
+          <li><b>Batch-only scoring has no skew by construction</b> and needs none of it.</li>
+          <li><b>Test before buying:</b> log the served features, recompute, compare.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="08-training.html">Chapter 8 &mdash; Training as a pipeline step</a>. Resources, checkpointing, distributed training, and hyperparameter search that finishes.</p>
+          </div>
+          <div class="fi">
+            <i>PICKED UP FROM</i>
+            <p><a href="02-reproducibility.html">Chapter 2</a>'s pattern returns: an aggregate metric that does not move while a large share of individual decisions do.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>Log one day of served feature vectors, recompute the same rows through your training pipeline, and count how many differ.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   shared: logistic regression and AUC
+   ============================================================ */
+function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+function gauss(rnd) {
+  var u1 = Math.max(1e-12, rnd()), u2 = rnd();
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+function avg(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i]; return s / a.length; }
+function sigm(z) { return 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z)))); }
+function auc(sc, lb) {
+  var idx = sc.map(function (s, i) { return i; }).sort(function (a, b) { return sc[a] - sc[b]; });
+  var rk = new Array(sc.length), i = 0;
+  while (i < idx.length) {
+    var j = i;
+    while (j + 1 < idx.length && sc[idx[j + 1]] === sc[idx[i]]) j++;
+    var r = (i + j) / 2 + 1;
+    for (var k = i; k <= j; k++) rk[idx[k]] = r;
+    i = j + 1;
+  }
+  var np = 0, nn = 0, sp = 0;
+  for (var t = 0; t < lb.length; t++) { if (lb[t]) { np++; sp += rk[t]; } else nn++; }
+  return (np && nn) ? (sp - np * (np + 1) / 2) / (np * nn) : 0.5;
+}
+function solveSys(A, b) {
+  var n = b.length, M = A.map(function (r, i) { return r.concat([b[i]]); });
+  for (var c = 0; c < n; c++) {
+    var p = c;
+    for (var r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    var t = M[c]; M[c] = M[p]; M[p] = t;
+    if (Math.abs(M[c][c]) < 1e-12) return null;
+    for (var r2 = 0; r2 < n; r2++) {
+      if (r2 === c) continue;
+      var f = M[r2][c] / M[c][c];
+      for (var k = c; k <= n; k++) M[r2][k] -= f * M[c][k];
+    }
+  }
+  return M.map(function (r, i) { return r[n] / M[i][i]; });
+}
+function fitLogit(X, y, lam) {
+  var n = y.length, p = X[0].length + 1, D = X.map(function (r) { return [1].concat(r); });
+  var beta = new Array(p).fill(0);
+  for (var it = 0; it < 25; it++) {
+    var A = [], b = [];
+    for (var a = 0; a < p; a++) { A.push(new Array(p).fill(0)); b.push(0); }
+    for (var i = 0; i < n; i++) {
+      var eta = 0;
+      for (var q = 0; q < p; q++) eta += D[i][q] * beta[q];
+      var mu = sigm(eta), w = Math.max(1e-6, mu * (1 - mu)), z = eta + (y[i] - mu) / w;
+      for (var a2 = 0; a2 < p; a2++) {
+        for (var b2 = 0; b2 < p; b2++) A[a2][b2] += D[i][a2] * w * D[i][b2];
+        b[a2] += D[i][a2] * w * z;
+      }
+    }
+    for (var d = 1; d < p; d++) A[d][d] += lam;
+    var nb = solveSys(A, b);
+    if (!nb) break;
+    var mv = 0;
+    for (var q2 = 0; q2 < p; q2++) mv += Math.abs(nb[q2] - beta[q2]);
+    beta = nb;
+    if (mv < 1e-10) break;
+  }
+  return beta;
+}
+function score(beta, x) {
+  var s = beta[0];
+  for (var i = 0; i < x.length; i++) s += beta[i + 1] * x[i];
+  return sigm(s);
+}
+
+/* ============================================================
+   Demo 1 — training-serving skew
+   ============================================================ */
+(function () {
+  var NF = 4, W = [1.2, -0.9, 0.7, -0.5], REPS = 12;
+  var $ = function (id) { return document.getElementById(id); };
+  var CASES = [
+    { label: "none \u2014 the same code", skew: {} },
+    { label: "rounds to one decimal", skew: { rounding: true } },
+    { label: "fills missing values with 0", skew: { nullZero: true } },
+    { label: "uses a 24-hour-old value", skew: { stale: true } },
+    { label: "off-by-one window boundary", skew: { window: true } },
+    { label: "all four", skew: { rounding: true, nullZero: true, stale: true, window: true } }
+  ];
+
+  function trueRows(n, rnd) {
+    var rows = [];
+    for (var i = 0; i < n; i++) {
+      var x = [];
+      for (var j = 0; j < NF; j++) x.push(gauss(rnd));
+      x[1] += 2.0;      /* not centred, so filling with 0 is not filling with the mean */
+      var isNull = rnd() < 0.12;
+      var z = -0.2;
+      for (var j2 = 0; j2 < NF; j2++) z += W[j2] * x[j2];
+      rows.push({ x: x, isNull: isNull, y: rnd() < sigm(z) ? 1 : 0, drift: gauss(rnd) });
+    }
+    return rows;
+  }
+  /* the batch pipeline: column-mean imputation, full precision, exact window */
+  function batchFeatures(rows) {
+    var m1 = avg(rows.filter(function (r) { return !r.isNull; }).map(function (r) { return r.x[1]; }));
+    return rows.map(function (r) {
+      var x = r.x.slice();
+      if (r.isNull) x[1] = m1;
+      return x;
+    });
+  }
+  /* the serving path, with each difference switchable */
+  function servingFeatures(rows, skew) {
+    var m1 = avg(rows.filter(function (r) { return !r.isNull; }).map(function (r) { return r.x[1]; }));
+    return rows.map(function (r) {
+      var x = r.x.slice();
+      if (r.isNull) x[1] = skew.nullZero ? 0 : m1;
+      if (skew.rounding) x[0] = Math.round(x[0] * 10) / 10;
+      if (skew.stale) x[2] = x[2] + 0.35 * r.drift;
+      if (skew.window) x[3] = x[3] * 0.92;
+      return x;
+    });
+  }
+
+  var cache = {};
+  function run(ci) {
+    if (cache[ci]) return cache[ci];
+    var skew = CASES[ci].skew, rnd = lcg(1001);
+    var off = [], on = [], flips = [], example = null;
+    for (var r = 0; r < REPS; r++) {
+      var tr = trueRows(4000, rnd), te = trueRows(4000, rnd);
+      var beta = fitLogit(batchFeatures(tr), tr.map(function (o) { return o.y; }), 1.0);
+      var Xoff = batchFeatures(te), Xon = servingFeatures(te, skew);
+      var soff = Xoff.map(function (x) { return score(beta, x); });
+      var son = Xon.map(function (x) { return score(beta, x); });
+      var yy = te.map(function (o) { return o.y; });
+      off.push(auc(soff, yy)); on.push(auc(son, yy));
+      var f = 0;
+      for (var i = 0; i < te.length; i++) if ((soff[i] > 0.5 ? 1 : 0) !== (son[i] > 0.5 ? 1 : 0)) f++;
+      flips.push(f / te.length);
+      if (!example) example = { soff: soff, son: son };
+    }
+    cache[ci] = { offline: avg(off), online: avg(on), flip: avg(flips), example: example };
+    return cache[ci];
+  }
+
+  function chart(ci) {
+    var W2 = 700, H = 190, B = 30, L = 44;
+    var d = run(ci), e = d.example;
+    var xOf = function (v) { return L + v * (W2 - L - 150); };
+    var yOf = function (v) { return (H - B) - v * (H - B - 26); };
+    var svg = ['<svg viewBox="0 0 ' + W2 + ' ' + H + '" width="' + W2 + '" height="' + H + '" role="img" aria-label="Offline score against served score, per case">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">WHAT THE MODEL SCORED OFFLINE, AGAINST WHAT IT SCORED IN SERVING</text>');
+    svg.push('<line x1="' + xOf(0) + '" y1="' + yOf(0) + '" x2="' + xOf(1) + '" y2="' + yOf(1) +
+      '" stroke="#CFD8E0" stroke-width="1.6" stroke-dasharray="4 3"/>');
+    svg.push('<line x1="' + xOf(0.5).toFixed(1) + '" y1="20" x2="' + xOf(0.5).toFixed(1) + '" y2="' + (H - B) +
+      '" stroke="#8FA0AF" stroke-width="1"/>');
+    svg.push('<line x1="' + L + '" y1="' + yOf(0.5).toFixed(1) + '" x2="' + (W2 - 146) + '" y2="' + yOf(0.5).toFixed(1) +
+      '" stroke="#8FA0AF" stroke-width="1"/>');
+    var step = Math.max(1, Math.floor(e.soff.length / 700));
+    for (var i = 0; i < e.soff.length; i += step) {
+      var flipped = (e.soff[i] > 0.5 ? 1 : 0) !== (e.son[i] > 0.5 ? 1 : 0);
+      svg.push('<circle cx="' + xOf(e.soff[i]).toFixed(1) + '" cy="' + yOf(e.son[i]).toFixed(1) +
+        '" r="' + (flipped ? 2.4 : 1.3) + '" fill="' + (flipped ? "#C0453A" : "#8FA0AF") +
+        '" opacity="' + (flipped ? 0.9 : 0.35) + '"/>');
+    }
+    [0, 0.5, 1].forEach(function (v) {
+      svg.push('<text x="' + xOf(v).toFixed(1) + '" y="' + (H - 12) + '" font-size="9" fill="#7C8B99" text-anchor="middle">' + v + '</text>');
+      svg.push('<text x="' + (L - 6) + '" y="' + (yOf(v) + 4).toFixed(1) + '" font-size="9" fill="#7C8B99" text-anchor="end">' + v + '</text>');
+    });
+    var px = W2 - 142;
+    svg.push('<text x="' + px + '" y="34" font-size="9.5" fill="#7C8B99">offline AUC</text>');
+    svg.push('<text x="' + px + '" y="52" font-size="13" font-weight="700" fill="#166B47">' + d.offline.toFixed(4) + '</text>');
+    svg.push('<text x="' + px + '" y="74" font-size="9.5" fill="#7C8B99">online AUC</text>');
+    svg.push('<text x="' + px + '" y="92" font-size="13" font-weight="700" fill="' +
+      (d.offline - d.online > 0.005 ? "#9B2C22" : "#166B47") + '">' + d.online.toFixed(4) + '</text>');
+    svg.push('<text x="' + px + '" y="114" font-size="9.5" fill="#7C8B99">decisions changed</text>');
+    svg.push('<text x="' + px + '" y="132" font-size="15" font-weight="700" fill="' +
+      (d.flip > 0.01 ? "#9B2C22" : "#166B47") + '">' + (d.flip * 100).toFixed(2) + '%</text>');
+    svg.push('<text x="0" y="' + (H - 1) + '" font-size="9.5" fill="#7C8B99">red points crossed the decision threshold \u2014 same case, same model, different answer</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var ci = +$("sk-case").value;
+    var d = run(ci), base = run(0);
+
+    $("sk-off").textContent = d.offline.toFixed(4);
+    $("sk-off-tile").className = "tile good";
+    $("sk-on").textContent = d.online.toFixed(4);
+    $("sk-on-sub").textContent = "lost " + (d.offline - d.online).toFixed(4);
+    $("sk-on-tile").className = "tile " + (d.offline - d.online > 0.005 ? "bad" : "good");
+    $("sk-flip").textContent = (d.flip * 100).toFixed(2) + "%";
+    $("sk-flip-tile").className = "tile " + (d.flip > 0.01 ? "bad" : "good");
+    $("sk-verd").textContent = ci === 0 ? "Nothing to see" : "No";
+    $("sk-verd-sub").textContent = ci === 0 ? "the paths are identical"
+      : "offline AUC unchanged at " + base.offline.toFixed(4);
+    $("sk-verd-tile").className = "tile " + (ci === 0 ? "good" : "bad");
+
+    $("sk-canvas").innerHTML = chart(ci);
+
+    var lines = [];
+    lines.push("One trained model, one test set, and two ways of computing the features it is scored on. The serving path here " +
+      CASES[ci].label + ".");
+
+    if (ci === 0) {
+      lines.push("With no difference the two paths agree exactly: the same AUC and zero decisions changed. That is the control \u2014 now introduce one of the small, locally-sensible differences a serving implementation actually makes.");
+    } else {
+      lines.push("The offline AUC is " + d.offline.toFixed(4) + ". It is " + base.offline.toFixed(4) +
+        " in EVERY setting of this demo \u2014 identically, not approximately \u2014 because the skew lives in the serving path and the offline evaluation never executes it. No amount of cross-validation or holdout discipline detects any of this.");
+      lines.push("What it actually costs: " + (d.offline - d.online).toFixed(4) + " of AUC, about " +
+        (((d.offline - d.online) / (d.offline - 0.5)) * 100).toFixed(1) +
+        "% of the model's skill above chance, and " + (d.flip * 100).toFixed(2) +
+        "% of cases decided differently. Neither figure appears in a model report.");
+      if (ci === 5) {
+        lines.push("Note which difference dominates. Rounding costs " + (run(1).offline - run(1).online).toFixed(4) +
+          " and the null fill costs " + (run(2).offline - run(2).online).toFixed(4) +
+          " \u2014 twelve times more than the stale value at " + (run(3).offline - run(3).online).toFixed(4) +
+          ". The intuition that a day-old feature is the risky one is not what the arithmetic says.");
+      }
+      lines.push("The only way to find this is to log the feature vectors serving actually received, recompute the same rows through the batch path, and compare. Any difference is skew \u2014 and once you have the served vectors, the online number above becomes measurable rather than hypothetical.");
+    }
+    $("sk-note").textContent = lines.join("\n\n");
+  }
+
+  $("sk-case").addEventListener("change", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — point-in-time correctness
+   ============================================================ */
+(function () {
+  var REPS = 12, HORIZON = 200;
+  var $ = function (id) { return document.getElementById(id); };
+
+  var cache = null;
+  function run() {
+    if (cache) return cache;
+    var rnd = lcg(1101);
+    var offPIT = [], offNaive = [], onPIT = [], onNaive = [], example = null;
+    for (var r = 0; r < REPS; r++) {
+      var N = 6000, rows = [];
+      for (var i = 0; i < N; i++) {
+        var rate = Math.exp(gauss(rnd) * 0.55);
+        var tEvent = 40 + Math.floor(rnd() * 120);
+        var countAtEvent = Math.max(0, Math.round(rate * tEvent + gauss(rnd) * 3));
+        var z = -0.9 + 0.024 * countAtEvent - 1.3 * Math.log(1 + rate) + 1.1 * gauss(rnd);
+        var churn = sigm(z) > rnd() ? 1 : 0;
+        /* a churner stops accumulating; others carry on to the reporting date */
+        var stopAt = churn ? tEvent + Math.floor(rnd() * 60) : HORIZON;
+        var countToday = Math.max(0, Math.round(rate * Math.min(stopAt, HORIZON) + gauss(rnd) * 3));
+        rows.push({ rate: rate, atEvent: countAtEvent, today: countToday, y: churn });
+      }
+      var half = Math.floor(N / 2), tr = rows.slice(0, half), te = rows.slice(half);
+      var feat = function (o, mode) {
+        return [Math.log(1 + (mode === "pit" ? o.atEvent : o.today)), Math.log(1 + o.rate)];
+      };
+      var yTr = tr.map(function (o) { return o.y; }), yTe = te.map(function (o) { return o.y; });
+      var bPIT = fitLogit(tr.map(function (o) { return feat(o, "pit"); }), yTr, 1.0);
+      var bNaive = fitLogit(tr.map(function (o) { return feat(o, "today"); }), yTr, 1.0);
+      /* offline: scored the same way the training set was built */
+      offPIT.push(auc(te.map(function (o) { return score(bPIT, feat(o, "pit")); }), yTe));
+      offNaive.push(auc(te.map(function (o) { return score(bNaive, feat(o, "today")); }), yTe));
+      /* online: only the as-of value exists at serving time, for either model */
+      onPIT.push(auc(te.map(function (o) { return score(bPIT, feat(o, "pit")); }), yTe));
+      onNaive.push(auc(te.map(function (o) { return score(bNaive, feat(o, "pit")); }), yTe));
+      if (!example) example = te.slice(0, 1200);
+    }
+    cache = {
+      pit: { off: avg(offPIT), on: avg(onPIT) },
+      naive: { off: avg(offNaive), on: avg(onNaive) },
+      example: example
+    };
+    return cache;
+  }
+
+  function chart(mode) {
+    var W = 700, H = 190, B = 30, L = 46;
+    var d = run(), e = d.example;
+    var key = mode === "pit" ? "atEvent" : "today";
+    var vals = e.map(function (o) { return Math.log(1 + o[key]); });
+    var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+    var bins = 26, ch = new Array(bins).fill(0), no = new Array(bins).fill(0);
+    e.forEach(function (o) {
+      var b = Math.min(bins - 1, Math.floor((Math.log(1 + o[key]) - lo) / (hi - lo + 1e-9) * bins));
+      if (o.y) ch[b]++; else no[b]++;
+    });
+    var mx = Math.max(Math.max.apply(null, ch), Math.max.apply(null, no)) || 1;
+    var xOf = function (i) { return L + (i + 0.5) / bins * (W - L - 150); };
+    var yOf = function (v) { return (H - B) - v / mx * (H - B - 26); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Feature distribution for churners and non-churners">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">THE FEATURE, ' +
+      (mode === "pit" ? "AS OF THE EVENT" : "AS OF TODAY") + ', FOR CHURNERS AND NON-CHURNERS</text>');
+    for (var i = 0; i < bins; i++) {
+      if (no[i]) svg.push('<rect x="' + (xOf(i) - 7).toFixed(1) + '" y="' + yOf(no[i]).toFixed(1) +
+        '" width="6.5" height="' + Math.max(0.8, (H - B) - yOf(no[i])).toFixed(1) + '" fill="#20456A" opacity="0.8"/>');
+      if (ch[i]) svg.push('<rect x="' + (xOf(i) + 0.5).toFixed(1) + '" y="' + yOf(ch[i]).toFixed(1) +
+        '" width="6.5" height="' + Math.max(0.8, (H - B) - yOf(ch[i])).toFixed(1) + '" fill="#C0453A" opacity="0.85"/>');
+    }
+    var px = W - 142;
+    svg.push('<rect x="' + px + '" y="28" width="12" height="9" fill="#20456A" opacity="0.8"/>');
+    svg.push('<text x="' + (px + 18) + '" y="36" font-size="9" fill="#54677A">stayed</text>');
+    svg.push('<rect x="' + px + '" y="44" width="12" height="9" fill="#C0453A" opacity="0.85"/>');
+    svg.push('<text x="' + (px + 18) + '" y="52" font-size="9" fill="#54677A">churned</text>');
+    var m = mode === "pit" ? d.pit : d.naive;
+    svg.push('<text x="' + px + '" y="80" font-size="9.5" fill="#7C8B99">offline</text>');
+    svg.push('<text x="' + px + '" y="98" font-size="13" font-weight="700" fill="#166B47">' + m.off.toFixed(4) + '</text>');
+    svg.push('<text x="' + px + '" y="118" font-size="9.5" fill="#7C8B99">online</text>');
+    svg.push('<text x="' + px + '" y="136" font-size="13" font-weight="700" fill="' +
+      (m.on < 0.5 ? "#9B2C22" : "#166B47") + '">' + m.on.toFixed(4) + '</text>');
+    svg.push('<text x="0" y="' + (H - 12) + '" font-size="9" fill="#7C8B99">low \u2192 high</text>');
+    svg.push('<text x="0" y="' + (H - 1) + '" font-size="9.5" fill="' + (mode === "pit" ? "#166B47" : "#9B2C22") + '">' +
+      (mode === "pit"
+        ? "as of the event the two groups overlap, and the model has to work for its 0.7363"
+        : "as of today the churners are separated \u2014 because they stopped accumulating after churning") + '</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var mode = $("pt-mode").value;
+    var d = run(), m = mode === "pit" ? d.pit : d.naive;
+
+    $("pt-off").textContent = m.off.toFixed(4);
+    $("pt-off-tile").className = "tile " + (mode === "pit" ? "good" : "bad");
+    $("pt-on").textContent = m.on.toFixed(4);
+    $("pt-on-tile").className = "tile " + (m.on > 0.5 ? "good" : "bad");
+    $("pt-gap").textContent = (m.off - m.on).toFixed(4);
+    $("pt-gap-tile").className = "tile " + (Math.abs(m.off - m.on) < 0.01 ? "good" : "bad");
+    $("pt-verd").textContent = mode === "pit" ? "Honest" : "Inverted";
+    $("pt-verd-sub").textContent = mode === "pit" ? "offline predicts online"
+      : "below 0.5 in production";
+    $("pt-verd-tile").className = "tile " + (mode === "pit" ? "good" : "bad");
+
+    $("pt-canvas").innerHTML = chart(mode);
+
+    var lines = [];
+    lines.push("A churn model with two features: purchases so far, and the user's rate. Labels come from events scattered through the past, and the question is which value of \u201cpurchases so far\u201d gets joined to a label from three months ago.");
+
+    if (mode === "pit") {
+      lines.push("Using the value AS OF THE EVENT gives an offline AUC of " + d.pit.off.toFixed(4) +
+        " and an online AUC of " + d.pit.on.toFixed(4) + " \u2014 a gap of " +
+        (d.pit.off - d.pit.on).toFixed(4) + ".");
+      lines.push("That zero is structural rather than lucky. If the training set is assembled from exactly the values serving would have seen, offline evaluation IS a simulation of production, and there is no gap to have. Now switch to the join people actually write.");
+    } else {
+      lines.push("Joining to TODAY'S feature table gives an offline AUC of " + d.naive.off.toFixed(4) +
+        " \u2014 far better than the correct build's " + d.pit.off.toFixed(4) +
+        ", and the model that wins any bake-off between them.");
+      lines.push("In production it scores " + d.naive.on.toFixed(4) + ", which is BELOW 0.5. It is not merely useless \u2014 it is inverted. A user who churned stopped accumulating purchases, so their count today is low, and the model learned that a low count means churn. At serving time it sees the count as of NOW, when the future churners have not yet stopped and their counts look perfectly healthy. The relationship it learned runs backwards from the one it faces.");
+      lines.push("Nothing was joined wrongly. No key was duplicated, no row was dropped, and every value in that training set was a genuine value of the feature. It was read at the wrong MOMENT.");
+      lines.push("The chart shows the mechanism directly: as of today the two groups separate cleanly, which is the leak. As of the event they overlap, which is what the real problem looks like.");
+    }
+    $("pt-note").textContent = lines.join("\n\n");
+  }
+
+  $("pt-mode").addEventListener("change", render);
+  render();
+})();
+
+initChapter("07-features.html");
+</script>
+</body>
+</html>

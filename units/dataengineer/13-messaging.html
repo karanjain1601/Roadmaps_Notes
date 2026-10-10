@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Messaging and streaming logs — Data Engineer</title>
+<meta name="description" content="Queues against logs, Kafka's partitions offsets and consumer groups, key skew, and what at-most-once, at-least-once and exactly-once actually promise.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">Data Engineer</a> <span>/</span> Chapter 13</p>
+    <p class="chnum">CHAPTER 13</p>
+    <h1>Messaging and streaming logs</h1>
+    <p class="lede">Two things get called message brokers and they are structurally different: a queue hands work out and forgets it, a log records events and remembers them. Confusing the two is the source of most surprise in this area, along with a persistent misunderstanding of what exactly-once delivery can possibly mean.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~28 min</b> read</div>
+      <div><b>Part 4</b> Moving data</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="two">
+      <p class="kicker">THE DISTINCTION</p>
+      <h2>Queues and logs</h2>
+      <p class="sub">Both move messages between systems. What happens after a message is read is completely different, and it determines what each is good for.</p>
+
+      <div class="cols">
+        <div>
+          <h4>A queue distributes work</h4>
+          <p>A message is delivered to one consumer, acknowledged, and <strong>deleted</strong>. The queue is a work list: its natural length is zero, and a growing queue means you are falling behind. Consumers are interchangeable workers and messages need not be ordered relative to each other.</p>
+          <p>RabbitMQ, SQS, Celery, most job systems.</p>
+        </div>
+        <div>
+          <h4>A log records history</h4>
+          <p>A message is appended to an ordered, immutable sequence and <strong>retained</strong> for a configured period. Reading does not consume it. Each consumer tracks its own position, so several independent consumers read the same messages, and a consumer can rewind.</p>
+          <p>Kafka, Kinesis, Pulsar, and the write-ahead logs of chapter 5.</p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>The consequences of that one difference</caption>
+          <thead>
+            <tr><th></th><th>Queue</th><th>Log</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>After reading</td><td>Deleted</td><td>Retained</td></tr>
+            <tr><td>Consumers per message</td><td>One</td><td>Any number, independently</td></tr>
+            <tr><td>Replay</td><td>Impossible</td><td>Reset the offset</td></tr>
+            <tr><td>Ordering</td><td>Best effort, lost under concurrency</td><td>Total within a partition</td></tr>
+            <tr><td>Healthy depth</td><td>Zero</td><td>Whatever retention allows</td></tr>
+            <tr><td>Adding a consumer later</td><td>Sees only new messages</td><td>Can start from the beginning</td></tr>
+            <tr><td>Per-message routing and priority</td><td>Rich</td><td>Essentially none</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>Why data engineering mostly wants a log</b>
+        <p>The replay row decides it. A pipeline whose input is deleted on read has no recovery path when the transformation turns out to be wrong &mdash; which is <a href="12-batch-ingestion.html">chapter 12</a>'s argument for a landing zone, and a log <em>is</em> a landing zone with an ordering guarantee. Adding a new consumer that can read history is the other decisive property: with a queue, a new use case starts from today.</p>
+        <p>Queues remain the right answer for actual work distribution: send this email, resize this image, charge this card. If the message is a task rather than a fact, you want a queue.</p>
+      </div>
+    </section>
+
+    <section id="log">
+      <p class="kicker">THE MODEL</p>
+      <h2>Partitions, offsets and consumer groups</h2>
+      <p class="sub">Four concepts. Everything else about operating a log follows from how they interact.</p>
+
+      <div class="terms">
+        <dt>Topic and partition</dt>
+        <dd>A topic is a named stream, divided into partitions. <strong>A partition is the unit of ordering and the unit of parallelism</strong>, and those two facts being the same fact is the central design tension of the whole system. Each partition is an append-only sequence on disk.</dd>
+
+        <dt>Offset</dt>
+        <dd>A message's position within its partition. Monotonic, per-partition, and assigned by the broker &mdash; the same role the LSN played in <a href="05-change-data-capture.html">chapter 5</a>. A consumer's progress is entirely described by one offset per partition.</dd>
+
+        <dt>Consumer group</dt>
+        <dd>A set of consumers sharing the work of a topic. The coordinator assigns each partition to exactly one member. Different groups are independent, each with its own offsets, which is how one topic feeds a warehouse loader, a fraud model and a search indexer without them interfering.</dd>
+
+        <dt>Retention</dt>
+        <dd>How long messages are kept: by time, by size, or by <strong>compaction</strong>, which retains only the most recent message per key. Compaction is what makes a topic converge to a snapshot of current state, and it is why the tombstones of chapter 5 exist.</dd>
+      </div>
+
+      <p>The consequence that catches people is stated plainly: <strong>a partition goes to exactly one consumer in a group.</strong> So a group can never have more useful consumers than there are partitions, and ordering only holds within a partition. Both halves of that are the subject of the next section.</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">topology.txt</span><button class="code-copy">Copy</button></div>
+        <pre><code data-lang="python">topic: orders, 4 partitions
+
+  p0  [ o0 o1 o2 o3 ... ]   <- append only, ordered
+  p1  [ o0 o1 o2 ... ]
+  p2  [ o0 o1 o2 o3 o4 ... ]
+  p3  [ o0 o1 ... ]
+
+group "warehouse-loader"   c1 -> p0,p1    c2 -> p2,p3
+group "fraud-model"        c1 -> p0,p1,p2,p3      (own offsets)</code></pre>
+      </div>
+    </section>
+
+    <section id="keys">
+      <p class="kicker">WHERE THROUGHPUT GOES</p>
+      <h2>Keys, partitions and skew</h2>
+      <p class="sub">A message's key decides its partition, which decides its ordering and which consumer handles it. Choose the key badly and no amount of scaling helps.</p>
+
+      <p>A producer with a key hashes it and takes the modulus of the partition count, so all messages with the same key land in the same partition and are therefore ordered relative to each other. That is exactly the property <a href="05-change-data-capture.html">chapter 5</a> required for a CDC stream: partition by primary key and a row's changes stay in order.</p>
+
+      <p>The cost is that load follows the key distribution rather than being balanced by the system. The demo hashes real keys into partitions and works out where the throughput ceiling actually sits.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Partition load, consumer assignment and the throughput ceiling</b>
+          <span>100,000 messages hashed by key, assigned as a group coordinator would</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Distinct keys
+              <select id="pk-keys">
+                <option value="8">8</option>
+                <option value="60">60</option>
+                <option value="1000" selected>1,000</option>
+              </select>
+            </label>
+            <label>Key skew
+              <input type="range" id="pk-skew" min="0" max="25" step="1" value="0">
+              <output id="pk-skew-o">uniform</output>
+            </label>
+            <label>Partitions
+              <select id="pk-parts">
+                <option value="4">4</option>
+                <option value="12" selected>12</option>
+                <option value="48">48</option>
+                <option value="256">256</option>
+              </select>
+            </label>
+            <label>Consumers in the group
+              <input type="range" id="pk-cons" min="1" max="32" step="1" value="6">
+              <output id="pk-cons-o">6</output>
+            </label>
+          </div>
+
+          <div class="canvas" id="pk-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="pk-idle-tile"><i>IDLE CONSUMERS</i><b id="pk-idle">0</b><s id="pk-idle-sub"></s></div>
+            <div class="tile" id="pk-skew-tile"><i>PARTITION SKEW</i><b id="pk-skewv">0</b><s>busiest over mean</s></div>
+            <div class="tile"><i>BUSIEST PARTITION</i><b id="pk-max">0</b><s id="pk-max-sub"></s></div>
+            <div class="tile hi"><i>THROUGHPUT CEILING</i><b id="pk-tput">0</b><s>limited by one consumer</s></div>
+            <div class="tile" id="pk-floor-tile"><i>HOTTEST KEY</i><b id="pk-floor">0</b><s id="pk-floor-sub"></s></div>
+          </div>
+
+          <p class="readout" id="pk-note"></p>
+        </div>
+      </div>
+
+      <p>Four results, and the third is the one worth remembering.</p>
+
+      <ol>
+        <li><strong>Consumers beyond the partition count do nothing.</strong> Twelve partitions and twenty-four consumers leaves twelve sitting idle, holding a group membership and consuming no messages. Scaling a consumer deployment past the partition count is a no-op that looks like capacity.</li>
+        <li><strong>More partitions balance <em>worse</em> for a fixed number of keys.</strong> With a thousand uniform keys the skew is 1.06 at four partitions, 1.19 at twelve, 1.60 at sixty-four and 2.56 at two hundred and fifty-six — because fewer keys per partition means less averaging. Over-partitioning is not free.</li>
+        <li><strong>Partition count cannot fix key skew.</strong> Set the keys to eight and the skew high, so one key carries about 76% of the traffic. The busiest partition holds 76,486 messages at four partitions and 76,066 at every count from twelve upward &mdash; the hot key itself is the floor. The hot key is a hard floor, because a key cannot be split across partitions without giving up the ordering that was the reason for keying in the first place.</li>
+        <li><strong>The ceiling is set by the busiest consumer, not the average.</strong> Throughput is total work divided by the slowest member's share, so a single hot partition caps the whole group however much you add elsewhere.</li>
+      </ol>
+
+      <div class="note trap">
+        <b>What to do about a hot key</b>
+        <p>There is no configuration fix; the options all involve giving something up. <strong>Salt the key</strong> &mdash; append a random suffix from a small range &mdash; which spreads the load and destroys per-key ordering. <strong>Split by a compound key</strong> if a finer grain still satisfies your ordering requirement. <strong>Handle the hot key separately</strong> with a dedicated consumer and a different code path. Or <strong>accept it</strong> and size that one partition's consumer for the peak.</p>
+        <p>Deciding requires knowing what the ordering guarantee is actually for. If nothing downstream depends on per-key order, you should not have been keying at all.</p>
+      </div>
+
+      <p>One operational note that follows from the modulus. <strong>Changing the partition count re-maps every key</strong>, because <code>hash(key) % 12</code> and <code>hash(key) % 24</code> put the same key in different places. Messages already written stay where they are, so for a period the same key exists in two partitions with no ordering between them. Partition counts can be increased and are painful to change; choose with headroom.</p>
+    </section>
+
+    <section id="delivery">
+      <p class="kicker">THE CLAIMS</p>
+      <h2>Delivery semantics, precisely</h2>
+      <p class="sub">Three phrases, one of which is routinely oversold. The difference between them is entirely about when you record your progress.</p>
+
+      <p>A consumer does two things: process a message, and record that it has done so by committing an offset. The order of those two operations is the whole subject.</p>
+
+      <div class="terms">
+        <dt>At-most-once</dt>
+        <dd>Commit the offset first, then process. A crash between the two means the message is never processed and never redelivered, because the offset has already moved past it. <strong>Loses messages, never duplicates.</strong></dd>
+
+        <dt>At-least-once</dt>
+        <dd>Process first, then commit. A crash between the two means the message is redelivered and processed again. <strong>Duplicates messages, never loses them.</strong> The sane default, and what essentially every system gives you unless you work at it.</dd>
+
+        <dt>Exactly-once</dt>
+        <dd>Neither loss nor duplication. Achievable, with conditions that matter, and discussed below.</dd>
+      </div>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Two thousand messages through crashes</b>
+          <span>offset committed before or after processing, with an optional deduplication store</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Semantics
+              <select id="dl-mode">
+                <option value="at-most-once">At-most-once (commit first)</option>
+                <option value="at-least-once" selected>At-least-once (commit after)</option>
+              </select>
+            </label>
+            <label>Batch size
+              <select id="dl-batch">
+                <option value="20">20</option>
+                <option value="100" selected>100</option>
+                <option value="500">500</option>
+              </select>
+            </label>
+            <label>Crash every
+              <select id="dl-crash">
+                <option value="0">never</option>
+                <option value="5" selected>5th batch</option>
+                <option value="2">2nd batch</option>
+              </select>
+            </label>
+            <label>Deduplication window
+              <select id="dl-dedup">
+                <option value="0" selected>none</option>
+                <option value="20">20 message ids</option>
+                <option value="200">200 message ids</option>
+                <option value="2000">2,000 message ids</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="dl-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>APPLIED</i><b id="dl-applied">0</b><s>correct is 2,000</s></div>
+            <div class="tile" id="dl-lost-tile"><i>LOST</i><b id="dl-lost">0</b><s>never processed</s></div>
+            <div class="tile" id="dl-dup-tile"><i>DUPLICATED</i><b id="dl-dup">0</b><s>processed twice</s></div>
+            <div class="tile" id="dl-ok-tile"><i>RESULT</i><b id="dl-ok">&mdash;</b><s id="dl-ok-sub"></s></div>
+          </div>
+
+          <p class="readout" id="dl-note"></p>
+        </div>
+      </div>
+
+      <p>The demo makes the trade concrete and then makes the escape visible. At-most-once loses 160 of 2,000 messages and duplicates none. At-least-once duplicates 240 and loses none. A deduplication store covering 200 message ids gives neither — but a window of 20 ids against batches of 100 leaks all 240 duplicates straight through, because the redelivery span is wider than the memory.</p>
+
+      <div class="note key">
+        <b>What exactly-once actually means</b>
+        <p>Two genuinely different things are sold under the phrase.</p>
+        <p><strong>Exactly-once processing within one system.</strong> Kafka transactions let a consumer read, process and write &mdash; to Kafka &mdash; atomically, committing the output and the offset together. This is real and it works. Its boundary is the system: as soon as your side effect is a database write, an HTTP call or an email, the transaction cannot cover it.</p>
+        <p><strong>Effectively-once end to end</strong>, which is at-least-once delivery plus an idempotent consumer. This is the only thing available when the side effect leaves the broker, and it is what the dedup column in the demo models. It is also exactly the LSN-guarded upsert from <a href="05-change-data-capture.html">chapter 5</a> and the atomic partition write from <a href="12-batch-ingestion.html">chapter 12</a> &mdash; the same answer arriving for the third time.</p>
+      </div>
+
+      <p>So the practical instruction is the one this unit keeps repeating: <strong>stop trying to make delivery exact and make the effect idempotent.</strong> A dedup store then becomes an optimisation rather than a correctness requirement, which matters because a dedup store is a stateful component with a retention window that will eventually be too short.</p>
+    </section>
+
+    <section id="brokers">
+      <p class="kicker">THE PRODUCTS</p>
+      <h2>What to use</h2>
+
+      <div class="tw">
+        <table>
+          <caption>The systems you are likely to meet, and where each is the right answer</caption>
+          <thead>
+            <tr><th>System</th><th>Shape</th><th>Strength</th><th>Reach for it when</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>Kafka</strong></td><td>Log</td><td>Throughput, retention, replay, ecosystem</td><td>Event streams feeding several consumers, CDC transport, anything you may want to replay</td></tr>
+            <tr><td><strong>RabbitMQ</strong></td><td>Queue</td><td>Routing, priorities, per-message TTL, delayed delivery</td><td>Task distribution with real routing logic</td></tr>
+            <tr><td><strong>SQS</strong></td><td>Queue</td><td>Zero operations, effectively infinite scale</td><td>Work queues on AWS where you do not want to run anything</td></tr>
+            <tr><td><strong>SNS</strong></td><td>Fan-out</td><td>One publish to many subscribers</td><td>Notifying several systems, usually in front of SQS queues</td></tr>
+            <tr><td><strong>Kinesis</strong></td><td>Log</td><td>Managed, AWS-native</td><td>Kafka's shape without running Kafka, if you are on AWS</td></tr>
+            <tr><td><strong>Pulsar</strong></td><td>Both</td><td>Queue and log semantics, tiered storage, multi-tenancy</td><td>You genuinely need both models and can afford the operational surface</td></tr>
+            <tr><td><strong>Postgres</strong></td><td>Queue</td><td>It is already there, and transactional with your data</td><td>Modest volumes. <code>SELECT ... FOR UPDATE SKIP LOCKED</code> is a real queue and chapter 3's arithmetic applies</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note tip">
+        <b>The unfashionable answer that is often right</b>
+        <p>Under a few thousand messages a second, a table in the database you already run is a perfectly good queue, and it has one property no broker can offer: the enqueue is <em>in the same transaction</em> as the data change that caused it. That eliminates the dual-write problem entirely &mdash; the situation where you commit a row and then fail to publish the event, leaving the two permanently disagreeing. Reaching for Kafka to avoid a database table frequently introduces that problem in exchange for scale you do not need.</p>
+        <p>The pattern that solves it properly when you do need a broker is the <strong>transactional outbox</strong>: write the event to a table in the same transaction as the data, and have a separate process ship the table to the broker. Which is CDC, applied to your own outbox.</p>
+      </div>
+    </section>
+
+    <section id="operating">
+      <p class="kicker">RUNNING IT</p>
+      <h2>Four things you will have to manage</h2>
+
+      <div class="terms">
+        <dt>Consumer lag</dt>
+        <dd>The gap between the latest offset and the consumer's committed offset, in messages and in time. The single most important metric on a log, and it should be alerted on in <em>seconds behind</em> rather than message count, because message count is meaningless across a volume change. Lag rising steadily means throughput is insufficient; lag sawtoothing means a batch or rebalance pattern.</dd>
+
+        <dt>Retention against replay need</dt>
+        <dd>Retention is your recovery window. Seven days of retention means you can rebuild a consumer's state from up to seven days ago and no further, so a bug found on day eight is unrecoverable from the log. Set retention from the recovery you want, not from disk convenience &mdash; and note that compacted topics keep the latest value per key indefinitely, which is a different guarantee.</dd>
+
+        <dt>Rebalancing</dt>
+        <dd>When a consumer joins, leaves or is presumed dead, partitions are reassigned and consumption pauses. A consumer whose processing occasionally exceeds the poll timeout is declared dead, triggering a rebalance, which slows everyone, which causes more timeouts. Cooperative and static assignment exist specifically to limit this; if you see repeated rebalances, look at processing time per poll before anything else.</dd>
+
+        <dt>Poison messages</dt>
+        <dd>A message that always fails will be retried forever and block its partition, since offsets advance in order. A dead-letter topic with a bounded retry count is not optional. Attach the original topic, partition, offset and the error, or triage is guesswork.</dd>
+      </div>
+
+      <p>Backpressure deserves a note because logs and queues handle it oppositely. A queue applies backpressure by growing until the producer notices or is throttled. A log does not push back at all — it accepts writes at broker speed and lets the consumer fall behind, which is a feature: a traffic spike becomes lag rather than a rejected write. The failure mode is that lag exceeds retention, at which point the consumer's next read fails because the data it wanted has been deleted, and it has silently skipped a gap. <strong>Alert on lag approaching retention</strong>, not just on lag.</p>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>A queue distributes work and deletes it; a log records history and retains it.</b> Data engineering usually wants a log, because replay and independent consumers are the properties that matter.</li>
+          <li><b>A partition is both the unit of ordering and the unit of parallelism,</b> and that coincidence is the source of most difficulty.</li>
+          <li><b>Consumers beyond the partition count are idle.</b> Twenty-four consumers on twelve partitions leaves twelve doing nothing.</li>
+          <li><b>More partitions balance worse for a fixed key count</b> &mdash; skew 1.06 at four partitions rising to 2.56 at two hundred and fifty-six, with a thousand uniform keys.</li>
+          <li><b>Partition count cannot fix key skew.</b> With one key holding 76% of traffic, the busiest partition holds 76,486 messages at four partitions and 76,066 at every count from twelve to 1,024. The hot key is a hard floor.</li>
+          <li><b>Throughput is set by the busiest consumer,</b> so one hot partition caps the whole group.</li>
+          <li><b>Changing the partition count re-maps every key,</b> so the same key temporarily lives in two partitions with no ordering between them.</li>
+          <li><b>At-most-once loses and never duplicates; at-least-once duplicates and never loses.</b> Measured: 160 lost against 240 duplicated on the same 2,000 messages.</li>
+          <li><b>A dedup store only works within its window.</b> Twenty ids against batches of a hundred leaked every one of the 240 duplicates.</li>
+          <li><b>Exactly-once is two claims.</b> Transactional processing within one system is real and bounded by that system; end to end you get at-least-once plus an idempotent consumer, which is the same answer as chapters 5 and 12.</li>
+          <li><b>A database table is a legitimate queue at modest volume,</b> and uniquely lets the enqueue share a transaction with the data change. Otherwise use a transactional outbox.</li>
+          <li><b>Alert on lag in seconds, and on lag approaching retention.</b> Exceeding retention means the consumer silently skips a gap.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="14-stream-processing.html">Chapter 14 &mdash; Stream processing</a>. Event time against processing time, windows, watermarks, and the stateful joins that make streaming genuinely hard.</p>
+          </div>
+          <div class="fi">
+            <i>BUILDS ON</i>
+            <p>The partition-by-key requirement and the LSN-guarded apply are <a href="05-change-data-capture.html">chapter 5</a>; the idempotency argument is <a href="12-batch-ingestion.html">chapter 12</a>. This chapter is where both become one rule.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>On your busiest topic, compare messages per partition rather than the total. If the ratio between the busiest and the mean is above about two, you have key skew and adding consumers will not help.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Demo 1 — partition load, assignment and the throughput ceiling
+   ============================================================ */
+(function () {
+  var TOTAL = 100000, RATE = 5000;   /* messages, and messages/sec per consumer */
+  var $ = function (id) { return document.getElementById(id); };
+
+  /* FNV-1a alone has weak low bits, so `% smallPartitionCount` clusters.
+     A murmur-style final avalanche fixes it, which is why Kafka uses murmur2. */
+  function hash(str) {
+    var h = 2166136261;
+    for (var i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b);
+    h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35);
+    h ^= h >>> 16;
+    return h >>> 0;
+  }
+
+  function keyLoads(nKeys, skew) {
+    var w = [], sum = 0;
+    for (var i = 1; i <= nKeys; i++) { var v = 1 / Math.pow(i, skew); w.push(v); sum += v; }
+    return w.map(function (v, i) { return { key: "k" + (i + 1), msgs: Math.round(TOTAL * v / sum) }; });
+  }
+
+  function assign(keys, parts, consumers) {
+    var pload = [];
+    for (var i = 0; i < parts; i++) pload.push(0);
+    keys.forEach(function (k) { pload[hash(k.key) % parts] += k.msgs; });
+    var cload = [], owner = [];
+    for (var c = 0; c < consumers; c++) cload.push(0);
+    for (var p = 0; p < parts; p++) { var cc = p % consumers; cload[cc] += pload[p]; owner.push(cc); }
+    var total = pload.reduce(function (a, b) { return a + b; }, 0);
+    var maxP = Math.max.apply(null, pload), maxC = Math.max.apply(null, cload);
+    return { pload: pload, cload: cload, owner: owner,
+             idle: Math.max(0, consumers - parts), total: total,
+             maxP: maxP, maxC: maxC, skew: maxP / (total / parts),
+             tput: maxC > 0 ? total / (maxC / RATE) : 0 };
+  }
+
+  function chart(a, parts, consumers) {
+    var W = 700, H = 132, L = 8;
+    var shown = Math.min(parts, 64);
+    var bw = (W - L - 12) / shown;
+    var max = Math.max.apply(null, a.pload);
+    var cols = ["#20456A", "#2E8B5F", "#E0699F", "#D9A24A", "#7C8CF8", "#C0453A"];
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Messages per partition, coloured by owning consumer">'];
+    svg.push('<text x="' + L + '" y="11" font-size="10" font-weight="700" fill="#7C8B99">MESSAGES PER PARTITION' +
+      (parts > 64 ? ' (FIRST 64 OF ' + parts + ')' : '') + ' &middot; COLOUR IS THE OWNING CONSUMER</text>');
+    var mean = a.total / parts;
+    var yOf = function (v) { return (H - 26) - v / max * (H - 26 - 18); };
+    svg.push('<line x1="' + L + '" y1="' + yOf(mean) + '" x2="' + (W - 12) + '" y2="' + yOf(mean) +
+      '" stroke="#0C1D30" stroke-width="1.2" stroke-dasharray="4 3"/>');
+    svg.push('<text x="' + (W - 14) + '" y="' + (yOf(mean) - 4) + '" font-size="9.5" fill="#0C1D30" text-anchor="end">mean</text>');
+    for (var i = 0; i < shown; i++) {
+      var x = L + i * bw, y = yOf(a.pload[i]);
+      svg.push('<rect x="' + (x + 0.5).toFixed(1) + '" y="' + y.toFixed(1) + '" width="' + Math.max(1, bw - 1).toFixed(1) +
+        '" height="' + ((H - 26) - y).toFixed(1) + '" fill="' + cols[a.owner[i] % cols.length] + '"/>');
+    }
+    svg.push('<text x="' + L + '" y="' + (H - 4) + '" font-size="9.5" fill="#7C8B99">' +
+      (a.idle > 0 ? a.idle + " consumer" + (a.idle === 1 ? "" : "s") + " assigned no partition at all" :
+       "every consumer holds at least one partition") + '</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var nKeys = +$("pk-keys").value, skew = +$("pk-skew").value / 10;
+    var parts = +$("pk-parts").value, cons = +$("pk-cons").value;
+    $("pk-skew-o").textContent = skew === 0 ? "uniform" : skew.toFixed(1);
+    $("pk-cons-o").textContent = cons;
+
+    var keys = keyLoads(nKeys, skew);
+    var a = assign(keys, parts, cons);
+    var hottest = keys.reduce(function (m, k) { return k.msgs > m.msgs ? k : m; }, keys[0]);
+
+    $("pk-idle").textContent = a.idle;
+    $("pk-idle-sub").textContent = "of " + cons + " consumers";
+    $("pk-idle-tile").className = "tile " + (a.idle > 0 ? "bad" : "good");
+    $("pk-skewv").textContent = a.skew.toFixed(2) + "\u00d7";
+    $("pk-skew-tile").className = "tile " + (a.skew > 2 ? "bad" : a.skew < 1.3 ? "good" : "");
+    $("pk-max").textContent = a.maxP.toLocaleString();
+    $("pk-max-sub").textContent = "mean " + Math.round(a.total / parts).toLocaleString();
+    $("pk-tput").textContent = Math.round(a.tput).toLocaleString() + "/s";
+    $("pk-floor").textContent = hottest.msgs.toLocaleString();
+    $("pk-floor-sub").textContent = (hottest.msgs / TOTAL * 100).toFixed(1) + "% of all traffic";
+    $("pk-floor-tile").className = "tile " + (hottest.msgs / TOTAL > 0.2 ? "bad" : "");
+
+    $("pk-canvas").innerHTML = chart(a, parts, cons);
+
+    var lines = [];
+    lines.push(nKeys.toLocaleString() + " keys across " + parts + " partitions and " + cons +
+      " consumers. The busiest partition holds " + a.maxP.toLocaleString() + " messages against a mean of " +
+      Math.round(a.total / parts).toLocaleString() + " \u2014 a skew of " + a.skew.toFixed(2) +
+      ". Throughput is capped at " + Math.round(a.tput).toLocaleString() +
+      "/s, set by the busiest consumer rather than the average.");
+
+    if (a.idle > 0) {
+      lines.push(a.idle + " of the " + cons + " consumers are assigned no partition and process nothing. " +
+        "A partition goes to exactly one member of a group, so the group can never usefully exceed " + parts +
+        " consumers. Scaling the deployment past that looks like capacity and is a no-op.");
+    }
+
+    if (hottest.msgs / TOTAL > 0.15) {
+      var big = assign(keys, 1024, Math.min(1024, 64));
+      lines.push("One key carries " + (hottest.msgs / TOTAL * 100).toFixed(1) + "% of the traffic, and that is a hard floor: at " +
+        parts + " partitions the busiest holds " + a.maxP.toLocaleString() + ", and at 1,024 partitions it still holds " +
+        big.maxP.toLocaleString() + ". A key cannot be split across partitions without giving up the per-key ordering that was the reason for keying. Adding partitions here buys nothing at all.");
+      lines.push("The fixes all cost something: salt the key and lose ordering, use a finer compound key if that still satisfies your guarantee, route the hot key to a dedicated consumer, or size for the peak. Choosing requires knowing what the ordering is actually for \u2014 and if nothing downstream depends on it, you should not be keying.");
+    } else if (skew === 0) {
+      var s4 = assign(keys, 4, 4).skew, s256 = assign(keys, 256, 64).skew;
+      lines.push("With uniform keys the load is close to even, and note the direction: skew is " +
+        s4.toFixed(2) + " at 4 partitions and " + s256.toFixed(2) +
+        " at 256. More partitions balance worse for a fixed key count, because fewer keys land in each partition and the per-key noise no longer averages out. Over-partitioning is not a free hedge.");
+    }
+    $("pk-note").textContent = lines.join("\n\n");
+  }
+
+  ["pk-keys", "pk-skew", "pk-parts", "pk-cons"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — delivery semantics through crashes
+   ============================================================ */
+(function () {
+  var N = 2000;
+  var $ = function (id) { return document.getElementById(id); };
+
+  function deliver(mode, batch, crashEvery, dedupWindow) {
+    var processed = {}, applied = 0, dup = 0, lost = 0, seen = [];
+    var offset = 0, batchNo = 0, events = [], guard = 0;
+
+    while (offset < N && guard++ < 10000) {
+      batchNo++;
+      var end = Math.min(N, offset + batch);
+      var crash = crashEvery > 0 && batchNo % crashEvery === 0;
+      var mid = crash ? offset + Math.floor(batch * 0.6) : end;
+
+      if (mode === "at-most-once") {
+        var from = offset;
+        offset = end;                                   /* commit before processing */
+        for (var i = from; i < mid; i++) applied++;
+        if (crash) { lost += end - mid; events.push({ at: batchNo, kind: "lost", n: end - mid }); }
+        continue;
+      }
+
+      for (var j = offset; j < mid; j++) {
+        if (dedupWindow > 0 && seen.indexOf(j) >= 0) continue;   /* suppressed */
+        applied++;
+        if (dedupWindow > 0) { seen.push(j); if (seen.length > dedupWindow) seen.shift(); }
+        if (processed[j]) { dup++; }
+        processed[j] = (processed[j] || 0) + 1;
+      }
+      if (crash) {
+        events.push({ at: batchNo, kind: "redeliver", n: mid - offset });
+        /* offset not committed, so the batch is redelivered from its start */
+        if (mid === offset) offset = end;                        /* avoid a stall */
+      } else {
+        offset = end;
+      }
+    }
+    return { applied: applied, dup: dup, lost: lost, events: events };
+  }
+
+  function chart(r, mode) {
+    var W = 700, H = 106, L = 8;
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Messages applied against the correct total">'];
+    svg.push('<text x="' + L + '" y="11" font-size="10" font-weight="700" fill="#7C8B99">MESSAGES APPLIED AGAINST THE 2,000 THAT EXIST</text>');
+    var maxV = Math.max(N, r.applied) * 1.05;
+    var wOf = function (v) { return v / maxV * (W - L - 90); };
+    svg.push('<rect x="' + L + '" y="22" width="' + wOf(N).toFixed(1) + '" height="18" fill="#E4E9ED"/>');
+    svg.push('<text x="' + (L + wOf(N) + 8) + '" y="35" font-size="10.5" fill="#54677A">2,000 exist</text>');
+
+    var correct = r.applied - r.dup;
+    svg.push('<rect x="' + L + '" y="48" width="' + wOf(correct).toFixed(1) + '" height="18" fill="#2E8B5F"/>');
+    if (r.dup > 0) {
+      svg.push('<rect x="' + (L + wOf(correct)).toFixed(1) + '" y="48" width="' + Math.max(2, wOf(r.dup)).toFixed(1) +
+        '" height="18" fill="#C0453A"/>');
+    }
+    if (r.lost > 0) {
+      svg.push('<rect x="' + (L + wOf(correct)).toFixed(1) + '" y="48" width="' + Math.max(2, wOf(r.lost)).toFixed(1) +
+        '" height="18" fill="#E4E9ED" stroke="#C0453A" stroke-dasharray="3 2"/>');
+    }
+    svg.push('<text x="' + (L + wOf(Math.max(correct + r.dup, correct + r.lost)) + 8) + '" y="61" font-size="10.5" font-weight="600" fill="#16232F">' +
+      r.applied.toLocaleString() + ' applied</text>');
+
+    var lx = L;
+    [["#2E8B5F", "processed once"], ["#C0453A", r.dup > 0 ? "duplicates" : "losses"]].forEach(function (g) {
+      svg.push('<rect x="' + lx + '" y="' + (H - 18) + '" width="9" height="9" fill="' + g[0] + '"/>');
+      svg.push('<text x="' + (lx + 12) + '" y="' + (H - 10) + '" font-size="10" fill="#54677A">' + g[1] + '</text>');
+      lx += 32 + g[1].length * 5.6;
+    });
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var mode = $("dl-mode").value, batch = +$("dl-batch").value;
+    var crash = +$("dl-crash").value, dedup = +$("dl-dedup").value;
+
+    var r = deliver(mode, batch, crash, dedup);
+    var ok = r.dup === 0 && r.lost === 0;
+
+    $("dl-applied").textContent = r.applied.toLocaleString();
+    $("dl-lost").textContent = r.lost.toLocaleString();
+    $("dl-lost-tile").className = "tile " + (r.lost > 0 ? "bad" : "good");
+    $("dl-dup").textContent = r.dup.toLocaleString();
+    $("dl-dup-tile").className = "tile " + (r.dup > 0 ? "bad" : "good");
+    $("dl-ok").textContent = ok ? "Correct" : r.lost > 0 ? "Data lost" : "Over-counted";
+    $("dl-ok-sub").textContent = ok ? "effectively once" : "off by " + Math.abs(r.applied - N);
+    $("dl-ok-tile").className = "tile " + (ok ? "good" : "bad");
+
+    $("dl-canvas").innerHTML = chart(r, mode);
+
+    var lines = [];
+    if (crash === 0) {
+      lines.push("With no crashes every configuration is correct, which is the whole difficulty: delivery semantics are indistinguishable until something fails. Set a crash interval to separate them.");
+    } else if (mode === "at-most-once") {
+      lines.push("The offset is committed before the message is processed, so a crash mid-batch means those messages are never processed and never redelivered \u2014 the consumer's recorded position has already moved past them. " +
+        r.lost.toLocaleString() + " of " + N.toLocaleString() +
+        " messages were lost, and not one was duplicated. Note that a deduplication store cannot help here; there is nothing to deduplicate.");
+    } else if (r.dup > 0) {
+      lines.push("The offset is committed after processing, so a crash mid-batch leaves the batch uncommitted and the broker redelivers it whole. The " +
+        Math.floor(batch * 0.6) + " messages already processed in that batch are processed again: " +
+        r.dup.toLocaleString() + " duplicates, and nothing lost.");
+      if (dedup > 0) {
+        lines.push("The deduplication window of " + dedup + " message ids is narrower than the " + batch +
+          "-message redelivery span, so by the time a redelivered id is checked it has already fallen out of memory. All " +
+          r.dup.toLocaleString() + " duplicates leak through. A dedup store is only as good as its window, which is why it is the wrong primary defence.");
+      } else {
+        lines.push("This is what essentially every system gives you by default. The fix is not tighter delivery guarantees but an idempotent effect \u2014 an upsert keyed on the message id, or the atomic partition write from chapter 12 \u2014 at which point a duplicate is harmless rather than merely detectable.");
+      }
+    } else {
+      lines.push("A deduplication window of " + dedup + " ids comfortably covers the " + batch +
+        "-message redelivery span, so every redelivered message is recognised and suppressed: " +
+        r.applied.toLocaleString() + " applied, no duplicates, nothing lost. This is effectively-once, and it is at-least-once delivery plus a memory of what has been seen.");
+      lines.push("Be clear about what it costs. That memory is a stateful component with a retention window, and a replay from further back than the window will duplicate again. Making the effect itself idempotent gives the same guarantee with no window to size, which is why it is the better answer.");
+    }
+    $("dl-note").textContent = lines.join("\n\n");
+  }
+
+  ["dl-mode", "dl-batch", "dl-crash", "dl-dedup"].forEach(function (id) {
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+initChapter("13-messaging.html");
+</script>
+</body>
+</html>

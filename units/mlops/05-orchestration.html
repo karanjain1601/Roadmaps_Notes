@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Orchestration — MLOps</title>
+<meta name="description" content="Critical-path arithmetic for where parallelism pays, and why retries help far less than expected when failures are correlated.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">MLOps</a> <span>/</span> Chapter 5</p>
+    <p class="chnum">CHAPTER 05</p>
+    <h1>Orchestration</h1>
+    <p class="lede">A pipeline with <strong>196 minutes of work</strong> can never finish faster than <strong>135</strong>, however many workers you add — and three workers already reach that floor. Meanwhile three retries take independent failures from 71% to 99.2%, and leave correlated ones stalled at <strong>79.1%</strong> no matter how many more you add.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~27 min</b> read</div>
+      <div><b>Part 2</b> The pipeline</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="dag">
+      <p class="kicker">THE MODEL</p>
+      <h2>A graph, not a schedule</h2>
+      <p class="sub">The distinction sounds pedantic and it decides how the system behaves under failure.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Two ways to run the same six steps</caption>
+          <thead>
+            <tr><th></th><th>Six cron entries</th><th>One DAG</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>Ordering</strong></td><td>Implied by clock times</td><td>Declared by dependencies</td></tr>
+            <tr><td><strong>If a step runs late</strong></td><td>The next starts anyway, on stale input</td><td>The next waits</td></tr>
+            <tr><td><strong>If a step fails</strong></td><td>Downstream runs on yesterday's output</td><td>Downstream does not run</td></tr>
+            <tr><td><strong>Rerunning one step</strong></td><td>Manual, and you must know what follows</td><td><strong>The graph knows</strong></td></tr>
+            <tr><td><strong>Backfill</strong></td><td>A bespoke script</td><td>A parameterised rerun</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>The third row is the one that costs money</b>
+        <p>Cron has no concept of failure propagating. A feature job that fails silently leaves yesterday's feature table in place, and the training job that follows at 03:00 trains happily on it — producing a model that is quietly a day stale, with nothing in any log to say so.</p>
+        <p>That is <a href="01-why.html">chapter 1</a>'s silent failure arriving through the scheduler. A DAG turns it into a loud one: the downstream task is marked upstream-failed and does not run.</p>
+      </div>
+    </section>
+
+    <section id="critical">
+      <p class="kicker">PARALLELISM</p>
+      <h2>The critical path</h2>
+      <p class="sub">Adding workers helps until you hit the longest chain, and then it stops helping entirely.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Twelve tasks, 196 minutes of work</b>
+          <span>list scheduling, longest ready task first</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Workers available
+              <select id="cp-w">
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4" selected>4</option>
+                <option value="6">6</option>
+                <option value="12">12</option>
+              </select>
+            </label>
+            <label>Halve one task's duration
+              <select id="cp-fast">
+                <option value="none" selected>Nothing</option>
+                <option value="train">train &mdash; 60 min</option>
+                <option value="features_3">features_3 &mdash; 25 min</option>
+                <option value="features_1">features_1 &mdash; 20 min</option>
+                <option value="ingest_b">ingest_b &mdash; 8 min</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="cp-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="cp-ms-tile"><i>MAKESPAN</i><b id="cp-ms">0</b><s id="cp-ms-sub"></s></div>
+            <div class="tile"><i>CRITICAL PATH</i><b id="cp-len">0</b><s>the floor, at any worker count</s></div>
+            <div class="tile"><i>SPEEDUP OVER ONE WORKER</i><b id="cp-sp">0</b><s id="cp-sp-sub"></s></div>
+            <div class="tile hi" id="cp-idle-tile"><i>IDLE WORKER-MINUTES</i><b id="cp-idle">0</b><s>paid for, not used</s></div>
+          </div>
+
+          <p class="readout" id="cp-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>196 minutes of work across twelve tasks</caption>
+          <thead>
+            <tr><th>Workers</th><th>Makespan</th><th>Speedup</th><th>Idle worker-minutes</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>1</td><td>196 min</td><td>1.00&times;</td><td>0</td></tr>
+            <tr><td>2</td><td>149 min</td><td>1.32&times;</td><td>102</td></tr>
+            <tr><td><strong>3</strong></td><td><strong>135 min</strong></td><td><strong>1.45&times;</strong></td><td>209</td></tr>
+            <tr><td>4</td><td>135 min</td><td>1.45&times;</td><td>344</td></tr>
+            <tr><td>6</td><td>135 min</td><td>1.45&times;</td><td>614</td></tr>
+            <tr><td>12</td><td>135 min</td><td>1.45&times;</td><td><strong>1,424</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>The ceiling is 1.45×, and three workers reach it</b>
+        <p>The critical path is <strong>ingest_a → clean_a → join → features_3 → assemble → train → evaluate</strong>, which totals 135 minutes. No amount of parallelism gets below that, because those seven tasks must run in order.</p>
+        <p>So 196 minutes of work has a maximum speedup of <strong>1.45×</strong>, and it is reached at three workers. The ninth through twelfth workers contribute nothing but <strong>1,424 idle worker-minutes</strong> of billing.</p>
+        <p>This is worth computing before provisioning. A pipeline dominated by one long serial step — which any pipeline containing training is — has almost no parallelism to exploit, and the instinct to scale the cluster is answering the wrong question.</p>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Halving one task's duration, with four workers available</caption>
+          <thead>
+            <tr><th>Task</th><th>On the critical path</th><th>New makespan</th><th>Saved</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>train</strong></td><td>yes</td><td>105.0 min</td><td><strong>30.0</strong></td></tr>
+            <tr><td>features_3</td><td>yes</td><td>130.0 min</td><td>5.0</td></tr>
+            <tr><td>evaluate</td><td>yes</td><td>131.0 min</td><td>4.0</td></tr>
+            <tr><td><strong>features_1</strong></td><td>no</td><td>135.0 min</td><td><strong>0.0</strong></td></tr>
+            <tr><td><strong>ingest_b</strong></td><td>no</td><td>135.0 min</td><td><strong>0.0</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <b>Optimising off the critical path saves exactly nothing</b>
+        <p>Halving <code>features_1</code> — a twenty-minute task, a real piece of engineering work — saves <strong>0.0 minutes</strong>. So does halving <code>ingest_b</code>. Halving <code>train</code> saves thirty.</p>
+        <p>And the path is not the list of longest tasks. <code>features_1</code> at 20 minutes is longer than <code>evaluate</code> at 8, and speeding up the shorter one helps while the longer one does not. <strong>The critical path is the longest chain, which you cannot read off a task list</strong> — it has to be computed from the dependencies.</p>
+        <p>It also moves. Make training four times faster and the critical path drops to 90 minutes, at which point the next bottleneck is somewhere else and the whole calculation has to be redone.</p>
+      </div>
+    </section>
+
+    <section id="retries">
+      <p class="kicker">FAILURE</p>
+      <h2>What a retry actually buys</h2>
+      <p class="sub">Retry policies are designed for independent failures. Most real ones are not.</p>
+
+      <p>A task fails 30% of the time. Sometimes that is transient — a flaky connection, a preempted node. Sometimes it is an outage: the upstream service is down, the cluster is full, the credential expired, and every attempt in the next twenty minutes will fail for the same reason.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Retries against transient and correlated failure</b>
+          <span>30% failure rate, outages last 20 minutes, 20,000 simulated runs</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>How often a failure is an outage rather than a blip
+              <select id="rt-sticky">
+                <option value="0">Never &mdash; all failures independent</option>
+                <option value="0.2" selected>One time in five</option>
+                <option value="0.4">Two times in five</option>
+              </select>
+            </label>
+            <label>Retries
+              <select id="rt-n">
+                <option value="0">None</option>
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3" selected>3</option>
+                <option value="5">5</option>
+              </select>
+            </label>
+            <label>Wait between attempts
+              <select id="rt-bo">
+                <option value="0" selected>Immediate (30 seconds)</option>
+                <option value="1">Exponential backoff</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="rt-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="rt-ok-tile"><i>RUNS THAT SUCCEED</i><b id="rt-ok">0%</b><s id="rt-ok-sub"></s></div>
+            <div class="tile"><i>THE LAST RETRY ADDED</i><b id="rt-gain">0</b><s>percentage points</s></div>
+            <div class="tile"><i>WASTED COMPUTE</i><b id="rt-waste">0</b><s>minutes per run</s></div>
+            <div class="tile hi" id="rt-el-tile"><i>ELAPSED BEFORE GIVING UP</i><b id="rt-el">0</b><s id="rt-el-sub"></s></div>
+          </div>
+
+          <p class="readout" id="rt-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Immediate retries, 30% failure rate</caption>
+          <thead>
+            <tr><th>Retries</th><th>Independent failures</th><th>One failure in five is an outage</th><th>Wasted compute</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>0</td><td>70.6%</td><td>55.7%</td><td>0.44 min</td></tr>
+            <tr><td>1</td><td>90.9%</td><td>72.7%</td><td>0.72 min</td></tr>
+            <tr><td>2</td><td>97.4%</td><td>77.5%</td><td>0.94 min</td></tr>
+            <tr><td>3</td><td><strong>99.2%</strong></td><td><strong>79.1%</strong></td><td>1.15 min</td></tr>
+            <tr><td>5</td><td>99.9%</td><td><strong>79.6%</strong></td><td>1.56 min</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <b>The right-hand column stops moving</b>
+        <p>Under independent failure, retries work exactly as advertised: three of them take 70.6% to <strong>99.2%</strong>, and the problem is solved.</p>
+        <p>With one failure in five being an outage, the same three retries reach <strong>79.1%</strong>, and the fifth adds <strong>0.1 points</strong>. The sequence stalls just under 80% — which is precisely the ceiling set by how often the failure is an outage at all. Retrying into an outage is not a recovery strategy; it is load, applied to the thing that is already failing.</p>
+        <p>The wasted-compute column keeps climbing while the success column does not. That is the definition of a policy that has stopped working.</p>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>The same correlated case, with exponential backoff</caption>
+          <thead>
+            <tr><th>Retries</th><th>Immediate</th><th>Backoff</th><th>Elapsed (immediate)</th><th>Elapsed (backoff)</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>1</td><td>72.7%</td><td>72.7%</td><td>8.2 min</td><td>8.9 min</td></tr>
+            <tr><td>2</td><td>77.5%</td><td>77.5%</td><td>9.0 min</td><td>10.7 min</td></tr>
+            <tr><td><strong>3</strong></td><td>79.1%</td><td><strong>79.1%</strong></td><td>9.5 min</td><td><strong>12.8 min</strong></td></tr>
+            <tr><td><strong>5</strong></td><td>79.6%</td><td><strong>98.2%</strong></td><td>10.2 min</td><td><strong>20.3 min</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>Backoff works, and only once it has waited long enough</b>
+        <p>At five retries backoff reaches <strong>98.2%</strong> against immediate retry's 79.6%, because the cumulative wait outlasts the outage. It costs elapsed time — 20.3 minutes against 10.2 — and essentially no extra compute, which is the right trade against a shared dependency.</p>
+        <p>But look at the three-retry row: backoff gives <strong>79.1%</strong>, identical to immediate. Its cumulative 12.8 minutes is still inside the 20-minute outage, so it has bought nothing at all.</p>
+        <p><strong>The parameter that matters is the total time spanned, not the number of retries.</strong> A policy of "three attempts with backoff" against a twenty-minute outage is a policy that fails, and it fails while looking like best practice.</p>
+      </div>
+
+      <div class="note warn">
+        <b>And backoff is not a general improvement</b>
+        <p>With purely independent failures, backoff gives <strong>99.2%</strong> against immediate retry's 99.2% — no benefit — while still costing elapsed time.</p>
+        <p>So "always use exponential backoff" is advice with a missing condition. It is a fix for <em>correlated</em> failure specifically. If your failures are genuinely independent it buys you nothing but latency, and if they are correlated the thing to size is the window, not the count.</p>
+      </div>
+    </section>
+
+    <section id="triggers">
+      <p class="kicker">WHEN TO RUN</p>
+      <h2>Schedules, sensors and events</h2>
+      <p class="sub">Three ways to start a pipeline, with different failure modes.</p>
+
+      <div class="terms">
+        <dt>A schedule</dt>
+        <dd>Runs at a time. Simple, predictable, and it assumes the data arrived. When the upstream is late the pipeline runs on yesterday's data and succeeds &mdash; which is the silent failure again.</dd>
+
+        <dt>A sensor, polling for readiness</dt>
+        <dd>Waits for a file, a partition, a row count. Correct, and it occupies a worker slot while waiting. A pipeline with several sensors can deadlock itself by holding every slot waiting for things that need a slot to produce.</dd>
+
+        <dt>An event</dt>
+        <dd>The upstream signals completion. Best when you control the upstream and awkward when you do not, since a missed event means the pipeline simply never runs &mdash; a failure with no failed task to alert on.</dd>
+
+        <dt>Whatever you choose, add a deadline</dt>
+        <dd>"This should have completed by 06:00" catches all three failure modes above, including the one where nothing ran at all. It is the only alert that fires on absence, and absence is the failure mode a task-level alert cannot see.</dd>
+      </div>
+
+      <div class="note tip">
+        <b>Idempotence is what makes any of this safe</b>
+        <p><a href="04-pipelines.html">Chapter 4</a>'s requirement returns here with teeth. A scheduler retries, backfills, and occasionally runs the same interval twice after a restart. Every one of those is a rerun, and on a non-idempotent step each turns a recoverable failure into duplicated data.</p>
+        <p>The practical form: a task takes its interval as a parameter, derives its output location from it, and overwrites rather than appends. Then a rerun is free and a backfill is the same code.</p>
+      </div>
+    </section>
+
+    <section id="backfill">
+      <p class="kicker">HISTORY</p>
+      <h2>Backfills</h2>
+      <p class="sub">Reprocessing the past is where orchestration earns its keep, and where it most often goes wrong.</p>
+
+      <div class="check">
+        <li><strong>A backfill is a resource event, not a data event.</strong> Thirty days of a pipeline that normally runs once a day is thirty times the load, arriving at once. Cap the concurrency or it competes with the live run for the same cluster.</li>
+        <li><strong>Backfill in reverse order when the recent data matters more.</strong> If someone is waiting on the output, yesterday first is usually worth more than a month ago first.</li>
+        <li><strong>Beware point-in-time correctness.</strong> Reprocessing an old interval with <em>today's</em> feature code and today's upstream tables does not reconstruct what that day looked like — it produces something that never existed. <a href="07-features.html">Chapter 7</a> is about this specifically.</li>
+        <li><strong>A backfill writing to the same place as the live run is a race.</strong> Write to a separate location and swap, which is the same discipline as an idempotent step.</li>
+        <li><strong>Decide whether downstream should re-fire.</strong> Backfilling features usually should retrain; backfilling a report usually should not. The graph will happily do either.</li>
+      </div>
+
+      <div class="note warn">
+        <b>The backfill that quietly rewrites history</b>
+        <p>The worst version is a backfill that succeeds. Old partitions are replaced with values computed from today's code and today's upstream state, the metrics for last quarter shift, and there is no failure anywhere to investigate.</p>
+        <p>If the data is content-addressed as in <a href="03-versioning.html">chapter 3</a>, this is visible: the hash of a historical partition changed, and anything pinned to the old hash still resolves to the old data. Without that, the only record of what last quarter actually looked like was the number in a slide.</p>
+      </div>
+    </section>
+
+    <section id="reading">
+      <p class="kicker">JUDGEMENT</p>
+      <h2>Five questions about an orchestration setup</h2>
+
+      <div class="check">
+        <li><strong>What is the critical path, and how long is it?</strong> If nobody has computed it, the cluster is probably sized by feel. Here 196 minutes of work floors at 135.</li>
+        <li><strong>Which task would you speed up?</strong> If the answer is the biggest one rather than one on the path, the effort may return exactly nothing.</li>
+        <li><strong>Are the failures independent?</strong> Retries assume they are. At one in five being an outage, the policy stalls at 79.1%.</li>
+        <li><strong>Does the retry window outlast a typical outage?</strong> Three retries with backoff spanned 12.8 minutes against a 20-minute outage and bought nothing.</li>
+        <li><strong>What alerts if nothing runs at all?</strong> A task-level alert cannot fire on a task that never started.</li>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>A DAG declares ordering; cron implies it,</b> and the difference shows up under failure.</li>
+          <li><b>Cron lets a failed step's downstream run on yesterday's output</b> &mdash; chapter 1's silent failure via the scheduler.</li>
+          <li><b>196 minutes of work floors at a 135-minute critical path,</b> a maximum speedup of 1.45&times;.</li>
+          <li><b>Three workers reach that floor;</b> twelve add 1,424 idle worker-minutes and nothing else.</li>
+          <li><b>Halving an off-path task saves exactly 0.0 minutes.</b> Halving train saves 30.</li>
+          <li><b>The path is the longest chain, not the longest tasks,</b> and it cannot be read off a task list.</li>
+          <li><b>It moves once you optimise it</b> &mdash; four-times-faster training drops the path to 90 minutes.</li>
+          <li><b>Three retries take independent failures from 70.6% to 99.2%.</b></li>
+          <li><b>With one failure in five an outage they reach 79.1%,</b> and the fifth retry adds 0.1 points.</li>
+          <li><b>The sequence stalls at the ceiling the outage rate sets.</b> Retrying into an outage is load.</li>
+          <li><b>Wasted compute keeps climbing while success does not,</b> which defines a policy that has stopped working.</li>
+          <li><b>Backoff reaches 98.2% at five retries</b> because the cumulative wait outlasts the outage.</li>
+          <li><b>At three retries backoff gives 79.1%, identical to immediate,</b> having spanned only 12.8 minutes.</li>
+          <li><b>So size the retry WINDOW, not the retry count.</b></li>
+          <li><b>Backoff buys nothing under independent failure</b> &mdash; it is a fix for correlation specifically.</li>
+          <li><b>Add a deadline alert.</b> It is the only one that fires when nothing ran at all.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="06-data-contracts.html">Chapter 6 &mdash; Data validation and contracts</a>. Schema, distribution and semantic checks, where each fires, and thresholds that catch faults without crying wolf.</p>
+          </div>
+          <div class="fi">
+            <i>PICKED UP FROM</i>
+            <p><a href="04-pipelines.html">Chapter 4</a>'s idempotence requirement, which is what makes retries and backfills safe rather than destructive.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>Compute the critical path of your longest pipeline and compare it with the total task time. The ratio is your maximum possible speedup.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   shared helpers
+   ============================================================ */
+function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+function avg(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i]; return s / a.length; }
+
+/* ============================================================
+   Demo 1 — the critical path
+   ============================================================ */
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var TASKS = [
+    { id: "ingest_a", mins: 10, dep: [] },
+    { id: "ingest_b", mins: 8, dep: [] },
+    { id: "ingest_c", mins: 6, dep: [] },
+    { id: "clean_a", mins: 12, dep: ["ingest_a"] },
+    { id: "clean_b", mins: 9, dep: ["ingest_b"] },
+    { id: "join", mins: 15, dep: ["clean_a", "clean_b", "ingest_c"] },
+    { id: "features_1", mins: 20, dep: ["join"] },
+    { id: "features_2", mins: 18, dep: ["join"] },
+    { id: "features_3", mins: 25, dep: ["join"] },
+    { id: "assemble", mins: 5, dep: ["features_1", "features_2", "features_3"] },
+    { id: "train", mins: 60, dep: ["assemble"] },
+    { id: "evaluate", mins: 8, dep: ["train"] }
+  ];
+  var TOTALWORK = TASKS.reduce(function (a, t) { return a + t.mins; }, 0);
+
+  function byId(tasks) { var m = {}; tasks.forEach(function (t) { m[t.id] = t; }); return m; }
+  /* earliest finish with unlimited workers, and the chain that produced it */
+  function criticalPath(tasks) {
+    var m = byId(tasks), ef = {}, pred = {};
+    function finish(id) {
+      if (ef[id] !== undefined) return ef[id];
+      var t = m[id], start = 0, from = null;
+      t.dep.forEach(function (d) { var f = finish(d); if (f > start) { start = f; from = d; } });
+      pred[id] = from;
+      ef[id] = start + t.mins;
+      return ef[id];
+    }
+    tasks.forEach(function (t) { finish(t.id); });
+    var endId = null, best = 0;
+    tasks.forEach(function (t) { if (ef[t.id] > best) { best = ef[t.id]; endId = t.id; } });
+    var path = [], cur = endId;
+    while (cur) { path.unshift(cur); cur = pred[cur]; }
+    return { length: best, path: path, ef: ef };
+  }
+  /* list scheduling: run any ready task, longest first */
+  function schedule(tasks, workers) {
+    var done = {}, running = [], t = 0, remaining = tasks.length, timeline = [];
+    while (remaining > 0) {
+      var ready = tasks.filter(function (x) {
+        return !done[x.id] && !running.some(function (r) { return r.id === x.id; }) &&
+          x.dep.every(function (d) { return done[d]; });
+      }).sort(function (a, b) { return b.mins - a.mins; });
+      while (running.length < workers && ready.length) {
+        var nx = ready.shift();
+        running.push({ id: nx.id, start: t, end: t + nx.mins });
+        timeline.push({ id: nx.id, start: t, end: t + nx.mins });
+      }
+      if (!running.length) break;
+      t = Math.min.apply(null, running.map(function (r) { return r.end; }));
+      running.filter(function (r) { return r.end <= t; }).forEach(function (r) { done[r.id] = 1; remaining--; });
+      running = running.filter(function (r) { return r.end > t; });
+    }
+    return { makespan: t, timeline: timeline };
+  }
+  function withSpeedup(id) {
+    if (id === "none") return TASKS;
+    return TASKS.map(function (t) {
+      return t.id === id ? { id: t.id, mins: t.mins / 2, dep: t.dep } : t;
+    });
+  }
+
+  function chart(w, fast) {
+    var W = 700, H = 190, L = 8;
+    var tasks = withSpeedup(fast);
+    var sch = schedule(tasks, w), cp = criticalPath(tasks);
+    var onPath = {};
+    cp.path.forEach(function (id) { onPath[id] = 1; });
+    var scale = (W - L - 96) / Math.max(sch.makespan, 1);
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Gantt chart of the scheduled tasks">'];
+    svg.push('<text x="' + L + '" y="11" font-size="10" font-weight="700" fill="#7C8B99">WHEN EACH TASK RUNS WITH ' +
+      w + ' WORKER' + (w > 1 ? 'S' : '') + ' \u2014 CRITICAL PATH IN COLOUR</text>');
+    /* assign each task to a lane greedily */
+    var lanes = [];
+    sch.timeline.sort(function (a, b) { return a.start - b.start; }).forEach(function (t) {
+      var li = 0;
+      while (lanes[li] !== undefined && lanes[li] > t.start) li++;
+      t.lane = li;
+      lanes[li] = t.end;
+    });
+    var laneH = Math.min(15, (H - 62) / Math.max(1, lanes.length));
+    sch.timeline.forEach(function (t) {
+      var y = 22 + t.lane * (laneH + 2);
+      var x = L + t.start * scale, wdt = Math.max(2, (t.end - t.start) * scale);
+      svg.push('<rect x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" width="' + wdt.toFixed(1) +
+        '" height="' + laneH.toFixed(1) + '" rx="2" fill="' + (onPath[t.id] ? "#C0453A" : "#8FA0AF") +
+        '" opacity="' + (onPath[t.id] ? 0.92 : 0.55) + '"/>');
+      if (wdt > 40) {
+        svg.push('<text x="' + (x + 4).toFixed(1) + '" y="' + (y + laneH - 4).toFixed(1) +
+          '" font-size="8" fill="#fff">' + t.id + '</text>');
+      }
+    });
+    svg.push('<line x1="' + (L + cp.length * scale).toFixed(1) + '" y1="18" x2="' +
+      (L + cp.length * scale).toFixed(1) + '" y2="' + (H - 38) + '" stroke="#166B47" stroke-width="2" stroke-dasharray="4 3"/>');
+    svg.push('<text x="' + (L + cp.length * scale + 5).toFixed(1) + '" y="' + (H - 42) +
+      '" font-size="9" font-weight="700" fill="#166B47">critical path ' + cp.length.toFixed(0) + 'm</text>');
+    svg.push('<text x="' + L + '" y="' + (H - 22) + '" font-size="9.5" fill="#54677A">makespan ' +
+      sch.makespan.toFixed(0) + ' min \u00b7 total work ' +
+      tasks.reduce(function (a, t) { return a + t.mins; }, 0).toFixed(0) + ' min \u00b7 idle ' +
+      (sch.makespan * w - tasks.reduce(function (a, t) { return a + t.mins; }, 0)).toFixed(0) + ' worker-minutes</text>');
+    svg.push('<text x="' + L + '" y="' + (H - 6) + '" font-size="9.5" fill="#7C8B99">' +
+      cp.path.join(" \u2192 ") + '</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var w = +$("cp-w").value, fast = $("cp-fast").value;
+    var tasks = withSpeedup(fast);
+    var sch = schedule(tasks, w), cp = criticalPath(tasks);
+    var work = tasks.reduce(function (a, t) { return a + t.mins; }, 0);
+    var one = schedule(tasks, 1).makespan;
+    var base4 = schedule(TASKS, 4).makespan;
+
+    $("cp-ms").textContent = sch.makespan.toFixed(0) + " min";
+    $("cp-ms-sub").textContent = work.toFixed(0) + " minutes of work";
+    $("cp-ms-tile").className = "tile " + (sch.makespan <= cp.length + 0.01 ? "good" : "");
+    $("cp-len").textContent = cp.length.toFixed(0) + " min";
+    $("cp-sp").textContent = (one / sch.makespan).toFixed(2) + "\u00d7";
+    $("cp-sp-sub").textContent = "ceiling is " + (work / cp.length).toFixed(2) + "\u00d7";
+    var idle = sch.makespan * w - work;
+    $("cp-idle").textContent = idle.toFixed(0);
+    $("cp-idle-tile").className = "tile " + (idle > work ? "bad" : "");
+
+    $("cp-canvas").innerHTML = chart(w, fast);
+
+    var lines = [];
+    lines.push("Twelve tasks totalling " + work.toFixed(0) + " minutes of work. With " + w + " worker" +
+      (w > 1 ? "s" : "") + " the pipeline finishes in " + sch.makespan.toFixed(0) +
+      " minutes, against a critical path of " + cp.length.toFixed(0) + ".");
+    lines.push("That path is " + cp.path.join(" \u2192 ") +
+      ". Those tasks must run in order, so no amount of parallelism gets below " + cp.length.toFixed(0) +
+      " minutes. The ceiling on speedup is " + (work / cp.length).toFixed(2) + "\u00d7 and it is reached at three workers.");
+
+    if (idle > work) {
+      lines.push("At this worker count you are paying for " + idle.toFixed(0) +
+        " idle worker-minutes \u2014 more than the total useful work in the pipeline. A DAG dominated by one long serial step, which any pipeline containing training is, has very little parallelism to sell you.");
+    }
+
+    if (fast !== "none") {
+      var saved = base4 - schedule(tasks, 4).makespan;
+      var onPath = criticalPath(TASKS).path.indexOf(fast) >= 0;
+      lines.push("Halving " + fast + " " + (onPath ? "IS" : "is NOT") + " on the original critical path, and at four workers it saves " +
+        saved.toFixed(1) + " minutes." +
+        (onPath ? "" : " Exactly nothing \u2014 the work happens in parallel with something longer, so the finish time does not move."));
+      if (!onPath) {
+        lines.push("This is the trap. features_1 at 20 minutes is a longer task than evaluate at 8, and speeding up the SHORTER one helps while the longer one does not. The critical path is the longest CHAIN, and you cannot read it off a task list \u2014 it has to be computed from the dependencies.");
+      } else if (fast === "train") {
+        lines.push("And once training is faster the path shortens to " + cp.length.toFixed(0) +
+          " minutes, at which point the next bottleneck is somewhere else and the whole calculation has to be redone. Optimising the critical path is iterative by nature.");
+      }
+    } else {
+      lines.push("Now halve one task and watch which ones matter. The answer is not the biggest task.");
+    }
+    $("cp-note").textContent = lines.join("\n\n");
+  }
+
+  ["cp-w", "cp-fast"].forEach(function (id) { $(id).addEventListener("change", render); });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — what a retry actually buys
+   ============================================================ */
+(function () {
+  /* a task that fails because a dependency is down fails FAST, which is what makes an
+     immediate retry cheap in compute and useless in time */
+  var TASK_MINS = 10, FAIL_FAST = 1, IMMEDIATE_WAIT = 0.5, OUTAGE = 20, PFAIL = 0.30, REPS = 20000;
+  var $ = function (id) { return document.getElementById(id); };
+
+  var cache = {};
+  function run(sticky, retries, backoff) {
+    var key = sticky + "|" + retries + "|" + backoff;
+    if (cache[key]) return cache[key];
+    var rnd = lcg(801), ok = 0, wasted = [], elapsed = [];
+    for (var r = 0; r < REPS; r++) {
+      var outageEnds = rnd() < sticky ? OUTAGE : 0;
+      var t = 0, w = 0, done = false;
+      for (var a = 0; a <= retries; a++) {
+        var inOutage = t < outageEnds;
+        var fails = inOutage || rnd() < PFAIL;
+        if (!fails) { t += TASK_MINS; done = true; break; }
+        w += FAIL_FAST; t += FAIL_FAST;
+        if (a < retries) t += backoff ? Math.pow(2, a + 1) : IMMEDIATE_WAIT;
+      }
+      if (done) ok++;
+      wasted.push(w); elapsed.push(t);
+    }
+    cache[key] = { success: ok / REPS, wasted: avg(wasted), elapsed: avg(elapsed) };
+    return cache[key];
+  }
+
+  function chart(sticky, n, bo) {
+    var W = 700, H = 190, B = 30, L = 46;
+    var NS = [0, 1, 2, 3, 5];
+    var xOf = function (i) { return L + i / (NS.length - 1) * (W - L - 150); };
+    var yOf = function (v) { return (H - B) - v * (H - B - 26); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Success rate against retry count">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">SUCCESS RATE AGAINST NUMBER OF RETRIES</text>');
+    [[0, false, "#2E8B5F", "independent"], [sticky, false, "#C0453A", "correlated, immediate"],
+     [sticky, true, "#F2A03D", "correlated, backoff"]].forEach(function (c) {
+      if (c[0] === 0 && sticky === 0 && c[3] !== "independent") return;
+      var pts = NS.map(function (k, i) { return [i, run(c[0], k, c[1]).success]; });
+      var on = (Math.abs(c[0] - sticky) < 1e-9 || (sticky === 0 && c[0] === 0)) && (c[1] === (bo === 1));
+      svg.push('<path d="' + pts.map(function (p, i) {
+        return (i ? "L" : "M") + xOf(p[0]).toFixed(1) + " " + yOf(p[1]).toFixed(1);
+      }).join(" ") + '" fill="none" stroke="' + c[2] + '" stroke-width="' + (on ? 3.2 : 1.6) +
+        '" opacity="' + (on ? 1 : 0.45) + '"/>');
+      pts.forEach(function (p) {
+        svg.push('<circle cx="' + xOf(p[0]).toFixed(1) + '" cy="' + yOf(p[1]).toFixed(1) + '" r="' +
+          (on ? 3.4 : 2.2) + '" fill="' + c[2] + '"/>');
+      });
+    });
+    if (sticky > 0) {
+      svg.push('<line x1="' + L + '" y1="' + yOf(1 - sticky).toFixed(1) + '" x2="' + (W - 146) +
+        '" y2="' + yOf(1 - sticky).toFixed(1) + '" stroke="#0C1D30" stroke-width="1.4" stroke-dasharray="4 3"/>');
+      svg.push('<text x="' + (W - 142) + '" y="' + (yOf(1 - sticky) + 4).toFixed(1) +
+        '" font-size="9" fill="#0C1D30">' + ((1 - sticky) * 100).toFixed(0) + '% ceiling</text>');
+    }
+    NS.forEach(function (k, i) {
+      svg.push('<text x="' + xOf(i).toFixed(1) + '" y="' + (H - 12) + '" font-size="9" fill="#7C8B99" text-anchor="middle">' + k + '</text>');
+    });
+    [0.5, 0.75, 1].forEach(function (v) {
+      svg.push('<text x="' + (L - 6) + '" y="' + (yOf(v) + 4).toFixed(1) + '" font-size="9" fill="#7C8B99" text-anchor="end">' +
+        (v * 100).toFixed(0) + '%</text>');
+    });
+    var px = W - 142;
+    [["independent", "#2E8B5F"], ["correlated, immediate", "#C0453A"], ["correlated, backoff", "#F2A03D"]]
+      .forEach(function (c, i) {
+        svg.push('<line x1="' + px + '" y1="' + (100 + i * 15) + '" x2="' + (px + 14) + '" y2="' + (100 + i * 15) +
+          '" stroke="' + c[1] + '" stroke-width="2.4"/>');
+        svg.push('<text x="' + (px + 19) + '" y="' + (104 + i * 15) + '" font-size="8.5" fill="#54677A">' + c[0] + '</text>');
+      });
+    svg.push('<text x="0" y="' + (H - 1) + '" font-size="9.5" fill="#7C8B99">' +
+      (sticky > 0
+        ? "the dashed line is the ceiling set by how often the failure is an outage at all"
+        : "with independent failures every retry multiplies the remaining failure probability") + '</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var sticky = +$("rt-sticky").value, n = +$("rt-n").value, bo = +$("rt-bo").value;
+    var d = run(sticky, n, bo === 1);
+    var prev = n > 0 ? run(sticky, n - 1, bo === 1) : null;
+    var imm = run(sticky, n, false), back = run(sticky, n, true);
+
+    $("rt-ok").textContent = (d.success * 100).toFixed(1) + "%";
+    $("rt-ok-sub").textContent = sticky > 0 ? "ceiling is " + ((1 - sticky) * 100).toFixed(0) + "% without backoff"
+      : "no correlated outages here";
+    $("rt-ok-tile").className = "tile " + (d.success > 0.95 ? "good" : "bad");
+    $("rt-gain").textContent = prev ? "+" + ((d.success - prev.success) * 100).toFixed(1) : "\u2014";
+    $("rt-waste").textContent = d.wasted.toFixed(2);
+    $("rt-el").textContent = d.elapsed.toFixed(1) + " min";
+    $("rt-el-sub").textContent = sticky > 0
+      ? (d.elapsed > OUTAGE ? "outlasts a " + OUTAGE + "-min outage" : "still inside a " + OUTAGE + "-min outage")
+      : "not relevant here";
+    $("rt-el-tile").className = "tile " + (sticky > 0 && d.elapsed > OUTAGE ? "good" : sticky > 0 ? "bad" : "");
+
+    $("rt-canvas").innerHTML = chart(sticky, n, bo);
+
+    var lines = [];
+    lines.push("A task that fails 30% of the time, " + n + " retr" + (n === 1 ? "y" : "ies") + ", " +
+      (bo === 1 ? "exponential backoff" : "immediate retry") + ". " + (d.success * 100).toFixed(1) +
+      "% of runs succeed, having wasted " + d.wasted.toFixed(2) +
+      " minutes of compute and taken " + d.elapsed.toFixed(1) + " minutes of wall clock.");
+
+    if (sticky === 0) {
+      lines.push("With purely independent failures retries work exactly as advertised: each one multiplies the remaining failure probability, so three take 70.6% to " +
+        (run(0, 3, false).success * 100).toFixed(1) + "% and the problem is solved.");
+      lines.push("Note also that backoff buys nothing here \u2014 " + (run(0, 3, true).success * 100).toFixed(1) +
+        "% against " + (run(0, 3, false).success * 100).toFixed(1) +
+        "% \u2014 while still costing elapsed time. Now make one failure in five an outage.");
+    } else {
+      lines.push("With one failure in " + Math.round(1 / sticky) +
+        " being a " + OUTAGE + "-minute outage, every attempt inside that window fails for the same reason. The success rate is capped at " +
+        ((1 - sticky) * 100).toFixed(0) +
+        "% unless something waits the outage out, which is the dashed line on the chart.");
+      if (bo === 0) {
+        lines.push("Immediate retries stall against that ceiling: " +
+          [1, 2, 3, 5].map(function (k) { return (run(sticky, k, false).success * 100).toFixed(1) + "%"; }).join(" \u2192 ") +
+          " at 1, 2, 3 and 5 retries. The wasted-compute column keeps climbing while the success column does not, which is the definition of a policy that has stopped working.");
+        lines.push("Retrying into an outage is not a recovery strategy. It is load, applied to the thing that is already failing. Switch the wait to exponential backoff.");
+      } else {
+        lines.push("Backoff at 5 retries reaches " + (run(sticky, 5, true).success * 100).toFixed(1) +
+          "% against immediate retry's " + (run(sticky, 5, false).success * 100).toFixed(1) +
+          "%, because the cumulative wait of " + run(sticky, 5, true).elapsed.toFixed(1) +
+          " minutes outlasts the " + OUTAGE +
+          "-minute outage. It costs elapsed time and essentially no extra compute, which is the right trade against a shared dependency.");
+        if (d.elapsed < OUTAGE) {
+          lines.push("But at " + n + " retries it has bought NOTHING: " + (d.success * 100).toFixed(1) +
+            "% against immediate retry's " + (imm.success * 100).toFixed(1) + "%, because its cumulative " +
+            d.elapsed.toFixed(1) + " minutes is still inside the outage.");
+          lines.push("So the parameter that matters is the total time SPANNED, not the number of retries. \u201cThree attempts with backoff\u201d against a twenty-minute outage is a policy that fails while looking like best practice.");
+        }
+      }
+    }
+    $("rt-note").textContent = lines.join("\n\n");
+  }
+
+  ["rt-sticky", "rt-n", "rt-bo"].forEach(function (id) { $(id).addEventListener("change", render); });
+  render();
+})();
+
+initChapter("05-orchestration.html");
+</script>
+</body>
+</html>

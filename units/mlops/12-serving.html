@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Serving architectures — MLOps</title>
+<meta name="description" content="Why daily batch scoring destroys a fast-moving signal, and why precomputing 5% of entities beats both pure strategies.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">MLOps</a> <span>/</span> Chapter 12</p>
+    <p class="chnum">CHAPTER 12</p>
+    <h1>Serving architectures</h1>
+    <p class="lede">A signal with a week-long half-life loses <strong>0.0246</strong> of AUC to a day of staleness and still reads 0.7308. A six-hour signal loses <strong>0.2343</strong> and reads <strong>0.5161</strong> — essentially random. Same architecture, same interval: one degrades and the other stops working.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~28 min</b> read</div>
+      <div><b>Part 4</b> Serving</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="three">
+      <p class="kicker">THE OPTIONS</p>
+      <h2>Three ways to get a prediction to where it is needed</h2>
+
+      <div class="tw">
+        <table>
+          <caption>The same model, three delivery mechanisms</caption>
+          <thead>
+            <tr><th></th><th>Batch</th><th>Online</th><th>Streaming</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>When it runs</strong></td><td>On a schedule</td><td>On request</td><td>On an event</td></tr>
+            <tr><td><strong>Prediction age</strong></td><td>Up to the interval</td><td><strong>Zero</strong></td><td>Seconds</td></tr>
+            <tr><td><strong>Scores</strong></td><td>Everyone</td><td>Only what is asked</td><td>Whatever changed</td></tr>
+            <tr><td><strong>Latency to the caller</strong></td><td>A lookup</td><td>Inference time</td><td>A lookup</td></tr>
+            <tr><td><strong>Failure shows up as</strong></td><td>Stale data</td><td><strong>An error the user sees</strong></td><td>Growing lag</td></tr>
+            <tr><td><strong>Retries</strong></td><td>Free</td><td>Inside the request budget</td><td>Free, but ordering matters</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>Streaming is the interesting middle</b>
+        <p>It looks like online — predictions are fresh — but serves like batch, because the caller reads a stored value rather than waiting for inference. That combination is why it is the right answer more often than its reputation for complexity suggests.</p>
+        <p>The cost is that "whatever changed" requires knowing what changed, which means the event stream has to carry the feature updates. If you already have that stream, streaming inference is cheap; if you do not, building it is the whole project.</p>
+      </div>
+    </section>
+
+    <section id="freshness">
+      <p class="kicker">FRESHNESS</p>
+      <h2>What staleness costs</h2>
+      <p class="sub">A batch job scores everyone every T hours, so a prediction is up to T hours old when it is used. What that costs depends entirely on how fast the underlying state moves.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>The same prediction, used later</b>
+          <span>state follows an AR(1) process; 4,000 users, 10 replications</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>How old the prediction is when used
+              <select id="st-age">
+                <option value="1">1 hour</option>
+                <option value="6">6 hours</option>
+                <option value="24" selected>24 hours</option>
+                <option value="72">3 days</option>
+                <option value="168">A week</option>
+              </select>
+            </label>
+            <label>How fast the underlying state moves
+              <select id="st-hl">
+                <option value="168">Slowly &mdash; week-long half-life</option>
+                <option value="48">Moderately &mdash; two days</option>
+                <option value="6" selected>Fast &mdash; six hours</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="st-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile good"><i>IF SCORED FRESH</i><b id="st-fresh">0</b><s>the model's real skill</s></div>
+            <div class="tile" id="st-stale-tile"><i>AS ACTUALLY USED</i><b id="st-stale">0</b><s id="st-stale-sub"></s></div>
+            <div class="tile" id="st-mov-tile"><i>LOST BY USERS WHO MOVED</i><b id="st-mov">0</b><s id="st-mov-sub"></s></div>
+            <div class="tile hi" id="st-still-tile"><i>LOST BY THE REST</i><b id="st-still">0</b><s>state roughly unchanged</s></div>
+          </div>
+
+          <p class="readout" id="st-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>AUC as actually used, with the loss against fresh scoring in brackets</caption>
+          <thead>
+            <tr><th>Prediction age</th><th>Week-long half-life</th><th>Six-hour half-life</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>1 hour</td><td>0.7534 (&minus;0.0009)</td><td>0.7270 (&minus;0.0282)</td></tr>
+            <tr><td>6 hours</td><td>0.7488 (&minus;0.0062)</td><td>0.6278 (&minus;0.1252)</td></tr>
+            <tr><td><strong>24 hours</strong></td><td><strong>0.7308 (&minus;0.0246)</strong></td><td><strong>0.5161 (&minus;0.2343)</strong></td></tr>
+            <tr><td>3 days</td><td>0.6890 (&minus;0.0660)</td><td>0.5017 (&minus;0.2486)</td></tr>
+            <tr><td><strong>A week</strong></td><td>0.6278 (&minus;0.1252)</td><td><strong>0.5016</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <b>One degrades and the other stops working</b>
+        <p>The slow signal loses <strong>0.0246</strong> over a day — real, about a tenth of its skill above chance — and is still clearly useful at 0.7308. After a full week it still reads 0.6278.</p>
+        <p>The fast signal loses <strong>0.2343</strong> over the same day and reads <strong>0.5161</strong>, which is essentially random. And it has been there since the first day: by three days it is at 0.5017, because there is nothing left for more staleness to take.</p>
+        <p>That is not a difference of degree. Daily batch scoring is a perfectly sound architecture for the first column and a way of shipping a broken model for the second — and the model report looks identical either way, because <a href="07-features.html">chapter 7</a>'s point applies: offline evaluation scores fresh features.</p>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Where the loss falls — fast signal, 24 hours stale</caption>
+          <thead>
+            <tr><th>Group</th><th>Share of users</th><th>AUC lost</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>State moved materially</strong></td><td>47%</td><td><strong>0.3882</strong></td></tr>
+            <tr><td>State roughly unchanged</td><td>53%</td><td>0.0538</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>Which is the argument for a hybrid</b>
+        <p>The loss is <strong>seven times larger</strong> among the users whose state actually moved, and they are a minority. Everyone else is served perfectly well by a day-old prediction.</p>
+        <p>So the choice is not batch <em>or</em> online for the whole population. It is: batch for everyone, plus fresh scoring for the ones whose state changed since the batch ran — which is exactly what an event stream tells you. That is the streaming architecture, arrived at from the cost side rather than the architecture side.</p>
+        <p>And measuring this is cheap. Score a sample fresh, score them again with a day-old feature vector, and compare. You will get both the aggregate loss and the split, and the split tells you how much of the population actually needs freshness.</p>
+      </div>
+    </section>
+
+    <section id="cost">
+      <p class="kicker">COST</p>
+      <h2>Cost per prediction someone actually used</h2>
+      <p class="sub">Batch scores everyone whether or not anyone asks. Online scores only what is asked, at a higher unit cost and with capacity sized for the peak.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Two million entities, one batch run per day</b>
+          <span>batch &pound;1.20 per million, online &pound;7.50 per million plus standing capacity for a 3&times; peak</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Entities actually requested per day
+              <select id="co-u">
+                <option value="0.002">0.2%</option>
+                <option value="0.01">1%</option>
+                <option value="0.05" selected>5%</option>
+                <option value="0.2">20%</option>
+                <option value="0.6">60%</option>
+              </select>
+            </label>
+            <label>Precompute the most-requested share
+              <select id="co-head">
+                <option value="0">None &mdash; pure online</option>
+                <option value="0.01">1%</option>
+                <option value="0.05" selected>5%</option>
+                <option value="0.15">15%</option>
+                <option value="0.4">40%</option>
+                <option value="1">100% &mdash; pure batch</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="co-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="co-tot-tile"><i>DAILY COST</i><b id="co-tot">0</b><s id="co-tot-sub"></s></div>
+            <div class="tile"><i>REQUESTS SERVED FROM CACHE</i><b id="co-cov">0%</b><s>the rest go to inference</s></div>
+            <div class="tile"><i>PURE BATCH WOULD COST</i><b id="co-pb">0</b><s id="co-pb-sub"></s></div>
+            <div class="tile hi" id="co-verd-tile"><i>AGAINST THE BEST PURE OPTION</i><b id="co-verd">0%</b><s id="co-verd-sub"></s></div>
+          </div>
+
+          <p class="readout" id="co-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Pure batch against pure online, two million entities</caption>
+          <thead>
+            <tr><th>Requested per day</th><th>Batch total</th><th>Online total</th><th>Batch per useful</th><th>Online per useful</th><th>Cheaper</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>0.2%</td><td>&pound;2.40</td><td><strong>&pound;0.05</strong></td><td>&pound;0.600</td><td>&pound;0.013</td><td><strong>online</strong></td></tr>
+            <tr><td>1%</td><td>&pound;2.40</td><td>&pound;0.26</td><td>&pound;0.120</td><td>&pound;0.013</td><td>online</td></tr>
+            <tr><td>5%</td><td>&pound;2.40</td><td>&pound;1.27</td><td>&pound;0.024</td><td>&pound;0.013</td><td>online</td></tr>
+            <tr><td>20%</td><td><strong>&pound;2.40</strong></td><td>&pound;5.10</td><td>&pound;0.006</td><td>&pound;0.013</td><td><strong>batch</strong></td></tr>
+            <tr><td>60%</td><td>&pound;2.40</td><td>&pound;15.30</td><td><strong>&pound;0.002</strong></td><td>&pound;0.013</td><td>batch</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>The break-even is at 9.4% of entities requested per day</b>
+        <p>Below that, batch is paying to score people nobody asked about. Above it, online is paying a premium per prediction on volume high enough that precomputation amortises.</p>
+        <p>The counterintuitive part: <strong>the dearer online inference is, the lower the utilisation at which batch wins</strong> — 29.4% break-even at a 2× unit-cost ratio, 2.9% at 20×. A large model with expensive inference pushes you toward precomputation even at very low utilisation, which is the opposite of the usual instinct that big models are too expensive to run over everyone.</p>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Precomputing only the most-requested entities, at 5% utilisation. Requests follow a power law</caption>
+          <thead>
+            <tr><th>Precomputed share</th><th>Requests served from cache</th><th>Total cost</th><th>Against the best pure option</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>1%</td><td>22%</td><td>&pound;1.02</td><td>&minus;20%</td></tr>
+            <tr><td><strong>5%</strong></td><td>37%</td><td><strong>&pound;0.93</strong></td><td><strong>&minus;27%</strong></td></tr>
+            <tr><td>15%</td><td>53%</td><td>&pound;0.96</td><td>&minus;25%</td></tr>
+            <tr><td>40%</td><td>74%</td><td>&pound;1.30</td><td>&plus;2%</td></tr>
+            <tr><td>100%</td><td>100%</td><td>&pound;2.40</td><td>&plus;88%</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note tip">
+        <b>The hybrid beats both, and the optimum is small</b>
+        <p>Precomputing just <strong>5%</strong> of entities absorbs <strong>37%</strong> of requests and costs <strong>27% less</strong> than the better pure strategy. The optimum is interior — 40% is already worse than 5%, and 100% is 88% worse.</p>
+        <p>This works because requests are concentrated. A small precomputed head takes most of the traffic and the long tail is served online, which is what most real systems converge on after someone runs this arithmetic. It is also why the answer to "batch or online" is usually "both, and mostly online by entity count".</p>
+      </div>
+    </section>
+
+    <section id="failure">
+      <p class="kicker">FAILURE</p>
+      <h2>Three different things going wrong</h2>
+      <p class="sub">The architectures fail in ways that need different detection.</p>
+
+      <div class="terms">
+        <dt>Batch fails quietly</dt>
+        <dd>The job does not run and yesterday's predictions are still sitting there, being served. Nothing errors, nothing is slow, and the only symptom is age. This is <a href="06-data-contracts.html">chapter 6</a>'s stale-data problem: schema and distribution checks both pass at 0%, and only a freshness check sees it. Alert on the age of the newest prediction, not on the job's exit code.</dd>
+
+        <dt>Online fails loudly</dt>
+        <dd>Errors and timeouts the caller sees, which is unpleasant and at least self-reporting. The real risk is the tail: a model that is fast on average and slow on 1% of inputs breaks a request budget in a way the mean latency conceals, which is <a href="13-latency.html">chapter 13</a>'s subject.</dd>
+
+        <dt>Streaming fails as lag</dt>
+        <dd>The consumer falls behind and predictions get older without anything failing. Detectable, and only if you are watching consumer lag rather than throughput &mdash; a stalled consumer and a quiet stream look identical on a throughput graph.</dd>
+
+        <dt>All three need a fallback</dt>
+        <dd>What is served when the prediction is missing or the model is down? A default, the population average, the previous value, or a rules-based path. Deciding this in advance is a five-minute conversation; deciding it during an incident is not.</dd>
+      </div>
+
+      <div class="note warn">
+        <b>The fallback that hides the outage</b>
+        <p>A serving layer that silently returns the population average when the model is unavailable will pass every health check while delivering no personalisation at all. The system is up, latency is excellent, error rate is zero, and the model has been effectively switched off for a fortnight.</p>
+        <p>Fallbacks are correct. Fallbacks that are not <em>counted</em> are how a model quietly stops contributing. Emit a metric for the fallback rate and alert on it, because it is the one number that distinguishes a healthy system from a convincingly healthy one.</p>
+      </div>
+    </section>
+
+    <section id="choosing">
+      <p class="kicker">DECIDING</p>
+      <h2>Choosing, in order</h2>
+
+      <div class="check">
+        <li><strong>Measure the staleness cost first.</strong> Score a sample fresh and again with a day-old feature vector. If the loss is 0.0246 you have a much wider choice than if it is 0.2343.</li>
+        <li><strong>Then measure utilisation.</strong> What share of entities is actually requested per interval? The break-even was 9.4%, and most teams guess far higher than the truth.</li>
+        <li><strong>Prefer batch when both allow it.</strong> It is the simplest failure surface, retries are free, and latency is a lookup.</li>
+        <li><strong>Reach for streaming when freshness matters for a minority.</strong> The 47%-of-users-carrying-the-loss split is the signature of a case streaming handles well and pure online overserves.</li>
+        <li><strong>Reach for online when the input arrives with the request.</strong> If the features describe the request itself — a basket, a search query, a submitted form — there is nothing to precompute and the decision is already made.</li>
+        <li><strong>Then consider the hybrid,</strong> which beat both pure options by 27% here and is where most systems end up anyway.</li>
+      </div>
+    </section>
+
+    <section id="reading">
+      <p class="kicker">JUDGEMENT</p>
+      <h2>Five questions about a serving setup</h2>
+
+      <div class="check">
+        <li><strong>How old is a prediction when it is used?</strong> Not the batch interval &mdash; the age at the moment of use, which is up to the interval.</li>
+        <li><strong>What does that cost in AUC?</strong> Measurable in an afternoon, and the answer ranges from 0.0246 to 0.2343 on the same architecture.</li>
+        <li><strong>What share of entities is requested per interval?</strong> Break-even was 9.4%; guesses tend to be high.</li>
+        <li><strong>What is served when the model is unavailable, and how often does that happen?</strong> An uncounted fallback is a model switched off.</li>
+        <li><strong>What alerts on prediction age?</strong> A batch failure produces no errors, no latency and no failed checks &mdash; only staleness.</li>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>Batch, online and streaming differ in prediction age, what they score, and how they fail.</b></li>
+          <li><b>Streaming is fresh like online and serves like batch,</b> if you already have the event stream.</li>
+          <li><b>A week-half-life signal loses 0.0246 over a day and still reads 0.7308.</b></li>
+          <li><b>A six-hour signal loses 0.2343 and reads 0.5161</b> &mdash; essentially random.</li>
+          <li><b>One degrades and the other stops working.</b> The model report looks identical either way.</li>
+          <li><b>By three days the fast signal is at 0.5017;</b> there is nothing left to take.</li>
+          <li><b>The loss is seven times larger among users whose state moved,</b> and they are 47%.</li>
+          <li><b>So the choice is not batch or online for everyone</b> &mdash; it is batch plus freshness for the movers.</li>
+          <li><b>Measure it by scoring a sample twice,</b> fresh and with a day-old vector.</li>
+          <li><b>Break-even utilisation is 9.4% of entities requested per day.</b></li>
+          <li><b>Below it, batch pays to score people nobody asked about.</b></li>
+          <li><b>The dearer online inference is, the LOWER the break-even</b> &mdash; 29.4% at 2&times;, 2.9% at 20&times;.</li>
+          <li><b>Precomputing 5% of entities absorbs 37% of requests and costs 27% less</b> than the best pure option.</li>
+          <li><b>The optimum is interior:</b> 40% is worse than 5%, and 100% is 88% worse.</li>
+          <li><b>Batch fails as staleness, online as errors, streaming as lag</b> &mdash; three different alerts.</li>
+          <li><b>Count your fallback rate.</b> An uncounted fallback is a model switched off that passes every health check.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="13-latency.html">Chapter 13 &mdash; Latency, throughput and cost</a>. Queueing arithmetic for inference: utilisation and tail latency, batching trade-offs, and what a replica actually buys.</p>
+          </div>
+          <div class="fi">
+            <i>PICKED UP FROM</i>
+            <p><a href="07-features.html">Chapter 7</a>: offline evaluation scores fresh features, so the staleness cost appears nowhere in a model report.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>Score a sample of your users with today's features and again with yesterday's, and compare the two AUCs. That number decides your architecture.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   shared helpers
+   ============================================================ */
+function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+function gauss(rnd) {
+  var u1 = Math.max(1e-12, rnd()), u2 = rnd();
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+function avg(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i]; return s / a.length; }
+function sigm(z) { return 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z)))); }
+function auc(sc, lb) {
+  var idx = sc.map(function (s, i) { return i; }).sort(function (a, b) { return sc[a] - sc[b]; });
+  var rk = new Array(sc.length), i = 0;
+  while (i < idx.length) {
+    var j = i;
+    while (j + 1 < idx.length && sc[idx[j + 1]] === sc[idx[i]]) j++;
+    var r = (i + j) / 2 + 1;
+    for (var k = i; k <= j; k++) rk[idx[k]] = r;
+    i = j + 1;
+  }
+  var np = 0, nn = 0, sp = 0;
+  for (var t = 0; t < lb.length; t++) { if (lb[t]) { np++; sp += rk[t]; } else nn++; }
+  return (np && nn) ? (sp - np * (np + 1) / 2) / (np * nn) : 0.5;
+}
+
+/* ============================================================
+   Demo 1 — what staleness costs
+   ============================================================ */
+(function () {
+  var N = 4000, REPS = 10;
+  var $ = function (id) { return document.getElementById(id); };
+
+  var cache = {};
+  function staleness(ageHours, halfLife) {
+    var key = ageHours + "|" + halfLife;
+    if (cache[key]) return cache[key];
+    var rnd = lcg(1801);
+    var rho = Math.pow(0.5, ageHours / halfLife);   /* correlation across the gap */
+    var fresh = [], stale = [], movedLoss = [], stillLoss = [], movedShare = [], sample = null;
+    for (var r = 0; r < REPS; r++) {
+      var atScoring = [], atUse = [], y = [], moved = [];
+      for (var i = 0; i < N; i++) {
+        var x0 = gauss(rnd);
+        var x1 = rho * x0 + Math.sqrt(1 - rho * rho) * gauss(rnd);
+        atScoring.push(x0); atUse.push(x1);
+        y.push(rnd() < sigm(-0.4 + 1.1 * x1) ? 1 : 0);
+        moved.push(Math.abs(x1 - x0) > 1.0 ? 1 : 0);
+      }
+      fresh.push(auc(atUse, y));
+      stale.push(auc(atScoring, y));
+      var mS = [], mY = [], mF = [], sS = [], sY = [], sF = [];
+      for (var i2 = 0; i2 < N; i2++) {
+        if (moved[i2]) { mS.push(atScoring[i2]); mF.push(atUse[i2]); mY.push(y[i2]); }
+        else { sS.push(atScoring[i2]); sF.push(atUse[i2]); sY.push(y[i2]); }
+      }
+      if (mY.length > 50) movedLoss.push(auc(mF, mY) - auc(mS, mY));
+      if (sY.length > 50) stillLoss.push(auc(sF, sY) - auc(sS, sY));
+      movedShare.push(avg(moved));
+      if (!sample) sample = { atScoring: atScoring.slice(0, 900), atUse: atUse.slice(0, 900) };
+    }
+    cache[key] = {
+      rho: rho, fresh: avg(fresh), stale: avg(stale), loss: avg(fresh) - avg(stale),
+      movedLoss: avg(movedLoss), stillLoss: avg(stillLoss), movedShare: avg(movedShare),
+      sample: sample
+    };
+    return cache[key];
+  }
+
+  function chart(age, hl) {
+    var W = 700, H = 190, B = 30, L = 46;
+    var AGES = [1, 6, 24, 72, 168];
+    var xOf = function (i) { return L + i / (AGES.length - 1) * (W - L - 150); };
+    var yOf = function (v) { return (H - B) - (v - 0.48) / 0.30 * (H - B - 26); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="AUC as used against prediction age">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">AUC AS ACTUALLY USED, AGAINST HOW OLD THE PREDICTION IS</text>');
+    svg.push('<line x1="' + L + '" y1="' + yOf(0.5).toFixed(1) + '" x2="' + (W - 146) + '" y2="' + yOf(0.5).toFixed(1) +
+      '" stroke="#C0453A" stroke-width="1.4" stroke-dasharray="4 3"/>');
+    svg.push('<text x="' + (W - 142) + '" y="' + (yOf(0.5) + 4).toFixed(1) + '" font-size="9" fill="#9B2C22">random</text>');
+    [[168, "#2E8B5F", "week half-life"], [48, "#F2A03D", "two days"], [6, "#C0453A", "six hours"]].forEach(function (c) {
+      var on = c[0] === hl;
+      var pts = AGES.map(function (a, i) { return [i, staleness(a, c[0]).stale]; });
+      svg.push('<path d="' + pts.map(function (p, i) {
+        return (i ? "L" : "M") + xOf(p[0]).toFixed(1) + " " + yOf(p[1]).toFixed(1);
+      }).join(" ") + '" fill="none" stroke="' + c[1] + '" stroke-width="' + (on ? 3.2 : 1.6) +
+        '" opacity="' + (on ? 1 : 0.45) + '"/>');
+      pts.forEach(function (p, i) {
+        svg.push('<circle cx="' + xOf(p[0]).toFixed(1) + '" cy="' + yOf(p[1]).toFixed(1) + '" r="' +
+          (on && AGES[i] === age ? 5.5 : on ? 3 : 2) + '" fill="' + c[1] + '"/>');
+      });
+    });
+    AGES.forEach(function (a, i) {
+      svg.push('<text x="' + xOf(i).toFixed(1) + '" y="' + (H - 12) + '" font-size="9" fill="' +
+        (a === age ? "#A8386B" : "#7C8B99") + '" font-weight="' + (a === age ? 700 : 400) +
+        '" text-anchor="middle">' + (a < 24 ? a + "h" : (a / 24) + "d") + '</text>');
+    });
+    [0.5, 0.6, 0.7, 0.75].forEach(function (v) {
+      svg.push('<text x="' + (L - 6) + '" y="' + (yOf(v) + 4).toFixed(1) + '" font-size="9" fill="#7C8B99" text-anchor="end">' +
+        v.toFixed(2) + '</text>');
+    });
+    var px = W - 142;
+    [["week half-life", "#2E8B5F", 168], ["two days", "#F2A03D", 48], ["six hours", "#C0453A", 6]]
+      .forEach(function (c, i) {
+        svg.push('<line x1="' + px + '" y1="' + (32 + i * 15) + '" x2="' + (px + 14) + '" y2="' + (32 + i * 15) +
+          '" stroke="' + c[1] + '" stroke-width="' + (c[2] === hl ? 3.2 : 1.6) + '"/>');
+        svg.push('<text x="' + (px + 19) + '" y="' + (36 + i * 15) + '" font-size="8.5" fill="#54677A">' + c[0] + '</text>');
+      });
+    var d = staleness(age, hl);
+    svg.push('<text x="' + px + '" y="94" font-size="9.5" fill="#7C8B99">lost to staleness</text>');
+    svg.push('<text x="' + px + '" y="114" font-size="17" font-weight="700" fill="' +
+      (d.loss > 0.05 ? "#9B2C22" : "#166B47") + '">' + d.loss.toFixed(4) + '</text>');
+    svg.push('<text x="0" y="' + (H - 1) + '" font-size="9.5" fill="#7C8B99">the fast signal reaches the random line and stays there \u2014 more staleness cannot cost more</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var age = +$("st-age").value, hl = +$("st-hl").value;
+    var d = staleness(age, hl);
+
+    $("st-fresh").textContent = d.fresh.toFixed(4);
+    $("st-stale").textContent = d.stale.toFixed(4);
+    $("st-stale-sub").textContent = "lost " + d.loss.toFixed(4);
+    $("st-stale-tile").className = "tile " + (d.stale < 0.55 ? "bad" : d.loss > 0.05 ? "bad" : "good");
+    $("st-mov").textContent = d.movedLoss.toFixed(4);
+    $("st-mov-sub").textContent = (d.movedShare * 100).toFixed(0) + "% of users";
+    $("st-mov-tile").className = "tile " + (d.movedLoss > 0.1 ? "bad" : "");
+    $("st-still").textContent = d.stillLoss.toFixed(4);
+    $("st-still-tile").className = "tile " + (d.stillLoss < 0.1 ? "good" : "");
+
+    $("st-canvas").innerHTML = chart(age, hl);
+
+    var slow = staleness(24, 168), fast = staleness(24, 6);
+    var lines = [];
+    lines.push("A prediction computed " + (age < 24 ? age + " hours" : (age / 24) + " days") +
+      " before it is used, on a signal whose state has a " +
+      (hl < 24 ? hl + "-hour" : (hl / 24) + "-day") + " half-life. Scored fresh the model reads " +
+      d.fresh.toFixed(4) + "; as actually used it reads " + d.stale.toFixed(4) + ", a loss of " +
+      d.loss.toFixed(4) + ".");
+
+    if (d.stale < 0.55) {
+      lines.push("That is essentially random. This is not a degraded model, it is a model that has stopped working \u2014 and it will look completely healthy in every offline report, because offline evaluation scores FRESH features, which is chapter 7's point arriving through the serving schedule.");
+    }
+    lines.push("Compare the two extremes at a day of staleness: the slow signal loses " +
+      slow.loss.toFixed(4) + " and still reads " + slow.stale.toFixed(4) + ", while the fast one loses " +
+      fast.loss.toFixed(4) + " and reads " + fast.stale.toFixed(4) +
+      ". Same architecture, same interval \u2014 one degrades and the other stops working.");
+    lines.push("And the fast signal reaches that floor on the FIRST day: by three days it is at " +
+      staleness(72, 6).stale.toFixed(4) + ", because there is nothing left for more staleness to take. The slow signal is still at " +
+      staleness(168, 168).stale.toFixed(4) + " after a full week.");
+    lines.push("Now look at where the loss falls. Users whose state moved materially are " +
+      (d.movedShare * 100).toFixed(0) + "% of the population and carry a loss of " +
+      d.movedLoss.toFixed(4) + "; everyone else loses " + d.stillLoss.toFixed(4) +
+      ". So the choice is not batch OR online for the whole population \u2014 it is batch for everyone plus fresh scoring for the minority whose state changed, which is what an event stream tells you.");
+    lines.push("Measuring this costs an afternoon: score a sample with today's features, score them again with yesterday's, and compare. You get both the aggregate loss and the split, and the split tells you how much of your population actually needs freshness.");
+    $("st-note").textContent = lines.join("\n\n");
+  }
+
+  ["st-age", "st-hl"].forEach(function (id) { $(id).addEventListener("change", render); });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — cost per prediction someone used
+   ============================================================ */
+(function () {
+  var N = 2000000, BATCH_UNIT = 0.0000012, ONLINE_UNIT = 0.0000075, PEAK = 3.0, CONC = 3.0;
+  var $ = function (id) { return document.getElementById(id); };
+
+  function pureBatch() { return N * BATCH_UNIT; }
+  function pureOnline(u) { return N * u * ONLINE_UNIT * (1 + 0.35 * (PEAK - 1)); }
+  /* requests follow a power law, so a small precomputed head absorbs a large share */
+  function coverage(headShare) { return headShare <= 0 ? 0 : Math.min(1, Math.pow(headShare, 1 / CONC)); }
+  function hybrid(u, headShare) {
+    var cov = coverage(headShare);
+    return N * headShare * BATCH_UNIT + N * u * (1 - cov) * ONLINE_UNIT * (1 + 0.35 * (PEAK - 1));
+  }
+  function breakEven(ratio) {
+    var lo = 0, hi = 1;
+    for (var i = 0; i < 200; i++) {
+      var m = (lo + hi) / 2;
+      var on = N * m * (BATCH_UNIT * ratio) * (1 + 0.35 * (PEAK - 1));
+      if (pureBatch() > on) lo = m; else hi = m;
+    }
+    return (lo + hi) / 2;
+  }
+
+  function chart(u, head) {
+    var W = 700, H = 190, B = 30, L = 50;
+    var HS = [0, 0.01, 0.05, 0.15, 0.4, 1];
+    var xOf = function (i) { return L + i / (HS.length - 1) * (W - L - 150); };
+    var costs = HS.map(function (h) { return hybrid(u, h); });
+    var hi = Math.max.apply(null, costs) * 1.05;
+    var yOf = function (v) { return (H - B) - v / hi * (H - B - 26); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Daily cost against the precomputed share">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">DAILY COST AGAINST HOW MUCH YOU PRECOMPUTE</text>');
+    svg.push('<path d="' + costs.map(function (c, i) {
+      return (i ? "L" : "M") + xOf(i).toFixed(1) + " " + yOf(c).toFixed(1);
+    }).join(" ") + '" fill="none" stroke="#20456A" stroke-width="3"/>');
+    var bi = costs.indexOf(Math.min.apply(null, costs));
+    HS.forEach(function (h, i) {
+      var on = Math.abs(h - head) < 1e-9;
+      svg.push('<circle cx="' + xOf(i).toFixed(1) + '" cy="' + yOf(costs[i]).toFixed(1) + '" r="' +
+        (on ? 6 : i === bi ? 4.5 : 3) + '" fill="' + (i === bi ? "#2E8B5F" : "#20456A") + '"/>');
+      svg.push('<text x="' + xOf(i).toFixed(1) + '" y="' + (H - 16) + '" font-size="9" fill="' +
+        (on ? "#A8386B" : "#7C8B99") + '" font-weight="' + (on ? 700 : 400) + '" text-anchor="middle">' +
+        (h === 0 ? "none" : h === 1 ? "all" : (h * 100) + "%") + '</text>');
+      svg.push('<text x="' + xOf(i).toFixed(1) + '" y="' + (H - 4) + '" font-size="8" fill="#8FA0AF" text-anchor="middle">' +
+        (coverage(h) * 100).toFixed(0) + '% cov</text>');
+    });
+    svg.push('<text x="' + xOf(bi).toFixed(1) + '" y="' + (yOf(costs[bi]) - 11).toFixed(1) +
+      '" font-size="9" font-weight="700" fill="#166B47" text-anchor="middle">cheapest</text>');
+    [0, hi / 2, hi].forEach(function (v) {
+      svg.push('<text x="' + (L - 6) + '" y="' + (yOf(v) + 4).toFixed(1) + '" font-size="9" fill="#7C8B99" text-anchor="end">\u00a3' +
+        v.toFixed(2) + '</text>');
+    });
+    var px = W - 142;
+    svg.push('<text x="' + px + '" y="40" font-size="9.5" fill="#7C8B99">pure batch</text>');
+    svg.push('<text x="' + px + '" y="58" font-size="13" font-weight="700" fill="#54677A">\u00a3' +
+      pureBatch().toFixed(2) + '</text>');
+    svg.push('<text x="' + px + '" y="80" font-size="9.5" fill="#7C8B99">pure online</text>');
+    svg.push('<text x="' + px + '" y="98" font-size="13" font-weight="700" fill="#54677A">\u00a3' +
+      pureOnline(u).toFixed(2) + '</text>');
+    svg.push('<text x="' + px + '" y="120" font-size="9.5" fill="#7C8B99">best hybrid</text>');
+    svg.push('<text x="' + px + '" y="138" font-size="15" font-weight="700" fill="#166B47">\u00a3' +
+      costs[bi].toFixed(2) + '</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var u = +$("co-u").value, head = +$("co-head").value;
+    var cost = hybrid(u, head), pb = pureBatch(), po = pureOnline(u);
+    var bestPure = Math.min(pb, po);
+    var HS = [0, 0.01, 0.05, 0.15, 0.4, 1];
+    var costs = HS.map(function (h) { return hybrid(u, h); });
+    var bestH = Math.min.apply(null, costs);
+
+    $("co-tot").textContent = "\u00a3" + cost.toFixed(2);
+    $("co-tot-sub").textContent = head === 0 ? "pure online" : head === 1 ? "pure batch"
+      : (head * 100) + "% precomputed";
+    $("co-tot-tile").className = "tile " + (cost <= bestH + 1e-9 ? "good" : "");
+    $("co-cov").textContent = (coverage(head) * 100).toFixed(0) + "%";
+    $("co-pb").textContent = "\u00a3" + pb.toFixed(2);
+    $("co-pb-sub").textContent = "pure online: \u00a3" + po.toFixed(2);
+    $("co-verd").textContent = ((cost / bestPure - 1) * 100).toFixed(0) + "%";
+    $("co-verd-sub").textContent = cost < bestPure ? "cheaper than either" : "worse than one of them";
+    $("co-verd-tile").className = "tile " + (cost < bestPure ? "good" : "bad");
+
+    $("co-canvas").innerHTML = chart(u, head);
+
+    var be = breakEven(ONLINE_UNIT / BATCH_UNIT);
+    var lines = [];
+    lines.push("Two million entities, one batch run per day, " + (u * 100).toFixed(1) +
+      "% of them actually requested. Pure batch costs \u00a3" + pb.toFixed(2) +
+      " and pure online \u00a3" + po.toFixed(2) + "; " +
+      (head === 0 ? "serving everything online" : head === 1 ? "precomputing everything"
+        : "precomputing the most-requested " + (head * 100) + "%") + " costs \u00a3" + cost.toFixed(2) + ".");
+    lines.push("The break-even between the two pure strategies is at " + (be * 100).toFixed(1) +
+      "% of entities requested per day. Below that, batch is paying to score people nobody asked about; above it, online is paying a per-prediction premium on volume high enough that precomputation amortises.");
+    lines.push("The counterintuitive part is what happens when inference gets expensive: the break-even goes DOWN, not up. At a 2\u00d7 unit-cost ratio it sits at " +
+      (breakEven(2) * 100).toFixed(1) + "%, and at 20\u00d7 it sits at " + (breakEven(20) * 100).toFixed(1) +
+      "%. A large model with costly inference pushes you toward precomputation even at very low utilisation \u2014 the opposite of the instinct that big models are too expensive to run over everyone.");
+
+    if (head > 0 && head < 1) {
+      lines.push("And the hybrid beats both. Precomputing " + (head * 100) +
+        "% of entities absorbs " + (coverage(head) * 100).toFixed(0) + "% of requests, because requests are concentrated \u2014 so the small precomputed head takes most of the traffic and the long tail goes to inference. At \u00a3" +
+        cost.toFixed(2) + " against \u00a3" + bestPure.toFixed(2) + " that is " +
+        ((1 - cost / bestPure) * 100).toFixed(0) + "% cheaper than the better pure option.");
+      lines.push("Note that the optimum is interior and small: 40% precomputed is already worse than 5%, and 100% is far worse. Which is why most real systems converge on a cached head plus online tail after someone works this out, and why the answer to \u201cbatch or online\u201d is usually \u201cboth, and mostly online by entity count\u201d.");
+    } else {
+      lines.push("Try the intermediate settings. Because requests follow a power law, precomputing a small share of entities absorbs a disproportionate share of requests \u2014 and the cheapest option is neither of the two pure ones.");
+    }
+    $("co-note").textContent = lines.join("\n\n");
+  }
+
+  ["co-u", "co-head"].forEach(function (id) { $(id).addEventListener("change", render); });
+  render();
+})();
+
+initChapter("12-serving.html");
+</script>
+</body>
+</html>

@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8. Latency, batching and the queue — Code Review</title>
+<meta name="description" content="Review as a queueing problem: why utilisation and wait are not proportional, why a shared queue beats assigned reviewers, and how many review windows a day.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span class="sep">/</span> <a href="index.html">Code Review</a> <span class="sep">/</span> Chapter 8</p>
+    <p class="chapter">Chapter 8 <span class="part">· The mechanics</span></p>
+    <h1>Latency, batching and the queue</h1>
+    <p class="lede">A team at 50% review utilisation and one at 99% differ by a quarter in how busy they feel and by <strong>forty times</strong> in how long a pull request waits. Review is a queue, and queues do not degrade gracefully.</p>
+    <div class="meta">
+      <span><b>7</b> sections</span>
+      <span><b>2</b> demos</span>
+      <span><b>7</b> self-check questions</span>
+      <span>Roughly <b>30</b> minutes</span>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page">
+    <h2>On this page</h2>
+    <div data-sections></div>
+    <h2>Nearby chapters</h2>
+    <div data-nearby></div>
+  </nav>
+
+  <main>
+
+    <!-- ==================================================== -->
+    <section id="s-queue">
+      <h2>The hyperbola</h2>
+      <div class="h2rule"></div>
+
+      <p>Chapters 4, 6 and 7 each hit the same 1/(1 − ρ) factor from a different direction. Here it is on its own terms: expected wait for a single reviewer is <code>1 / (μ − λ)</code>, where μ is what they can review and λ is what arrives.</p>
+
+      <!-- ------------- DEMO 1 ------------- -->
+      <div class="demo" id="demo-q">
+        <div class="demo-top">
+          <h3>Demo 1 — utilisation against wait</h3>
+          <p>One reviewer clearing 8 pull requests a day, with a variable arrival rate.</p>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Arrivals per day <input type="range" id="q-a" min="5" max="790" value="400" step="5"><span id="q-av" style="font-size:12px;color:#54677A"></span></label>
+            <label>Reviewers <input type="range" id="q-c" min="1" max="8" value="1"><span id="q-cv" style="font-size:12px;color:#54677A"></span></label>
+            <label>Queue
+              <span class="seg" id="q-m">
+                <button type="button" data-m="pool" aria-pressed="true">shared</button>
+                <button type="button" data-m="split" aria-pressed="false">assigned</button>
+              </span>
+            </label>
+          </div>
+
+          <div class="stage">
+            <div id="q-chart"></div>
+          </div>
+
+          <div class="rgrid">
+            <div class="tile"><span class="k">Utilisation</span><span class="v" id="q-rho">—</span></div>
+            <div class="tile"><span class="k">Expected wait</span><span class="v sm" id="q-wait">—</span></div>
+            <div class="tile"><span class="k">Open at any moment</span><span class="v sm" id="q-wip">—</span></div>
+            <div class="tile"><span class="k">Diffs settle at</span><span class="v sm" id="q-size">—</span></div>
+            <div class="tile"><span class="k">Caught</span><span class="v" id="q-caught">—</span></div>
+            <div class="tile"><span class="k">Other queue type</span><span class="v sm" id="q-other">—</span></div>
+          </div>
+
+          <p class="readout" id="q-out"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>One reviewer, capacity 8 PRs/day</caption>
+          <thead><tr><th>Arriving</th><th>Utilisation</th><th>Wait</th></tr></thead>
+          <tbody>
+            <tr><td>4/day</td><td class="num">50%</td><td class="num">2.0 h</td></tr>
+            <tr><td>6/day</td><td class="num">75%</td><td class="num">4.0 h</td></tr>
+            <tr><td>7/day</td><td class="num">87.5%</td><td class="num">8.0 h</td></tr>
+            <tr><td>7.5/day</td><td class="num">93.8%</td><td class="num">16.0 h</td></tr>
+            <tr><td>7.9/day</td><td class="num">98.8%</td><td class="num"><strong>80.0 h</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b class="tag">Utilisation is a terrible thing to maximise</b>
+        <p>Going from 50% to 99% utilisation multiplies the wait by <strong>40</strong>. A reviewer who is busy half the time and one who is busy almost all the time look similar in any capacity report and produce completely different systems.</p>
+        <p>This is why "everyone should be fully utilised" is a mistake specifically for review. <strong>The slack is the product.</strong></p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-pool">
+      <h2>Shared queue against assigned reviewers</h2>
+      <div class="h2rule"></div>
+
+      <p>Twenty-four pull requests a day, four reviewers clearing eight each. Two ways to route them: one shared queue anyone picks from, or each reviewer owning a quarter of the work.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Same total capacity, different routing</caption>
+          <thead><tr><th>Reviewers</th><th>Shared queue</th><th>Assigned</th><th>Pooling gain</th></tr></thead>
+          <tbody>
+            <tr><td>3</td><td class="num">never clears</td><td class="num">never clears</td><td class="num">—</td></tr>
+            <tr><td><strong>4</strong></td><td class="num"><strong>1.51 h</strong></td><td class="num"><strong>4.00 h</strong></td><td class="num"><strong>2.6×</strong></td></tr>
+            <tr><td>5</td><td class="num">1.12 h</td><td class="num">2.50 h</td><td class="num">2.2×</td></tr>
+            <tr><td>6</td><td class="num">1.03 h</td><td class="num">2.00 h</td><td class="num">1.9×</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>An assigned reviewer can be idle while another has a backlog; a shared queue cannot waste capacity that way. It is the same reason one supermarket line feeding many tills beats one line per till.</p>
+
+      <div class="note warn">
+        <b class="tag">A result I had backwards</b>
+        <p>I assumed pooling would help <em>more</em> as the team grew. It helps more when the system is <strong>closer to capacity</strong> — 2.6× at four reviewers, falling to 1.9× at six. With slack everywhere, an assigned reviewer is rarely the bottleneck, so there is little idle capacity for pooling to reclaim.</p>
+        <p>Which means the teams that would benefit most from a shared queue are precisely the ones too busy to reorganise.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-tension">
+      <h2>Does that contradict chapter 1?</h2>
+      <div class="h2rule"></div>
+
+      <p>Chapter 1 found that <em>deliberate</em> reviewer assignment beat random assignment for knowledge spread. This chapter says pool the queue. Those sound opposed, so it is worth measuring rather than reasoning about.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Lone modules across 40 seeds, 8 developers, 40 modules</caption>
+          <thead><tr><th>Routing</th><th>Seeds with a bus factor of 1</th></tr></thead>
+          <tbody>
+            <tr><td>Shared queue, any non-author</td><td class="num"><strong>0 of 40</strong></td></tr>
+            <tr><td>Code owners — each module has one</td><td class="num"><strong>40 of 40</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b class="tag">No contradiction — pooling wins on both</b>
+        <p>Chapter 1's finding was that the reviewer must not be the <strong>author</strong>. It never required a fixed <em>owner</em>. A shared queue satisfies both constraints: it excludes the author and it spreads exposure widely.</p>
+        <p>Code ownership is the arrangement that loses on both counts — 2.6× the latency and a lone module on every seed.</p>
+      </div>
+
+      <p>That does not make ownership worthless. It buys <strong>consistency</strong>: one person holding the shape of a module, catching the drift that a rotating reviewer will not notice. But consistency is the third of chapter 1's four goals, not the first two — so "we use code owners" is a decision to trade latency and bus factor for it, and worth making deliberately rather than by default.</p>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-windows">
+      <h2>How often to review</h2>
+      <div class="h2rule"></div>
+
+      <p>Reviewing the instant a request arrives gives the shortest wait and destroys the reviewer's day. Reviewing once a week gives perfect focus and everything else in this unit gets worse. There is a number in between.</p>
+
+      <!-- ------------- DEMO 2 ------------- -->
+      <div class="demo" id="demo-win">
+        <div class="demo-top">
+          <h3>Demo 2 — review windows a day</h3>
+          <p>Focus lost to interruptions against the wait those interruptions buy, at 23 minutes to recover from each.</p>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Windows per day <input type="range" id="wn-w" min="1" max="24" value="2"><span id="wn-wv" style="font-size:12px;color:#54677A"></span></label>
+            <label>Recovery cost <input type="range" id="wn-c" min="5" max="40" value="23"><span id="wn-cv" style="font-size:12px;color:#54677A"></span></label>
+          </div>
+
+          <div class="stage">
+            <div id="wn-chart"></div>
+          </div>
+
+          <div class="rgrid">
+            <div class="tile"><span class="k">Average wait</span><span class="v sm" id="wn-wait">—</span></div>
+            <div class="tile"><span class="k">Focus lost</span><span class="v sm" id="wn-focus">—</span></div>
+            <div class="tile"><span class="k">Diffs settle at</span><span class="v sm" id="wn-size">—</span></div>
+            <div class="tile"><span class="k">Caught</span><span class="v" id="wn-caught">—</span></div>
+            <div class="tile"><span class="k">Deep-work time left</span><span class="v sm" id="wn-deep">—</span></div>
+            <div class="tile"><span class="k">Verdict</span><span class="v sm" id="wn-verdict">—</span></div>
+          </div>
+
+          <p class="readout" id="wn-out"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Windows a day, and what each costs</caption>
+          <thead><tr><th>Windows</th><th>Average wait</th><th>Focus lost</th><th>Diffs settle at</th><th>Caught</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td class="num">4.00 h</td><td class="num">23 min</td><td class="num">50 lines</td><td class="num">100%</td></tr>
+            <tr><td><strong>2</strong></td><td class="num"><strong>2.00 h</strong></td><td class="num"><strong>46 min</strong></td><td class="num">25 lines</td><td class="num">100%</td></tr>
+            <tr><td>4</td><td class="num">1.00 h</td><td class="num">92 min</td><td class="num">12 lines</td><td class="num">100%</td></tr>
+            <tr><td>24</td><td class="num">0.17 h</td><td class="num"><strong>552 min</strong></td><td class="num">2 lines</td><td class="num">100%</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="big">Continuous review costs nine hours of recovered focus a day.</p>
+
+      <p>That is more than a working day — the reviewer never reaches deep work at all. And it buys 1.8 hours of latency against reviewing twice, which the last two columns say is worth nothing measurable: both settle diffs well inside the detection curve.</p>
+
+      <div class="note tip">
+        <b class="tag">Two windows a day</b>
+        <p>Modelled, that costs <strong>46 focus-minutes</strong> and loses nothing on catch rate. It is short enough that diffs stay small — which is chapter 4's whole concern — and leaves the reviewer with most of their day intact.</p>
+        <p>The corollary matters as much: <strong>a review request is not an interruption to answer immediately.</strong> Treating it as one is the expensive default, and it is usually adopted out of politeness.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-wip">
+      <h2>Why a WIP limit works</h2>
+      <div class="h2rule"></div>
+
+      <p>Little's law: <code>L = λW</code>. The number of pull requests open at any moment equals the arrival rate times the average wait.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Six pull requests a day arriving</caption>
+          <thead><tr><th>Average wait</th><th>Open simultaneously</th></tr></thead>
+          <tbody>
+            <tr><td>1 hour</td><td class="num">0.75</td></tr>
+            <tr><td>4 hours</td><td class="num">3.0</td></tr>
+            <tr><td>24 hours</td><td class="num"><strong>18.0</strong></td></tr>
+            <tr><td>72 hours</td><td class="num">54.0</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The law runs both ways, which is the useful part. Capping the number of open pull requests <em>forces the wait down</em>, because throughput is fixed by capacity — you cannot hold L low and W high at the same time.</p>
+
+      <div class="note warn">
+        <b class="tag">But it must be imposed on the right half</b>
+        <p>A WIP limit looks like a restriction on authors: "no more than three open PRs each". Read through Little's law it is a <strong>commitment by reviewers</strong> — the only way to keep L under the cap without throttling throughput is to cut W.</p>
+        <p>Imposed on authors alone it becomes a queue outside the queue: work waiting to become a pull request, invisible to every metric, with all the same costs.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-traps">
+      <h2>Traps</h2>
+      <div class="h2rule"></div>
+
+      <div class="tw">
+        <table>
+          <caption>Where the queue gets mismanaged</caption>
+          <thead><tr><th>Trap</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Maximising reviewer utilisation</strong></td><td>50% to 99% is 40× the wait; slack is the product</td></tr>
+            <tr><td><strong>Assigning reviewers by ownership</strong></td><td>2.6× the latency and a lone module on every seed</td></tr>
+            <tr><td><strong>Reviewing on arrival</strong></td><td>Nine hours of recovered focus a day</td></tr>
+            <tr><td><strong>A WIP limit on authors only</strong></td><td>Moves the queue somewhere unmeasured</td></tr>
+            <tr><td><strong>Adding reviewers to fix latency</strong></td><td>Works, but pooling the existing ones is free</td></tr>
+            <tr><td><strong>Reading average wait alone</strong></td><td>The distribution has a long tail near capacity</td></tr>
+            <tr><td><strong>Treating "we're busy" as an explanation</strong></td><td>Busy is ρ; the wait is 1/(1 − ρ), and they are not the same shape</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The last one is the summary of this chapter and arguably of Part 2. Everyone on a slow-review team can tell you they are busy, and they are right — but the felt difference between 90% and 98% utilisation is small while the difference in wait is fivefold. Intuition tracks ρ. Outcomes track 1/(1 − ρ).</p>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-check">
+      <h2>Check yourself</h2>
+      <div class="h2rule"></div>
+
+      <div class="check">
+        <details>
+          <summary>Why is high reviewer utilisation a bad target?</summary>
+          <div class="ans">
+            <p>Because wait is <code>1/(μ − λ)</code>, a hyperbola, not a line. Going from 50% to 99% utilisation multiplies the wait by <strong>40</strong> — from 2 hours to 80. A reviewer busy half the time and one busy almost all the time look similar in any capacity report and produce completely different systems. For review specifically, the slack is the product.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Shared queue or assigned reviewers?</summary>
+          <div class="ans">
+            <p>Shared. At 24 PRs a day across four reviewers, a shared queue waits <strong>1.51 hours</strong> and assigned queues wait <strong>4.00</strong> — 2.6× at identical total capacity. An assigned reviewer can be idle while another has a backlog; a shared queue cannot waste capacity that way, which is why one supermarket line feeding many tills beats one line per till.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Does pooling help more as the team grows?</summary>
+          <div class="ans">
+            <p>No — I had this backwards. It helps more when the system is <strong>closer to capacity</strong>: 2.6× at four reviewers, 2.2× at five, 1.9× at six. With slack everywhere an assigned reviewer is rarely the bottleneck, so there is little idle capacity for pooling to reclaim. The unfortunate consequence is that the teams who would gain most are the ones too busy to reorganise.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Chapter 1 said assign reviewers deliberately. Does this contradict it?</summary>
+          <div class="ans">
+            <p>No. Chapter 1's finding was that the reviewer must not be the <strong>author</strong> — it never required a fixed <em>owner</em>. A shared queue satisfies both: it excludes the author and spreads exposure widely. Measured across 40 seeds, a shared queue leaves a lone module on <strong>0</strong> of them and code ownership on <strong>40</strong>. Ownership loses on both counts and buys consistency, which is a different one of chapter 1's four goals.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>How often should a reviewer check the queue?</summary>
+          <div class="ans">
+            <p>Twice a day. At 23 minutes to recover from an interruption, two windows costs <strong>46 focus-minutes</strong> and gives a 2-hour average wait — short enough that diffs settle at 25 lines, well inside the detection curve. Continuous review costs <strong>552 minutes</strong> of recovered focus, more than a working day, and buys 1.8 hours of latency that the catch rate cannot detect.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>What does Little's law tell you about WIP limits?</summary>
+          <div class="ans">
+            <p>That capping open pull requests <em>forces the wait down</em>. <code>L = λW</code>, and throughput is fixed by capacity, so you cannot hold L low and W high simultaneously — at 6 PRs a day, an 18-deep queue means a 24-hour wait and a 3-deep queue means 4 hours. The law running both directions is what makes the limit a lever rather than a rule.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Your team caps open PRs per author and nothing improves. Why?</summary>
+          <div class="ans">
+            <p>Because the cap was applied to the wrong half of the loop. Read through Little's law, a WIP limit is a <strong>commitment by reviewers</strong> — the only way to keep L under the cap without throttling throughput is to cut W. Imposed on authors alone it creates a queue outside the queue: work waiting to become a pull request, invisible to every metric, carrying all the same costs.</p>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-recap">
+      <div class="recap">
+        <h2>Ten things to carry forward</h2>
+        <ol>
+          <li><b>Wait is 1/(μ − λ)</b> — a hyperbola. 50% to 99% utilisation is 40× the wait.</li>
+          <li><b>Slack is the product.</b> Full utilisation is the wrong target for review.</li>
+          <li><b>A shared queue is 2.6× faster</b> than assigned reviewers at identical capacity.</li>
+          <li><b>Pooling helps most near capacity,</b> not with more reviewers — the reverse of what I assumed.</li>
+          <li><b>Pooling also wins on bus factor:</b> 0 lone modules against 40 of 40.</li>
+          <li><b>Code ownership buys consistency</b> and pays 2.6× latency for it.</li>
+          <li><b>Two review windows a day:</b> 46 focus-minutes, nothing lost on catch rate.</li>
+          <li><b>Continuous review costs nine hours of focus a day.</b></li>
+          <li><b>L = λW runs both ways;</b> a WIP cap forces the wait down.</li>
+          <li><b>Intuition tracks ρ; outcomes track 1/(1 − ρ).</b></li>
+        </ol>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<footer>
+  <div class="foot-inner">
+    <div class="fi-grid">
+      <div class="fi">
+        <h3>What comes next</h3>
+        <p>Part 2 ends here. Part 3 turns from process to substance: what to actually look for, starting with correctness and the edge cases nobody tested.</p>
+      </div>
+      <div class="fi">
+        <h3>About the queueing models</h3>
+        <p>M/M/1 and Erlang C are standard results, implemented here rather than quoted. They assume Poisson arrivals and exponential service times, which real review only approximates — the shapes are robust to that, the exact hours less so.</p>
+      </div>
+      <div class="fi">
+        <h3>The same factor, four times</h3>
+        <p>1/(1 − ρ) has now appeared in chapters 4, 6, 7 and 8, entered from diff size, comment delivery, author response and reviewer scheduling. That is one system with four handles on it.</p>
+      </div>
+    </div>
+    <div class="pager" data-pager></div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">&uarr;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+const DENSITY = 0.06, SCALE = 124.3, CAP = 12, AUTHOR_RATE = 80, REVIEW_RATE = 400;
+const caught = loc => loc ? Math.min(1, (CAP * (1 - Math.exp(-loc / SCALE))) / (DENSITY * loc)) : 1;
+const settled = baseDays => AUTHOR_RATE * (baseDays / (1 - AUTHOR_RATE / REVIEW_RATE));
+
+/* =============================================================
+   Demo 1 — the queue
+   ============================================================= */
+(function(){
+  const SERVICE = 8;
+  let mode = "pool";
+  const fact = n => { let f = 1; for (let i = 2; i <= n; i++) f *= i; return f; };
+  function erlangC(c, a){
+    if (a >= c) return 1;
+    const top = (Math.pow(a, c) / fact(c)) * (c / (c - a));
+    let bottom = top;
+    for (let k = 0; k < c; k++) bottom += Math.pow(a, k) / fact(k);
+    return top / bottom;
+  }
+  const mm1 = (lam, mu) => lam >= mu ? null : 1 / (mu - lam);
+  function mmc(lam, mu, c){
+    const a = lam / mu;
+    if (a >= c) return null;
+    return erlangC(c, a) / (c * mu - lam) + 1 / mu;
+  }
+
+  function draw(){
+    const arrivals = +document.getElementById("q-a").value / 100;
+    const c = +document.getElementById("q-c").value;
+    document.getElementById("q-av").textContent = arrivals.toFixed(2) + " PRs/day";
+    document.getElementById("q-cv").textContent = c + (c === 1 ? " reviewer" : " reviewers");
+
+    const pooled = mmc(arrivals, SERVICE, c);
+    const split = mm1(arrivals / c, SERVICE);
+    const w = mode === "pool" ? pooled : split;
+    const other = mode === "pool" ? split : pooled;
+    const rho = arrivals / (SERVICE * c);
+
+    const W = 560, H = 165, PAD = 36;
+    const x = r => PAD + r * (W - PAD - 8);
+    const maxW = 12;                                  // hours, clipped
+    const y = h => H - 22 - Math.min(h, maxW) / maxW * (H - 44);
+    let d = "";
+    for (let r = 0.02; r < 0.995; r += 0.005){
+      const lam = r * SERVICE * c;
+      const ww = mode === "pool" ? mmc(lam, SERVICE, c) : mm1(lam / c, SERVICE);
+      if (ww === null) break;
+      d += (d ? " L" : "M") + x(r).toFixed(1) + " " + y(ww * 8).toFixed(1);
+    }
+    document.getElementById("q-chart").innerHTML = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;overflow:visible">
+      <line x1="${PAD}" y1="${H-22}" x2="${W-8}" y2="${H-22}" stroke="#CFD8E0"/>
+      <line x1="${PAD}" y1="14" x2="${PAD}" y2="${H-22}" stroke="#CFD8E0"/>
+      <path d="${d}" fill="none" stroke="#E2574C" stroke-width="2"/>
+      ${w !== null ? `<line x1="${x(rho)}" y1="14" x2="${x(rho)}" y2="${H-22}" stroke="#0C1D30" stroke-dasharray="3 3"/>
+      <circle cx="${x(rho)}" cy="${y(w*8)}" r="4" fill="#0C1D30"/>` : ""}
+      <text x="${PAD}" y="${H-6}" font-size="10" fill="#7D8EA0">0% utilised</text>
+      <text x="${W-8}" y="${H-6}" font-size="10" fill="#7D8EA0" text-anchor="end">100%</text>
+      <text x="${PAD+4}" y="24" font-size="10.5" fill="#9A2E22">hours waiting (clipped at 12)</text>
+    </svg>`;
+
+    const wipDays = w === null ? null : arrivals * w;
+    const size = w === null ? null : settled(w);
+    setTile("q-rho", (rho * 100).toFixed(1) + "%");
+    setTile("q-wait", w === null ? "never clears" : (w * 8).toFixed(2) + " h");
+    setTile("q-wip", wipDays === null ? "unbounded" : wipDays.toFixed(1) + " PRs");
+    setTile("q-size", size === null ? "unbounded" : Math.round(size) + " lines");
+    setTile("q-caught", size === null ? "0%" : Math.round(caught(size) * 100) + "%");
+    setTile("q-other", other === null ? "never clears" : (other * 8).toFixed(2) + " h");
+
+    let msg;
+    if (w === null){
+      msg = "<b>Saturated.</b> Arrivals meet or exceed capacity, so the queue never clears and every " +
+            "quantity downstream is unbounded. Note that the <em>other</em> routing may still work — " +
+            "switch it and see.";
+    } else if (rho > 0.9){
+      msg = "<b>" + (rho*100).toFixed(1) + "% utilised, waiting " + (w*8).toFixed(1) + " hours.</b> " +
+            "You are on the vertical part of the curve, where a few percent of extra load doubles the " +
+            "wait. Everyone here can truthfully say they are busy — and the felt difference between 90% " +
+            "and 98% is small while the wait difference is fivefold.";
+    } else if (other !== null && Math.abs(other - w) > 0.02){
+      const faster = other > w;
+      msg = "At " + (rho*100).toFixed(0) + "% utilisation this waits <b>" + (w*8).toFixed(2) + " h</b>, " +
+            "against <b>" + (other*8).toFixed(2) + " h</b> for the " + (mode === "pool" ? "assigned" : "shared") +
+            " arrangement — " + (faster ? "pooling is " + (other/w).toFixed(1) + "× faster"
+                                        : "the difference runs the other way here") +
+            ". Same people, same capacity, different routing.";
+    } else {
+      msg = "At " + (rho*100).toFixed(0) + "% utilisation the wait is <b>" + (w*8).toFixed(2) + " hours</b>. " +
+            "With this much slack the two routings barely differ — pooling reclaims idle capacity, and " +
+            "there is not much idle capacity to reclaim. Push the arrivals up and the gap opens.";
+    }
+    document.getElementById("q-out").innerHTML = msg;
+  }
+  document.getElementById("q-m").addEventListener("click", e => {
+    const b = e.target.closest("button[data-m]"); if (!b) return;
+    mode = b.dataset.m;
+    [...e.currentTarget.querySelectorAll("button")].forEach(x => x.setAttribute("aria-pressed", String(x === b)));
+    draw();
+  });
+  ["q-a","q-c"].forEach(id => document.getElementById(id).addEventListener("input", draw));
+  draw();
+})();
+
+/* =============================================================
+   Demo 2 — review windows
+   ============================================================= */
+(function(){
+  function draw(){
+    const w = +document.getElementById("wn-w").value;
+    const cost = +document.getElementById("wn-c").value;
+    document.getElementById("wn-wv").textContent = w + (w === 1 ? " window" : " windows");
+    document.getElementById("wn-cv").textContent = cost + " min";
+    const lost = w * cost;
+    const wait = 8 / (2 * w);
+    const size = settled(wait / 8);
+    const deep = Math.max(0, 8 * 60 - lost);
+
+    const W = 560, H = 150, PAD = 36;
+    const x = k => PAD + ((k - 1) / 23) * (W - PAD - 8);
+    const maxLost = 24 * cost;
+    const yL = v => H - 22 - (v / Math.max(maxLost, 1)) * (H - 44);
+    const yW = v => H - 22 - (v / 4) * (H - 44);
+    let dl = "", dw = "";
+    for (let k = 1; k <= 24; k++){
+      dl += (dl ? " L" : "M") + x(k).toFixed(1) + " " + yL(k * cost).toFixed(1);
+      dw += (dw ? " L" : "M") + x(k).toFixed(1) + " " + yW(8 / (2 * k)).toFixed(1);
+    }
+    document.getElementById("wn-chart").innerHTML = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;overflow:visible">
+      <line x1="${PAD}" y1="${H-22}" x2="${W-8}" y2="${H-22}" stroke="#CFD8E0"/>
+      <path d="${dl}" fill="none" stroke="#E2574C" stroke-width="2"/>
+      <path d="${dw}" fill="none" stroke="#3FB984" stroke-width="2"/>
+      <line x1="${x(w)}" y1="10" x2="${x(w)}" y2="${H-22}" stroke="#0C1D30" stroke-dasharray="3 3"/>
+      <text x="${PAD}" y="${H-6}" font-size="10" fill="#7D8EA0">1 window</text>
+      <text x="${W-8}" y="${H-6}" font-size="10" fill="#7D8EA0" text-anchor="end">24 (continuous)</text>
+      <text x="${PAD+4}" y="22" font-size="10.5" fill="#9A2E22">focus lost</text>
+      <text x="${PAD+4}" y="36" font-size="10.5" fill="#166B47">average wait</text>
+    </svg>`;
+
+    setTile("wn-wait", wait.toFixed(2) + " h");
+    setTile("wn-focus", lost + " min");
+    setTile("wn-size", Math.round(size) + " lines");
+    setTile("wn-caught", Math.round(caught(size) * 100) + "%");
+    setTile("wn-deep", (deep / 60).toFixed(1) + " h");
+    setTile("wn-verdict", lost > 480 ? "unsustainable" : w >= 2 && w <= 4 ? "sensible" : w === 1 ? "slow" : "costly");
+
+    let msg;
+    if (lost >= 480){
+      msg = "<b>" + lost + " minutes of recovered focus — " + (lost/60).toFixed(1) + " hours, more than " +
+            "a working day.</b> At " + w + " interruptions the reviewer never reaches deep work at all, " +
+            "and it buys a wait of " + wait.toFixed(2) + " h against 2.00 at two windows. The catch rate " +
+            "cannot tell the difference; the reviewer's week can.";
+    } else if (w === 1){
+      msg = "<b>One window: " + lost + " focus-minutes and a " + wait.toFixed(1) + "-hour average wait.</b> " +
+            "Cheap on attention, and diffs still settle at " + Math.round(size) + " lines with a " +
+            Math.round(caught(size)*100) + "% catch rate. The risk is the tail — anything arriving just " +
+            "after the window waits most of a day.";
+    } else {
+      msg = "<b>" + w + " windows: " + lost + " focus-minutes for a " + wait.toFixed(2) + "-hour wait.</b> " +
+            "Diffs settle at " + Math.round(size) + " lines, caught " + Math.round(caught(size)*100) +
+            "% — nothing measurable is lost, and the reviewer keeps " + (deep/60).toFixed(1) +
+            " hours of their day. This is the region the model recommends.";
+    }
+    document.getElementById("wn-out").innerHTML = msg;
+  }
+  ["wn-w","wn-c"].forEach(id => document.getElementById(id).addEventListener("input", draw));
+  draw();
+})();
+
+initChapter("ch08-latency.html");
+</script>
+</body>
+</html>

@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Change data capture — Data Engineer</title>
+<meta name="description" content="Log-based change data capture: how the write-ahead log becomes a stream, the snapshot handover problem, tombstones, ordering guarantees and how to operate it.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">Data Engineer</a> <span>/</span> Chapter 05</p>
+    <p class="chnum">CHAPTER 05</p>
+    <h1>Change data capture</h1>
+    <p class="lede">Chapter 4 ended on a problem with no good solution inside the query model: you cannot reliably infer change by asking a database what it looks like now. CDC escapes the problem entirely by reading the log the database was already writing. The idea is elegant; the two places it goes wrong are the initial handover and the assumption that a stream arrives in order.</p>
+    <div class="meta">
+      <div><b>8</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~28 min</b> read</div>
+      <div><b>Part 2</b> Where data comes from</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="idea">
+      <p class="kicker">THE CORE IDEA</p>
+      <h2>The log was always there</h2>
+      <p class="sub">Every durable database already maintains an ordered record of every change it has made. CDC is the observation that this is exactly what you wanted.</p>
+
+      <p>A database cannot acknowledge a write until that write survives a crash. Writing the row to its final location on disk is too slow to do synchronously, so instead it appends a compact description of the change to a sequential file and forces that to disk. Only then does it acknowledge. The row itself is updated in memory and written out later, lazily.</p>
+
+      <p>That file is the write-ahead log — the WAL in Postgres, the binary log in MySQL, the transaction log in SQL Server, the redo log in Oracle. Three of its properties are what make CDC work:</p>
+
+      <div class="terms">
+        <dt>It is complete</dt>
+        <dd>Every committed change is in it, including deletes. There is no such thing as a change the database made without logging it, because a change that is not logged cannot be acknowledged.</dd>
+
+        <dt>It is in commit order</dt>
+        <dd>Entries appear in the order transactions committed, not the order statements ran. This is the precise thing the timestamp query in chapter 4 could not observe, and it is why late-committing transactions cannot slip past a log reader.</dd>
+
+        <dt>It shows intent, not just outcome</dt>
+        <dd>The log distinguishes an insert from an update from a delete, and typically carries both the old and new versions of the row. Querying state can only ever show you the outcome.</dd>
+      </div>
+
+      <div class="note key">
+        <b>Why this reframes chapter 4's problem</b>
+        <p>Timestamp-based extraction asks "which rows look like they changed?" and has to infer the answer from mutable state. CDC asks "what changed?" and reads the answer from a record the database keeps for its own reasons. The first question is unanswerable in general; the second is a file read. Every guarantee in this chapter descends from that difference.</p>
+      </div>
+
+      <p>The mechanism is not new or exotic. This is the same log the database uses for crash recovery and for streaming replication to a replica. CDC tools connect as if they were a replica, which is why they are usually low-impact on the source: the database was already producing this data for somebody.</p>
+    </section>
+
+    <section id="four">
+      <p class="kicker">THE OPTIONS</p>
+      <h2>Four ways to capture change</h2>
+      <p class="sub">Log-based is the right answer at scale, but the other three exist for reasons and two of them are sometimes correct.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Capture mechanisms compared on the properties that matter</caption>
+          <thead>
+            <tr><th>Mechanism</th><th>How</th><th>Deletes</th><th>Load on source</th><th>Needs source change</th><th>Latency</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Query-based</strong></td>
+              <td>Poll on <code>updated_at</code></td>
+              <td>No</td>
+              <td>A query per poll</td>
+              <td>Needs the column maintained</td>
+              <td>One poll interval</td>
+            </tr>
+            <tr>
+              <td><strong>Trigger-based</strong></td>
+              <td>Database triggers write to an audit table</td>
+              <td>Yes</td>
+              <td>Adds work to every write</td>
+              <td>Yes, invasive</td>
+              <td>One poll interval</td>
+            </tr>
+            <tr>
+              <td><strong>Log-based</strong></td>
+              <td>Read the WAL as a replica</td>
+              <td>Yes, explicitly</td>
+              <td>Minimal</td>
+              <td>Config only</td>
+              <td>Sub-second</td>
+            </tr>
+            <tr>
+              <td><strong>Application events</strong></td>
+              <td>The app publishes a domain event</td>
+              <td>Yes, if modelled</td>
+              <td>None on the database</td>
+              <td>Yes, significant</td>
+              <td>Sub-second</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Two of these deserve a fairer hearing than they usually get.</p>
+
+      <p><strong>Trigger-based capture</strong> is widely dismissed as legacy, and it is genuinely the worst option on performance — it puts synchronous extra work inside every transaction, so a write-heavy table pays for it forever. But it works on databases where you cannot get logical log access at all, which includes plenty of managed and older systems, and it captures deletes correctly. If the alternative is query-based polling on a table where deletes matter, triggers are the better wrong answer.</p>
+
+      <p><strong>Application events</strong> are, in an important sense, the <em>best</em> option and not a form of CDC at all. Instead of inferring meaning from row changes, the application publishes what actually happened: <code>OrderCancelled</code> rather than <code>orders.status changed from 2 to 5</code>. CDC gives you the database's internal representation, which is a private implementation detail of another team's service — every schema change is your problem, and you have to reverse-engineer business meaning from column mutations. Domain events invert both. The catch is that they require the owning team to build and maintain them, which is an organisational commitment rather than a configuration change.</p>
+
+      <div class="note tip">
+        <b>The pragmatic sequence</b>
+        <p>CDC is frequently the right <em>first</em> move precisely because it needs nothing from the source team, and it buys you a working pipeline while you make the longer argument for domain events on the interfaces that matter most. Treating CDC as permanent architecture for a service you do not own is how you end up coupled to somebody else's column names indefinitely.</p>
+      </div>
+    </section>
+
+    <section id="wal">
+      <p class="kicker">MECHANICS</p>
+      <h2>How log-based capture actually works</h2>
+      <p class="sub">Four concepts, and one of them will page you at 3am if you do not understand it.</p>
+
+      <p>Take Postgres as the worked example; MySQL and the others differ in naming more than in shape.</p>
+
+      <div class="terms">
+        <dt>Logical decoding</dt>
+        <dd>The raw WAL is physical — it describes byte changes to disk pages, which is useless to a consumer. Logical decoding is a plugin layer that translates those page changes back into row-level operations with column names and values. In Postgres this is <code>pgoutput</code> or <code>wal2json</code>; MySQL's binlog in <code>ROW</code> format is already close to logical.</dd>
+
+        <dt>Replication slot</dt>
+        <dd>A named, server-side bookmark recording how far a particular consumer has read. It is what makes the stream resumable: disconnect for an hour, reconnect, and you continue from where you stopped rather than losing the interval.</dd>
+
+        <dt>LSN, the log sequence number</dt>
+        <dd>A monotonically increasing position in the log. It is the only genuinely reliable ordering you have — more reliable than any timestamp, because it is assigned by the log rather than by a clock. Almost every correctness technique later in this chapter uses it.</dd>
+
+        <dt>Publication</dt>
+        <dd>Which tables the stream includes. Worth being deliberate about: capturing every table because it was easier is how you end up owning a dependency on every table.</dd>
+      </div>
+
+      <div class="note trap">
+        <b>The replication slot is a disk-space bomb</b>
+        <p>A slot guarantees the server retains WAL until the consumer has confirmed reading it. That guarantee has no expiry by default. If your connector crashes on a Friday and nobody notices, the primary retains every byte of WAL over the weekend until the disk fills, at which point the database stops accepting writes and you have taken down the application you were carefully reading from a replica to avoid disturbing.</p>
+        <p>This is the single most common CDC production incident. Mitigate on both sides: monitor slot lag as a first-class alert, and set <code>max_slot_wal_keep_size</code> (Postgres 13 and later) so the server drops the slot rather than the database. Dropping a slot means a re-snapshot, which is painful; a full primary is worse.</p>
+      </div>
+
+      <p>One consequence worth stating plainly: <strong>logical decoding only emits committed transactions</strong>, and it emits them at commit time, in commit order. A transaction open for ten minutes produces nothing for ten minutes and then appears atomically. This is the correct behaviour and it means CDC latency has a floor set by your longest transaction, not by the connector.</p>
+    </section>
+
+    <section id="handover">
+      <p class="kicker">THE FIRST HARD PART</p>
+      <h2>The snapshot handover</h2>
+      <p class="sub">The stream only tells you what changed since it started. You need the state before that, and joining the two is where the bugs are.</p>
+
+      <p>The log has finite retention, so it does not contain the row inserted three years ago that has never been touched since. Every CDC deployment therefore has two phases: an initial <strong>snapshot</strong> of current state, and the ongoing <strong>stream</strong>. The interesting question is what happens to writes that occur <em>during</em> the snapshot, which for a large table can take hours.</p>
+
+      <p>The obvious approach — snapshot the table, then start streaming from the moment the snapshot finished — is wrong, and the model below shows how wrong along with something less obvious about why it is so hard to detect.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Four handover strategies against ground truth</b>
+          <span>simulated writes during a snapshot, reconstructed state compared row by row</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Snapshot duration
+              <input type="range" id="ho-dur" min="0" max="70" step="5" value="30">
+              <output id="ho-dur-o">30% of window</output>
+            </label>
+            <label>Write volume
+              <select id="ho-writes">
+                <option value="200">200 writes (cold table)</option>
+                <option value="1000">1,000 writes</option>
+                <option value="2000" selected>2,000 writes</option>
+                <option value="10000">10,000 writes (hot table)</option>
+              </select>
+            </label>
+            <label>Snapshot chunks
+              <input type="range" id="ho-chunks" min="1" max="50" step="1" value="10">
+              <output id="ho-chunks-o">10</output>
+            </label>
+          </div>
+
+          <div class="canvas" id="ho-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile bad"><i>1 · SNAP THEN STREAM</i><b id="ho-r1">0</b><s>rows wrong</s></div>
+            <div class="tile good"><i>2 · MARK LSN FIRST</i><b id="ho-r2">0</b><s id="ho-d2">rows wrong</s></div>
+            <div class="tile"><i>3 · LOCKED SNAPSHOT</i><b id="ho-r3">0</b><s id="ho-b3">rows wrong</s></div>
+            <div class="tile good"><i>4 · CHUNKED SNAPSHOT</i><b id="ho-r4">0</b><s id="ho-d4">rows wrong</s></div>
+            <div class="tile hi"><i>CORRUPTED AT HANDOVER</i><b id="ho-corr">0</b><s id="ho-heal">before self-repair</s></div>
+          </div>
+
+          <p class="readout" id="ho-note"></p>
+        </div>
+      </div>
+
+      <h3>The four strategies</h3>
+
+      <ol>
+        <li><strong>Snapshot, then stream from the end.</strong> Rows read early in the snapshot and updated later in it fall into a blind gap: too late for the snapshot, too early for the stream. Broken.</li>
+        <li><strong>Note the log position first, then snapshot, then replay from that position.</strong> Correct. You deliberately re-apply changes already reflected in the snapshot, which is harmless <em>provided the apply is idempotent</em> — an absolute "set this row to these values" is fine, an increment is not.</li>
+        <li><strong>Lock the table for the snapshot.</strong> Correct and simple, and it blocks writes for the whole duration. Fine for a small table at 4am, unacceptable for a large one.</li>
+        <li><strong>Chunked snapshot interleaved with the stream.</strong> Read the table in key ranges, tracking a low watermark per chunk, and let stream events for already-snapshotted ranges apply normally. Correct with no lock. This is Debezium's incremental snapshot, following the DBLog design, and it is what you want for anything large.</li>
+      </ol>
+
+      <div class="note key">
+        <b>The finding that makes this bug hard to catch</b>
+        <p>Set the write volume to a hot table and watch the two right-hand tiles diverge. At 10,000 writes, roughly 184 of 200 rows are corrupted at handover &mdash; and essentially none are still wrong at the end, because a later write to the same row overwrites the stale value with a correct one.</p>
+        <p>The corruption is real, and busy rows repair themselves. So the surviving errors concentrate entirely in <strong>cold rows</strong>: reference data, dormant accounts, historical records that nobody updates. Those are frequently the rows whose correctness matters most, and they are the last place anyone looks. Row counts reconcile, spot checks on active records pass, and a handful of rows are permanently wrong with no signal at all.</p>
+      </div>
+
+      <p>Notice also that raising the chunk count reduces the buffered-and-superseded work without ever compromising correctness — that is the whole argument for chunking, and the reason chunk size is a tuning parameter rather than a correctness one.</p>
+    </section>
+
+    <section id="shape">
+      <p class="kicker">WHAT ARRIVES</p>
+      <h2>The shape of a change event</h2>
+      <p class="sub">A CDC event carries more than the new row, and the extra fields are what make correct application possible.</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">event.json</span><button class="code-copy">Copy</button></div>
+        <pre><code data-lang="json">{
+  "op": "u",
+  "before": { "id": 42, "status": "pending", "total": 1900 },
+  "after":  { "id": 42, "status": "paid",    "total": 1900 },
+  "source": {
+    "table": "orders",
+    "lsn": 24019576,
+    "txId": 998812,
+    "ts_ms": 1717243310221,
+    "snapshot": "false"
+  },
+  "ts_ms": 1717243310318
+}</code></pre>
+      </div>
+
+      <div class="terms">
+        <dt><code>op</code></dt>
+        <dd><code>c</code> create, <code>u</code> update, <code>d</code> delete, <code>r</code> read (a row from the initial snapshot rather than a live change). The <code>r</code> distinction matters: snapshot reads are not events that happened at that moment.</dd>
+
+        <dt><code>before</code> and <code>after</code></dt>
+        <dd>The row either side of the change. <code>before</code> requires the source to log full row images &mdash; Postgres needs <code>REPLICA IDENTITY FULL</code>, MySQL needs <code>binlog_row_image=FULL</code>. Without it you get only the primary key on a delete, which is enough to apply but not enough to audit what was lost.</dd>
+
+        <dt><code>lsn</code> and <code>txId</code></dt>
+        <dd>Position and transaction. The LSN is your ordering key and your deduplication key. The transaction id lets you group changes that committed together, which matters if a consumer needs transactional consistency across tables rather than per-row correctness.</dd>
+
+        <dt>Two timestamps</dt>
+        <dd><code>source.ts_ms</code> is when the database committed it; the outer <code>ts_ms</code> is when the connector processed it. The difference is your capture lag, and it is worth monitoring directly rather than inferring.</dd>
+      </div>
+
+      <h3>Tombstones, and why there are two delete messages</h3>
+
+      <p>A delete produces an event with <code>op: "d"</code>, an <code>after</code> of null, and the old row in <code>before</code>. Connectors then usually emit a second message for the same key with a <em>null value entirely</em> — a tombstone.</p>
+
+      <p>The reason is log compaction. On a compacted Kafka topic the broker retains only the most recent message per key, so the topic converges to a snapshot of current state. A null value is the signal that permits the broker to eventually remove the key altogether. Without a tombstone, a deleted row's last known state is retained forever in the compacted topic.</p>
+
+      <div class="note warn">
+        <b>Two consumer bugs that come from this</b>
+        <p>First: a consumer that deserialises without null-checking the value crashes on every tombstone, so deletes take down the pipeline while inserts and updates work perfectly. Second, and worse: a consumer that treats a tombstone as "no change" and skips it will apply the <code>op: "d"</code> event correctly but, on a compacted topic replayed after retention has removed the delete event, resurrect the row. Handle both messages explicitly and test deletion paths &mdash; deletes are the least-exercised branch in most consumers.</p>
+      </div>
+    </section>
+
+    <section id="applying">
+      <p class="kicker">THE SECOND HARD PART</p>
+      <h2>Applying the stream</h2>
+      <p class="sub">The stream is correct. Whether your copy ends up correct depends on three properties of how you apply it.</p>
+
+      <p>Two facts about delivery are true of essentially every message system and are covered properly in <a href="13-messaging.html">chapter 13</a>. Delivery is <strong>at-least-once</strong>, so duplicates happen whenever a consumer crashes between processing and committing its offset. And ordering is guaranteed only <em>within a partition</em>, so if two changes to the same row land in different partitions they can be applied in either order.</p>
+
+      <p>That second one is a configuration decision people make casually. Partition by primary key and all changes to a row are ordered relative to each other. Partition round-robin for even load and they are not.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Applying a change stream to a target table</b>
+          <span>partitioning, duplicates and delete handling against ground truth</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Partitioned by
+              <select id="ap-part">
+                <option value="key" selected>Primary key</option>
+                <option value="rr">Round-robin</option>
+              </select>
+            </label>
+            <label>Duplicate rate
+              <input type="range" id="ap-dup" min="0" max="30" step="1" value="8">
+              <output id="ap-dup-o">8%</output>
+            </label>
+            <label>Apply logic
+              <select id="ap-guard">
+                <option value="naive">Upsert on arrival</option>
+                <option value="lsn" selected>Upsert if LSN is newer</option>
+              </select>
+            </label>
+            <label>Deletes
+              <select id="ap-del">
+                <option value="skip">Skip delete events</option>
+                <option value="apply" selected>Apply as deletes</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="ap-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>EVENTS DELIVERED</i><b id="ap-n">0</b><s id="ap-nsub">including duplicates</s></div>
+            <div class="tile" id="ap-ord-tile"><i>OUT OF ORDER</i><b id="ap-ord">0</b><s>per-key inversions</s></div>
+            <div class="tile" id="ap-wrong-tile"><i>ROWS WRONG</i><b id="ap-wrong">0</b><s id="ap-wsub">against source</s></div>
+            <div class="tile" id="ap-res-tile"><i>RESURRECTED</i><b id="ap-res">0</b><s>deleted rows still present</s></div>
+          </div>
+
+          <p class="readout" id="ap-note"></p>
+        </div>
+      </div>
+
+      <p>The demo isolates three independent failure modes, and the combination that is actually safe is narrow.</p>
+
+      <ol>
+        <li><strong>Duplicates are harmless if the apply is idempotent.</strong> An absolute upsert applied twice gives the same result. Turn off the LSN guard while partitioning by key and duplicates still cost nothing.</li>
+        <li><strong>Reordering is not fixed by idempotency.</strong> Partition round-robin and an older change can arrive after a newer one, overwriting good data with stale data. Because the apply is idempotent, nothing errors &mdash; the row is simply wrong.</li>
+        <li><strong>The LSN guard fixes reordering.</strong> Store the LSN alongside each row and ignore any event whose LSN is not greater. This makes the apply order-insensitive as well as idempotent, which is the property you actually want. It costs one column.</li>
+        <li><strong>Skipping deletes resurrects rows.</strong> Predictably, but note that nothing else degrades &mdash; every present row is correct, the table just contains rows that no longer exist upstream. Aggregates over it are wrong in a way no row-level check detects.</li>
+      </ol>
+
+      <div class="note tip">
+        <b>The rule worth memorising</b>
+        <p>Make the apply <strong>idempotent and order-insensitive</strong>, then delivery guarantees stop mattering. An upsert keyed on the primary key, guarded by a stored LSN, handling tombstones explicitly, is correct under duplicates, reordering and replays alike. Once you have that, a full stream replay from the beginning of retention is a safe operation rather than a frightening one &mdash; and being able to replay safely is what makes CDC operable.</p>
+      </div>
+    </section>
+
+    <section id="operating">
+      <p class="kicker">RUNNING IT</p>
+      <h2>Operating CDC</h2>
+      <p class="sub">Four things that will happen, in roughly the order they will happen to you.</p>
+
+      <div class="terms">
+        <dt>Slot lag grows and nobody notices</dt>
+        <dd>Covered above and worth repeating because it is the incident. Alert on replication slot lag in bytes, with a threshold well below your WAL disk headroom, and treat it as a page rather than a ticket.</dd>
+
+        <dt>The source changes its schema</dt>
+        <dd>An <code>ALTER TABLE</code> appears in the stream as a schema change event. Your consumer now needs a policy: fail closed, or evolve. This is exactly the problem <a href="06-contracts.html">chapter 6</a> solves with a registry and compatibility rules, and CDC is the strongest argument for having one, because the change arrives with no warning at all.</dd>
+
+        <dt>Someone runs a bulk update</dt>
+        <dd>A migration touching ten million rows produces ten million change events in a few seconds. Your connector is fine; your downstream consumer, your topic retention and your warehouse merge costs may not be. Ask the owning team to tell you before large migrations, and size the pipeline for the burst rather than the average.</dd>
+
+        <dt>You need to re-snapshot</dt>
+        <dd>Because a slot was dropped, a table was added to the publication, or a consumer bug corrupted the target. This should be a routine, documented operation rather than a crisis, which means the incremental snapshot from the demo needs to be something you have actually run before you need it.</dd>
+      </div>
+
+      <p>A closing note on what CDC does and does not give you. Per-row, you get every change in commit order &mdash; that is solid. <strong>Cross-table transactional consistency is a different and harder property.</strong> If an order and its line items are written in one transaction, the events arrive with the same <code>txId</code> but may be spread across partitions and applied at different moments, so a consumer reading the target mid-apply can see the order without its items. If you need transactional consistency downstream you must buffer by transaction id and apply atomically, which most pipelines do not do and most consumers do not realise.</p>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>CDC works by reading a log the database already keeps.</b> It is complete, in commit order, and distinguishes inserts, updates and deletes &mdash; the three things querying state cannot give you.</li>
+          <li><b>Log-based capture is low-impact because it impersonates a replica.</b> The database was already producing this stream for somebody else.</li>
+          <li><b>Domain events published by the application are better than CDC,</b> because CDC couples you to another team's private schema. CDC is the right first move precisely because it needs nothing from them.</li>
+          <li><b>The replication slot will fill your primary's disk.</b> A stalled connector makes the server retain WAL indefinitely. Alert on slot lag; set a retention cap so the server sacrifices the slot rather than the database.</li>
+          <li><b>Snapshot-then-stream is broken.</b> Rows read early and updated during the snapshot fall into a blind gap. Correct options: mark the LSN first and replay, lock the table, or take a chunked incremental snapshot.</li>
+          <li><b>Handover corruption is masked by write volume.</b> On a hot table almost every corrupted row is repaired by a later write, so the surviving errors sit entirely in cold reference rows where nobody checks. Reconciliation looks fine.</li>
+          <li><b>A delete emits two messages.</b> The <code>op: "d"</code> event and a null-valued tombstone for log compaction. Consumers that ignore either one crash on deletes or resurrect rows.</li>
+          <li><b>Partition by primary key.</b> Ordering holds only within a partition; round-robin partitioning lets a stale change overwrite a newer one silently.</li>
+          <li><b>Make the apply idempotent and order-insensitive.</b> Upsert on the key, guarded by a stored LSN, tombstones handled. Then duplicates, reordering and full replays are all safe.</li>
+          <li><b>Per-row ordering is guaranteed; cross-table transactional consistency is not.</b> Same transaction, different partitions, different apply moments.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="06-contracts.html">Chapter 6 &mdash; Data contracts and schema evolution</a>. The compatibility rules that make an upstream change safe by construction, and which deploy order each one permits.</p>
+          </div>
+          <div class="fi">
+            <i>THE LAYER BENEATH</i>
+            <p>Why a transaction is invisible until commit, and what a WAL record contains, is MVCC and visibility. The <a href="../postgresqldba/index.html">PostgreSQL</a> unit covers both, along with replication slots from the database's side.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>If you run CDC, check whether your target table stores the source LSN. If not, your apply is order-dependent and you are relying on partitioning you may not have verified.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Demo 1 — snapshot / stream handover against ground truth
+   ============================================================ */
+(function () {
+  var ROWS = 200, HORIZON = 100, SNAP_START = 20, SEED = 7;
+
+  var $ = function (id) { return document.getElementById(id); };
+  function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+
+  function world(writes) {
+    var rnd = lcg(SEED), events = [];
+    for (var i = 0; i < writes; i++) events.push({ t: rnd() * HORIZON, row: 1 + Math.floor(rnd() * ROWS) });
+    events.sort(function (a, b) { return a.t - b.t; });
+    var seen = {};
+    events.forEach(function (e, i) { e.lsn = i + 1; seen[e.row] = (seen[e.row] || 0) + 1; e.val = seen[e.row]; });
+    return events;
+  }
+
+  function truth(events) {
+    var v = {}; for (var r = 1; r <= ROWS; r++) v[r] = 0;
+    events.forEach(function (e) { v[e.row] = e.val; });
+    return v;
+  }
+
+  /* the value the source held for row r at time t */
+  function valueAt(events, r, t) {
+    var v = 0;
+    for (var i = 0; i < events.length; i++) {
+      if (events[i].t > t) break;
+      if (events[i].row === r) v = events[i].val;
+    }
+    return v;
+  }
+
+  function wrong(copy, tru) {
+    var n = 0; for (var r = 1; r <= ROWS; r++) if ((copy[r] || 0) !== tru[r]) n++;
+    return n;
+  }
+
+  function readTime(r, dur) { return SNAP_START + (r / ROWS) * dur; }
+
+  function snapThenStream(events, dur) {
+    var copy = {}, tEnd = SNAP_START + dur;
+    for (var r = 1; r <= ROWS; r++) copy[r] = valueAt(events, r, readTime(r, dur));
+    events.forEach(function (e) { if (e.t > tEnd) copy[e.row] = e.val; });
+    return { copy: copy, blocked: 0, dupes: 0 };
+  }
+
+  function lsnThenSnap(events, dur) {
+    var copy = {}, dupes = 0;
+    for (var r = 1; r <= ROWS; r++) copy[r] = valueAt(events, r, readTime(r, dur));
+    events.forEach(function (e) {
+      if (e.t > SNAP_START) {
+        if (e.t <= SNAP_START + dur) dupes++;
+        copy[e.row] = e.val;                    /* absolute set: idempotent */
+      }
+    });
+    return { copy: copy, blocked: 0, dupes: dupes };
+  }
+
+  function lockedSnap(events, dur) {
+    var copy = {}, tEnd = SNAP_START + dur, blocked = 0;
+    events.forEach(function (e) { if (e.t > SNAP_START && e.t <= tEnd) blocked++; });
+    for (var r = 1; r <= ROWS; r++) copy[r] = valueAt(events, r, SNAP_START);
+    events.forEach(function (e) { if (e.t > SNAP_START) copy[e.row] = e.val; });
+    return { copy: copy, blocked: blocked, dupes: 0 };
+  }
+
+  function chunkedSnap(events, dur, chunks) {
+    var copy = {}, per = Math.ceil(ROWS / chunks), dupes = 0;
+    for (var c = 0; c < chunks; c++) {
+      var lo = c * per + 1, hi = Math.min(ROWS, (c + 1) * per);
+      var tc = SNAP_START + ((c + 1) / chunks) * dur;
+      for (var r = lo; r <= hi; r++) copy[r] = valueAt(events, r, tc);
+    }
+    events.forEach(function (e) {
+      var c = Math.floor((e.row - 1) / per);
+      var tc = SNAP_START + ((c + 1) / chunks) * dur;
+      if (e.t > tc) copy[e.row] = e.val;
+      else if (e.t > SNAP_START) dupes++;
+    });
+    return { copy: copy, blocked: 0, dupes: dupes };
+  }
+
+  /* rows with a write inside their blind gap, before any later repair */
+  function corrupted(events, dur) {
+    var hit = {}, tEnd = SNAP_START + dur;
+    events.forEach(function (e) {
+      var tr = readTime(e.row, dur);
+      if (e.t > tr && e.t <= tEnd) hit[e.row] = 1;
+    });
+    return Object.keys(hit).length;
+  }
+
+  function diagram(dur, chunks) {
+    var W = 700, H = 128, L = 8;
+    var xOf = function (t) { return L + t / HORIZON * (W - L - 12); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Snapshot window and blind gap">'];
+    var tEnd = SNAP_START + dur;
+
+    svg.push('<text x="' + L + '" y="10" font-size="10" font-weight="700" fill="#7C8B99">TIME &#8594;   THE SHADED WEDGE IS THE BLIND GAP: READ ALREADY, STREAM NOT YET STARTED</text>');
+
+    /* snapshot window */
+    svg.push('<rect x="' + xOf(SNAP_START) + '" y="20" width="' + Math.max(1, xOf(tEnd) - xOf(SNAP_START)) + '" height="76" fill="#F3D3E2" opacity="0.5"/>');
+    /* blind wedge: row r is read at readTime(r), exposed until tEnd */
+    var pts = ["" + xOf(SNAP_START) + ",20"];
+    for (var i = 0; i <= 20; i++) {
+      var r = (i / 20) * ROWS;
+      pts.push(xOf(readTime(Math.max(1, r), dur)) + "," + (20 + (i / 20) * 76));
+    }
+    pts.push(xOf(tEnd) + ",96");
+    pts.push(xOf(tEnd) + ",20");
+    svg.push('<polygon points="' + pts.join(" ") + '" fill="#C0453A" opacity="0.30"/>');
+
+    [[SNAP_START, "snapshot starts"], [tEnd, "snapshot ends"]].forEach(function (m) {
+      svg.push('<line x1="' + xOf(m[0]) + '" y1="16" x2="' + xOf(m[0]) + '" y2="100" stroke="#0C1D30" stroke-width="1.5"/>');
+      svg.push('<text x="' + (xOf(m[0]) + 4) + '" y="' + (H - 14) + '" font-size="9.5" fill="#54677A">' + m[1] + '</text>');
+    });
+
+    for (var c = 1; c < chunks && chunks <= 20; c++) {
+      var xc = xOf(SNAP_START + (c / chunks) * dur);
+      svg.push('<line x1="' + xc + '" y1="20" x2="' + xc + '" y2="96" stroke="#A8386B" stroke-width="0.7" stroke-dasharray="2 2"/>');
+    }
+
+    svg.push('<text x="' + L + '" y="' + (H - 2) + '" font-size="9.5" fill="#7C8B99">rows read in key order, first at the top</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var durPct = +$("ho-dur").value;
+    var dur = durPct;                  /* percentage of the window, numerically equal */
+    var writes = +$("ho-writes").value;
+    var chunks = +$("ho-chunks").value;
+
+    $("ho-dur-o").textContent = durPct + "% of window";
+    $("ho-chunks-o").textContent = chunks;
+
+    var events = world(writes), tru = truth(events);
+    var s1 = snapThenStream(events, dur), s2 = lsnThenSnap(events, dur);
+    var s3 = lockedSnap(events, dur), s4 = chunkedSnap(events, dur, chunks);
+    var r1 = wrong(s1.copy, tru), r2 = wrong(s2.copy, tru), r3 = wrong(s3.copy, tru), r4 = wrong(s4.copy, tru);
+    var corr = corrupted(events, dur);
+
+    $("ho-r1").textContent = r1;
+    $("ho-r2").textContent = r2;
+    $("ho-r3").textContent = r3;
+    $("ho-r4").textContent = r4;
+    $("ho-d2").textContent = s2.dupes + " re-applied";
+    $("ho-b3").textContent = s3.blocked + " writes blocked";
+    $("ho-d4").textContent = s4.dupes + " re-applied";
+    $("ho-corr").textContent = corr;
+    $("ho-heal").textContent = corr ? Math.round((1 - r1 / corr) * 100) + "% self-repaired" : "nothing exposed";
+
+    $("ho-canvas").innerHTML = diagram(dur, chunks);
+
+    var lines = [];
+    if (dur === 0) {
+      lines.push("An instantaneous snapshot has no blind gap, so all four strategies are correct. Every difference below exists only because reading a large table takes time \u2014 which is exactly why this bug is invisible in testing against a small one.");
+    } else {
+      lines.push("Snapshot occupies " + durPct + "% of the window. Strategy 1 leaves " + r1 +
+        " of " + ROWS + " rows wrong; strategies 2, 3 and 4 leave " + r2 + ", " + r3 + " and " + r4 +
+        ". Correctness is not a matter of care in the code \u2014 strategy 1 is wrong by construction and the other three are right by construction.");
+
+      lines.push(corr + " rows were corrupted at the handover, but only " + r1 +
+        " are still wrong at the end: " + (corr ? Math.round((1 - r1 / corr) * 100) : 0) +
+        "% were repaired by a later write overwriting the stale value. The errors that survive are in rows nothing has touched since \u2014 reference data and dormant records \u2014 so the busier the table, the better this bug hides.");
+
+      if (s3.blocked > 0) {
+        lines.push("Locking is correct but held " + s3.blocked + " writes for the duration. Chunking gets the same correctness with no lock, and raising the chunk count from 1 to " +
+          chunks + " cut re-applied events to " + s4.dupes + " without ever affecting the result \u2014 chunk size is a cost parameter, not a correctness one.");
+      }
+    }
+    $("ho-note").textContent = lines.join("\n\n");
+  }
+
+  ["ho-dur", "ho-writes", "ho-chunks"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — applying the stream
+   ============================================================ */
+(function () {
+  var KEYS = 60, N = 900, PARTS = 6, SEED = 4242, DEL_RATE = 0.12;
+
+  var $ = function (id) { return document.getElementById(id); };
+  function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+
+  /* the source change log, in commit order */
+  function source() {
+    var rnd = lcg(SEED), evs = [], ver = {};
+    for (var i = 0; i < N; i++) {
+      var k = 1 + Math.floor(rnd() * KEYS);
+      ver[k] = (ver[k] || 0) + 1;
+      var del = rnd() < DEL_RATE;
+      evs.push({ lsn: i + 1, key: k, op: del ? "d" : "u", val: del ? null : ver[k] });
+    }
+    return evs;
+  }
+
+  function truth(evs) {
+    var st = {};
+    evs.forEach(function (e) { if (e.op === "d") delete st[e.key]; else st[e.key] = e.val; });
+    return st;
+  }
+
+  /* deliver: assign partitions, duplicate some, then interleave partitions */
+  function deliver(evs, byKey, dupRate) {
+    var rnd = lcg(SEED + 1), buckets = [];
+    for (var p = 0; p < PARTS; p++) buckets.push([]);
+    evs.forEach(function (e, i) {
+      var p = byKey ? (e.key % PARTS) : (i % PARTS);
+      buckets[p].push(e);
+      if (rnd() < dupRate) buckets[p].push(e);      /* at-least-once */
+    });
+    /* consumers drain partitions independently; model that as a shuffled merge */
+    var idx = buckets.map(function () { return 0; }), out = [];
+    while (true) {
+      var live = [];
+      for (var p2 = 0; p2 < PARTS; p2++) if (idx[p2] < buckets[p2].length) live.push(p2);
+      if (!live.length) break;
+      var pick = live[Math.floor(rnd() * live.length)];
+      out.push(buckets[pick][idx[pick]++]);
+    }
+    return out;
+  }
+
+  function inversions(stream) {
+    var last = {}, n = 0;
+    stream.forEach(function (e) {
+      if (last[e.key] !== undefined && e.lsn < last[e.key]) n++;
+      if (last[e.key] === undefined || e.lsn > last[e.key]) last[e.key] = e.lsn;
+    });
+    return n;
+  }
+
+  function apply(stream, guard, handleDeletes) {
+    var st = {}, seen = {};
+    stream.forEach(function (e) {
+      if (guard && seen[e.key] !== undefined && e.lsn <= seen[e.key]) return;
+      if (e.op === "d") {
+        if (handleDeletes) { delete st[e.key]; }
+        else { if (guard) seen[e.key] = e.lsn; return; }
+      } else {
+        st[e.key] = e.val;
+      }
+      if (guard) seen[e.key] = e.lsn;
+    });
+    return st;
+  }
+
+  function compare(got, tru) {
+    var wrongN = 0, res = 0, keys = {};
+    Object.keys(got).forEach(function (k) { keys[k] = 1; });
+    Object.keys(tru).forEach(function (k) { keys[k] = 1; });
+    Object.keys(keys).forEach(function (k) {
+      var a = got[k], b = tru[k];
+      if (a === b) return;
+      wrongN++;
+      if (b === undefined && a !== undefined) res++;
+    });
+    return { wrong: wrongN, resurrected: res };
+  }
+
+  function lanes(stream, byKey) {
+    var W = 700, H = 96, L = 8, show = 150;
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Delivery order across partitions">'];
+    svg.push('<text x="' + L + '" y="10" font-size="10" font-weight="700" fill="#7C8B99">' +
+      (byKey ? "PARTITIONED BY KEY: EVERY EVENT FOR A KEY IS IN ONE LANE, SO ORDER HOLDS" :
+               "ROUND-ROBIN: ONE KEY IS SPREAD ACROSS LANES, SO ORDER IS LOST") + '</text>');
+    var seen = {}, colours = ["#E0699F", "#20456A", "#2E8B5F", "#C0453A", "#7C8CF8", "#D9A24A"];
+    var track = {};
+    stream.slice(0, show).forEach(function (e, i) {
+      var p = byKey ? (e.key % PARTS) : (i % PARTS);
+      if (track[e.key] === undefined) track[e.key] = Object.keys(track).length;
+      var y = 20 + p * 12;
+      var x = L + (i / show) * (W - L - 12);
+      var hot = e.key === 7;
+      svg.push('<rect x="' + x.toFixed(1) + '" y="' + y + '" width="3.4" height="9" fill="' +
+        (hot ? "#0C1D30" : colours[p]) + '" opacity="' + (hot ? 1 : 0.34) + '"/>');
+    });
+    for (var p2 = 0; p2 < PARTS; p2++) {
+      svg.push('<text x="' + (W - 10) + '" y="' + (28 + p2 * 12) + '" font-size="9" fill="#7C8B99" text-anchor="end">p' + p2 + '</text>');
+    }
+    svg.push('<text x="' + L + '" y="' + (H - 4) + '" font-size="9.5" fill="#7C8B99">dark marks are one single key, so you can see whether it stays in one lane</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var byKey = $("ap-part").value === "key";
+    var dup = +$("ap-dup").value / 100;
+    var guard = $("ap-guard").value === "lsn";
+    var handleDel = $("ap-del").value === "apply";
+
+    $("ap-dup-o").textContent = Math.round(dup * 100) + "%";
+
+    var evs = source(), tru = truth(evs);
+    var stream = deliver(evs, byKey, dup);
+    var inv = inversions(stream);
+    var got = apply(stream, guard, handleDel);
+    var cmp = compare(got, tru);
+
+    $("ap-n").textContent = stream.length;
+    $("ap-nsub").textContent = (stream.length - evs.length) + " duplicates of " + evs.length;
+    $("ap-ord").textContent = inv;
+    $("ap-ord-tile").className = "tile" + (inv > 0 ? " bad" : " good");
+    $("ap-wrong").textContent = cmp.wrong;
+    $("ap-wsub").textContent = "of " + Object.keys(tru).length + " live keys";
+    $("ap-wrong-tile").className = "tile" + (cmp.wrong > 0 ? " bad" : " good");
+    $("ap-res").textContent = cmp.resurrected;
+    $("ap-res-tile").className = "tile" + (cmp.resurrected > 0 ? " bad" : " good");
+
+    $("ap-canvas").innerHTML = lanes(stream, byKey);
+
+    var lines = [];
+    lines.push(evs.length + " source changes over " + KEYS + " keys delivered as " + stream.length +
+      " messages across " + PARTS + " partitions, with " + Math.round(dup * 100) + "% duplication. " +
+      inv + " per-key order inversions arrived. Final state differs from the source in " + cmp.wrong + " keys.");
+
+    if (!byKey && inv > 0 && !guard) {
+      lines.push("Round-robin partitioning spread each key across lanes, so a stale change can land after a newer one and overwrite it. Nothing errors \u2014 the upsert is perfectly idempotent, it is just applying the wrong version last. Idempotency does not protect against reordering; only an ordering check does.");
+    } else if (!byKey && guard) {
+      lines.push("The stream is still badly out of order \u2014 " + inv +
+        " inversions \u2014 but the LSN guard discards any event not newer than what the row already holds, so the result is correct anyway. This is the property worth having: correctness that does not depend on delivery order at all.");
+    } else if (byKey && dup > 0 && !guard) {
+      lines.push("Partitioning by key keeps every change to a row in one lane, so order holds and " +
+        (stream.length - evs.length) + " duplicates cost nothing: applying an absolute upsert twice gives the same row. Duplicates are only dangerous when the apply is relative rather than absolute.");
+    } else if (byKey && guard) {
+      lines.push("Ordered by key and guarded by LSN: duplicates are discarded rather than merely harmless, and the pipeline would survive a full replay from the start of retention. This is the configuration to aim for.");
+    }
+
+    if (cmp.resurrected > 0) {
+      lines.push(cmp.resurrected + " keys deleted upstream are still present in the target. Every row in the table is individually correct, which is why row-level checks pass \u2014 the table simply contains records that no longer exist, and any aggregate over it is quietly overstated.");
+    }
+    $("ap-note").textContent = lines.join("\n\n");
+  }
+
+  ["ap-part", "ap-dup", "ap-guard", "ap-del"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+initChapter("05-change-data-capture.html");
+</script>
+</body>
+</html>

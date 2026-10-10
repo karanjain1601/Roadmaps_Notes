@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Service networking, ingress and mesh — DevOps</title>
+<meta name="description" content="How a service name becomes a set of endpoints, exactly how long traffic keeps arriving at a terminating pod, ingress and the Gateway API, the sidecar model and mTLS, and why gRPC traffic collapses onto one replica.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%237C8CF8' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">DevOps</a><span class="sep">/</span><span>Chapter 12</span></p>
+    <p class="chno">Chapter 12 · Containers</p>
+    <h1>Service networking, ingress and mesh</h1>
+    <p class="lede">Pods are ephemeral and have addresses that change constantly, so something must translate a stable name into a current set of endpoints and keep that translation up to date on every node. The interesting parts are the gaps: how long the translation is wrong after a pod dies, and what happens when the thing doing the balancing is looking at connections rather than requests.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapters 04, 06, 11</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="discovery">
+<h2>From a name to a set of endpoints</h2><div class="h2rule"></div>
+
+<p class="lead">A Service is a stable name and virtual IP in front of a changing set of pods. Nothing is proxying in the usual sense — the ClusterIP does not exist on any interface. It is a rule in every node's dataplane that rewrites the destination to one of the current endpoints.</p>
+
+<ol class="steps">
+<li><strong>A Service selects pods by label.</strong> The endpoints controller watches pods matching that selector and maintains an <code>EndpointSlice</code> listing the addresses that are currently <em>ready</em> — readiness, not liveness, and not merely running.</li>
+<li><strong>Cluster DNS resolves the name to the ClusterIP.</strong> CoreDNS serves <code>svc.namespace.svc.cluster.local</code>. This is where chapter 7's <code>ndots:5</code> problem lives, and it is why a fully qualified external name deserves a trailing dot.</li>
+<li><strong>Every node's dataplane rewrites the destination.</strong> <code>kube-proxy</code> in iptables mode writes a chain per service that DNATs to a random endpoint; in IPVS mode it programs a kernel load balancer instead. Newer clusters may use eBPF via Cilium and skip <code>kube-proxy</code> entirely.</li>
+<li><strong>The packet goes straight to the pod.</strong> There is no hop through a proxy process. The connection is client-pod to server-pod, which is why you cannot see service traffic by looking at a load balancer, and why the balancing decision is made once per <em>connection</em>.</li>
+</ol>
+
+<div class="tw">
+<table>
+<thead><tr><th>Dataplane</th><th>Cost of a rule change</th><th>Balancing</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><strong>iptables</strong></td><td class="no">Rewrites a large ruleset; O(n) match. Degrades noticeably past a few thousand services</td><td>Random per connection</td><td>The long-standing default; still fine for most clusters</td></tr>
+<tr><td><strong>IPVS</strong></td><td class="yes">Hash table; O(1)</td><td>Round robin, least-conn and others</td><td>The answer for large clusters. Same per-connection limitation</td></tr>
+<tr><td><strong>eBPF</strong> (Cilium)</td><td class="yes">Map update</td><td>Per connection, plus L7 policy</td><td>Removes <code>kube-proxy</code>; can also do the sidecar's job in the kernel</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Service type</th><th>Reachable from</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>ClusterIP</code></td><td>Inside the cluster</td><td class="yes">The default and almost always correct for service-to-service</td></tr>
+<tr><td><code>NodePort</code></td><td>Any node's IP on a high port</td><td>A building block for the below; rarely used directly</td></tr>
+<tr><td><code>LoadBalancer</code></td><td>The internet, via a cloud load balancer</td><td class="no">One provisioned load balancer <em>per service</em>. Expensive at scale — this is what Ingress exists to avoid</td></tr>
+<tr><td><code>ExternalName</code></td><td>Returns a CNAME</td><td>Pointing a cluster name at something outside</td></tr>
+<tr><td>Headless (<code>clusterIP: None</code>)</td><td>DNS returns every pod IP, no virtual IP</td><td class="yes">StatefulSets, and any client that wants to do its own balancing — including gRPC</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="endpoints">
+<h2>How long traffic keeps arriving at a dead pod</h2><div class="h2rule"></div>
+
+<p>Removing a pod from rotation is not instant, and it is not one step. The endpoints controller must notice, write an updated <code>EndpointSlice</code>, and then <em>every node in the cluster</em> must observe that change and reprogram its dataplane. Until the last node has done so, traffic still arrives.</p>
+
+<div class="eq plain"><code>window &nbsp;=&nbsp; detection &nbsp;+&nbsp; control-plane propagation &nbsp;+&nbsp; per-node dataplane sync</code></div>
+<p class="where">On a graceful deletion, detection is zero — the API server knows immediately — but propagation is not, and the pod is sent <code>SIGTERM</code> at the same moment the removal starts. On a crash, detection is the readiness probe: <b>period × failureThreshold</b>, which at the defaults of 10 seconds and 3 failures is <b>thirty seconds</b> before anything even begins.</p>
+
+<div class="demo" id="d-ep">
+  <div class="demo-top"><div class="demo-title">The window in which requests still hit a terminating pod</div><div class="demo-hint">Add a preStop sleep, then switch to a crash and watch the number change scale</div></div>
+  <div class="demo-body">
+    <canvas id="cEp" aria-label="A timeline of pod termination showing detection, propagation and the window in which requests fail"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>What happened</label><select id="epM">
+        <option value="delete" selected>rolling update — graceful delete</option>
+        <option value="crash">the pod crashed (OOMKilled)</option>
+      </select></div>
+      <div class="ctrl"><label><code>preStop</code> sleep <b id="epSo">0</b> s</label><input type="range" id="epS" min="0" max="20" value="0"></div>
+      <div class="ctrl"><label>Probe period <b id="epPo">10</b> s</label><input type="range" id="epP" min="1" max="30" value="10"></div>
+      <div class="ctrl"><label>failureThreshold <b id="epFo">3</b></label><input type="range" id="epF" min="1" max="6" value="3"></div>
+      <div class="ctrl"><label>Dataplane sync <b id="epDo">0.8</b> s</label><input type="range" id="epD" min="1" max="80" value="8"></div>
+      <div class="ctrl"><label>Traffic <b id="epRo">2000</b>/s over <b id="epNo">10</b> replicas</label><input type="range" id="epR" min="100" max="8000" step="100" value="2000"></div>
+    </div>
+    <div class="rgrid" id="epOut"></div>
+    <div class="readout" id="epNote"></div>
+  </div>
+</div>
+
+<div class="box trap"><b class="tag">Why <code>preStop: sleep 5</code> appears in so many manifests</b>
+<p style="margin-bottom:6px">On a graceful delete, two things start at the same instant: the kubelet begins terminating the pod, and the endpoints controller begins removing it. They are not ordered. If the pod stops accepting connections before the last node has updated its rules, every request routed there in the interim fails — <b>240 requests</b> at the settings above, on every pod replaced, in a routine rolling update.</p>
+<p style="margin-bottom:0">A <code>preStop</code> hook that simply sleeps delays the <code>SIGTERM</code> without doing anything else, giving the removal time to propagate first. Five seconds against a 1.2-second propagation takes the failures to zero. It is not elegant and it is the standard answer; the alternative is for the application to fail its readiness probe on <code>SIGTERM</code> and then keep serving for a few seconds, which is chapter 6's shutdown sequence and is better if you control the code. Make sure <code>terminationGracePeriodSeconds</code> exceeds the sleep plus the drain, or the kubelet's <code>SIGKILL</code> arrives in the middle of it.</p>
+</div>
+
+<div class="box warn"><b class="tag">A crash is a completely different order of magnitude</b>
+<p style="margin-bottom:0">Nothing tells the control plane that a pod has stopped serving; it has to be discovered. With the default probe settings — period 10&nbsp;s, failureThreshold 3 — detection alone takes <b>30 seconds</b>, during which the pod is still in the endpoint list and still receiving its full share. That is <b>6,240 failed requests</b> at 2,000&nbsp;rps across ten replicas. Tightening the probe to period 2 with threshold 2 cuts the window to 5.2&nbsp;s and the failures to 1,040 — a sixfold improvement from two numbers in a manifest. The counterweight is that aggressive probes eject healthy pods during a transient blip, so the sensible landing point is a fast, cheap readiness probe that tests only the process itself, and retries on the client side or in the mesh to cover the rest.</p>
+</div>
+</section>
+
+<section id="ingress">
+<h2>Ingress and the Gateway API</h2><div class="h2rule"></div>
+
+<p>A <code>LoadBalancer</code> service provisions one cloud load balancer per service, which is expensive and gives you no L7 routing. An <strong>Ingress</strong> is a single entry point that routes by host and path to many backend services — one cloud load balancer in front of an nginx or Envoy deployment inside the cluster, which is chapter 6's reverse proxy with its configuration generated from Kubernetes objects.</p>
+
+<div class="kv">
+<dt>Ingress is limited, and its extensions are vendor-specific</dt><dd>The resource covers host, path and TLS. Everything else — rate limiting, header manipulation, canary weights, authentication — arrives as controller-specific annotations, so an Ingress written for the nginx controller is not portable to any other.</dd>
+<dt>The Gateway API is the replacement</dt><dd>It splits the concern properly: <code>GatewayClass</code> and <code>Gateway</code> are owned by the platform team, <code>HTTPRoute</code> by the application team, and cross-namespace references are explicit. Traffic splitting by weight, header matching and request mirroring are first-class rather than annotations, which is what makes chapter 18's canary deployments declarative.</dd>
+<dt>Terminate TLS at the gateway</dt><dd>One place for certificates, chapter 7's ACME automation, and cipher policy. <code>cert-manager</code> issues and renews them as Kubernetes objects, which removes the most common cause of an expired certificate — a renewal that succeeded and never reloaded anything.</dd>
+<dt><code>externalTrafficPolicy</code> is a real trade-off</dt><dd><code>Cluster</code>, the default, accepts traffic on any node and forwards it to a pod possibly on another node — even balancing, one extra hop, and the client's source IP is lost to SNAT. <code>Local</code> only sends to pods on the receiving node — preserves the source IP and removes the hop, at the cost of uneven balancing if pods are unevenly distributed across nodes.</dd>
+</div>
+</section>
+
+<section id="balancing">
+<h2>Why all your gRPC traffic is on one pod</h2><div class="h2rule"></div>
+
+<p>The balancing decision in a plain Kubernetes Service is made <strong>once per connection</strong>, when the first packet is DNATed. With HTTP/1 and no keep-alive that is roughly once per request and the distribution is even. With HTTP/2 and gRPC — which multiplex thousands of requests over a small number of long-lived connections — the request distribution is simply whatever the connection distribution happened to be, and it never changes.</p>
+
+<div class="demo" id="d-lb">
+  <div class="demo-top"><div class="demo-title">Connections are balanced; requests are not</div><div class="demo-hint">Set 10 connections over 20 backends, then scale the backends up</div></div>
+  <div class="demo-body">
+    <canvas id="cLb2" aria-label="Requests received by each backend when balancing is done per connection"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Client connections <b id="lbCo">10</b></label><input type="range" id="lbC" min="1" max="1000" value="10"></div>
+      <div class="ctrl"><label>Backend pods <b id="lbBo">20</b></label><input type="range" id="lbB" min="2" max="40" value="20"></div>
+      <div class="ctrl"><label>Balancing</label><select id="lbL">
+        <option value="l4" selected>per connection (Service / L4)</option>
+        <option value="l7">per request (mesh, L7 proxy, or a gRPC client-side balancer)</option>
+      </select></div>
+      <div class="ctrl"><label><input type="checkbox" id="lbS"> just scaled out — half the pods are new</label></div>
+    </div>
+    <div class="rgrid" id="lbOut"></div>
+    <div class="readout" id="lbNote"></div>
+  </div>
+</div>
+
+<div class="kv">
+<dt>With fewer connections than backends, some get nothing at all</dt><dd>Ten connections over twenty pods leaves about <b>twelve pods (60%) receiving zero requests</b>, while the busiest gets roughly <b>4.3×</b> the average. You are paying for twenty replicas and running on eight.</dd>
+<dt>The imbalance shrinks as connections per backend grows</dt><dd>At 100 connections over 20 backends the worst is 1.9× the mean; at 10,000 it is 1.08×. This is why the problem is invisible for HTTP/1 services with many short connections and severe for gRPC with a handful of pooled ones — same infrastructure, opposite outcome.</dd>
+<dt>Scaling out does nothing until clients reconnect</dt><dd>Existing connections are pinned to the pods they were established with. Double the replica count during an incident and <b>every new pod receives zero traffic</b> — the classic "we scaled up and nothing improved", which then gets misdiagnosed as a downstream problem.</dd>
+</div>
+
+<div class="box tip"><b class="tag">Three ways to fix it, in increasing order of cost</b>
+<p style="margin-bottom:6px"><strong>Client-side balancing over a headless Service.</strong> Set <code>clusterIP: None</code> so DNS returns every pod address, and let the gRPC client balance across them with <code>round_robin</code>. No infrastructure, and the client re-resolves as pods change. The catch is that DNS-based membership updates lag, and every client language needs the configuration.</p>
+<p style="margin-bottom:6px"><strong>An L7 proxy in the path.</strong> Envoy, Linkerd or an ingress controller in HTTP/2 mode balances per request rather than per connection, which removes the problem entirely and gives you chapter 6's least-connections and power-of-two-choices as well. This is one of the strongest practical arguments for a mesh.</p>
+<p style="margin-bottom:0"><strong>Bound connection lifetime.</strong> <code>max_connection_age</code> in the gRPC server, or <code>MAX_CONCURRENT_STREAMS</code> tuning, forces periodic reconnection so the distribution is reshuffled and new pods are eventually discovered. A blunt instrument, but it costs one server option and it is often enough.</p>
+</div>
+</section>
+
+<section id="mesh">
+<h2>The service mesh: what it gives and what it costs</h2><div class="h2rule"></div>
+
+<p>A mesh puts a proxy — historically a sidecar container in every pod — on both ends of every call, and controls all of them from one place. Everything it provides is something you could implement in each application; the argument is that doing it once in the infrastructure is cheaper and more consistent than doing it in five languages.</p>
+
+<div class="cards">
+<div>
+<h5>What you get</h5>
+<p>mTLS between every service with automatic certificate rotation on an hourly cycle, so chapter 7's renewal problem disappears. Per-request L7 balancing, which fixes the gRPC problem above. Retries, timeouts and circuit breaking as policy rather than library code. Traffic splitting by weight for chapter 18's canaries. And uniform golden-signal metrics and distributed traces for every call, with no application changes.</p>
+</div>
+<div>
+<h5>What it costs</h5>
+<p>Roughly 0.5–1&nbsp;ms of added latency per hop — doubled, since the proxy is on both ends — which compounds with call depth: a five-hop chain pays it ten times. Around 50–100&nbsp;MB of memory and a slice of CPU per pod, scaling with pod count rather than traffic. A control plane to run and upgrade. And a substantial increase in the number of places a request can fail, in ways that are unfamiliar during an incident.</p>
+</div>
+</div>
+
+<div class="box intu"><b class="tag">When it is worth it, and the sidecar-less alternative</b>
+<p style="margin-bottom:0">The honest test is how many of the benefits you already have and how many services you run. With five services, an L7 ingress and a shared client library get you most of the way at a fraction of the operational cost. With a hundred services in four languages and a compliance requirement for encryption in transit, implementing mTLS and consistent retry policy in every one of them is the more expensive option by a wide margin, and the mesh wins. The middle ground has changed recently: <strong>ambient</strong> or sidecar-less modes — Istio ambient, Cilium's eBPF dataplane — move mTLS and L4 policy into a per-node component and make the L7 proxy optional per workload, which removes most of the per-pod memory cost and much of the latency for services that only need encryption and identity. If you evaluated meshes a few years ago and concluded the overhead was not worth it, that arithmetic is worth redoing.</p>
+</div>
+
+<div class="box warn"><b class="tag">Sidecars have two operational sharp edges</b>
+<p style="margin-bottom:0"><strong>Startup ordering.</strong> If the application container starts before the proxy is ready, its first outbound calls fail — which turns into a crash loop for anything that connects to a dependency at boot. Kubernetes native sidecars (an <code>initContainer</code> with <code>restartPolicy: Always</code>) fix this properly; before that it needed hold-until-ready hacks. <strong>Shutdown ordering.</strong> The mirror image: if the proxy exits first, the application's in-flight requests fail, and a <code>Job</code> whose sidecar never exits runs forever and never completes. Both are ordering problems around a container that was never designed to be part of your pod's lifecycle, and both are worth verifying explicitly rather than assuming.</p>
+</div>
+</section>
+
+<section id="close">
+<h2>Check yourself</h2><div class="h2rule"></div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>Every rolling update produces a small burst of 502s even though the application handles <code>SIGTERM</code> correctly. Why, and what fixes it?
+<button class="reveal">Show answer</button><div class="ans">Handling <code>SIGTERM</code> correctly is necessary and not sufficient, because the removal from the endpoint list and the <code>SIGTERM</code> begin at the same moment and are not ordered. The endpoints controller must write an updated <code>EndpointSlice</code> and then every node in the cluster must observe it and reprogram its dataplane — a second or so in a small cluster, several in a large one. If the application shuts down promptly on <code>SIGTERM</code>, it stops accepting before some nodes have stopped routing, and everything sent in the interim fails: about 240 requests per pod replaced at 2,000&nbsp;rps across ten replicas. The standard fix is a <code>preStop</code> hook that sleeps for longer than the propagation delay, which delays the <code>SIGTERM</code> so the removal lands first. The better fix if you control the code is for the process to fail its readiness probe immediately on <code>SIGTERM</code> and keep serving for a few seconds before draining. Either way, <code>terminationGracePeriodSeconds</code> must exceed the delay plus the drain time.</div></li>
+
+<li>A pod is OOMKilled at peak. Why is the user impact so much larger than a rolling update, and what are the two numbers that control it?
+<button class="reveal">Show answer</button><div class="ans">Because nothing informs the control plane that the pod has stopped serving — it must be discovered by the readiness probe. Detection therefore takes <code>periodSeconds × failureThreshold</code>, which at the defaults of 10 and 3 is thirty seconds, and only then does the propagation delay begin. Throughout that window the pod remains in the endpoint list and receives its full share of traffic, all of which fails: roughly 6,240 requests at 2,000&nbsp;rps across ten replicas, against 240 for a graceful delete. The two numbers are the probe period and the failure threshold; tightening them to 2 and 2 cuts the window from 31 seconds to 5 and the failures to about 1,040. The counterweight is that aggressive probes eject healthy pods during a transient blip, per chapter 6, so the balance is a fast probe that tests only the process itself plus client-side or mesh retries to cover what remains.</div></li>
+
+<li>You have twenty replicas of a gRPC service. Metrics show three of them handling almost all the traffic and several handling none. Explain.
+<button class="reveal">Show answer</button><div class="ans">A Kubernetes Service balances per <em>connection</em>, not per request: <code>kube-proxy</code> picks an endpoint when the connection is established and every request on that connection goes to the same pod forever. gRPC runs over HTTP/2 and multiplexes many requests over a small number of long-lived connections, so the request distribution is just the connection distribution — and with a handful of clients each holding one or two connections, most pods get none. In the model, ten connections over twenty backends leaves about twelve pods idle with the busiest at 4.3× the mean. The same infrastructure is perfectly even for HTTP/1 because those connections are short and numerous. Fixes: a headless Service plus client-side <code>round_robin</code> so the client balances across all pod IPs itself; an L7 proxy or mesh in the path that balances per request; or bounding connection lifetime with <code>max_connection_age</code> so the distribution reshuffles periodically.</div></li>
+
+<li>During an incident you double the replicas of that same gRPC service and nothing improves. Why?
+<button class="reveal">Show answer</button><div class="ans">Because existing connections are pinned to the pods they were established with, and nothing moves them. New pods join the endpoint list and receive traffic only from connections established after they appeared — so if the clients are long-lived and are not reconnecting, every new pod sits at zero while the original ones stay saturated. The model shows exactly this: scaling from ten to twenty backends with 200 established connections leaves all ten new backends with no requests. It is a particularly nasty failure during an incident because the obvious action produces no effect and attention moves to the wrong place. Forcing reconnection is the immediate lever — a rolling restart of the clients, or <code>max_connection_age</code> on the server if it is already configured — and per-request balancing is the durable fix.</div></li>
+
+<li>Someone proposes a <code>LoadBalancer</code> service for each of forty microservices. What is wrong with that?
+<button class="reveal">Show answer</button><div class="ans">Each one provisions a separate cloud load balancer, so it is forty billable load balancers, forty public addresses, forty places to attach a certificate and forty sets of DNS records — with no L7 routing, since the cloud LB is only forwarding to a NodePort. It is also forty separate things to keep consistent for rate limiting, TLS policy and access logging. An Ingress or Gateway is one cloud load balancer in front of a proxy deployment inside the cluster that routes by host and path to all forty services, with certificates managed once by <code>cert-manager</code>. The exception is a service that genuinely needs a non-HTTP protocol or its own address, where a dedicated load balancer is appropriate — but that should be an argued case rather than the default. Internal service-to-service traffic should be <code>ClusterIP</code> and never touch a load balancer at all.</div></li>
+
+<li>A mesh adds about 0.7&nbsp;ms per proxy hop. Your architecture has a five-service call chain. What is the real latency cost and what does it imply?
+<button class="reveal">Show answer</button><div class="ans">The proxy is on both ends of every call, so each hop pays it twice: roughly 1.4&nbsp;ms per hop, and about 7&nbsp;ms over a five-hop chain — before considering that the tail is worse than the mean, since each proxy adds its own queueing. If the chain's total budget is 50&nbsp;ms that is 14% spent on infrastructure. The implication is not that meshes are bad but that <em>call depth</em> is the multiplier, so the mesh makes an existing architectural problem more expensive: a deep synchronous chain was already fragile, because availability multiplies and latency adds, and the mesh sharpens the incentive to flatten it. It also argues for evaluating ambient or sidecar-less modes, which keep mTLS and identity while making the L7 proxy optional per workload, so services needing only encryption stop paying the full per-hop cost.</div></li>
+
+<li>What is the practical difference between <code>externalTrafficPolicy: Cluster</code> and <code>Local</code>?
+<button class="reveal">Show answer</button><div class="ans"><code>Cluster</code>, the default, lets any node accept the traffic and forward it to a pod anywhere in the cluster. Balancing is even regardless of how pods are distributed, at the cost of one extra network hop and — more consequentially — the loss of the client's source IP, because the forwarding node performs SNAT. That breaks IP allowlists, geolocation and per-client rate limiting, and it is why your access logs show node addresses. <code>Local</code> forwards only to pods on the receiving node, which preserves the source IP and removes the hop, but makes balancing depend on pod distribution: a node with three pods gets the same share of load-balancer traffic as a node with one, so those three are underused and the one is overloaded. Nodes with no pods fail the load balancer's health check and are removed, which is the mechanism that stops traffic black-holing. Use <code>Local</code> when you need the source IP, and pair it with a topology spread constraint from chapter 11 so pods are distributed evenly enough for the balancing to be fair.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin-bottom:0">That completes the containers part. Chapter 13 starts on infrastructure: what the cloud providers actually rent you underneath the marketing names, the shared responsibility model, and how the bill is computed.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 12</h2><p>Service networking, ingress and mesh. Part of the DevOps unit — <a href="index.html">all 24 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 18 (traffic splitting and safe rollouts), 19 (declarative routing), 21 (mesh-issued identities), 22 (golden signals from the proxy).</p></div>
+    <div><h2>Going deeper</h2><p>The Kubernetes unit covers Services and Ingress in full. The Gateway API specification is short and worth reading in place of the Ingress documentation.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: endpoint propagation window ============ */
+(function(){
+  const cv=document.getElementById("cEp"); if(!cv) return;
+  const mEl=document.getElementById("epM"), sEl=document.getElementById("epS"), pEl=document.getElementById("epP"),
+        fEl=document.getElementById("epF"), dEl=document.getElementById("epD"), rEl=document.getElementById("epR");
+  const out=document.getElementById("epOut"), note=document.getElementById("epNote");
+  const CONTROL=0.4, REPLICAS=10;
+
+  function model(){
+    const mode=mEl.value, preStop=Math.round(+sEl.value);
+    const period=Math.round(+pEl.value), thr=Math.round(+fEl.value);
+    const sync=Math.round(+dEl.value)/10, rate=Math.round(+rEl.value);
+    const propagation=CONTROL+sync;
+    const detection= mode==="crash" ? period*thr : 0;
+    const unprotected = mode==="crash" ? detection+propagation
+                                       : Math.max(0, propagation-preStop);
+    const share=1/REPLICAS;
+    const failed=rate*share*unprotected;
+    return {mode,preStop,period,thr,sync,rate,propagation,detection,unprotected,
+            failed, share, covered: mode!=="crash" && preStop>=propagation};
+  }
+
+  function draw(){
+    const m=model();
+    document.getElementById("epSo").textContent=m.preStop;
+    document.getElementById("epPo").textContent=m.period;
+    document.getElementById("epFo").textContent=m.thr;
+    document.getElementById("epDo").textContent=m.sync.toFixed(1);
+    document.getElementById("epRo").textContent=m.rate.toLocaleString();
+    document.getElementById("epNo").textContent=REPLICAS;
+    sEl.disabled = m.mode==="crash";
+    pEl.disabled = m.mode!=="crash"; fEl.disabled = m.mode!=="crash";
+
+    const w=cv.clientWidth||660, h=104, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+
+    const L=14,R=w-14,span=R-L;
+    const total=Math.max(m.detection+m.propagation+Math.max(m.preStop,1), 3);
+    const sc=span/total;
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText(m.mode==="crash" ? "the pod stops serving at t=0 — nothing knows yet"
+                                  : "deletion requested at t=0", L, 12);
+
+    let x=L;
+    const seg=(len,col,lab)=>{
+      const bw=len*sc; if(bw<=0) return;
+      ctx.fillStyle=col; ctx.fillRect(x,24,bw,24);
+      if(bw>52){ ctx.fillStyle= col==="#EDF1F4"?PC.text:"#fff"; ctx.font="600 9px Archivo, Arial"; ctx.textAlign="left";
+        ctx.fillText(lab, x+5, 36); }
+      x+=bw;
+    };
+    if(m.mode==="crash"){
+      seg(m.detection, PC.bad, "probe detection "+m.detection+"s");
+      seg(m.propagation, "#E8907A", "propagation "+m.propagation.toFixed(1)+"s");
+    } else {
+      if(m.preStop>0) seg(Math.min(m.preStop,m.propagation), PC.ok, "preStop covers propagation");
+      seg(Math.max(0,m.propagation-m.preStop), PC.bad, "unprotected "+Math.max(0,m.propagation-m.preStop).toFixed(1)+"s");
+      if(m.preStop>m.propagation) seg(m.preStop-m.propagation, "#CFE3D6", "preStop slack");
+    }
+    ctx.strokeStyle="#D5DDE4"; ctx.lineWidth=1; ctx.strokeRect(L+.5,24.5,Math.min(span,x-L),24);
+
+    ctx.textAlign="left"; ctx.font="9.5px Archivo, Arial"; ctx.fillStyle=PC.text;
+    ctx.fillText("0 s", L, 56);
+    ctx.textAlign="right"; ctx.fillText(total.toFixed(1)+" s", Math.min(R,x), 56);
+
+    ctx.textAlign="left"; ctx.font=(m.failed?"700 ":"600 ")+"11px Archivo, Arial";
+    ctx.fillStyle= m.failed>1000?PC.bad : m.failed>0?PC.warn : PC.ok;
+    ctx.fillText(m.failed>0
+      ? "requests still routed to this pod for "+m.unprotected.toFixed(1)+" s → "+
+        Math.round(m.failed).toLocaleString()+" failed requests"
+      : "no window: the endpoint is removed everywhere before the pod stops accepting", L, 76);
+    ctx.font="9.5px Archivo, Arial"; ctx.fillStyle=PC.text;
+    ctx.fillText("this pod carries 1/"+REPLICAS+" of "+m.rate.toLocaleString()+" req/s = "+
+                 Math.round(m.rate/REPLICAS).toLocaleString()+" req/s", L, 92);
+
+    out.innerHTML=
+      '<div><span>detection</span><b>'+m.detection.toFixed(1)+' s</b></div>'+
+      '<div><span>propagation</span><b>'+m.propagation.toFixed(1)+' s</b></div>'+
+      '<div><span>unprotected window</span><b style="color:'+(m.unprotected>5?PC.bad:m.unprotected>0?PC.warn:PC.ok)+'">'+
+        m.unprotected.toFixed(1)+' s</b></div>'+
+      '<div><span>failed requests</span><b style="color:'+(m.failed>1000?PC.bad:m.failed>0?PC.warn:PC.ok)+'">'+
+        Math.round(m.failed).toLocaleString()+'</b></div>'+
+      '<div><span>per pod replaced</span><b>'+Math.round(m.failed).toLocaleString()+'</b></div>'+
+      '<div><span>whole rollout</span><b>'+Math.round(m.failed*REPLICAS).toLocaleString()+'</b></div>';
+
+    let msg;
+    if(m.mode==="crash")
+      msg='Nothing tells the control plane the pod has stopped serving, so it has to be <em>discovered</em>. '+
+          'Detection alone takes <b>period '+m.period+' × threshold '+m.thr+' = '+m.detection+
+          ' s</b>, and only then does the '+m.propagation.toFixed(1)+' s propagation begin. '+
+          'Throughout that window the pod is still in the endpoint list and still receiving its full share: <b>'+
+          Math.round(m.failed).toLocaleString()+'</b> failed requests. Tighten the probe and watch this collapse.';
+    else if(m.covered)
+      msg='The <code>preStop</code> sleep of <b>'+m.preStop+' s</b> exceeds the <b>'+m.propagation.toFixed(1)+
+          ' s</b> propagation delay, so every node has stopped routing before the pod receives <code>SIGTERM</code>. '+
+          '<b>Zero failed requests.</b> Make sure <code>terminationGracePeriodSeconds</code> is larger than this sleep plus the drain time, or the kubelet\u2019s SIGKILL lands in the middle of it.';
+    else
+      msg='Deletion starts the <code>SIGTERM</code> and the endpoint removal <b>at the same moment</b> — they are not ordered. '+
+          'Propagation takes '+m.propagation.toFixed(1)+' s (control plane '+CONTROL+' s + dataplane sync '+m.sync.toFixed(1)+
+          ' s across every node), leaving <b>'+m.unprotected.toFixed(1)+' s</b> in which nodes still route here after the pod stops accepting: <b>'+
+          Math.round(m.failed).toLocaleString()+'</b> failed requests per pod, <b>'+
+          Math.round(m.failed*REPLICAS).toLocaleString()+'</b> over a full rollout. Add a preStop sleep longer than the propagation.';
+    note.innerHTML=msg;
+  }
+  [mEl,sEl,pEl,fEl,dEl,rEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+
+/* ============ demo 2: connection vs request balancing ============ */
+(function(){
+  const cv=document.getElementById("cLb2"); if(!cv) return;
+  const cEl=document.getElementById("lbC"), bEl=document.getElementById("lbB"),
+        lEl=document.getElementById("lbL"), sEl=document.getElementById("lbS");
+  const out=document.getElementById("lbOut"), note=document.getElementById("lbNote");
+  function rng(seed){ let s=seed>>>0; return ()=>(s=(Math.imul(s,1664525)+1013904223)>>>0)/4294967296; }
+
+  function model(){
+    const conns=Math.max(1,Math.round(+cEl.value)), backends=Math.max(2,Math.round(+bEl.value));
+    const l7=lEl.value==="l7", scaled=sEl.checked;
+    /* when "just scaled out", existing connections are pinned to the ORIGINAL half */
+    const pool = scaled ? Math.max(1,Math.floor(backends/2)) : backends;
+    const bins=new Array(backends).fill(0);
+    if(l7){
+      for(let i=0;i<backends;i++) bins[i]=conns/backends;   /* per-request: perfectly even */
+    } else {
+      const R=rng(1234567);
+      for(let c=0;c<conns;c++) bins[Math.floor(R()*pool)]++;
+    }
+    const mean=conns/backends;
+    const max=Math.max(...bins), min=Math.min(...bins);
+    const empty=bins.filter(b=>b===0).length;
+    return {conns,backends,l7,scaled,pool,bins,mean,max,min,empty,
+            imbalance: mean>0?max/mean:0, emptyPct:empty/backends};
+  }
+
+  function draw(){
+    const m=model();
+    document.getElementById("lbCo").textContent=m.conns.toLocaleString();
+    document.getElementById("lbBo").textContent=m.backends;
+
+    const w=cv.clientWidth||660, h=92, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("share of requests reaching each backend pod", 14, 12);
+
+    const L=14,R=w-14,span=R-L, bw=span/m.backends;
+    const top=24, base=68;
+    const peak=Math.max(1,m.max);
+    m.bins.forEach((v,i)=>{
+      const bh=(v/peak)*(base-top);
+      const isNew=m.scaled && i>=m.pool;
+      ctx.fillStyle= v===0 ? (isNew?"#F4CFCB":"#E6EBEF") : (m.l7?PC.ok:(v>m.mean*1.6?PC.bad:PC.line));
+      ctx.fillRect(L+i*bw+1, base-Math.max(v===0?2:bh,2), Math.max(1,bw-2), Math.max(v===0?2:bh,2));
+    });
+    ctx.strokeStyle="#D5DDE4"; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(L,base+.5); ctx.lineTo(R,base+.5); ctx.stroke();
+    /* mean line */
+    const my=base-(m.mean/peak)*(base-top);
+    ctx.setLineDash([3,3]); ctx.strokeStyle=PC.warn; ctx.lineWidth=1.2;
+    ctx.beginPath(); ctx.moveTo(L,my); ctx.lineTo(R,my); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle=PC.warn; ctx.font="600 9px Archivo, Arial"; ctx.textAlign="right";
+    ctx.fillText("even share", R, my-7);
+
+    ctx.textAlign="left"; ctx.font="9.5px Archivo, Arial"; ctx.fillStyle=PC.text;
+    ctx.fillText(m.backends+" pods", L, base+12);
+    ctx.textAlign="right";
+    ctx.fillStyle= m.empty?PC.bad:PC.ok;
+    ctx.fillText(m.empty? m.empty+" pods receiving nothing" : "every pod receiving traffic", R, base+12);
+    if(m.scaled && !m.l7){ ctx.textAlign="left"; ctx.fillStyle=PC.bad; ctx.font="700 9px Archivo, Arial";
+      ctx.fillText("the right-hand half are the new pods", L, base+24); }
+
+    out.innerHTML=
+      '<div><span>connections</span><b>'+m.conns.toLocaleString()+'</b></div>'+
+      '<div><span>even share would be</span><b>'+m.mean.toFixed(2)+'</b></div>'+
+      '<div><span>busiest pod gets</span><b style="color:'+(m.imbalance>1.5?PC.bad:PC.ok)+'">'+m.max.toFixed(2)+'</b></div>'+
+      '<div><span>imbalance</span><b style="color:'+(m.imbalance>1.5?PC.bad:m.imbalance>1.15?PC.warn:PC.ok)+'">'+
+        m.imbalance.toFixed(2)+'×</b></div>'+
+      '<div><span>pods idle</span><b style="color:'+(m.empty?PC.bad:PC.ok)+'">'+m.empty+' ('+(m.emptyPct*100).toFixed(0)+'%)</b></div>'+
+      '<div><span>balancing</span><b style="font-size:11px;color:'+(m.l7?PC.ok:PC.warn)+'">'+
+        (m.l7?"per request":"per connection")+'</b></div>';
+
+    let msg;
+    if(m.l7)
+      msg='Per-request balancing distributes every request independently, so the connection count is irrelevant and every pod gets an equal share. '+
+          'This is what a mesh sidecar, an L7 proxy in HTTP/2 mode, or a gRPC client-side balancer over a headless Service gives you — '+
+          'and it also brings chapter 6\u2019s least-connections and power-of-two-choices with it.';
+    else if(m.scaled)
+      msg='<b>You just doubled the replicas and every new pod is receiving zero requests.</b> Connections were established against the original '+
+          m.pool+' pods and are pinned there; nothing moves them. This is the "we scaled up and nothing improved" failure, and during an incident it usually sends attention to the wrong place. '+
+          'Force reconnection (restart the clients, or set <code>max_connection_age</code>) or switch to per-request balancing.';
+    else if(m.conns<m.backends)
+      msg='With <b>'+m.conns+' connections</b> across <b>'+m.backends+' pods</b>, most pods cannot receive anything — there are not enough connections to go round. '+
+          '<b>'+m.empty+' pods ('+(m.emptyPct*100).toFixed(0)+'%) are idle</b> and the busiest carries '+m.imbalance.toFixed(1)+
+          '× the even share. You are paying for '+m.backends+' replicas and running on '+(m.backends-m.empty)+'.';
+    else
+      msg='At '+(m.conns/m.backends).toFixed(1)+' connections per pod the distribution is uneven by <b>'+m.imbalance.toFixed(2)+
+          '×</b>. The imbalance shrinks as connections per pod grows, which is why this is invisible for HTTP/1 — many short connections — and severe for gRPC, '+
+          'where a handful of pooled connections carry everything. Drag the connection count down towards the pod count to see it collapse.';
+    note.innerHTML=msg;
+  }
+  [cEl,bEl,lEl,sEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+</script>
+</body>
+</html>

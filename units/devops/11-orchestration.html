@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Orchestration and scheduling — DevOps</title>
+<meta name="description" content="The reconciliation loop every orchestrator is built from, the scheduler's filter-and-score pass and why bin-packing beats spreading for placement, requests against limits, QoS classes and eviction order, and the autoscalers.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%237C8CF8' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">DevOps</a><span class="sep">/</span><span>Chapter 11</span></p>
+    <p class="chno">Chapter 11 · Containers</p>
+    <h1>Orchestration and scheduling</h1>
+    <p class="lede">Every orchestrator ever built is the same loop: read the desired state, observe the actual state, do something about the difference, repeat forever. Everything else — pods, tasks, allocations, services — is vocabulary. This chapter is that loop, the placement decision it makes on your behalf, and the two numbers that control both.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapters 02, 09</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="loop">
+<h2>The reconciliation loop</h2><div class="h2rule"></div>
+
+<p class="lead">Chapter 1 promised that four questions decode any tool in this space: <em>where is the desired state written, what compares it against reality, what does it do about a difference, and what happens when that action fails halfway</em>. An orchestrator is the purest example.</p>
+
+<div class="eq plain"><code>for ever: &nbsp; observe(actual) &nbsp;→&nbsp; diff(desired, actual) &nbsp;→&nbsp; act &nbsp;→&nbsp; sleep</code></div>
+<p class="where">The important property is that it is <b>level-triggered</b>, not edge-triggered. It does not react to the event "a pod died" — it repeatedly notices the condition "there are four pods and I want five". That distinction is why the system self-heals after a missed message, a controller restart or a network partition: nothing depends on having seen a particular event, only on the current difference being visible.</p>
+
+<div class="kv">
+<dt>Desired state is declarative and stored centrally</dt><dd>In Kubernetes, objects in etcd behind the API server. You write what you want; you never write the steps. This is the same shape as Terraform's state file (chapter 14) and a Git repository under ArgoCD (chapter 19).</dd>
+<dt>Controllers each watch one slice</dt><dd>The Deployment controller manages ReplicaSets; the ReplicaSet controller manages Pods; the scheduler assigns Pods to nodes; the kubelet on each node makes its assigned Pods real. No component knows the whole picture, and each is independently restartable because it derives everything from current state.</dd>
+<dt>Actions are idempotent by necessity</dt><dd>The loop runs again in a second and must not do the same thing twice. This is chapter 3's idempotency requirement promoted from a scripting nicety to an architectural constraint.</dd>
+<dt>Failure halfway is the normal case</dt><dd>A controller that crashes between creating a pod and recording that it did so simply observes the discrepancy on the next pass. There is no transaction and no rollback, because there is nothing to roll back to — only a difference to reduce.</dd>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Object</th><th>Guarantees</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><strong>Pod</strong></td><td>One or more containers sharing a network namespace and volumes, scheduled together</td><td>The unit of scheduling. You rarely create one directly</td></tr>
+<tr><td><strong>ReplicaSet</strong></td><td>Exactly N identical pods exist</td><td>Managed by Deployments; you rarely touch it</td></tr>
+<tr><td><strong>Deployment</strong></td><td>A ReplicaSet plus a rollout strategy and history</td><td class="yes">The default for stateless services. Chapter 18 is about its strategy field</td></tr>
+<tr><td><strong>StatefulSet</strong></td><td>Stable identity, stable storage, ordered start and stop</td><td>Databases and anything where pod-2 must be pod-2 after a restart</td></tr>
+<tr><td><strong>DaemonSet</strong></td><td>One pod per node, including nodes added later</td><td>Log shippers, metric agents, CNI plugins</td></tr>
+<tr><td><strong>Job</strong> / <strong>CronJob</strong></td><td>Runs to completion, with retries; on a schedule</td><td>Batch work, migrations. Watch <code>concurrencyPolicy</code>: the default lets runs overlap</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="scheduling">
+<h2>How the scheduler decides</h2><div class="h2rule"></div>
+
+<p>Placement is two passes over the node list, run once per pod. <strong>Filter</strong> eliminates nodes that cannot work: not enough unreserved CPU or memory, a taint the pod does not tolerate, a node selector or affinity rule that does not match, no free host port, a volume that cannot attach in that zone. <strong>Score</strong> ranks the survivors, and the pod goes to the winner.</p>
+
+<p>The scoring strategy is where the interesting decision lives, because it is really a bin-packing policy — and the scheduler places pods <em>one at a time with no lookahead</em>, so an early policy choice can make a later pod unplaceable.</p>
+
+<div class="demo" id="d-sched">
+  <div class="demo-top"><div class="demo-title">Filter, score, place — one pod at a time</div><div class="demo-hint">Spread the eight small pods first, then try to place the 3-CPU one</div></div>
+  <div class="demo-body">
+    <canvas id="cSched" aria-label="Four nodes with their CPU allocation, and the pods placed on each"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Scoring strategy</label><select id="scS">
+        <option value="least" selected>LeastAllocated — spread across nodes</option>
+        <option value="most">MostAllocated — bin-pack</option>
+        <option value="balanced">BalancedAllocation — even cpu:mem ratio</option>
+      </select></div>
+      <div class="ctrl"><label>Nodes <b id="scNo">4</b> × 4 CPU</label><input type="range" id="scN" min="2" max="8" value="4"></div>
+      <div class="ctrl"><label>Small pods (1 CPU) <b id="scPo">8</b></label><input type="range" id="scP" min="0" max="24" value="8"></div>
+      <div class="ctrl"><label>Large pod <b id="scLo">3</b> CPU</label><input type="range" id="scL" min="1" max="4" value="3"></div>
+      <div class="ctrl"><label><input type="checkbox" id="scF"> schedule the large pod <em>first</em></label></div>
+    </div>
+    <div class="rgrid" id="scOut"></div>
+    <div class="readout" id="scNote"></div>
+  </div>
+</div>
+
+<div class="box trap"><b class="tag">Free capacity is not placeable capacity</b>
+<p style="margin-bottom:6px">At the defaults, spreading puts two small pods on each of four nodes. The cluster then has <b>8 CPU free</b> and cannot place a 3-CPU pod, because the largest single gap is 2. The pod sits <code>Pending</code> with <code>Insufficient cpu</code>, which reads like a capacity problem and is actually a fragmentation problem — adding a node fixes it, and so would having packed differently.</p>
+<p style="margin-bottom:0">Bin-packing places all nine. It pays for that by putting <b>4 pods</b> on one node instead of 2, so losing that node loses twice as much. And note the third case: the same nine pods in a different order all fit even when spreading. The scheduler never revisits a placement, so outcomes depend on arrival order — which is why the descheduler exists, and why anti-affinity rules are the right way to express "these must not share a node" rather than hoping the scoring policy produces it.</p>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Placement control</th><th>Says</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td><code>nodeSelector</code></td><td>Only nodes with this label</td><td>Simple and rigid; a hard filter</td></tr>
+<tr><td><code>nodeAffinity</code></td><td>Required or preferred node properties</td><td><code>preferred</code> is a score adjustment, so it can be ignored under pressure</td></tr>
+<tr><td><code>podAntiAffinity</code></td><td>Do not co-locate with pods matching this</td><td class="yes">The correct way to say "spread my replicas across nodes". <code>required</code> can leave pods Pending; <code>preferred</code> cannot</td></tr>
+<tr><td><code>topologySpreadConstraints</code></td><td>Even distribution across zones or nodes, within a skew</td><td class="yes">More expressive and cheaper to evaluate than anti-affinity. The modern answer</td></tr>
+<tr><td>Taints and tolerations</td><td>The <em>node</em> repels pods unless they opt in</td><td>The inverse direction: used for GPU nodes, spot instances, control-plane nodes</td></tr>
+<tr><td><code>priorityClassName</code></td><td>This pod may preempt lower-priority pods</td><td class="no">Preemption evicts running workloads. Powerful, and easy to configure into a cascade</td></tr>
+<tr><td><code>PodDisruptionBudget</code></td><td>Never voluntarily take me below N available</td><td class="yes">What protects you during node drains and upgrades. Chapter 18</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section id="requests">
+<h2>Requests, limits and who gets evicted</h2><div class="h2rule"></div>
+
+<p>Two numbers per resource, and they do entirely different jobs. Conflating them is the single most common source of both wasted money and surprise outages.</p>
+
+<div class="cards">
+<div>
+<h5>Requests</h5>
+<p>A reservation. The scheduler subtracts it from the node's allocatable capacity when deciding what else fits, and the kubelet uses it to set <code>cpu.weight</code>. Nothing enforces it at runtime — a pod may use more if the node has spare. <strong>Requests decide placement and protection.</strong></p>
+</div>
+<div>
+<h5>Limits</h5>
+<p>A ceiling. CPU over the limit is throttled (chapter 9); memory over the limit is an immediate cgroup OOM kill. The scheduler ignores limits entirely. <strong>Limits decide what happens when you exceed them.</strong></p>
+</div>
+</div>
+
+<p>The gap between requests and actual usage is what makes a cluster affordable — you can commit 150% of a node's memory in limits because not everything peaks together. It is also precisely what creates the risk, and QoS class is how the kubelet decides who pays when the bet goes wrong.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>QoS class</th><th>Set by</th><th>Evicted</th></tr></thead>
+<tbody>
+<tr><td><strong>Guaranteed</strong></td><td>Requests equal limits, for every resource in every container</td><td class="yes">Last</td></tr>
+<tr><td><strong>Burstable</strong></td><td>Requests set, limits higher or absent</td><td>Second, ordered by how far usage exceeds the request</td></tr>
+<tr><td><strong>BestEffort</strong></td><td>Neither set</td><td class="no">First, always, regardless of how little it is using</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="demo" id="d-evict">
+  <div class="demo-top"><div class="demo-title">Memory pressure, and the order the kubelet picks</div><div class="demo-hint">Raise the api pod's request to its usage — then set its limit equal too</div></div>
+  <div class="demo-body">
+    <canvas id="cEvict" aria-label="Per-pod memory request against actual usage, with QoS class and eviction order"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>api request <b id="evRo">1024</b> MiB</label><input type="range" id="evR" min="256" max="5120" step="128" value="1024"></div>
+      <div class="ctrl"><label>api limit <b id="evLo">6144</b> MiB</label><input type="range" id="evL" min="256" max="6144" step="128" value="6144"></div>
+      <div class="ctrl"><label>api actual usage <b id="evAo">4000</b> MiB</label><input type="range" id="evA" min="256" max="5120" step="128" value="4000"></div>
+      <div class="ctrl"><label>node allocatable <b id="evNo">8192</b> MiB</label><input type="range" id="evN" min="4096" max="16384" step="512" value="8192"></div>
+    </div>
+    <div class="rgrid" id="evOut"></div>
+    <div class="readout" id="evNote"></div>
+  </div>
+</div>
+
+<div class="box warn"><b class="tag">Three things the eviction order teaches</b>
+<p style="margin-bottom:6px"><strong>BestEffort dies first even when it is tiny.</strong> The 200&nbsp;MiB cache pod is evicted before a pod using 4&nbsp;GB, because class outranks size. Omitting requests to "keep it simple" is opting into being killed first, every time.</p>
+<p style="margin-bottom:6px"><strong>Among Burstable, distance above the request decides.</strong> The api pod at 4,000&nbsp;MiB against a 1,024&nbsp;MiB request is 2,976 over; the worker at 1,800 against 2,048 is 248 under. The api pod goes first despite both being Burstable — <em>requests, not raw usage, determine who is safe</em>.</p>
+<p style="margin-bottom:0"><strong>Being slightly under your request is not protection.</strong> Raise the api request to 4,096 — above its 4,000 usage — and it is <em>still</em> evicted second, because at 96&nbsp;MiB under it is the least-under-request Burstable pod on the node. Only setting requests equal to limits moves it to Guaranteed, and then the worker is evicted instead. That is what Guaranteed is for, and it is the correct configuration for anything whose eviction would be an incident.</p>
+</div>
+
+<div class="box tip"><b class="tag">The position that follows</b>
+<p style="margin-bottom:0"><strong>Always set memory requests, set memory limits equal to them for anything critical, and size both from observed usage plus headroom.</strong> Memory is not compressible: there is no throttling, only a kill, so the limit is doing real work. <strong>Set CPU requests, and be cautious with CPU limits</strong> for the reasons in chapter 9 — <code>cpu.weight</code> already prevents starvation under contention, while a limit throttles even when the node is idle. And measure: a cluster where requests are set from guesswork is either wasting most of its capacity or is one traffic spike from a cascade of evictions, and usually both on different nodes.</p>
+</div>
+</section>
+
+<section id="autoscale">
+<h2>The three autoscalers, and why they oscillate</h2><div class="h2rule"></div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Scaler</th><th>Changes</th><th>Reacts in</th><th>Watch out for</th></tr></thead>
+<tbody>
+<tr><td><strong>HPA</strong></td><td>Replica count</td><td>15 s poll, plus metric lag</td><td>The metric it scales on must actually correlate with load</td></tr>
+<tr><td><strong>VPA</strong></td><td>Requests and limits</td><td>Minutes</td><td class="no">Recreates pods to apply changes; conflicts with HPA on the same metric</td></tr>
+<tr><td><strong>Cluster autoscaler</strong> / Karpenter</td><td>Node count</td><td>Minutes, plus boot and image pull</td><td>Only adds a node when a pod is <em>already</em> Pending — so it is reactive by construction</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>All three are feedback controllers with delay, and delayed feedback oscillates. The HPA formula is deliberately simple:</p>
+
+<div class="eq plain"><code>desired replicas &nbsp;=&nbsp; ⌈ current replicas × (current metric ÷ target metric) ⌉</code></div>
+<p class="where">With a 10% tolerance band so it ignores small deviations, a scale-up that takes effect immediately, and a <b>five-minute stabilisation window</b> on scale-down that makes it use the highest recommendation from the last five minutes. That asymmetry is deliberate: scaling up early is cheap and scaling down early is an outage, so the controller is biased. Without the window, the loop of "load drops, remove pods, remaining pods get busier, add pods back" runs indefinitely.</p>
+
+<div class="box trap"><b class="tag">Scaling on CPU when the bottleneck is elsewhere</b>
+<p style="margin-bottom:0">The default HPA metric is CPU utilisation as a percentage of the <em>request</em>, and it only works if CPU is what saturates. A service whose limit is a downstream connection pool, or that spends its time waiting on I/O, shows flat CPU while queueing badly — so the HPA does nothing while latency climbs, and the on-call engineer scales it by hand. Worse, a service throttled by a CPU limit (chapter 9) shows CPU pinned at the limit and scales up forever without improving, because each new replica is throttled identically. Scale on the thing that actually saturates: queue depth, requests in flight, or a latency SLO via custom metrics. And note the interaction — because utilisation is measured against the request, changing a request silently changes every HPA threshold that depends on it.</p>
+</div>
+
+<p>Two other patterns are worth knowing. <strong>Pod Disruption Budgets</strong> constrain what the cluster may do to you voluntarily — a node drain will block rather than take you below the budget — which is what makes cluster autoscaling and node upgrades safe. And <strong>overprovisioning</strong> with low-priority placeholder pods gives the cluster autoscaler somewhere to preempt from: real pods evict the placeholders instantly and get scheduled in milliseconds, while a new node boots in the background to replace the slack. That converts a several-minute scale-up into an immediate one, at the cost of paying for the slack.</p>
+
+<div class="box intu"><b class="tag">The other orchestrators, briefly</b>
+<p style="margin-bottom:0">Kubernetes is not the only implementation of the loop, and the differences are mostly in scope. <strong>Nomad</strong> does scheduling and little else, runs containers and plain binaries alike, and is a single binary — genuinely simpler, with a much smaller ecosystem. <strong>ECS</strong> is AWS-managed and integrates with the rest of AWS more cleanly than Kubernetes does, at the price of being AWS-only. <strong>Docker Swarm</strong> is the simplest and is effectively in maintenance. All four have the same reconciliation loop, a filter-and-score scheduler, and the same requests-versus-limits distinction under different names — which is the point of learning the mechanism rather than the vocabulary.</p>
+</div>
+</section>
+
+<section id="close">
+<h2>Check yourself</h2><div class="h2rule"></div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>A pod is <code>Pending</code> with <code>0/4 nodes available: Insufficient cpu</code>. <code>kubectl top nodes</code> shows every node about half idle. Explain, and give two fixes.
+<button class="reveal">Show answer</button><div class="ans">Two separate things are being confused. First, scheduling uses <em>requests</em>, not actual usage: a node whose pods request 4 CPU is full from the scheduler's point of view even if they are using 0.2 each, so <code>kubectl top</code> is showing you the wrong number. Second, even genuinely free capacity may not be placeable — it has to be free <em>on one node</em>. Spreading eight 1-CPU pods over four 4-CPU nodes leaves 8 CPU free in the cluster and a largest single gap of 2, so a 3-CPU pod cannot be placed anywhere. Check with <code>kubectl describe node</code>, which prints requests rather than usage. The fixes: reduce the requests if they are set far above observed usage, which is the common case; add a node, which creates a large contiguous gap; or run the descheduler to repack. Longer term, if fragmentation is chronic, moving the scoring policy toward bin-packing helps placement at the cost of blast radius.</div></li>
+
+<li>Why can the same set of pods be schedulable in one order and not another?
+<button class="reveal">Show answer</button><div class="ans">Because the scheduler places pods one at a time and never reconsiders. It has no lookahead and no notion of the pods that will arrive next, so each decision is locally optimal against the scoring function and can be globally wrong. Placing eight small pods first with a spreading policy leaves four gaps of 2 CPU and nothing can take a 3-CPU pod; placing the large pod first leaves plenty of room for the small ones and all nine fit. This is a genuine property rather than a bug — optimal bin-packing is NP-hard and a scheduler making thousands of decisions a minute cannot solve it — but it has practical consequences. Use <code>priorityClassName</code> so that important pods are scheduled before filler and can preempt it, express real constraints with anti-affinity or topology spread rather than hoping the scoring policy produces them, and run the descheduler if placements drift badly over time.</div></li>
+
+<li>Your smallest, least important pod has no requests or limits "to keep the manifest simple". Under memory pressure, what happens to it?
+<button class="reveal">Show answer</button><div class="ans">It is evicted first, always, regardless of how little memory it is using. Omitting both requests and limits puts a pod in the BestEffort QoS class, and the kubelet's eviction ranking is by class before anything else: every BestEffort pod goes before any Burstable pod, which goes before any Guaranteed one. In the demo a 200&nbsp;MiB BestEffort cache is evicted before a pod using 4&nbsp;GB. There is also a second cost: with no request, the scheduler counts the pod as consuming nothing, so it will happily place it on a node that has no room for it in practice — the pod is scheduled and then killed. "Simple" here means "first to die and invisible to the scheduler", which is rarely what the author intended.</div></li>
+
+<li>Two Burstable pods on the same node. One is using 1,800&nbsp;MiB, the other 4,000&nbsp;MiB. Which is evicted first, and is the answer "the bigger one"?
+<button class="reveal">Show answer</button><div class="ans">Not necessarily — it depends on their requests, not their usage. The kubelet ranks Burstable pods by how far usage exceeds the request. In the demo, the 4,000&nbsp;MiB pod requests 1,024 and is therefore 2,976 above; the 1,800&nbsp;MiB pod requests 2,048 and is 248 <em>below</em>. The larger one is evicted, but because it overran its reservation, not because it is larger — if the requests were reversed the answer would flip. This is the practical meaning of a request: it is a claim on protection as much as a scheduling input. Note the corollary the demo also shows: merely raising the request slightly above your usage is not enough, because you can still be the least-under-request Burstable pod on the node. To be genuinely protected, set requests equal to limits and become Guaranteed.</div></li>
+
+<li>A node is committed at 150% of its memory in limits. Is that wrong?
+<button class="reveal">Show answer</button><div class="ans">No — it is the point. Overcommitting limits is what makes a cluster affordable, because workloads do not all peak simultaneously and sizing every pod for its peak would waste most of the hardware. What matters is the other number: the sum of <em>requests</em> must not exceed allocatable, because that is the reservation the scheduler honours, and the gap between total requests and total limits is the size of the bet you are taking. The bet fails when enough pods peak together to push actual usage past the eviction threshold, and then the QoS ranking decides who pays. So the healthy configuration is requests sized from observed usage with headroom, limits above them for burst, Guaranteed for anything whose eviction would be an incident, and monitoring on the node's actual usage against the eviction threshold rather than on the commitment ratio. A cluster at 150% limits and 60% requests is well configured; one at 150% requests is not schedulable at all.</div></li>
+
+<li>Your HPA is at maximum replicas, CPU shows 100%, and adding replicas does not reduce latency. What should you check?
+<button class="reveal">Show answer</button><div class="ans">Whether CPU is actually the constraint, and specifically whether the pods are being throttled by a CPU limit. HPA utilisation is measured against the <em>request</em>, so a pod with a request of 200m and a limit of 500m that is throttled at the limit reports 250% utilisation and scales forever — but every new replica is throttled identically, so total useful throughput barely moves. Check <code>container_cpu_cfs_throttled_periods_total</code>, per chapter 9. The other possibility is that the bottleneck is downstream and shared: a connection pool, a database, a rate-limited third-party API. Adding replicas then increases contention for the same constrained resource and can make latency worse, and it is the metastable pattern from chapter 6. The fix in the first case is to raise or remove the CPU limit; in the second it is to scale on the thing that actually saturates — queue depth, in-flight requests, or a latency objective — rather than on CPU.</div></li>
+
+<li>Why does the HPA scale up immediately but wait five minutes to scale down?
+<button class="reveal">Show answer</button><div class="ans">Because the two errors have very different costs and because a feedback loop with delay oscillates. Scaling up too eagerly wastes some money for a few minutes; scaling down too eagerly causes an outage. The controller is therefore deliberately asymmetric: scale-up applies at once, while scale-down uses the highest recommendation from a five-minute stabilisation window, so a brief dip in load cannot remove capacity. Without it the loop is self-sustaining — load drops, replicas are removed, the remaining replicas become busier, the metric rises, replicas are added back, load per replica drops, and it repeats indefinitely, with every cycle causing pod churn and cold starts. The same reasoning appears throughout this unit: chapter 6's jittered retry backoff and chapter 8's TTL jitter are the same idea, which is that a control loop needs damping or its corrections become the disturbance.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin-bottom:0">Chapter 12 finishes this part with what happens between the pods: how a name becomes a set of endpoints, exactly how long traffic keeps arriving at a pod you have already killed, and why your gRPC traffic is all going to one replica.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 11</h2><p>Orchestration and scheduling. Part of the DevOps unit — <a href="index.html">all 24 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 12 (endpoints and readiness), 18 (rollouts and disruption budgets), 19 (the same loop applied to git), 23 (capacity and cost).</p></div>
+    <div><h2>Going deeper</h2><p>The Kubernetes unit on this site covers the object model and the operational surface in full. The scheduler's framework documentation lists every filter and score plugin.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: filter and score ============ */
+(function(){
+  const cv=document.getElementById("cSched"); if(!cv) return;
+  const sEl=document.getElementById("scS"), nEl=document.getElementById("scN"),
+        pEl=document.getElementById("scP"), lEl=document.getElementById("scL"), fEl=document.getElementById("scF");
+  const out=document.getElementById("scOut"), note=document.getElementById("scNote");
+  const NODE_CPU=4, NODE_MEM=16;
+
+  function schedule(nodeCount,smallCount,bigCpu,strategy,bigFirst){
+    const st=Array.from({length:nodeCount},(_,i)=>
+      ({name:"node"+(i+1),cpu:NODE_CPU,mem:NODE_MEM,usedCpu:0,usedMem:0,pods:[]}));
+    const small=Array.from({length:smallCount},(_,i)=>({name:"s"+(i+1),cpu:1,mem:2,big:false}));
+    const big={name:"BIG",cpu:bigCpu,mem:bigCpu*2,big:true};
+    const queue = bigFirst ? [big,...small] : [...small,big];
+    const pending=[];
+    for(const p of queue){
+      const fits=st.filter(n=>n.cpu-n.usedCpu>=p.cpu && n.mem-n.usedMem>=p.mem);
+      if(!fits.length){ pending.push(p); continue; }
+      const score=n=>{
+        const cf=(n.usedCpu+p.cpu)/n.cpu, mf=(n.usedMem+p.mem)/n.mem;
+        if(strategy==="least") return (2-cf-mf)/2;
+        if(strategy==="most")  return (cf+mf)/2;
+        return 1-Math.abs(cf-mf);
+      };
+      let best=fits[0];
+      for(const n of fits) if(score(n)>score(best)) best=n;
+      best.usedCpu+=p.cpu; best.usedMem+=p.mem; best.pods.push(p);
+    }
+    const freeCpu=st.reduce((s,n)=>s+(n.cpu-n.usedCpu),0);
+    const largestGap=Math.max(0,...st.map(n=>n.cpu-n.usedCpu));
+    return {st,pending,freeCpu,largestGap,
+            placed:queue.length-pending.length, total:queue.length,
+            empty:st.filter(n=>!n.pods.length).length,
+            blast:Math.max(0,...st.map(n=>n.pods.length))};
+  }
+
+  function draw(){
+    const nodes=Math.max(2,Math.round(+nEl.value)), small=Math.round(+pEl.value),
+          big=Math.round(+lEl.value), strat=sEl.value, first=fEl.checked;
+    document.getElementById("scNo").textContent=nodes;
+    document.getElementById("scPo").textContent=small;
+    document.getElementById("scLo").textContent=big;
+    const m=schedule(nodes,small,big,strat,first);
+
+    const w=cv.clientWidth||660, h=30+nodes*26+18, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("each node has "+NODE_CPU+" CPU", 14, 12);
+
+    const L=62, R=w-70, span=R-L, unit=span/NODE_CPU;
+    m.st.forEach((n,i)=>{
+      const y=24+i*26;
+      ctx.textAlign="right"; ctx.font="10.5px ui-monospace, monospace"; ctx.fillStyle=PC.ink;
+      ctx.fillText(n.name, L-8, y+10);
+      ctx.fillStyle="#EDF1F4"; ctx.fillRect(L,y+2,span,17);
+      let x=L;
+      n.pods.forEach(p=>{
+        const bw=p.cpu*unit;
+        ctx.fillStyle= p.big?PC.ok:PC.line;
+        ctx.fillRect(x+1,y+3,bw-2,15);
+        if(bw>34){ ctx.fillStyle="#fff"; ctx.font="700 8.5px Archivo, Arial"; ctx.textAlign="center";
+          ctx.fillText(p.name, x+bw/2, y+10); }
+        x+=bw;
+      });
+      ctx.strokeStyle="#D5DDE4"; ctx.lineWidth=1; ctx.strokeRect(L+.5,y+2.5,span,17);
+      const free=n.cpu-n.usedCpu;
+      ctx.textAlign="left"; ctx.font="10px ui-monospace, monospace";
+      ctx.fillStyle= free>=big?PC.ok:PC.text;
+      ctx.fillText(free+" free", R+8, y+10);
+    });
+
+    const yb=24+nodes*26+6;
+    ctx.textAlign="left"; ctx.font="600 10.5px Archivo, Arial";
+    if(m.pending.length){
+      ctx.fillStyle=PC.bad;
+      ctx.fillText("Pending: "+m.pending.map(p=>p.name).join(", ")+
+        "  —  Insufficient cpu (largest single gap is "+m.largestGap+", "+m.freeCpu+" free in total)", 14, yb+4);
+    } else {
+      ctx.fillStyle=PC.ok;
+      ctx.fillText("all "+m.total+" pods placed  ·  "+m.freeCpu+" CPU free  ·  worst-case blast radius "+m.blast+" pods", 14, yb+4);
+    }
+
+    out.innerHTML=
+      '<div><span>placed</span><b style="color:'+(m.pending.length?PC.bad:PC.ok)+'">'+m.placed+' / '+m.total+'</b></div>'+
+      '<div><span>free in cluster</span><b>'+m.freeCpu+' CPU</b></div>'+
+      '<div><span>largest single gap</span><b style="color:'+(m.largestGap>=big?PC.ok:PC.bad)+'">'+m.largestGap+' CPU</b></div>'+
+      '<div><span>fragmented</span><b>'+(m.freeCpu-m.largestGap)+' CPU</b></div>'+
+      '<div><span>empty nodes</span><b>'+m.empty+'</b></div>'+
+      '<div><span>blast radius</span><b style="color:'+(m.blast>=4?PC.warn:PC.ink)+'">'+m.blast+' pods</b></div>';
+
+    let msg;
+    if(m.pending.length)
+      msg='<b>'+m.freeCpu+' CPU is free across the cluster and the '+big+
+          '-CPU pod cannot be placed anywhere</b>, because free capacity has to be free on <em>one</em> node and the largest gap is '+
+          m.largestGap+'. This reads as a capacity problem and is a fragmentation problem: '+
+          (first?'':'tick "schedule the large pod first" and the identical pods all fit, because the scheduler places one at a time and never revisits a decision.');
+    else if(strat==="most")
+      msg='Bin-packing fills nodes before starting new ones, so large gaps survive and the '+big+
+          '-CPU pod fits. The price is concentration: <b>'+m.blast+' pods share one node</b>, so losing it loses '+m.blast+
+          '. Spreading would halve that and strand the large pod.';
+    else if(first)
+      msg='Scheduling the large pod first reserves a contiguous gap before the small ones fragment the cluster, so everything fits under the same spreading policy. '+
+          '<b>The scheduler has no lookahead</b> — outcomes depend on arrival order, which is why priority classes and anti-affinity exist rather than relying on the scoring policy.';
+    else
+      msg='Everything fits at these settings. Raise the number of small pods or the size of the large one to reach the point where spreading strands it.';
+    note.innerHTML=msg;
+  }
+  [sEl,nEl,pEl,lEl,fEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+
+/* ============ demo 2: QoS and eviction ============ */
+(function(){
+  const cv=document.getElementById("cEvict"); if(!cv) return;
+  const rEl=document.getElementById("evR"), lEl=document.getElementById("evL"),
+        aEl=document.getElementById("evA"), nEl=document.getElementById("evN");
+  const out=document.getElementById("evOut"), note=document.getElementById("evNote");
+  const EVICT_HARD=500;
+
+  function qos(p){
+    const hasReq=p.req>0, hasLim=p.lim>0;
+    if(!hasReq && !hasLim) return "BestEffort";
+    if(hasReq && hasLim && p.req===p.lim) return "Guaranteed";
+    return "Burstable";
+  }
+  function model(){
+    const alloc=Math.round(+nEl.value);
+    const pods=[
+      {name:"cache",  req:0,               lim:0,               actual:200},
+      {name:"api",    req:Math.round(+rEl.value), lim:Math.round(+lEl.value), actual:Math.round(+aEl.value)},
+      {name:"worker", req:2048,            lim:4096,            actual:1800},
+      {name:"db",     req:2048,            lim:2048,            actual:2100}
+    ].map(p=>Object.assign({},p,{qos:qos(p),over:p.actual-p.req}));
+
+    const usage=pods.reduce((s,p)=>s+p.actual,0);
+    const threshold=alloc-EVICT_HARD;
+    const reqSum=pods.reduce((s,p)=>s+p.req,0);
+    const limSum=pods.reduce((s,p)=>s+p.lim,0);
+    /* kubelet: BestEffort first, then Burstable by usage above request, Guaranteed last */
+    const rank={BestEffort:0,Burstable:1,Guaranteed:2};
+    const order=pods.slice().sort((a,b)=>rank[a.qos]-rank[b.qos] || b.over-a.over || b.actual-a.actual);
+    const evicted=[]; let live=usage;
+    for(const p of order){ if(live<=threshold) break; evicted.push(p.name); live-=p.actual; }
+    /* a pod exceeding its own memory limit is OOMKilled by the cgroup, separately */
+    const oom=pods.filter(p=>p.lim>0 && p.actual>p.lim).map(p=>p.name);
+    return {alloc,pods,order,usage,threshold,evicted,oom,live,reqSum,limSum,
+            reqPct:reqSum/alloc, limPct:limSum/alloc, pressure:usage>threshold};
+  }
+
+  function draw(){
+    const m=model();
+    document.getElementById("evRo").textContent=Math.round(+rEl.value);
+    document.getElementById("evLo").textContent=Math.round(+lEl.value);
+    document.getElementById("evAo").textContent=Math.round(+aEl.value);
+    document.getElementById("evNo").textContent=m.alloc;
+
+    const w=cv.clientWidth||660, h=30+m.pods.length*24+22, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("request (outline) against actual usage (filled) — node "+m.alloc+" MiB", 14, 12);
+
+    const L=66, R=w-116, span=R-L;
+    const scale=span/Math.max(m.alloc*0.6, ...m.pods.map(p=>Math.max(p.actual,p.req)));
+    m.pods.forEach((p,i)=>{
+      const y=24+i*24, idx=m.evicted.indexOf(p.name);
+      ctx.textAlign="right"; ctx.font=(idx>=0?"700 ":"")+"10.5px ui-monospace, monospace";
+      ctx.fillStyle= idx>=0?PC.bad:PC.ink;
+      ctx.fillText(p.name, L-8, y+10);
+      /* request outline */
+      if(p.req>0){ ctx.strokeStyle="#9AA8B5"; ctx.lineWidth=1.2; ctx.setLineDash([3,2]);
+        ctx.strokeRect(L+.5,y+2.5,Math.max(2,p.req*scale),16); ctx.setLineDash([]); }
+      /* actual */
+      const col = idx===0?PC.bad : idx>0?"#E8907A" : p.over>0?PC.warn : PC.line;
+      ctx.fillStyle=col; ctx.fillRect(L,y+4,Math.max(2,p.actual*scale),12);
+      ctx.textAlign="left"; ctx.font="9.5px Archivo, Arial"; ctx.fillStyle=PC.text;
+      ctx.fillText(p.qos, R+8, y+10);
+      if(idx>=0){ ctx.fillStyle=PC.bad; ctx.font="700 9px Archivo, Arial";
+        ctx.fillText("evicted #"+(idx+1), R+68, y+10); }
+    });
+
+    const yb=24+m.pods.length*24+8;
+    ctx.textAlign="left"; ctx.font="600 10px Archivo, Arial";
+    ctx.fillStyle= m.pressure?PC.bad:PC.ok;
+    ctx.fillText(m.pressure
+      ? "usage "+m.usage+" MiB is above the "+m.threshold+" MiB eviction threshold — kubelet evicts: "+m.evicted.join(" → ")
+      : "usage "+m.usage+" MiB is below the "+m.threshold+" MiB eviction threshold — no pressure", 14, yb+4);
+
+    out.innerHTML=
+      '<div><span>node usage</span><b style="color:'+(m.pressure?PC.bad:PC.ok)+'">'+m.usage+' / '+m.alloc+' MiB</b></div>'+
+      '<div><span>requests commit</span><b style="color:'+(m.reqPct>1?PC.bad:PC.ink)+'">'+(m.reqPct*100).toFixed(0)+'%</b></div>'+
+      '<div><span>limits commit</span><b>'+(m.limPct*100).toFixed(0)+'%</b></div>'+
+      '<div><span>api QoS</span><b style="font-size:11.5px;color:'+
+        (m.pods[1].qos==="Guaranteed"?PC.ok:m.pods[1].qos==="Burstable"?PC.warn:PC.bad)+'">'+m.pods[1].qos+'</b></div>'+
+      '<div><span>evicted</span><b style="font-size:11px;color:'+(m.evicted.length?PC.bad:PC.ok)+'">'+
+        (m.evicted.join(", ")||"none")+'</b></div>'+
+      '<div><span>OOMKilled</span><b style="font-size:11px;color:'+(m.oom.length?PC.bad:PC.ok)+'">'+
+        (m.oom.join(", ")||"none")+'</b></div>';
+
+    const api=m.pods[1];
+    let msg='The api pod requests <b>'+api.req+'</b> MiB, is limited to <b>'+api.lim+
+      '</b> and is using <b>'+api.actual+'</b> — so it is '+(api.over>=0?"<b>"+api.over+" MiB above</b>":"<b>"+(-api.over)+" MiB below</b>")+
+      ' its request, and its QoS class is <b>'+api.qos+'</b>. ';
+    if(m.oom.length)
+      msg+='<b style="color:#D9534F">It is also over its own memory limit</b>, so the cgroup OOM killer terminates it immediately — that is a separate mechanism from eviction, and it does not wait for node pressure. ';
+    if(!m.pressure)
+      msg+='The node is below its eviction threshold, so nothing is evicted. Raise the api pod\u2019s usage to create pressure.';
+    else if(m.evicted.length){
+      msg+='Under pressure the kubelet evicts <b>'+m.evicted.join(" then ")+'</b>. '+
+           'Note the ordering rule: BestEffort goes first regardless of size — the cache pod is only 200 MiB — then Burstable pods ordered by how far they exceed their request, then Guaranteed. ';
+      if(api.qos==="Guaranteed") msg+='Setting requests equal to limits has moved the api pod to Guaranteed, so it is now last in line and the worker is taken instead.';
+      else if(api.over<0) msg+='<b>The api pod is under its request and still evicted</b>, because it is the least-under-request Burstable pod on the node. Being under your request is only protection relative to your neighbours; set the limit equal to the request to become Guaranteed.';
+      else msg+='Raise the api request above its usage and watch the order change — then set the limit equal to it and watch it drop out of the list entirely.';
+    }
+    note.innerHTML=msg;
+  }
+  [rEl,lEl,aEl,nEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+</script>
+</body>
+</html>

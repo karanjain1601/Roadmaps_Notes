@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Networking for operators — DevOps</title>
+<meta name="description" content="The layered model, CIDR and subnet planning, TCP versus UDP, connection states and ephemeral port exhaustion, firewalls, and a layer-by-layer diagnostic ladder.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%237C8CF8' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">DevOps</a><span class="sep">/</span><span>Chapter 04</span></p>
+    <p class="chno">Chapter 04 · Foundations</p>
+    <h1>Networking for operators</h1>
+    <p class="lede">You do not need to be a network engineer, but you will plan address space that cannot be changed later, and you will be handed an incident whose only symptom is "it's slow sometimes". Both need the same small set of ideas: how addresses are carved up, what a connection actually costs, and a diagnostic ladder that works from the bottom rather than from the guess.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapter 02</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="layers">
+<h2>The layers, and the tool that lives at each</h2><div class="h2rule"></div>
+
+<p class="lead">The seven-layer OSI model is what gets taught; the four-layer TCP/IP model is what exists. The reason to know either is not the taxonomy — it is that <strong>each layer has its own failure mode and its own diagnostic tool</strong>, and the discipline of walking them in order is what turns a vague "the network is broken" into an answer.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Layer</th><th>Addresses by</th><th>Unit</th><th>Fails as</th><th>Ask it with</th></tr></thead>
+<tbody>
+<tr><td><strong>Link</strong> (L2)</td><td>MAC address</td><td>Frame</td><td>No carrier, wrong VLAN, duplex mismatch, ARP not resolving</td><td><code>ip link</code>, <code>ip neigh</code>, <code>ethtool</code></td></tr>
+<tr><td><strong>Internet</strong> (L3)</td><td>IP address</td><td>Packet</td><td>No route, wrong gateway, MTU black hole, asymmetric routing</td><td><code>ip route get</code>, <code>ping</code>, <code>mtr</code>, <code>traceroute</code></td></tr>
+<tr><td><strong>Transport</strong> (L4)</td><td>Port</td><td>Segment</td><td>Connection refused, timeout, port exhaustion, backlog full</td><td><code>ss -tunap</code>, <code>nc -zv</code>, <code>tcpdump</code></td></tr>
+<tr><td><strong>Application</strong> (L7)</td><td>Name, URL</td><td>Message</td><td>TLS mismatch, 502, wrong virtual host, bad DNS answer</td><td><code>curl -v</code>, <code>dig</code>, <code>openssl s_client</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Each layer wraps the one above it. An HTTP request becomes a TCP segment, which becomes an IP packet, which becomes an Ethernet frame — every step adding a header and none of them removing the constraint that the innermost payload must fit. That is the whole of encapsulation, and it explains the MTU problems later in the chapter.</p>
+
+<div class="box tip"><b class="tag">The three-command triage that resolves most of it</b>
+<p style="margin-bottom:0"><code>ping</code> answers "can packets reach the host at all" (L3). <code>nc -zv host port</code> answers "is something listening and reachable there" (L4). <code>curl -v</code> answers "does the application respond correctly" (L7). Run them in that order and each failure tells you which layer to investigate — and, just as usefully, which layers to stop investigating. Most incidents blamed on the network turn out to fail at L7 with all three lower layers healthy.</p>
+</div>
+</section>
+
+<section id="addressing">
+<h2>Addresses, subnets and the plan you cannot change later</h2><div class="h2rule"></div>
+
+<p>An IPv4 address is 32 bits. A CIDR prefix says how many of those bits identify the network, leaving the rest to identify hosts within it. <code>10.0.0.0/16</code> fixes the first 16 bits, so every address from <code>10.0.0.0</code> to <code>10.0.255.255</code> is inside it — 65,536 addresses.</p>
+
+<div class="eq plain"><code>addresses = 2<sup>(32 − prefix)</sup> &nbsp;&nbsp;·&nbsp;&nbsp; usable = that − 2 &nbsp;&nbsp;·&nbsp;&nbsp; on AWS, usable = that − 5</code></div>
+<p class="where">Two addresses are always reserved: the first is the network identifier and the last is the broadcast address. Cloud providers reserve more — AWS takes five per subnet (network, VPC router, DNS, a future use, and broadcast), which is why a <code>/28</code> gives you eleven usable addresses rather than fourteen and why <code>/28</code> is the smallest subnet AWS permits.</p>
+
+<p>Three ranges are reserved for private use and never routed on the public internet: <code>10.0.0.0/8</code>, <code>172.16.0.0/12</code> and <code>192.168.0.0/16</code>. The choice among them is not arbitrary — it determines whether you can ever peer with another network.</p>
+
+<div class="demo" id="d-cidr">
+  <div class="demo-top"><div class="demo-title">Carving a VPC, and testing what falls inside it</div><div class="demo-hint">Try to fit 60 subnets into a /16 split into /20s</div></div>
+  <div class="demo-body">
+    <canvas id="cCidr" aria-label="A bar showing a base network divided into equal subnets, with a test address marked"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Base network</label><select id="cdBase">
+        <option value="10.0.0.0/16" selected>10.0.0.0/16 — 65,536 addresses</option>
+        <option value="10.0.0.0/20">10.0.0.0/20 — 4,096</option>
+        <option value="172.31.0.0/16">172.31.0.0/16 — the AWS default VPC</option>
+        <option value="192.168.0.0/24">192.168.0.0/24 — 256</option>
+      </select></div>
+      <div class="ctrl"><label>Split into <b id="cdPo">/24</b></label><input type="range" id="cdP" min="17" max="28" value="24"></div>
+      <div class="ctrl"><label>Subnets to allocate <b id="cdNo">6</b></label><input type="range" id="cdN" min="1" max="64" value="6"></div>
+      <div class="ctrl"><label>Does this address fit?</label><select id="cdTest">
+        <option value="10.0.5.7" selected>10.0.5.7</option>
+        <option value="10.0.0.1">10.0.0.1</option>
+        <option value="10.0.255.255">10.0.255.255</option>
+        <option value="10.1.0.1">10.1.0.1</option>
+        <option value="172.31.9.4">172.31.9.4</option>
+        <option value="192.168.0.99">192.168.0.99</option>
+      </select></div>
+    </div>
+    <div class="rgrid" id="cdOut"></div>
+    <div class="readout" id="cdNote"></div>
+  </div>
+</div>
+
+<div class="box warn"><b class="tag">The address-space decision you will regret</b>
+<p style="margin-bottom:6px">Almost every organisation eventually needs two networks to talk: a VPC peering, a VPN to an office, an acquisition, a move to a second cloud. Peering requires that the two ranges <strong>do not overlap</strong>, and there is no way to renumber a live network cheaply. Yet the default choice everywhere is <code>10.0.0.0/16</code>, which means the odds that your two networks collide are close to certain.</p>
+<p style="margin-bottom:0">The fix costs nothing at the start: allocate from a registry, give each environment and region a distinct block — production <code>10.10.0.0/16</code>, staging <code>10.20.0.0/16</code>, dev <code>10.30.0.0/16</code> — and write it down somewhere that is not one person's memory. Also size generously. A <code>/16</code> per VPC feels absurd for eight servers and costs nothing, because private address space is free; running out of it later costs a migration.</p>
+</div>
+
+<p>Because private ranges are not routable, anything on them reaching the internet passes through <strong>NAT</strong>, which rewrites the source address to a public one and keeps a translation table so replies find their way back. Three practical consequences follow, and all three surface in cloud bills and incidents.</p>
+
+<div class="kv">
+<dt>NAT is stateful, so it is a bottleneck and a single point of failure</dt><dd>Every outbound connection consumes an entry in a translation table with a finite size. A managed NAT gateway has a connection limit and a bandwidth limit, and hitting either produces intermittent connection failures that look like the destination is at fault.</dd>
+<dt>Inbound connections do not work through it</dt><dd>There is no table entry until an outbound connection creates one. This is why anything that needs to receive traffic sits in a public subnet behind a load balancer, and why NAT is a crude form of firewall as a side effect rather than by design.</dd>
+<dt>It is frequently the largest line on a cloud network bill</dt><dd>Managed NAT charges per hour <em>and</em> per gigabyte processed. Traffic to services in the same provider that could have gone via a VPC endpoint instead routes out through NAT and back, paying twice for nothing. This is one of the highest-return things to check on any cloud account.</dd>
+</div>
+</section>
+
+<section id="transport">
+<h2>TCP, UDP and what a connection costs</h2><div class="h2rule"></div>
+
+<p>TCP gives you an ordered, reliable, flow-controlled byte stream, and it charges for it: a three-way handshake before any data moves, acknowledgements and retransmissions, congestion control that starts slow, and state kept on both ends. UDP gives you none of that and charges nothing.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th>TCP</th><th>UDP</th></tr></thead>
+<tbody>
+<tr><td>Before data flows</td><td>1 round trip (3-way handshake), plus 1–2 more for TLS</td><td class="yes">Nothing</td></tr>
+<tr><td>Delivery</td><td class="yes">Ordered, retransmitted on loss</td><td>Best effort; reordering and loss are yours to handle</td></tr>
+<tr><td>Loss behaviour</td><td>Retransmit and slow down — a stall</td><td class="yes">The packet is gone; the next one is unaffected</td></tr>
+<tr><td>Per-connection state</td><td class="no">Both ends, plus every stateful middlebox on the path</td><td class="yes">None</td></tr>
+<tr><td>Head-of-line blocking</td><td class="no">Yes — one lost segment stalls everything behind it</td><td class="yes">No</td></tr>
+<tr><td>Use for</td><td>HTTP/1 and /2, SSH, database protocols, anything where a missing byte is fatal</td><td>DNS, NTP, syslog, metrics, VXLAN, WireGuard, QUIC (and so HTTP/3), video</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>A TCP connection walks a state machine, and the states you find in <code>ss</code> output are diagnostic in themselves.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>State</th><th>Means</th><th>A large count means</th></tr></thead>
+<tbody>
+<tr><td><code>LISTEN</code></td><td>A socket is accepting connections</td><td>Normal. Its absence is why you get "connection refused"</td></tr>
+<tr><td><code>SYN-SENT</code></td><td>We sent SYN, waiting for the reply</td><td class="no">Piling up means the destination is unreachable or silently dropping — a firewall <code>DROP</code> rather than <code>REJECT</code></td></tr>
+<tr><td><code>SYN-RECV</code></td><td>We got SYN, sent SYN-ACK, waiting for ACK</td><td class="no">A full accept backlog, or a SYN flood. Check <code>ss -s</code> and the listen queue</td></tr>
+<tr><td><code>ESTABLISHED</code></td><td>Data can flow</td><td>Normal. Compare against your pool sizes</td></tr>
+<tr><td><code>CLOSE-WAIT</code></td><td>The peer closed; <em>we</em> have not</td><td class="no"><strong>An application bug.</strong> Your code is not calling <code>close()</code> on sockets the other side has finished with. It will leak file descriptors until it hits its limit</td></tr>
+<tr><td><code>FIN-WAIT-2</code></td><td>We closed; waiting for the peer to close</td><td>The mirror image — the peer has the bug</td></tr>
+<tr><td><code>TIME-WAIT</code></td><td>We closed last, and are waiting 2×MSL (60 s on Linux)</td><td class="yes">Usually healthy, and the subject of the next demo. It is the price of closing a connection, paid by whichever side closes first</td></tr>
+</tbody>
+</table>
+</div>
+
+<p><code>TIME-WAIT</code> is worth understanding properly because it causes a failure that looks impossible. The side that initiates the close must keep the four-tuple reserved for twice the maximum segment lifetime, so that a delayed duplicate segment from the old connection cannot be delivered to a new connection reusing the same ports. It is correct and necessary. It is also expensive when you make many short-lived outbound connections.</p>
+
+<div class="demo" id="d-ports">
+  <div class="demo-top"><div class="demo-title">Ephemeral port exhaustion</div><div class="demo-hint">Raise the rate to 500/s, then turn on keep-alive</div></div>
+  <div class="demo-body">
+    <canvas id="cPorts" aria-label="A bar showing ephemeral ports consumed by established and TIME-WAIT connections against the available range">
+    </canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>New connections <b id="ptRo">200</b>/s</label><input type="range" id="ptR" min="10" max="1500" step="10" value="200"></div>
+      <div class="ctrl"><label>Each call takes <b id="ptDo">50</b> ms</label><input type="range" id="ptD" min="5" max="2000" step="5" value="50"></div>
+      <div class="ctrl"><label>Ephemeral range</label><select id="ptG">
+        <option value="32768" selected>32768–60999 — the Linux default (28,232)</option>
+        <option value="1024">1024–65535 — widened (64,512)</option>
+        <option value="49152">49152–65535 — IANA range (16,384)</option>
+      </select></div>
+      <div class="ctrl"><label>Requests per connection <b id="ptKo">1</b></label><input type="range" id="ptK" min="1" max="200" value="1"></div>
+      <div class="ctrl"><label><input type="checkbox" id="ptW"> <code>tcp_tw_reuse=1</code></label></div>
+    </div>
+    <div class="rgrid" id="ptOut"></div>
+    <div class="readout" id="ptNote"></div>
+  </div>
+</div>
+
+<div class="box trap"><b class="tag">Why this is the classic microservices outage</b>
+<p style="margin-bottom:6px">At 500 new connections a second with 50&nbsp;ms calls, only <b>25</b> sockets are ESTABLISHED at any moment — but <b>30,000</b> are sitting in TIME-WAIT, because each one holds its port for 60 seconds after finishing. That is 99.9% of the consumed ports held by connections that completed. The default ephemeral range is 28,232 ports, so the service fails at roughly <b>470 new connections per second</b> regardless of how fast the far end is, and the error is <code>EADDRNOTAVAIL</code> — "cannot assign requested address" — which reads like a configuration problem rather than a capacity one.</p>
+<p style="margin-bottom:0">The correct fix is almost always <strong>connection reuse</strong>: an HTTP client with keep-alive and a properly sized connection pool turns 500 connections a second into five. Widening the ephemeral range roughly doubles the ceiling and buys you time, not a solution. <code>tcp_tw_reuse</code> lets the kernel recycle TIME-WAIT sockets for new <em>outbound</em> connections and is safe; its old sibling <code>tcp_tw_recycle</code> was removed from Linux because it broke clients behind NAT.</p>
+</div>
+
+<div class="box intu"><b class="tag">Two more limits in the same family</b>
+<p style="margin-bottom:0">The port ceiling is per destination four-tuple, so it applies per <em>remote address and port</em> — talking to two backends doubles your headroom, which is why the problem often appears only when a service is consolidated behind one load balancer. And on the receiving side there is an equivalent: the accept backlog, set by <code>listen()</code> and capped by <code>net.core.somaxconn</code>. When it fills, new SYNs are dropped silently, the client retries after a one-second timeout, and your latency graph grows a cluster of requests at almost exactly 1s, 3s and 7s. That signature is diagnostic — see it and check <code>ss -lnt</code> for a non-zero <code>Recv-Q</code> on the listening socket.</p>
+</div>
+</section>
+
+<section id="ports">
+<h2>Ports, protocols and MTU</h2><div class="h2rule"></div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Port</th><th>Service</th><th>Operational note</th></tr></thead>
+<tbody>
+<tr><td>22</td><td>SSH</td><td>Key-based only. Chapter 21 covers why an SSH key on a laptop is a secret with no rotation story</td></tr>
+<tr><td>53</td><td>DNS</td><td>UDP first, TCP when the answer exceeds 512 bytes. Blocking TCP/53 breaks DNSSEC and large answers intermittently</td></tr>
+<tr><td>80 / 443</td><td>HTTP / HTTPS</td><td>443 also carries HTTP/3 over UDP, which many firewall policies silently drop</td></tr>
+<tr><td>123</td><td>NTP</td><td class="yes">Clock skew breaks TLS validation, JWT expiry, TOTP and log correlation. Check it before believing any timestamp</td></tr>
+<tr><td>3306 / 5432 / 6379 / 27017</td><td>MySQL / PostgreSQL / Redis / MongoDB</td><td class="no">None of these should ever be reachable from the internet. All four appear in mass-exploitation scans within minutes of exposure</td></tr>
+<tr><td>2379 / 6443 / 10250</td><td>etcd / Kubernetes API / kubelet</td><td class="no">Cluster control plane. An exposed kubelet on 10250 is a full compromise</td></tr>
+<tr><td>9090 / 9100</td><td>Prometheus / node_exporter</td><td>Unauthenticated by default and full of internal detail. Bind to a private interface</td></tr>
+<tr><td>&lt;1024</td><td>Privileged range</td><td>Binding needs root or <code>CAP_NET_BIND_SERVICE</code> — chapter 2</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The maximum transmission unit is the largest frame a link will carry, normally 1500 bytes on Ethernet. When a packet is too large and cannot be fragmented, the router is supposed to send back an ICMP "fragmentation needed" message so the sender reduces its segment size. This is <strong>Path MTU Discovery</strong>, and it is broken on any network where somebody blocked ICMP wholesale for "security".</p>
+
+<div class="box trap"><b class="tag">The MTU black hole, and how to recognise it</b>
+<p style="margin-bottom:0">The symptom is unmistakable once you have seen it: the connection establishes, small requests work perfectly, and anything above about 1400 bytes hangs forever. <code>ping</code> succeeds, <code>curl</code> to a small endpoint succeeds, a large POST times out. It happens most often over VPN and overlay networks, where the tunnel header eats 50–100 bytes of the 1500 and something on the path is discarding the ICMP that would have said so. Confirm it with <code>ping -M do -s 1472 host</code>, halving the size until it passes; the largest working size plus 28 is your real path MTU. The fixes are to lower the interface MTU, enable MSS clamping on the tunnel, or — best — stop dropping ICMP type 3 code 4.</p>
+</div>
+</section>
+
+<section id="firewalls">
+<h2>Firewalls, and the difference between DROP and REJECT</h2><div class="h2rule"></div>
+
+<p>Packet filtering happens in several places at once, and knowing which one is refusing you saves a great deal of time. On a cloud instance there are typically three independent layers, all of which must allow the traffic.</p>
+
+<div class="cards">
+<div>
+<h5>Host firewall</h5>
+<p><code>nftables</code> or <code>iptables</code>, and <code>ufw</code> or <code>firewalld</code> in front of them. Stateful: an established connection's return traffic is allowed automatically, which is why you only ever write rules for the initiating direction.</p>
+</div>
+<div>
+<h5>Security group</h5>
+<p>Attached to the instance or ENI. <strong>Stateful and allow-only</strong> — you cannot write a deny rule, so the absence of an allow is the deny. Can reference another security group as a source, which is how you express "anything in the web tier" without hard-coding addresses.</p>
+</div>
+<div>
+<h5>Network ACL</h5>
+<p>Attached to the subnet. <strong>Stateless</strong>, so return traffic needs its own explicit rule — and because replies come from ephemeral ports, that rule has to permit the whole 32768–60999 range. This is why a NACL edit breaks things in ways a security group edit does not.</p>
+</div>
+</div>
+
+<p>The choice between rejecting and dropping is more consequential than it looks:</p>
+
+<div class="kv">
+<dt><code>REJECT</code> sends an ICMP unreachable or a TCP RST</dt><dd>The client fails immediately with "connection refused". Fast, honest, and the right default <em>inside</em> your own network, because it turns a 30-second timeout into an instant error and a clear log line.</dd>
+<dt><code>DROP</code> silently discards</dt><dd>The client waits for its full connect timeout and then retries, because it cannot distinguish a firewall from a slow network. Appropriate at the internet edge, where you do not want to confirm to a scanner that the host exists — and actively harmful internally, where it converts a misconfiguration into an intermittent latency mystery.</dd>
+</div>
+
+<div class="box tip"><b class="tag">Reading a hang as a diagnosis</b>
+<p style="margin-bottom:0">The <em>shape</em> of the failure identifies the layer before you run anything. <strong>Instant "connection refused"</strong> means the packet arrived and nothing was listening — the host is fine, the process is not, or the port is wrong. <strong>A hang until timeout</strong> means the packets are vanishing — a <code>DROP</code> rule, a missing route, or a security group. <strong>Connects then hangs</strong> means the TCP handshake completed and the application never replied — so it is L7: a deadlock, an exhausted thread pool, or a downstream dependency of its own. <strong>Works for small payloads, hangs for large ones</strong> is the MTU black hole above. Four symptoms, four different places to look, and none of them require a packet capture to distinguish.</p>
+</div>
+</section>
+
+<section id="diagnosis">
+<h2>The diagnostic ladder</h2><div class="h2rule"></div>
+
+<p>When something cannot reach something else, work upward and stop at the first rung that fails. The discipline matters more than the specific commands: each step eliminates a layer, and skipping to the interesting hypothesis is how an hour disappears.</p>
+
+<ol class="steps">
+<li><strong>Is the name resolving, and to what?</strong> <code>dig +short api.internal</code>. Compare against what you expect. A stale record or a split-horizon mismatch explains an astonishing share of "the network is broken", and it costs two seconds to rule out. Chapter 7 goes deeper.</li>
+<li><strong>Is there a route to that address?</strong> <code>ip route get 10.0.5.7</code> shows the interface and gateway the kernel would actually use. On a host with a VPN or several interfaces, this is where you discover the traffic is leaving the wrong one.</li>
+<li><strong>Do packets get there and back?</strong> <code>ping -c3</code>, then <code>mtr -rw</code> for per-hop loss. Remember that many hosts and most cloud load balancers do not answer ICMP at all, so a failed ping is weak evidence — but a successful one is conclusive for L3.</li>
+<li><strong>Is anything listening, from here?</strong> <code>nc -zv host 5432</code> or <code>curl -v telnet://host:5432</code>. From the destination, <code>ss -lnt 'sport = :5432'</code> — and check the <em>bind address</em>. A service bound to <code>127.0.0.1</code> is invisible from anywhere else, which is the single most common cause of "it works on the box".</li>
+<li><strong>Does the application answer correctly?</strong> <code>curl -v</code> with <code>--resolve</code> to bypass DNS, and <code>-w '%{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total}\n'</code> to see exactly which phase is slow. That one flag separates DNS, TCP, TLS and server think-time without any other tool.</li>
+<li><strong>Is TLS the problem?</strong> <code>openssl s_client -connect host:443 -servername host</code>. Checks the chain, the expiry and — via <code>-servername</code> — whether SNI is what makes it work or fail. Chapter 7.</li>
+<li><strong>Only now, capture.</strong> <code>tcpdump -ni any 'host 10.0.5.7 and port 5432' -w /tmp/c.pcap</code>. Retransmissions, resets and zero-window advertisements are visible here and nowhere else. It is the last step because it is the slowest to read, not because it is the least useful.</li>
+</ol>
+
+<div class="code"><div class="code-top"><span class="code-lang">bash — the one-liner worth keeping</span><button class="code-copy">Copy</button></div><pre><span class="c"># where do the milliseconds actually go? DNS, TCP, TLS, server, or transfer?</span>
+curl -o /dev/null -s -w \
+  <span class="s">'dns %{time_namelookup}s  tcp %{time_connect}s  tls %{time_appconnect}s  ttfb %{time_starttransfer}s  total %{time_total}s\n'</span> \
+  https://api.example.com/health
+
+<span class="c"># dns 0.004s  tcp 0.031s  tls 0.089s  ttfb 0.412s  total 0.413s</span>
+<span class="c">#                                       ^^^^^^^^^ 320 ms of server think-time.</span>
+<span class="c">#                                       the network contributed 89 ms and is not your problem</span>
+
+<span class="c"># connection states at a glance — CLOSE-WAIT piling up is an application bug</span>
+ss -tan | awk <span class="s">'NR&gt;1 {print $1}'</span> | sort | uniq -c | sort -rn
+
+<span class="c"># is the accept backlog full? Recv-Q on a LISTEN socket is the current queue depth</span>
+ss -lnt</pre></div>
+</section>
+
+<section id="close">
+<h2>Check yourself</h2><div class="h2rule"></div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>You are asked for a VPC for a new region and reply "10.0.0.0/16, same as the others". Why is that a problem, and what does it cost to fix later?
+<button class="reveal">Show answer</button><div class="ans">Two networks with identical or overlapping CIDR ranges cannot be peered, VPN'd together, or routed between, because a router cannot decide which side <code>10.0.5.7</code> belongs to. The moment anyone needs cross-region traffic, an acquisition happens, or an office VPN is added, the only remedies are renumbering one side — every subnet, security group rule, hard-coded address and firewall entry, on a live system — or inserting NAT between the two, which breaks source-address visibility and adds a stateful failure point. Preventing it costs one line in a registry: give each region and environment its own non-overlapping block, and size each one generously, because private address space is free.</div></li>
+
+<li>An AWS <code>/28</code> subnet gives 11 usable addresses rather than the 14 the arithmetic suggests. Where do the other three go?
+<button class="reveal">Show answer</button><div class="ans">A <code>/28</code> is 16 addresses. Two are reserved by IP itself — the network identifier and the broadcast address — leaving 14. AWS reserves three more in every subnet: the second address for the VPC router, the third for DNS, and the fourth for future use. That is five in total, so 11 remain. It matters when sizing small subnets, and it is why <code>/28</code> is the smallest subnet AWS will create: anything smaller would have no usable addresses left.</div></li>
+
+<li>A service making outbound HTTP calls starts failing with "cannot assign requested address" at around 470 requests per second. <code>ss</code> shows tens of thousands of sockets in TIME-WAIT and only a few dozen ESTABLISHED. Diagnose and fix.
+<button class="reveal">Show answer</button><div class="ans">Ephemeral port exhaustion. Each outbound connection reserves a local port for its lifetime and then for 60 seconds of TIME-WAIT afterwards, and TIME-WAIT dominates completely when calls are short: at 500 connections a second with 50&nbsp;ms calls, about 25 are active and 30,000 are waiting. The default range of 28,232 ports therefore caps you near 470 new connections a second no matter how fast the server responds. The real fix is connection reuse — enable HTTP keep-alive and give the client a properly sized connection pool, which turns hundreds of connections a second into a handful. Widening <code>net.ipv4.ip_local_port_range</code> roughly doubles the ceiling and <code>tcp_tw_reuse=1</code> lets the kernel recycle TIME-WAIT entries for new outbound connections; both are legitimate mitigations that buy time. Do not reach for <code>tcp_tw_recycle</code> — it was removed from Linux because it breaks clients behind NAT.</div></li>
+
+<li>Thousands of sockets are sitting in CLOSE-WAIT and the count only grows. Whose bug is it?
+<button class="reveal">Show answer</button><div class="ans">Yours. CLOSE-WAIT means the peer sent FIN — it has finished and closed its side — and your process has not called <code>close()</code> on its end. The socket cannot progress out of that state until your application acts, so the count grows monotonically and each entry holds a file descriptor. It ends in "too many open files" and a service that stops accepting anything. Typical causes are an HTTP client whose response bodies are never closed, a connection pool that leaks on the error path, or an exception thrown between acquiring a connection and releasing it. Contrast with FIN-WAIT-2, which is the mirror image and indicates the peer has the bug, and with TIME-WAIT, which is normal and self-clearing.</div></li>
+
+<li>An internal service is unreachable. Requests hang for thirty seconds and then time out rather than failing immediately. What does that tell you before you run anything?
+<button class="reveal">Show answer</button><div class="ans">The packets are being discarded silently rather than refused, so something is dropping them: a firewall rule using <code>DROP</code>, a missing or wrong route, a security group with no matching allow, or a stateless network ACL that permits the outbound packet but not the reply. A "connection refused" would have meant the opposite — that packets arrived at a live host where nothing was listening on that port, which points at the process or the port number rather than the path. The distinction is worth internalising because it halves the search space instantly, and it is also the argument for using <code>REJECT</code> rather than <code>DROP</code> inside your own network: an immediate honest error is far cheaper to diagnose than a timeout.</div></li>
+
+<li>Small API calls work perfectly. A large file upload over the same VPN connection hangs indefinitely. What is happening?
+<button class="reveal">Show answer</button><div class="ans">An MTU black hole. The VPN adds tunnel headers, so the usable payload is smaller than the standard 1500 bytes. When a packet exceeds the path MTU and has the don't-fragment bit set, a router should return ICMP "fragmentation needed" so the sender lowers its segment size — but if ICMP is being filtered somewhere on the path, that message never arrives, the sender keeps retransmitting a packet that can never get through, and the transfer stalls forever while small packets continue to work. Confirm with <code>ping -M do -s 1472 host</code> and halve the size until it succeeds; the largest working size plus 28 bytes is the real path MTU. Fix by lowering the interface MTU, enabling MSS clamping on the tunnel, or — properly — allowing ICMP type 3 code 4 through the filter.</div></li>
+
+<li><code>curl -w</code> reports <code>dns 0.004 tcp 0.031 tls 0.089 ttfb 0.412 total 0.413</code>. Where is the time, and what would you investigate?
+<button class="reveal">Show answer</button><div class="ans">Time to first byte is 412&nbsp;ms and TLS completed at 89&nbsp;ms, so roughly 320&nbsp;ms elapsed between the request being fully sent and the first byte of the response — that is server think-time, not network. DNS at 4&nbsp;ms, TCP connect at 27&nbsp;ms and the TLS handshake at 58&nbsp;ms are all unremarkable. Investigate the application: a slow query, a synchronous call to a downstream service, or contention on a pool. The useful part of this measurement is what it rules out — no amount of network tuning, CDN placement or TCP configuration will move a number that the network did not produce, and this one flag settles the question before anyone opens a ticket with the network team.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin-bottom:0">That closes the foundations. Chapter 5 starts the second part with version control — not the commands, but the object model underneath, and why the branching strategy you pick sets a ceiling on the deploy cadence from chapter 1.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 04</h2><p>Networking for operators. Part of the DevOps unit — <a href="index.html">all 24 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 06 (proxies and connection handling), 07 (DNS and TLS in full), 12 (cluster networking and ingress), 13 (VPC design on a real provider), 23 (incident triage).</p></div>
+    <div><h2>Going deeper</h2><p>The Network Engineer unit on this site covers routing, switching and wireless properly. Beej's Guide to Network Programming is the readable reference for the socket layer.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: CIDR planning ============ */
+(function(){
+  const cv=document.getElementById("cCidr"); if(!cv) return;
+  const bEl=document.getElementById("cdBase"), pEl=document.getElementById("cdP"),
+        nEl=document.getElementById("cdN"), tEl=document.getElementById("cdTest");
+  const out=document.getElementById("cdOut"), note=document.getElementById("cdNote");
+
+  const ip2n=ip=>ip.split(".").reduce((a,o)=>((a<<8)>>>0)+(+o),0)>>>0;
+  const n2ip=n=>[24,16,8,0].map(s=>(n>>>s)&255).join(".");
+  function net(base,prefix){
+    const size=Math.pow(2,32-prefix);
+    const mask=prefix===0?0:((0xFFFFFFFF<<(32-prefix))>>>0);
+    const n=(ip2n(base)&mask)>>>0;
+    return {n,prefix,size,network:n2ip(n),broadcast:n2ip(n+size-1),
+            first:n2ip(n+1),last:n2ip(n+size-2),
+            hosts:Math.max(0,size-2),aws:Math.max(0,size-5)};
+  }
+
+  function draw(){
+    const [bIp,bPfxStr]=bEl.value.split("/"); const bPfx=+bPfxStr;
+    let pfx=+pEl.value;
+    if(pfx<=bPfx) pfx=bPfx+1;                       /* a subnet must be smaller than its parent */
+    pEl.min=String(bPfx+1);
+    if(pfx>28+0) pfx=Math.min(pfx,28);
+    document.getElementById("cdPo").textContent="/"+pfx;
+
+    const base=net(bIp,bPfx), sub0=Math.pow(2,32-pfx);
+    const capacity=Math.floor(base.size/sub0);
+    nEl.max=String(Math.min(64,capacity));
+    let want=Math.min(+nEl.value, 64);
+    document.getElementById("cdNo").textContent=want;
+    const alloc=Math.min(want,capacity);
+    const overflow=want-alloc;
+
+    const test=tEl.value, tn=ip2n(test);
+    const inBase = tn>=base.n && tn<base.n+base.size;
+    const idx = inBase ? Math.floor((tn-base.n)/sub0) : -1;
+    const inAlloc = idx>=0 && idx<alloc;
+    const sub = idx>=0 ? net(n2ip(base.n+idx*sub0),pfx) : null;
+
+    const w=cv.clientWidth||660, h=118, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+
+    const L=14,R=w-14,span=R-L;
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText(base.network+"/"+base.prefix+"  —  "+base.size.toLocaleString()+" addresses, "+
+                 capacity.toLocaleString()+" possible /"+pfx+" subnets", L, 12);
+
+    /* the whole base range */
+    ctx.fillStyle="#EDF1F4"; ctx.fillRect(L,24,span,30);
+    /* allocated subnets, drawn only while they stay legible */
+    const drawn=Math.min(alloc,Math.max(1,Math.floor(span/3)));
+    for(let i=0;i<drawn;i++){
+      const x=L+(i*sub0/base.size)*span, bw=Math.max(1,(sub0/base.size)*span-1);
+      ctx.fillStyle= (i===idx&&inAlloc)?PC.line:"#C7CEFB";
+      ctx.fillRect(x,24,bw,30);
+    }
+    ctx.strokeStyle="#D5DDE4"; ctx.lineWidth=1; ctx.strokeRect(L+.5,24.5,span,30);
+    if(alloc>drawn){ ctx.fillStyle=PC.text; ctx.font="9px Archivo, Arial"; ctx.textAlign="left";
+      ctx.fillText("(subnets narrower than a pixel — showing the first "+drawn+")", L, 64); }
+
+    /* the test address */
+    if(inBase){
+      const x=L+((tn-base.n)/base.size)*span;
+      ctx.strokeStyle=inAlloc?PC.ok:PC.warn; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.moveTo(x,20); ctx.lineTo(x,58); ctx.stroke();
+      ctx.fillStyle=inAlloc?PC.ok:PC.warn; ctx.font="600 10px Archivo, Arial";
+      ctx.textAlign= x>L+span*0.7?"right":"left";
+      ctx.fillText(test, x+(x>L+span*0.7?-5:5), 16);
+    } else {
+      ctx.fillStyle=PC.bad; ctx.font="600 10px Archivo, Arial"; ctx.textAlign="right";
+      ctx.fillText(test+" is outside this network entirely", R, 16);
+    }
+
+    /* the containing subnet spelled out */
+    ctx.textAlign="left"; ctx.font="10.5px ui-monospace, monospace"; ctx.fillStyle=PC.ink;
+    ctx.fillText(sub
+      ? "subnet "+idx+":  "+sub.network+"/"+pfx+"   usable "+sub.first+" – "+sub.last
+      : "no containing subnet", L, 80);
+    ctx.fillStyle=PC.text; ctx.font="10px Archivo, Arial";
+    ctx.fillText(sub
+      ? sub.size.toLocaleString()+" addresses  ·  "+sub.hosts.toLocaleString()+" usable  ·  "+
+        sub.aws.toLocaleString()+" usable on AWS (5 reserved per subnet)"
+      : "pick an address inside "+base.network+"/"+base.prefix, L, 96);
+
+    out.innerHTML=
+      '<div><span>base size</span><b>'+base.size.toLocaleString()+'</b></div>'+
+      '<div><span>per subnet</span><b>'+sub0.toLocaleString()+'</b></div>'+
+      '<div><span>usable each</span><b>'+Math.max(0,sub0-2).toLocaleString()+'</b></div>'+
+      '<div><span>AWS usable</span><b>'+Math.max(0,sub0-5).toLocaleString()+'</b></div>'+
+      '<div><span>subnets available</span><b style="color:'+(overflow?PC.bad:PC.ink)+'">'+alloc+' / '+Math.min(capacity,999999).toLocaleString()+'</b></div>'+
+      '<div><span>'+test+'</span><b style="font-size:12px;color:'+(inAlloc?PC.ok:inBase?PC.warn:PC.bad)+'">'+
+        (inAlloc?"subnet "+idx:inBase?"unallocated":"outside")+'</b></div>';
+
+    note.innerHTML = overflow
+      ? '<b>A /'+base.prefix+' only holds '+capacity+' subnets of /'+pfx+'.</b> You asked for '+want+
+        ', so '+overflow+' cannot be placed. Either use a smaller subnet size (a larger prefix number) or a bigger base network — '+
+        'which is exactly the decision that becomes unfixable once addresses are in use.'
+      : inBase
+        ? 'Masking '+test+' with /'+pfx+' clears the host bits and gives <b>'+sub.network+'</b>, which is subnet <b>'+idx+
+          '</b> of the plan'+(inAlloc?'':' — but you have only allocated '+alloc+', so this address is in unassigned space')+'. '+
+          'Each /'+pfx+' holds '+sub0.toLocaleString()+' addresses; two are reserved by IP itself and AWS takes three more, leaving <b>'+
+          Math.max(0,sub0-5).toLocaleString()+'</b> for instances.'
+        : '<b>'+test+' is not inside '+base.network+'/'+base.prefix+'</b>, so no amount of subnetting reaches it. '+
+          'This is what a peering failure looks like from the routing table\u2019s point of view: the address simply is not in the range this network knows about.';
+  }
+  [bEl,pEl,nEl,tEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+
+/* ============ demo 2: ephemeral port exhaustion ============ */
+(function(){
+  const cv=document.getElementById("cPorts"); if(!cv) return;
+  const rEl=document.getElementById("ptR"), dEl=document.getElementById("ptD"),
+        gEl=document.getElementById("ptG"), kEl=document.getElementById("ptK"), wEl=document.getElementById("ptW");
+  const out=document.getElementById("ptOut"), note=document.getElementById("ptNote");
+  const TW=60;                                   /* 2 x MSL on Linux */
+  const RANGES={"32768":[32768,60999],"1024":[1024,65535],"49152":[49152,65535]};
+
+  function model(){
+    const rate=+rEl.value, hold=+dEl.value/1000, keep=+kEl.value, reuse=wEl.checked;
+    const [lo,hi]=RANGES[gEl.value], range=hi-lo+1;
+    const connRate=rate/keep;                    /* keep-alive amortises N requests over one connection */
+    const tw=reuse?TW*0.05:TW;                   /* tw_reuse recycles almost immediately */
+    const est=connRate*hold, wait=connRate*tw, used=est+wait;
+    return {rate,hold,keep,reuse,lo,hi,range,connRate,tw,est,wait,used,
+            headroom:range-used, exhausted:used>=range,
+            maxConnRate:range/(hold+tw), pctWait:used>0?wait/used:0};
+  }
+
+  function draw(){
+    const m=model();
+    document.getElementById("ptRo").textContent=m.rate;
+    document.getElementById("ptDo").textContent=dEl.value;
+    document.getElementById("ptKo").textContent=m.keep;
+
+    const w=cv.clientWidth||660, h=104, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+
+    const L=14,R=w-14,span=R-L;
+    const scale=span/Math.max(m.range,m.used);
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("local ports in use  —  range "+m.lo+"–"+m.hi+" ("+m.range.toLocaleString()+")", L, 12);
+
+    ctx.fillStyle="#EDF1F4"; ctx.fillRect(L,24,Math.min(span,m.range*scale),28);
+    const we=Math.min(span,m.est*scale);
+    ctx.fillStyle=PC.line; ctx.fillRect(L,24,Math.max(m.est>0?1.5:0,we),28);
+    const ww=Math.min(span-we,m.wait*scale);
+    ctx.fillStyle= m.exhausted?PC.bad:PC.warn; ctx.fillRect(L+we,24,Math.max(0,ww),28);
+    ctx.strokeStyle="#D5DDE4"; ctx.lineWidth=1;
+    ctx.strokeRect(L+.5,24.5,Math.min(span,m.range*scale),28);
+
+    /* the ceiling */
+    const cx=L+Math.min(span,m.range*scale);
+    ctx.setLineDash([3,3]); ctx.strokeStyle=PC.ink; ctx.lineWidth=1.4;
+    ctx.beginPath(); ctx.moveTo(cx,18); ctx.lineTo(cx,58); ctx.stroke(); ctx.setLineDash([]);
+
+    /* legend */
+    ctx.font="9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillStyle=PC.line; ctx.fillRect(L,66,12,7);
+    ctx.fillStyle=PC.text; ctx.fillText("ESTABLISHED "+Math.round(m.est).toLocaleString(), L+17, 70);
+    const x2=L+150;
+    ctx.fillStyle=m.exhausted?PC.bad:PC.warn; ctx.fillRect(x2,66,12,7);
+    ctx.fillStyle=PC.text; ctx.fillText("TIME_WAIT "+Math.round(m.wait).toLocaleString()+
+      "  ("+(m.pctWait*100).toFixed(1)+"% of the ports)", x2+17, 70);
+
+    ctx.textAlign="left"; ctx.font=(m.exhausted?"700 ":"600 ")+"11px Archivo, Arial";
+    ctx.fillStyle=m.exhausted?PC.bad:PC.ok;
+    ctx.fillText(m.exhausted
+      ? "EADDRNOTAVAIL — cannot assign requested address. Ceiling is "+Math.round(m.maxConnRate).toLocaleString()+" new connections/s"
+      : Math.round(m.headroom).toLocaleString()+" ports spare — ceiling is "+Math.round(m.maxConnRate).toLocaleString()+" new connections/s", L, 90);
+
+    out.innerHTML=
+      '<div><span>new connections/s</span><b>'+(m.connRate>=1?Math.round(m.connRate):m.connRate.toFixed(1))+'</b></div>'+
+      '<div><span>ESTABLISHED</span><b>'+Math.round(m.est).toLocaleString()+'</b></div>'+
+      '<div><span>TIME_WAIT</span><b style="color:'+(m.exhausted?PC.bad:PC.ink)+'">'+Math.round(m.wait).toLocaleString()+'</b></div>'+
+      '<div><span>ports used</span><b>'+Math.round(m.used).toLocaleString()+' / '+m.range.toLocaleString()+'</b></div>'+
+      '<div><span>utilisation</span><b style="color:'+(m.exhausted?PC.bad:m.used/m.range>0.7?PC.warn:PC.ok)+'">'+
+        Math.min(999,(m.used/m.range*100)).toFixed(0)+'%</b></div>'+
+      '<div><span>state</span><b style="font-size:11.5px;color:'+(m.exhausted?PC.bad:PC.ok)+'">'+
+        (m.exhausted?"exhausted":"ok")+'</b></div>';
+
+    let msg='At '+m.rate+' requests/s with '+m.keep+' request'+(m.keep>1?"s":"")+' per connection you open <b>'+
+      (m.connRate>=1?Math.round(m.connRate):m.connRate.toFixed(1))+'</b> connections a second. '+
+      'Each holds a port for the '+dEl.value+' ms call plus <b>'+m.tw.toFixed(0)+' s</b> of TIME_WAIT afterwards, so '+
+      Math.round(m.est).toLocaleString()+' ports are doing work and <b>'+Math.round(m.wait).toLocaleString()+
+      '</b> are held by connections that already finished — '+(m.pctWait*100).toFixed(1)+'% of the total.';
+    if(m.exhausted)
+      msg+=' <b style="color:#D9534F">That exceeds the range.</b> New connections fail with EADDRNOTAVAIL. '+
+           'Raising the request rate will not help and neither will a faster server: the limit is ports, not throughput.';
+    else if(m.keep>1)
+      msg+=' Keep-alive is doing the work here — '+m.keep+' requests share one connection, so the port cost falls by the same factor. This is the fix, and it is a client configuration change rather than a kernel one.';
+    else if(m.reuse)
+      msg+=' <code>tcp_tw_reuse</code> lets the kernel recycle TIME_WAIT sockets for new outbound connections, which collapses the dominant term. Safe, unlike the removed <code>tcp_tw_recycle</code> — but connection pooling is still the better answer.';
+    else
+      msg+=' Push the rate up until it breaks, then fix it with keep-alive rather than with a wider port range.';
+    note.innerHTML=msg;
+  }
+  [rEl,dEl,gEl,kEl,wEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+</script>
+</body>
+</html>

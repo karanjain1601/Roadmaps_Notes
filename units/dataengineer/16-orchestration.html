@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Orchestration — Data Engineer</title>
+<meta name="description" content="DAGs and schedules, clock against completion against data-aware triggering, retries across wide graphs, and the orchestration tools compared.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">Data Engineer</a> <span>/</span> Chapter 16</p>
+    <p class="chnum">CHAPTER 16</p>
+    <h1>Orchestration</h1>
+    <p class="lede">Chapter 2 found that 89% of a pipeline's worst-case staleness was waiting for a scheduler rather than computing. This is the chapter that reclaims it — and shows that the obvious way to reclaim it, staggering cron jobs so each starts when the last usually finishes, is silently wrong the first time a stage runs long.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~27 min</b> read</div>
+      <div><b>Part 4</b> Moving data</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="why">
+      <p class="kicker">WHAT IT IS FOR</p>
+      <h2>The problem an orchestrator solves</h2>
+      <p class="sub">Not "running things on a schedule". Cron does that. The orchestrator exists for what happens between and after.</p>
+
+      <p>The reason teams end up with one is always the same sequence. First a script on a cron. Then a second script that must run after the first, so the cron times are staggered. Then a third that depends on both. Then one fails at 3am and the two downstream jobs run anyway, producing wrong numbers from stale input, and nobody notices for two days.</p>
+
+      <p>What is actually needed is a system that knows the <em>dependency graph</em> rather than a set of independent times:</p>
+
+      <div class="terms">
+        <dt>Dependencies</dt>
+        <dd>Run B after A succeeds, and if A fails do not run B at all. This alone is most of the value.</dd>
+
+        <dt>Retries with policy</dt>
+        <dd>Retry a transient failure a bounded number of times with backoff, and escalate when the budget is spent. The second demo shows why this is not optional on any graph of real width.</dd>
+
+        <dt>Backfill as a first-class operation</dt>
+        <dd>Re-run a range of historical periods, with the same code, at controlled concurrency. <a href="12-batch-ingestion.html">Chapter 12</a>'s procedure needs a system that supports it.</dd>
+
+        <dt>Observability of runs</dt>
+        <dd>What ran, when, for how long, with what code version, and what the logs said. This is where incident response starts.</dd>
+
+        <dt>A place to attach everything else</dt>
+        <dd>SLAs, alerts, data quality gates, lineage. The orchestrator is where the pipeline becomes a system you can reason about rather than a collection of scripts.</dd>
+      </div>
+
+      <div class="note key">
+        <b>The honest version of "you might not need one"</b>
+        <p>Below about ten tasks with a simple linear dependency, cron plus a wrapper script that exits non-zero and pages you is genuinely adequate, and chapter 3's arithmetic applies to orchestrators as much as to anything else. The threshold is not task count but <strong>whether you can still hold the dependency graph in your head</strong>. The moment somebody has to ask "what does this table depend on?" and the answer requires reading three cron files, you have already needed one for a while.</p>
+      </div>
+    </section>
+
+    <section id="dag">
+      <p class="kicker">THE STRUCTURE</p>
+      <h2>DAGs, tasks and runs</h2>
+      <p class="sub">Three words, and one distinction that causes more confusion than the rest of the vocabulary combined.</p>
+
+      <p>A <strong>DAG</strong> is the dependency graph: tasks as nodes, "must run after" as directed edges, and no cycles — a cycle would be a task that must run before itself. A <strong>task</strong> is a unit of work. A <strong>run</strong> is one execution of the DAG for one logical period.</p>
+
+      <p>The confusion is between the period a run is <em>for</em> and the time it <em>executes</em>. A daily run covering the twenty-fourth of the month starts after the twenty-fourth is over — so the run labelled with one date executes on the next. Airflow's historical naming of this as the "execution date" when it means the period start has probably cost the field thousands of hours; it now calls it the logical date, which is what it always was.</p>
+
+      <div class="note tip">
+        <b>The rule that follows</b>
+        <p>Every task should take its period as a <strong>parameter</strong> and process exactly that period, never "now" and never "yesterday" computed inside the task. A task that calls <code>current_date - 1</code> internally cannot be backfilled, cannot be re-run for a specific day, and will process the wrong period if it is retried after midnight. Parameterising the period is what makes the idempotent partition write of <a href="12-batch-ingestion.html">chapter 12</a> usable at all.</p>
+      </div>
+
+      <p>One design question worth settling early: <strong>how much work belongs in a task?</strong> Too fine and the graph becomes unreadable and the scheduler overhead dominates. Too coarse and a failure means re-running an hour of work that mostly succeeded. A workable rule is that a task should be the smallest unit you would ever want to retry independently — usually one table's worth of transformation.</p>
+    </section>
+
+    <section id="triggering">
+      <p class="kicker">THE FRESHNESS QUESTION</p>
+      <h2>Three ways to decide when to run</h2>
+      <p class="sub">Chapter 2 measured the cost of getting this wrong. This is the fix, and the near-miss that looks like the fix.</p>
+
+      <p>Recall the chain from chapter 2: four stages with run durations of 6, 12, 8 and 4 minutes. On independent hourly crons the worst-case data age was 270 minutes, of which 240 was waiting. Three ways to schedule the same chain:</p>
+
+      <div class="terms">
+        <dt>Independent clocks</dt>
+        <dd>Every stage has its own cron. Each contributes a full interval of waiting. Simple, robust, and slow.</dd>
+
+        <dt>Staggered clocks</dt>
+        <dd>Each stage is scheduled at an offset chosen so it starts just after the previous one usually finishes. Nearly as fast as anything else, and it is the obvious optimisation.</dd>
+
+        <dt>Completion-triggered</dt>
+        <dd>A stage starts when its upstream finishes. This is what an orchestrator is for, and it removes the waiting entirely except for the first stage's interval.</dd>
+      </div>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Freshness and correctness under three triggering models</b>
+          <span>chapter 2's four-stage chain, with one stage allowed to run long</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Triggering
+              <select id="tr-mode">
+                <option value="unaligned">Independent clocks</option>
+                <option value="staggered">Staggered clocks</option>
+                <option value="completion" selected>Completion-triggered</option>
+              </select>
+            </label>
+            <label>First-stage interval
+              <select id="tr-int">
+                <option value="15">15 min</option>
+                <option value="60" selected>60 min</option>
+                <option value="360">6 hours</option>
+              </select>
+            </label>
+            <label>Core transform runs
+              <input type="range" id="tr-stretch" min="10" max="50" step="5" value="10">
+              <output id="tr-stretch-o">as expected</output>
+            </label>
+          </div>
+
+          <div class="canvas" id="tr-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile hi"><i>WORST-CASE AGE</i><b id="tr-worst">0</b><s id="tr-worst-sub"></s></div>
+            <div class="tile"><i>SPENT WAITING</i><b id="tr-wait">0</b><s id="tr-wait-sub"></s></div>
+            <div class="tile" id="tr-stale-tile"><i>READS STALE INPUT</i><b id="tr-stale">&mdash;</b><s id="tr-stale-sub"></s></div>
+            <div class="tile" id="tr-var-tile"><i>UNDER VARIANCE</i><b id="tr-var">&mdash;</b><s id="tr-var-sub"></s></div>
+          </div>
+
+          <p class="readout" id="tr-note"></p>
+        </div>
+      </div>
+
+      <p>The three models separate on two axes, and the second is the one that matters.</p>
+
+      <ol>
+        <li><strong>Completion-triggering takes 270 minutes to 90.</strong> All the waiting except the first stage's interval disappears, because nothing sits idle after its input is ready. This is chapter 2's 89% figure being reclaimed.</li>
+        <li><strong>Staggered clocks get almost the same number and are silently wrong.</strong> 94 minutes against 90 — practically identical. But the offsets were sized for normal durations, so the first time the core transform takes three times as long, stage 3 starts on schedule and reads <em>yesterday's</em> output. No error, no alert, no failed task. A complete, plausible, wrong result.</li>
+        <li><strong>Completion-triggering degrades honestly.</strong> The same overrun makes it slower — 114 minutes instead of 90 — and it cannot produce a wrong answer, because stage 3 does not exist until stage 2 has finished.</li>
+      </ol>
+
+      <div class="note trap">
+        <b>Why staggered cron is the most dangerous of the three</b>
+        <p>It is the configuration a competent engineer arrives at by reasoning, it performs beautifully in testing, and its failure mode is the silent-wrongness class from <a href="01-what-it-is.html">chapter 1</a>: correct types, plausible row counts, freshness checks passing, wrong numbers. It also fails <em>intermittently</em>, only on days when a stage runs long, which makes it maddening to diagnose.</p>
+        <p>If you take one operational thing from this chapter: any dependency expressed as a time offset rather than as an actual dependency is a bug waiting for a slow day.</p>
+      </div>
+
+      <p>There is a fourth model worth naming. <strong>Data-aware or asset-based scheduling</strong> triggers on the <em>materialisation of a dataset</em> rather than the completion of a task: stage 3 runs when the partition it needs exists. It behaves like completion-triggering for freshness, and adds two things — a task can wait on a specific partition rather than on the most recent run, and an external producer can trigger downstream work without being part of your DAG. That is the model Dagster is built around and which Airflow added as datasets.</p>
+    </section>
+
+    <section id="retries">
+      <p class="kicker">WHY GRAPHS NEED RETRIES</p>
+      <h2>Failure across width</h2>
+      <p class="sub">A one-percent chance of failure is negligible for one task and near-certain across two hundred. The arithmetic is unforgiving and the fix is cheap.</p>
+
+      <p>Tasks fail transiently for reasons that have nothing to do with your code: a spot instance reclaimed, a network blip, a warehouse queue timeout, a rate limit, a brief credential refresh. Say each task has a 1% chance of hitting one. Across a graph of <em>N</em> tasks the probability that <em>all</em> succeed is <code>0.99^N</code>, which falls fast.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Probability a whole DAG run succeeds</b>
+          <span>independent transient failures, with retries and backoff</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Tasks in the DAG
+              <input type="range" id="rt-tasks" min="10" max="800" step="10" value="200">
+              <output id="rt-tasks-o">200</output>
+            </label>
+            <label>Per-task failure chance
+              <select id="rt-p">
+                <option value="0.002">0.2%</option>
+                <option value="0.01" selected>1%</option>
+                <option value="0.05">5%</option>
+              </select>
+            </label>
+            <label>Retries per task
+              <input type="range" id="rt-retries" min="0" max="5" step="1" value="0">
+              <output id="rt-retries-o">none</output>
+            </label>
+            <label>Tasks are idempotent
+              <select id="rt-idem">
+                <option value="yes" selected>Yes</option>
+                <option value="no">No</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="rt-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="rt-ok-tile"><i>RUNS THAT SUCCEED</i><b id="rt-ok">0%</b><s id="rt-ok-sub"></s></div>
+            <div class="tile"><i>EFFECTIVE TASK FAILURE</i><b id="rt-eff">0</b><s>after all attempts</s></div>
+            <div class="tile"><i>FAILED RUNS PER YEAR</i><b id="rt-year">0</b><s>on a daily schedule</s></div>
+            <div class="tile" id="rt-idem-tile"><i>RETRY SAFETY</i><b id="rt-safe">&mdash;</b><s id="rt-safe-sub"></s></div>
+          </div>
+
+          <p class="readout" id="rt-note"></p>
+        </div>
+      </div>
+
+      <p>The headline is that <strong>a 200-task DAG with a 1% per-task failure rate succeeds only 13% of the time without retries</strong> — so 87% of nightly runs fail, and somebody is woken up almost every night for something that would have worked on a second attempt. Three retries take the effective per-task failure to one in a hundred million, and the run succeeds essentially always.</p>
+
+      <div class="note warn">
+        <b>Retries are only safe if tasks are idempotent</b>
+        <p>Set the idempotency control to no. The arithmetic is unchanged &mdash; the run still succeeds &mdash; but each retry of a partially-completed task duplicates whatever it had already written, which is precisely <a href="12-batch-ingestion.html">chapter 12</a>'s append case ending at 2,600 rows against a correct 1,000.</p>
+        <p>So retries and idempotency are one feature, not two. An orchestrator that retries non-idempotent tasks is a machine for corrupting data politely. Getting the write strategy right is what makes the retry policy usable.</p>
+      </div>
+
+      <p>Two refinements worth configuring rather than accepting the defaults. <strong>Exponential backoff with jitter</strong>, because retrying immediately against a rate limit or an overloaded warehouse makes the outage worse, and retrying on a fixed interval synchronises every failed task into a thundering herd. And <strong>distinguishing retryable from terminal failures</strong>: a timeout deserves a retry, a syntax error or a missing column does not, and retrying it five times just delays the alert by twenty minutes.</p>
+    </section>
+
+    <section id="tools">
+      <p class="kicker">THE TOOLS</p>
+      <h2>What to run</h2>
+
+      <div class="tw">
+        <table>
+          <caption>The systems you will meet, and what each is actually for</caption>
+          <thead>
+            <tr><th>Tool</th><th>Model</th><th>Strength</th><th>Reach for it when</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>Airflow</strong></td><td>Task DAGs in Python</td><td>Ubiquity, operators for everything, managed everywhere</td><td>General orchestration; the safe default, and the one your next hire will know</td></tr>
+            <tr><td><strong>dbt</strong></td><td>SQL models with inferred dependencies</td><td>Transformation specifically: lineage, tests and docs from the SQL itself</td><td>Warehouse transformation. Not a general orchestrator &mdash; usually run <em>by</em> one</td></tr>
+            <tr><td><strong>Dagster</strong></td><td>Assets rather than tasks</td><td>Data-aware scheduling, typed inputs and outputs, strong local testing</td><td>You want the graph to be about datasets rather than about steps</td></tr>
+            <tr><td><strong>Prefect</strong></td><td>Python-native flows</td><td>Dynamic graphs, light footprint, ordinary Python control flow</td><td>Workflows whose shape depends on runtime data</td></tr>
+            <tr><td><strong>Temporal</strong></td><td>Durable execution</td><td>Long-running, stateful, exactly-resumable workflows</td><td>Business processes and sagas rather than data pipelines</td></tr>
+            <tr><td>Cloud-native schedulers</td><td>Varies</td><td>No infrastructure to run</td><td>Small graphs already living entirely in one cloud</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>The pairing that covers most cases</b>
+        <p>An orchestrator for <em>everything</em> plus dbt for <em>transformation</em> is the most common working arrangement, and it is a good one. The orchestrator handles ingestion, external dependencies, retries and scheduling; dbt owns the SQL layer, where it derives the dependency graph from the queries themselves rather than making you declare it &mdash; which eliminates the entire class of bug where the declared order and the actual order disagree.</p>
+        <p>The failure to avoid is running dbt as a single orchestrator task. A one-task DAG that internally runs four hundred models gives you no per-model retry, no per-model timing, and no useful failure message. Expose the models as tasks.</p>
+      </div>
+    </section>
+
+    <section id="patterns">
+      <p class="kicker">PRACTICE</p>
+      <h2>Patterns worth adopting, and four to avoid</h2>
+
+      <div class="cols">
+        <div>
+          <h4>Adopt</h4>
+          <ul>
+            <li><strong>Parameterise the period.</strong> Every task takes its logical date and processes exactly that.</li>
+            <li><strong>One task per retryable unit.</strong> Usually one table.</li>
+            <li><strong>Quality gates as tasks.</strong> A failing assertion should stop the graph before the bad data reaches a consumer, which is <a href="20-cicd-testing.html">chapter 20</a>.</li>
+            <li><strong>Separate backfill concurrency.</strong> Chapter 12's rule, enforced by the scheduler.</li>
+            <li><strong>Alert on the SLA, not the failure.</strong> A run that failed and was retried successfully is not an incident; a run that has not produced data by 07:00 is.</li>
+          </ul>
+        </div>
+        <div>
+          <h4>Avoid</h4>
+          <ul>
+            <li><strong>Time-offset dependencies.</strong> The staggered-cron failure, in any disguise.</li>
+            <li><strong>Sensors that poll forever.</strong> A sensor with no timeout occupies a worker slot indefinitely and can deadlock the pool. Bound them, and prefer event triggers.</li>
+            <li><strong>Business logic in the orchestrator.</strong> It should decide <em>what runs when</em>, not compute anything. Logic in a DAG file is untestable and runs on the scheduler.</li>
+            <li><strong>One giant DAG.</strong> Split by domain and connect across with dataset dependencies, or every team waits on every other team's failures.</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>A note on the sensor point, because it is the most common self-inflicted outage in Airflow specifically. A sensor waiting for a file occupies a worker slot while it waits. Twenty sensors on a pool of sixteen workers means all sixteen slots are held by tasks doing nothing, and the tasks that would satisfy them cannot start. The pool is deadlocked and the graph is stalled with no failure anywhere. Deferrable or reschedule-mode sensors exist precisely for this and should be the default.</p>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>An orchestrator is for dependencies, retries, backfills and observability,</b> not for running things on a schedule. The threshold for needing one is when the graph no longer fits in your head.</li>
+          <li><b>The period a run is for is not the time it executes.</b> Parameterise the period into every task; a task computing "yesterday" internally cannot be backfilled or safely retried.</li>
+          <li><b>Completion-triggering takes chapter 2's 270 minutes to 90,</b> reclaiming almost all the waiting.</li>
+          <li><b>Staggered cron gets 94 minutes and is silently wrong.</b> When a stage overruns, the next starts on schedule and reads the previous day's output &mdash; no error, no alert, plausible numbers.</li>
+          <li><b>Completion-triggering degrades honestly:</b> the same overrun makes it slower, 114 minutes, and it cannot produce a wrong answer.</li>
+          <li><b>Any dependency expressed as a time offset is a bug waiting for a slow day.</b></li>
+          <li><b>Data-aware scheduling is the fourth model:</b> trigger on a partition existing rather than a task finishing, which lets external producers drive your graph.</li>
+          <li><b>A 200-task DAG at 1% per-task failure succeeds 13% of the time without retries.</b> Three retries take effective failure to one in a hundred million.</li>
+          <li><b>Retries and idempotency are one feature.</b> Retrying a non-idempotent task is chapter 12's append case: the run goes green and the data is wrong.</li>
+          <li><b>Back off exponentially with jitter,</b> and do not retry terminal errors &mdash; that only delays the alert.</li>
+          <li><b>Orchestrator plus dbt is the common pairing,</b> but expose the models as tasks rather than running dbt as one.</li>
+          <li><b>Alert on the SLA, not on the failure.</b> A retried-and-recovered run is not an incident.</li>
+          <li><b>Bound your sensors.</b> Polling sensors holding worker slots is the classic self-inflicted stall.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="17-serving-analytics.html">Chapter 17 &mdash; Serving analytics and BI</a>. Part 5 opens on the half of the job that gets judged: marts, semantic layers, metric definitions and Reverse ETL.</p>
+          </div>
+          <div class="fi">
+            <i>PART 4 IS NOW COMPLETE</i>
+            <p>Chapters 12 to 16 covered batch and stream, queues and logs, distributed compute, and the scheduler that holds them together. Everything from here is about who consumes the result.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>Find any two jobs in your platform where the second is scheduled at a fixed time after the first. That is a time-offset dependency, and it is wrong on the first slow day.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Demo 1 — triggering model, freshness and correctness
+   ============================================================ */
+(function () {
+  var STAGES = [
+    { n: "Ingest", d: 6 }, { n: "Core transform", d: 12 },
+    { n: "Marts", d: 8 }, { n: "BI refresh", d: 4 }
+  ];
+  var $ = function (id) { return document.getElementById(id); };
+
+  function model(mode, interval, stretch) {
+    var dur = STAGES.map(function (s, i) { return i === 1 ? s.d * stretch : s.d; });
+    var run = dur.reduce(function (a, b) { return a + b; }, 0);
+    var worst, wait, stale = false, starts = [];
+
+    if (mode === "unaligned") {
+      worst = 0;
+      for (var i = 0; i < 4; i++) { starts.push(null); worst += interval + dur[i]; }
+      wait = interval * 4;
+    } else if (mode === "staggered") {
+      /* offsets are fixed, sized for the NORMAL durations */
+      var off = 0;
+      for (var j = 0; j < 4; j++) { starts.push(off); off += STAGES[j].d; }
+      worst = interval + off + dur[3];
+      wait = worst - run;
+      for (var k = 0; k < 3; k++) if (starts[k] + dur[k] > starts[k + 1]) stale = true;
+    } else {
+      var o2 = 0;
+      for (var m = 0; m < 4; m++) { starts.push(o2); o2 += dur[m]; }
+      worst = interval + run;
+      wait = interval;
+    }
+    return { worst: Math.round(worst), wait: Math.round(wait), run: run,
+             stale: stale, starts: starts, dur: dur };
+  }
+
+  function mins(t) {
+    if (t < 60) return Math.round(t) + "m";
+    var h = Math.floor(t / 60), m = Math.round(t % 60);
+    return h + "h" + (m ? " " + m + "m" : "");
+  }
+
+  function chart(mode, interval, stretch) {
+    var r = model(mode, interval, stretch);
+    var W = 700, H = 148, L = 112;
+    var span = mode === "unaligned" ? r.worst : Math.max(r.worst - interval, 1);
+    var xOf = function (t) { return L + t / span * (W - L - 96); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Stage timing under the chosen triggering model">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">' +
+      (mode === "unaligned" ? "EACH STAGE WAITS A FULL INTERVAL FOR ITS OWN CRON"
+       : mode === "staggered" ? "FIXED OFFSETS SIZED FOR NORMAL DURATIONS"
+       : "EACH STAGE STARTS WHEN ITS UPSTREAM FINISHES") + '</text>');
+
+    STAGES.forEach(function (s, i) {
+      var y = 24 + i * 26;
+      svg.push('<text x="0" y="' + (y + 14) + '" font-size="11" font-weight="600" fill="#16232F">' + s.n + '</text>');
+      if (mode === "unaligned") {
+        var wx = xOf(i * (interval + 0)), ww = xOf(interval) - xOf(0);
+        svg.push('<rect x="' + (L).toFixed(1) + '" y="' + y + '" width="' + Math.max(2, (W - L - 96) * (interval / (interval + r.dur[i])) / 4).toFixed(1) +
+          '" height="18" fill="#F3D3E2"/>');
+        svg.push('<text x="' + (L + 6) + '" y="' + (y + 13) + '" font-size="9.5" fill="#A8386B">waits up to ' + interval + 'm for its cron</text>');
+        svg.push('<rect x="' + (W - 96) + '" y="' + y + '" width="' + Math.max(3, r.dur[i] * 1.6).toFixed(1) +
+          '" height="18" fill="#20456A"/>');
+        svg.push('<text x="' + (W - 96 + Math.max(3, r.dur[i] * 1.6) + 5) + '" y="' + (y + 13) + '" font-size="9.5" fill="#54677A">' + r.dur[i] + 'm</text>');
+      } else {
+        var x0 = xOf(r.starts[i]), w0 = Math.max(3, xOf(r.starts[i] + r.dur[i]) - x0);
+        var overruns = mode === "staggered" && i < 3 && (r.starts[i] + r.dur[i] > r.starts[i + 1]);
+        svg.push('<rect x="' + x0.toFixed(1) + '" y="' + y + '" width="' + w0.toFixed(1) + '" height="18" rx="2" fill="' +
+          (overruns ? "#C0453A" : "#20456A") + '"/>');
+        svg.push('<text x="' + (x0 + w0 + 6) + '" y="' + (y + 13) + '" font-size="9.5" fill="' +
+          (overruns ? "#C0453A" : "#54677A") + '">' + Math.round(r.dur[i]) + 'm' +
+          (overruns ? " \u2014 overruns its slot" : "") + '</text>');
+        if (mode === "staggered" && i < 3) {
+          svg.push('<line x1="' + xOf(r.starts[i + 1]).toFixed(1) + '" y1="' + y + '" x2="' + xOf(r.starts[i + 1]).toFixed(1) +
+            '" y2="' + (y + 44) + '" stroke="#7C8B99" stroke-width="1" stroke-dasharray="2 2"/>');
+        }
+      }
+    });
+    svg.push('<text x="0" y="' + (H - 6) + '" font-size="10" font-weight="700" fill="#0C1D30">worst-case data age ' +
+      mins(r.worst) + (r.stale ? '   \u2014 and a stage is reading stale input' : '') + '</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var mode = $("tr-mode").value, interval = +$("tr-int").value;
+    var stretch = +$("tr-stretch").value / 10;
+    $("tr-stretch-o").textContent = stretch === 1 ? "as expected" : stretch.toFixed(1) + "\u00d7 as long";
+
+    var r = model(mode, interval, stretch);
+    var normal = model(mode, interval, 1);
+    var comp = model("completion", interval, stretch);
+    var unal = model("unaligned", interval, stretch);
+
+    $("tr-worst").textContent = mins(r.worst);
+    $("tr-worst-sub").textContent = "independent clocks give " + mins(unal.worst);
+    $("tr-wait").textContent = mins(r.wait);
+    $("tr-wait-sub").textContent = Math.round(r.wait / r.worst * 100) + "% of the total";
+    $("tr-stale").textContent = r.stale ? "Yes" : "No";
+    $("tr-stale-sub").textContent = r.stale ? "silently, with no error" : "dependencies are real";
+    $("tr-stale-tile").className = "tile " + (r.stale ? "bad" : "good");
+    $("tr-var").textContent = r.stale ? "Wrong" : (r.worst > normal.worst ? "Slower" : "Unchanged");
+    $("tr-var-sub").textContent = r.stale ? "produces a bad answer"
+      : r.worst > normal.worst ? mins(r.worst - normal.worst) + " later than normal" : "absorbs the overrun";
+    $("tr-var-tile").className = "tile " + (r.stale ? "bad" : "good");
+
+    $("tr-canvas").innerHTML = chart(mode, interval, stretch);
+
+    var lines = [];
+    if (mode === "unaligned") {
+      lines.push("Every stage waits for its own cron, so each contributes a full " + interval +
+        "-minute interval plus its runtime: worst case " + mins(r.worst) + ", of which " + mins(r.wait) +
+        " is waiting and only " + mins(r.run) + " is computing. This is exactly chapter 2's measurement \u2014 " +
+        Math.round(r.wait / r.worst * 100) + "% of staleness is a scheduler, not a job.");
+      lines.push("It is also completely robust. A stage running three times as long delays the result and cannot corrupt it, because the next stage will still find whatever the previous one last produced and no stage assumes anything about timing. Slow and honest.");
+    } else if (mode === "staggered") {
+      lines.push("Offsets are chosen so each stage starts just after the previous one usually finishes, giving a worst case of " +
+        mins(r.worst) + " against " + mins(unal.worst) + " for independent clocks and " + mins(comp.worst) +
+        " for completion-triggering. On the numbers alone this looks like the answer.");
+      if (r.stale) {
+        lines.push("But the core transform is now taking " + stretch.toFixed(1) +
+          " times as long, so it overruns its slot. The next stage starts at its scheduled offset regardless and reads the previous run's output. Nothing fails: no task errors, no alert fires, the freshness check passes because a partition was written on time. The numbers are simply from yesterday.");
+        lines.push("Note that the worst-case age tile did not move. That is the point \u2014 the failure does not show up as slowness, it shows up as a plausible wrong answer, and only on days when a stage runs long. Intermittent, silent and correct-looking is the worst combination in this unit.");
+      } else {
+        lines.push("At normal durations nothing is wrong, which is why this configuration passes testing. Drag the core transform slider and watch what happens the first time it runs long \u2014 the schedule does not adapt, so the next stage starts on time and reads stale input.");
+      }
+    } else {
+      lines.push("Each stage begins when its upstream finishes, so the only waiting left is the first stage's " +
+        interval + "-minute interval: worst case " + mins(r.worst) + " against " + mins(unal.worst) +
+        " for independent clocks. That is chapter 2's 89% waiting figure almost entirely reclaimed.");
+      if (stretch > 1) {
+        lines.push("With the core transform running " + stretch.toFixed(1) + " times as long, the result arrives " +
+          mins(r.worst - normal.worst) + " later than usual \u2014 " + mins(r.worst) +
+          " instead of " + mins(normal.worst) +
+          ". It degrades in the honest direction. A downstream stage cannot read stale input because it does not start until its input exists, so the worst outcome available is lateness, which an SLA alert will catch.");
+      } else {
+        lines.push("The real advantage over staggered cron is not the four minutes. It is that the dependency is expressed as a dependency, so there is no timing assumption to violate. Stretch the core transform and compare the two models directly.");
+      }
+    }
+    $("tr-note").textContent = lines.join("\n\n");
+  }
+
+  ["tr-mode", "tr-int", "tr-stretch"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — retries across a wide DAG
+   ============================================================ */
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+
+  function run(tasks, p, retries) {
+    var perTask = Math.pow(p, retries + 1);            /* every attempt fails */
+    return { perTask: perTask, allOk: Math.pow(1 - perTask, tasks) };
+  }
+
+  function chart(tasks, p, retries) {
+    var W = 700, H = 152, L = 42, B = 28;
+    var xs = [10, 50, 100, 200, 400, 800];
+    var xOf = function (i) { return L + i / (xs.length - 1) * (W - L - 60); };
+    var yOf = function (v) { return (H - B) - v * (H - B - 22); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Run success probability against DAG width">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">PROBABILITY A WHOLE RUN SUCCEEDS, AGAINST DAG WIDTH</text>');
+    svg.push('<line x1="' + L + '" y1="' + (H - B) + '" x2="' + (W - 56) + '" y2="' + (H - B) + '" stroke="#CFD8E0"/>');
+    [0, 0.5, 1].forEach(function (v) {
+      svg.push('<line x1="' + L + '" y1="' + yOf(v) + '" x2="' + (W - 56) + '" y2="' + yOf(v) + '" stroke="#E1E7EC" stroke-dasharray="3 3"/>');
+      svg.push('<text x="2" y="' + (yOf(v) + 4) + '" font-size="9.5" fill="#7C8B99">' + Math.round(v * 100) + '%</text>');
+    });
+    var cols = ["#C0453A", "#D9A24A", "#7C8CF8", "#2E8B5F", "#166B47", "#0C1D30"];
+    [0, 1, 2, 3].forEach(function (rr) {
+      var d = xs.map(function (t, i) { return (i ? "L" : "M") + xOf(i).toFixed(1) + " " + yOf(run(t, p, rr).allOk).toFixed(1); }).join(" ");
+      var on = rr === retries;
+      svg.push('<path d="' + d + '" fill="none" stroke="' + cols[rr] + '" stroke-width="' + (on ? 2.8 : 1.2) +
+        '" opacity="' + (on ? 1 : 0.5) + '"/>');
+      svg.push('<text x="' + (W - 52) + '" y="' + (yOf(run(800, p, rr).allOk) + 4) + '" font-size="10" font-weight="' +
+        (on ? 700 : 400) + '" fill="' + cols[rr] + '">' + rr + (rr === 1 ? " retry" : " retries") + '</text>');
+    });
+    var idx = xs.reduce(function (best, t, i) { return Math.abs(t - tasks) < Math.abs(xs[best] - tasks) ? i : best; }, 0);
+    svg.push('<circle cx="' + xOf(idx).toFixed(1) + '" cy="' + yOf(run(xs[idx], p, retries).allOk).toFixed(1) + '" r="5" fill="#E0699F"/>');
+    xs.forEach(function (t, i) {
+      svg.push('<text x="' + xOf(i) + '" y="' + (H - 9) + '" font-size="9.5" fill="#7C8B99" text-anchor="middle">' + t + '</text>');
+    });
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var tasks = +$("rt-tasks").value, p = +$("rt-p").value;
+    var retries = +$("rt-retries").value, idem = $("rt-idem").value === "yes";
+    $("rt-tasks-o").textContent = tasks;
+    $("rt-retries-o").textContent = retries === 0 ? "none" : retries;
+
+    var r = run(tasks, p, retries);
+    var none = run(tasks, p, 0), three = run(tasks, p, 3);
+
+    $("rt-ok").textContent = (r.allOk * 100).toFixed(r.allOk > 0.999 ? 4 : 1) + "%";
+    $("rt-ok-sub").textContent = ((1 - r.allOk) * 100).toFixed(1) + "% of runs fail";
+    $("rt-ok-tile").className = "tile " + (r.allOk > 0.99 ? "good" : r.allOk < 0.8 ? "bad" : "");
+    $("rt-eff").textContent = r.perTask < 1e-6 ? r.perTask.toExponential(0) : (r.perTask * 100).toFixed(4) + "%";
+    $("rt-year").textContent = Math.round((1 - r.allOk) * 365);
+    $("rt-safe").textContent = idem ? "Safe" : "Corrupts";
+    $("rt-safe-sub").textContent = idem ? "a retry replaces" : "a retry duplicates";
+    $("rt-idem-tile").className = "tile " + (idem ? "good" : "bad");
+
+    $("rt-canvas").innerHTML = chart(tasks, p, retries);
+
+    var lines = [];
+    lines.push(tasks + " tasks each with a " + (p * 100) + "% chance of a transient failure. With " +
+      (retries === 0 ? "no retries" : retries + (retries === 1 ? " retry" : " retries")) +
+      ", the effective per-task failure rate is " +
+      (r.perTask < 1e-6 ? r.perTask.toExponential(1) : (r.perTask * 100).toFixed(4) + "%") +
+      " and " + (r.allOk * 100).toFixed(r.allOk > 0.999 ? 4 : 1) +
+      "% of runs complete \u2014 about " + Math.round((1 - r.allOk) * 365) + " failed runs a year on a daily schedule.");
+
+    if (retries === 0) {
+      lines.push("Without retries the arithmetic is unforgiving: success is 0." + (100 - p * 100) +
+        " raised to the power of " + tasks + ". At this width " + ((1 - none.allOk) * 100).toFixed(0) +
+        "% of nightly runs fail, and somebody is paged for something that would have worked on a second attempt. Three retries take it to " +
+        (three.allOk * 100).toFixed(3) + "%.");
+      lines.push("This is why retry policy is not a nicety. A wide DAG without one is not a pipeline, it is a nightly alarm clock.");
+    } else {
+      lines.push("Each retry multiplies the per-task failure probability by itself, so the effect compounds extremely fast: " +
+        (none.perTask * 100).toFixed(2) + "% becomes " +
+        (r.perTask < 1e-6 ? r.perTask.toExponential(1) : (r.perTask * 100).toFixed(4) + "%") +
+        ". Retries are the cheapest reliability you will ever buy, provided the tasks tolerate them.");
+    }
+
+    if (!idem) {
+      lines.push("But the tasks are not idempotent. The arithmetic above is unchanged \u2014 the run still reports success \u2014 while every retry of a partially-completed task duplicates whatever it had already written. That is chapter 12's append case: a failure at 60% followed by a retry ended at 2,600 rows against a correct 1,000.");
+      lines.push("So retries and idempotency are one feature rather than two. An orchestrator retrying non-idempotent tasks converts transient failures into permanent data corruption, and does it with a green dashboard.");
+    }
+    $("rt-note").textContent = lines.join("\n\n");
+  }
+
+  ["rt-tasks", "rt-p", "rt-retries", "rt-idem"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+initChapter("16-orchestration.html");
+</script>
+</body>
+</html>

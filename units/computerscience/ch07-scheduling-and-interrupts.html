@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7. Scheduling, interrupts and context switches — Computer Science</title>
+<meta name="description" content="FCFS, SJF, SRTF, round robin, priorities and MLFQ; Linux CFS and EEVDF; interrupts, traps and system calls; what a context switch costs.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span class="sep">/</span> <a href="index.html">Computer Science</a> <span class="sep">/</span> Chapter 7</p>
+    <p class="chapter">Chapter 7 <span class="part">· The operating system</span></p>
+    <h1>Scheduling, interrupts and context switches</h1>
+    <p class="lede">There are more runnable threads than cores, so something has to choose. Every choice trades one victim's latency for another's throughput, and there is no algorithm that wins on all the metrics at once — a fact that stops being frustrating once you can see it happen.</p>
+    <div class="meta">
+      <span><b>8</b> sections</span>
+      <span><b>2</b> demos</span>
+      <span><b>7</b> self-check questions</span>
+      <span>Roughly <b>35</b> minutes</span>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page">
+    <h2>On this page</h2>
+    <div data-sections></div>
+    <h2>Nearby chapters</h2>
+    <div data-nearby></div>
+  </nav>
+
+  <main>
+
+    <!-- ==================================================== -->
+    <section id="s-problem">
+      <h2>The problem, stated honestly</h2>
+      <div class="h2rule"></div>
+
+      <p>A scheduler picks which runnable thread gets a core next, and for how long. It runs constantly, has to decide in microseconds, and knows almost nothing about what it is scheduling. In particular it does not know how long anything will take, which rules out most of the algorithms that would be optimal if it did.</p>
+
+      <p>It gets control at only a few moments, and the list is short enough to memorise:</p>
+
+      <ul>
+        <li>A thread <strong>blocks</strong> on I/O, a lock, or a sleep.</li>
+        <li>A thread <strong>exits</strong>.</li>
+        <li>A <strong>timer interrupt</strong> fires and the current thread's quantum has expired.</li>
+        <li>A thread becomes <strong>runnable</strong> — I/O completed, a lock was released — and may deserve the CPU more than whoever holds it.</li>
+      </ul>
+
+      <p>A scheduler that only acts on the first two is <strong>non-preemptive</strong>: once a thread has the CPU it keeps it until it gives it up voluntarily. That was how early Macintosh and Windows worked, and it is why one misbehaving program could freeze the whole machine. A scheduler that acts on all four is <strong>preemptive</strong>, and needs a timer interrupt to take the CPU back by force.</p>
+
+      <h3>What we are optimising</h3>
+
+      <dl class="terms">
+        <dt>Turnaround time</dt>
+        <dd>Completion minus arrival. The total elapsed time a job spent in the system. What a batch job cares about.</dd>
+
+        <dt>Waiting time</dt>
+        <dd>Turnaround minus the time actually spent running. Pure overhead from the job's point of view.</dd>
+
+        <dt>Response time</dt>
+        <dd>Arrival to <em>first</em> time on the CPU. What an interactive user feels — the delay between a keypress and something happening.</dd>
+
+        <dt>Throughput</dt>
+        <dd>Jobs completed per unit time. Hurt by every context switch.</dd>
+
+        <dt>Fairness</dt>
+        <dd>Nobody starves and, ideally, everybody gets a share proportional to their weight. Hard to define, easy to violate.</dd>
+      </dl>
+
+      <div class="note key">
+        <b class="tag">These conflict, permanently</b>
+        <p>Minimising average turnaround means running short jobs first, which starves long ones. Minimising response time means switching often, which costs throughput. Guaranteeing fairness means sometimes running a job that is not the best choice for any other metric. Every real scheduler is a heuristic compromise, and the compromise is retuned every few kernel releases.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-algos">
+      <h2>The classic algorithms</h2>
+      <div class="h2rule"></div>
+
+      <div class="tw">
+        <table>
+          <caption>The five you should be able to run by hand</caption>
+          <thead><tr><th>Algorithm</th><th>Picks</th><th>Preemptive</th><th>Strength</th><th>Failure mode</th></tr></thead>
+          <tbody>
+            <tr><td><strong>FCFS</strong> first come, first served</td><td>Earliest arrival</td><td>No</td><td>Trivial, no starvation</td><td>Convoy effect: one long job blocks everything</td></tr>
+            <tr><td><strong>SJF</strong> shortest job first</td><td>Smallest total burst</td><td>No</td><td>Provably optimal average waiting time when all jobs are present</td><td>Needs to know burst lengths; starves long jobs</td></tr>
+            <tr><td><strong>SRTF</strong> shortest remaining time</td><td>Smallest remaining burst</td><td>Yes</td><td>Best averages of the classic set</td><td>Same, plus constant preemption</td></tr>
+            <tr><td><strong>RR</strong> round robin</td><td>Head of a circular queue</td><td>Yes, on quantum</td><td>Bounded response: nobody waits more than (<em>n</em>−1)·<em>q</em></td><td>Poor turnaround; quantum is hard to pick</td></tr>
+            <tr><td><strong>Priority</strong></td><td>Highest priority</td><td>Either</td><td>Expresses what matters</td><td>Starvation, and priority inversion</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- ------------- DEMO 1 ------------- -->
+      <div class="demo" id="demo-sched">
+        <div class="demo-top">
+          <h3>Demo 1 — run the schedulers on the same workload</h3>
+          <p>Every algorithm is simulated tick by tick from the same arrival and burst times, and every metric is computed from the resulting timeline. Edit the workload and all five recompute.</p>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Algorithm
+              <select id="sc-algo">
+                <option value="fcfs">FCFS — first come, first served</option>
+                <option value="sjf">SJF — shortest job first, non-preemptive</option>
+                <option value="srtf" selected>SRTF — shortest remaining time, preemptive</option>
+                <option value="rr">RR — round robin</option>
+                <option value="prio">Priority — preemptive, lower number wins</option>
+              </select>
+            </label>
+            <label id="sc-qlab">Quantum <input type="number" id="sc-q" value="2" min="1" max="20"></label>
+            <label>Workload
+              <select id="sc-load">
+                <option value="classic" selected>Four mixed jobs</option>
+                <option value="convoy">One long job, then three short ones</option>
+                <option value="starve">One long job, then a stream of short ones</option>
+                <option value="together">Four jobs, all arriving at once</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="stage">
+            <p style="margin:0 0 8px;font-size:12.5px;color:#54677A">Arrival and burst times</p>
+            <div id="sc-jobs" style="font-family:var(--mono);font-size:12.5px"></div>
+            <p style="margin:14px 0 8px;font-size:12.5px;color:#54677A">Timeline</p>
+            <div id="sc-gantt"></div>
+          </div>
+
+          <div class="stage">
+            <div id="sc-table"></div>
+          </div>
+
+          <div class="rgrid">
+            <div class="tile"><span class="k">Avg turnaround</span><span class="v" id="sc-tt">—</span></div>
+            <div class="tile"><span class="k">Avg waiting</span><span class="v" id="sc-wt">—</span></div>
+            <div class="tile"><span class="k">Avg response</span><span class="v" id="sc-rt">—</span></div>
+            <div class="tile"><span class="k">Worst response</span><span class="v" id="sc-mr">—</span></div>
+            <div class="tile"><span class="k">Context switches</span><span class="v" id="sc-cs">—</span></div>
+            <div class="tile"><span class="k">Makespan</span><span class="v" id="sc-mk">—</span></div>
+          </div>
+
+          <p class="readout" id="sc-out"></p>
+        </div>
+      </div>
+
+      <p>On the default workload — bursts of 7, 4, 1 and 4 arriving at 0, 2, 4 and 5 — the results line up as the theory predicts. FCFS averages <strong>4.75</strong> units of waiting, SJF gets it to <strong>4</strong>, and SRTF to <strong>3</strong>. SRTF also has the best average response, 0.5, because it preempts the moment a shorter job appears.</p>
+
+      <p>Then look at what that costs. SRTF gives P1 a turnaround of <strong>16</strong> against FCFS's 7: the algorithm with the best average has the worst individual outcome, because P1 is the long job and gets pushed behind everything. Switch to the starvation workload and it becomes stark — by time 17 the long job has completed <strong>1 unit of 20</strong> under SRTF and <strong>6</strong> under round robin, six times the progress for identical total work.</p>
+
+      <div class="note trap">
+        <b class="tag">Turnaround cannot see starvation</b>
+        <p>On the starvation workload both SRTF and round robin give the long job a turnaround of 36, and that is not a coincidence. Whichever job finishes last always has turnaround = makespan − arrival, and the makespan is the same for <em>any</em> work-conserving scheduler, because the total work is the same. Averages and turnaround simply cannot express "this job made no progress for sixteen units". Progress over time can, which is why real schedulers track accumulated runtime rather than completion.</p>
+      </div>
+
+      <h3>Multi-level feedback queues</h3>
+
+      <p>The practical answer to "SJF is optimal but you cannot know burst lengths" is to guess from behaviour. An MLFQ keeps several queues at different priorities and moves jobs between them:</p>
+
+      <ol>
+        <li>New jobs enter at the highest priority.</li>
+        <li>A job that uses its entire quantum is assumed to be CPU-bound and is demoted one level. Lower levels get longer quanta.</li>
+        <li>A job that blocks before its quantum expires is assumed to be interactive and stays where it is.</li>
+        <li>Periodically, everything is promoted back to the top so nothing starves and so jobs that change behaviour are re-evaluated.</li>
+      </ol>
+
+      <p>The result approximates SJF without any advance knowledge: interactive jobs, which are short by nature, float to the top and get fast response, while long computations sink and run efficiently with big quanta. Rule 4 exists because without it a batch job could starve forever, and because programs change phase — a compiler is I/O-bound reading source and CPU-bound optimising.</p>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-cfs">
+      <h2>What Linux actually does</h2>
+      <div class="h2rule"></div>
+
+      <p>From 2007 to 2023 the Linux default was the <strong>Completely Fair Scheduler</strong>. Its idea is elegant: instead of queues and quanta, give each task a <em>virtual runtime</em> and always run the task with the smallest one.</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">the one line that is CFS</span><button class="code-copy">Copy</button></div>
+<pre>vruntime += actual_runtime × (weight_of_nice_0 / weight_of_this_task)
+
+<span class="c">// a nice 0 task advances vruntime at real time</span>
+<span class="c">// a nice -5 task advances it more slowly, so it is picked more often</span>
+<span class="c">// a nice +5 task advances it faster, so it is picked less often</span>
+
+<span class="c">// runnable tasks live in a red-black tree keyed by vruntime;</span>
+<span class="c">// "pick the next task" is just "take the leftmost node"</span></pre>
+      </div>
+
+      <p>Each nice level changes the weight by roughly 1.25×, so the ten steps from nice 0 to nice 19 change a task's CPU share by about a factor of ten. There is no fixed quantum: CFS computes a target latency (a few milliseconds) and divides it among the runnable tasks in proportion to weight, with a floor so that a hundred runnable tasks do not each get a microsecond. A newly woken task gets its vruntime clamped so it can jump the queue slightly, which is how interactive tasks get their responsiveness without any explicit notion of interactivity.</p>
+
+      <p>In Linux 6.6, CFS was replaced by <strong>EEVDF</strong> — Earliest Eligible Virtual Deadline First — which keeps virtual runtime but adds an explicit deadline per task, letting the scheduler give short-running tasks lower latency without the pile of heuristics CFS had accumulated. The core idea, that fairness is bookkeeping over accumulated virtual time rather than a queue, is unchanged.</p>
+
+      <div class="tw">
+        <table>
+          <caption>The scheduling classes Linux offers, highest priority first</caption>
+          <thead><tr><th>Class</th><th>Policy</th><th>Used for</th></tr></thead>
+          <tbody>
+            <tr><td>Deadline</td><td><code>SCHED_DEADLINE</code></td><td>Tasks declaring a runtime, period and deadline; the kernel admission-controls them</td></tr>
+            <tr><td>Real-time</td><td><code>SCHED_FIFO</code>, <code>SCHED_RR</code></td><td>Audio, robotics. Runs until it blocks — a busy loop here can lock up a core</td></tr>
+            <tr><td>Normal</td><td><code>SCHED_OTHER</code></td><td>Everything else, via CFS/EEVDF and nice values</td></tr>
+            <tr><td>Batch / Idle</td><td><code>SCHED_BATCH</code>, <code>SCHED_IDLE</code></td><td>Background work that should never disturb anything</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-interrupts">
+      <h2>How the kernel gets control</h2>
+      <div class="h2rule"></div>
+
+      <p>A running user thread owns the CPU. The kernel is not a process sitting alongside it waiting for a turn; it is code that runs when something forces a transition. There are exactly three kinds of forcing event, and they differ in where they come from and whether they were expected.</p>
+
+      <div class="tw">
+        <table>
+          <caption>The three ways control leaves user code</caption>
+          <thead><tr><th></th><th>Source</th><th>Timing</th><th>Examples</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Interrupt</strong></td><td>External hardware</td><td>Asynchronous — unrelated to the current instruction</td><td>Timer tick, key press, network packet, disk completion</td></tr>
+            <tr><td><strong>Trap</strong> (or exception)</td><td>The current instruction</td><td>Synchronous, deliberate</td><td>System call, breakpoint, debugger</td></tr>
+            <tr><td><strong>Fault</strong></td><td>The current instruction</td><td>Synchronous, accidental</td><td>Page fault, divide by zero, invalid opcode, segmentation fault</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>All three take the same route. The CPU switches to kernel mode, saves enough state to resume, looks up a handler in the interrupt descriptor table, and jumps to it. The handler runs, and then execution returns to the interrupted instruction — or to the <em>next</em> one, depending on the cause. A page fault re-runs the faulting instruction after the page is mapped; a system call resumes after it; a segmentation fault usually does not resume at all.</p>
+
+      <h3>Why system calls cost more than function calls</h3>
+
+      <p>A system call is not a jump into a library. It is a privilege transition: <code>syscall</code> on x86-64 switches to ring 0, swaps to the kernel stack, and on return restores everything. The direct cost is a few hundred cycles; since Spectre and Meltdown, the mitigations — flushing branch predictors, switching page tables under KPTI — have added several hundred more.</p>
+
+      <p>That cost is why so much systems engineering is about making fewer, bigger calls. Buffered I/O batches many small writes into one <code>write</code>. <code>epoll</code> and <code>io_uring</code> report many ready sockets per call instead of one. <code>sendfile</code> and <code>splice</code> move data between descriptors without copying it through userspace at all. And <code>gettimeofday</code> does not enter the kernel at all on Linux: the vDSO maps a page of kernel-maintained data into every process so the time can be read with an ordinary load.</p>
+
+      <div class="note tip">
+        <b class="tag">Top halves and bottom halves</b>
+        <p>An interrupt handler runs with interrupts disabled and blocks everything else on that core, so it must be short. The convention is to split it: the <strong>top half</strong> does the minimum — acknowledge the device, copy the data out, schedule the rest — and a <strong>bottom half</strong> (a softirq, tasklet or workqueue in Linux) does the real processing later with interrupts enabled. A network card raising 100,000 interrupts per second would otherwise leave no time for anything else, which is also why high-rate NICs switch to polling under load. That mechanism is called NAPI, and it is a scheduler decision in disguise.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-switch">
+      <h2>What a context switch costs</h2>
+      <div class="h2rule"></div>
+
+      <p>Switching threads means saving registers into one task structure and loading them from another. That part is genuinely cheap, a few hundred cycles. The expensive parts are everything else:</p>
+
+      <ul>
+        <li>Entering and leaving the kernel, with the mitigation overhead above.</li>
+        <li>Switching page tables if the new thread belongs to a different process, which historically flushed the whole TLB. Tagged TLBs (PCID on x86, ASIDs on ARM) avoid the flush but not the pressure.</li>
+        <li><strong>Cold caches.</strong> The incoming thread finds L1 and L2 full of the outgoing thread's data and takes hundreds of misses before it is back at speed. This usually dominates everything else and it does not show up as scheduler time in any profile.</li>
+        <li>Scheduler bookkeeping: updating vruntime, re-inserting into the red-black tree, load balancing across cores.</li>
+      </ul>
+
+      <!-- ------------- DEMO 2 ------------- -->
+      <div class="demo" id="demo-quantum">
+        <div class="demo-top">
+          <h3>Demo 2 — picking a quantum</h3>
+          <p>Round robin with the switch cost actually charged into the timeline, not assumed away. Every number below comes from running the schedule; the sweep shows what quantum does to throughput and to responsiveness at the same time.</p>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Runnable threads <input type="number" id="qt-n" value="10" min="2" max="200"></label>
+            <label>Burst each <input type="number" id="qt-b" value="100" min="10" max="1000"></label>
+            <label>Switch cost <input type="number" id="qt-c" value="1" min="0" max="20"></label>
+            <label>Quantum <input type="range" id="qt-q" min="0" max="6" value="3" step="1"><span id="qt-qv" style="font-size:12px;color:#54677A"></span></label>
+          </div>
+
+          <div class="stage">
+            <p style="margin:0 0 8px;font-size:12.5px;color:#54677A">CPU utilisation (bars) and average response time (line), across quanta</p>
+            <div id="qt-chart"></div>
+          </div>
+
+          <div class="rgrid">
+            <div class="tile"><span class="k">CPU utilisation</span><span class="v" id="qt-util">—</span></div>
+            <div class="tile"><span class="k">Context switches</span><span class="v" id="qt-sw">—</span></div>
+            <div class="tile"><span class="k">Time lost to switching</span><span class="v" id="qt-lost">—</span></div>
+            <div class="tile"><span class="k">Avg response</span><span class="v" id="qt-resp">—</span></div>
+            <div class="tile"><span class="k">Avg turnaround</span><span class="v" id="qt-turn">—</span></div>
+            <div class="tile"><span class="k">Total elapsed</span><span class="v" id="qt-total">—</span></div>
+          </div>
+
+          <p class="readout" id="qt-out"></p>
+        </div>
+      </div>
+
+      <p>Ten threads, a burst of 100 each, a switch costing 1: at quantum 1 the CPU spends <strong>half its time switching</strong> and utilisation is 50.0%, but average response is 9. At quantum 100 — a quantum as long as the whole burst, which is FCFS wearing a disguise — utilisation reaches 99.1% and average response collapses to <strong>454.5</strong>. Quantum 10 sits at 91.0% utilisation with a response of 49.5.</p>
+
+      <p>The textbook approximation for efficiency is <em>q</em> / (<em>q</em> + <em>c</em>), and the simulator confirms it to within half a percent — it is always a slight under-estimate, because there is no switch before the very first slice. Set the switch cost to 0 and utilisation is 100% at every quantum, which is the check that the model is measuring what it claims to.</p>
+
+      <div class="note key">
+        <b class="tag">The rule of thumb</b>
+        <p>Pick a quantum an order of magnitude or two larger than the switch cost, then make sure <em>n</em> × <em>q</em> stays under the response time a human notices. With a switch around 1–5 µs and a perception threshold around 100 ms, that lands in the range of 1–10 ms, which is exactly where real quanta sit. Linux does not use a fixed quantum at all: it divides a target latency of a few milliseconds among the runnable tasks, with a floor so the quantum never shrinks below something the switch cost would dominate.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-practice">
+      <h2>Practical consequences</h2>
+      <div class="h2rule"></div>
+
+      <dl class="terms">
+        <dt>Priority inversion</dt>
+        <dd>A low-priority thread holds a lock a high-priority thread needs, and a medium-priority thread — which needs no lock — preempts the low one and prevents it from ever releasing. The high-priority thread is blocked by a thread it outranks. This is what repeatedly reset Mars Pathfinder in 1997. The standard fix is <strong>priority inheritance</strong>: a thread holding a lock temporarily inherits the priority of the highest-priority waiter.</dd>
+
+        <dt>The convoy effect</dt>
+        <dd>One long or I/O-heavy job at the front of a non-preemptive queue makes everything behind it wait, including jobs that would have finished instantly. It is the reason FCFS is unusable for interactive work, and it reappears at every layer: a slow query holding a database connection, a large request occupying a worker, a single slow shard delaying a scatter-gather.</dd>
+
+        <dt>Thread pool sizing</dt>
+        <dd>For CPU-bound work, roughly one thread per core: more only adds switches and cache damage. For I/O-bound work you want enough threads to keep the CPU busy while others block, which is <em>cores</em> × (1 + wait/compute). A task that waits 90% of the time justifies about ten threads per core. Guessing here is why so many services get slower when their thread pool is enlarged.</dd>
+
+        <dt>CPU affinity and NUMA</dt>
+        <dd>Pinning a thread to a core keeps its cache warm and avoids migration, which can be worth a great deal for latency-sensitive work. On a multi-socket machine, memory is attached to a particular socket and accessing another socket's memory is measurably slower, so the scheduler tries to keep threads near their memory. <code>taskset</code> and <code>numactl</code> let you take that decision yourself.</dd>
+      </dl>
+
+      <div class="note warn">
+        <b class="tag">Real-time priority is a loaded gun</b>
+        <p>A <code>SCHED_FIFO</code> thread runs until it blocks or yields. If it busy-loops, it will not be preempted by anything at a lower priority — including, on a single-core machine, the shell you would use to kill it. Linux defaults to reserving 5% of each period for non-real-time tasks precisely so this is recoverable, and that reservation is configurable and sometimes disabled by people who then discover why it existed.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-check">
+      <h2>Check yourself</h2>
+      <div class="h2rule"></div>
+
+      <div class="check">
+        <details>
+          <summary>SJF gives the lowest average waiting time. Why does no real operating system use it?</summary>
+          <div class="ans">
+            <p>Two reasons. It needs to know each job's total burst before running it, which is impossible for interactive work — the scheduler cannot know how long you will hold down a key. And it starves long jobs: a steady arrival of short jobs means a long one never becomes the shortest and never runs. MLFQ and CFS both approximate the benefit by inferring behaviour instead: a job that repeatedly blocks before using its quantum is treated as short, and periodic promotion or virtual-runtime accounting stops anything starving.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Round robin with an enormous quantum behaves identically to which algorithm, and why?</summary>
+          <div class="ans">
+            <p>FCFS. If the quantum exceeds every burst, no job is ever preempted, so each runs to completion in arrival order and the queue never rotates. The demo confirms this: set the quantum above the longest burst and the metrics and switch count match FCFS exactly. At the other extreme, a quantum of one time unit approaches processor sharing, where every job progresses at 1/<em>n</em> speed — good response, poor turnaround, and, once switching is not free, terrible throughput.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>SRTF has the best average turnaround on the demo workload and the worst individual one. Explain.</summary>
+          <div class="ans">
+            <p>SRTF always runs whatever will finish soonest, which is exactly what minimises the average — many jobs finish early and few finish late. But the long job is by definition never the one that finishes soonest, so it is preempted every time anything shorter arrives and is pushed to the end. On the default workload P1 gets a turnaround of 16 under SRTF against 7 under FCFS, while the average falls from 8.75 to 7. Averages reward exactly this kind of redistribution, which is why fairness has to be measured separately.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>On the starvation workload both SRTF and round robin give the long job a turnaround of 36. Does that mean neither starves it?</summary>
+          <div class="ans">
+            <p>No, it means turnaround cannot detect starvation. The job that finishes last always has turnaround = makespan − arrival, and every work-conserving scheduler has the same makespan because the total work is identical. What differs is <em>when</em> the work happened: by time 17 the long job has completed 1 unit of 20 under SRTF and 6 under round robin. Progress over time is the metric that sees it, which is precisely why CFS schedules on accumulated virtual runtime rather than on completion.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>A context switch costs 5 µs. Is a 10 µs quantum reasonable?</summary>
+          <div class="ans">
+            <p>No. Efficiency is roughly <em>q</em>/(<em>q</em>+<em>c</em>) = 10/15 = 67%, so a third of the machine is spent switching, and the real figure is worse because that formula ignores cache damage. You want the quantum one to two orders of magnitude above the switch cost — here, 0.5 to 5 ms — subject to <em>n</em> × <em>q</em> staying below the latency a user notices. Verify the shape in demo 2 by setting the switch cost to 5 and sweeping.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Your service handles requests that spend 90% of their time waiting on a database. How many worker threads per core?</summary>
+          <div class="ans">
+            <p>Around ten. The rule is <em>cores</em> × (1 + wait ÷ compute), and 0.9/0.1 = 9, giving a factor of 10. With one thread per core the CPU would idle 90% of the time; with a hundred you would pay for switches and stacks and memory without gaining throughput, since the CPU is already saturated at ten. The better answer for large numbers is usually to stop using a thread per request and use async I/O, which lets one thread hold thousands of in-flight requests without a stack each.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>A high-priority thread is blocked and never runs, even though the thread holding its lock is low-priority and ready. What is going on?</summary>
+          <div class="ans">
+            <p>Priority inversion. The low-priority lock holder is ready but not running, because medium-priority threads that need no lock keep preempting it. It therefore never reaches the point of releasing, and the high-priority thread waits behind a thread it outranks — effectively running at the low thread's priority. The fix is priority inheritance: while holding a contended lock, a thread temporarily runs at the priority of its highest-priority waiter. Mars Pathfinder rebooted repeatedly in 1997 for exactly this reason, and was fixed in flight by enabling priority inheritance on the offending mutex.</p>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-recap">
+      <div class="recap">
+        <h2>Ten things to carry forward</h2>
+        <ol>
+          <li><b>The scheduler only gets control at four moments:</b> block, exit, timer interrupt, and wake-up. Preemption exists because of the third.</li>
+          <li><b>Turnaround, waiting, response, throughput and fairness conflict.</b> No algorithm optimises all of them.</li>
+          <li><b>SJF is optimal for average waiting and unusable in practice,</b> because burst lengths are unknowable and long jobs starve.</li>
+          <li><b>Round robin buys bounded response,</b> at most (<em>n</em>−1)·<em>q</em> before first run, and pays for it in turnaround and switches.</li>
+          <li><b>Averages hide starvation.</b> The best average turnaround can coexist with the worst individual one.</li>
+          <li><b>Turnaround cannot see starvation at all</b> for the last-finishing job, because makespan is invariant across work-conserving schedulers. Measure progress over time.</li>
+          <li><b>MLFQ infers what SJF assumes,</b> by demoting jobs that use a full quantum and promoting periodically so nothing starves.</li>
+          <li><b>Linux schedules on virtual runtime,</b> weighted by nice, picking the leftmost node of a red-black tree — CFS until 6.6, EEVDF since.</li>
+          <li><b>Interrupts, traps and faults are the three doors into the kernel,</b> and a system call is a privilege transition, not a function call.</li>
+          <li><b>The quantum should be one or two orders of magnitude above the switch cost,</b> and the switch's real price is the cold cache that follows it.</li>
+        </ol>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<footer>
+  <div class="foot-inner">
+    <div class="fi-grid">
+      <div class="fi">
+        <h3>What comes next</h3>
+        <p>Chapter 8 deals with what happens when the threads this chapter interleaves touch the same data. Race conditions, atomicity, mutexes and semaphores, the four conditions for deadlock, and why <code>counter++</code> is three instructions.</p>
+      </div>
+      <div class="fi">
+        <h3>If you want to go deeper</h3>
+        <p><em>Operating Systems: Three Easy Pieces</em> devotes several excellent free chapters to scheduling and MLFQ. On a Linux box, <code>chrt</code>, <code>nice</code>, <code>taskset</code> and <code>perf sched</code> let you watch all of this on your own machine.</p>
+      </div>
+      <div class="fi">
+        <h3>Connections</h3>
+        <p>Chapter 5 explains why a switch costs more than the register save. Chapter 6 covers what is being switched. Chapter 8 covers priority inversion's other half, the lock.</p>
+      </div>
+    </div>
+    <div class="pager" data-pager></div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">&uarr;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* =============================================================
+   Demo 1 — the classic schedulers
+   ============================================================= */
+(function(){
+  const LOADS = {
+    classic: [
+      {pid:"P1", arrive:0, burst:7, prio:2},
+      {pid:"P2", arrive:2, burst:4, prio:1},
+      {pid:"P3", arrive:4, burst:1, prio:3},
+      {pid:"P4", arrive:5, burst:4, prio:2}
+    ],
+    convoy: [
+      {pid:"Long", arrive:0, burst:20, prio:2},
+      {pid:"A", arrive:1, burst:2, prio:1},
+      {pid:"B", arrive:2, burst:2, prio:1},
+      {pid:"C", arrive:3, burst:2, prio:1}
+    ],
+    starve: [{pid:"L", arrive:0, burst:20, prio:2}].concat(
+      Array.from({length:8}, (_, i) => ({pid:"S" + (i+1), arrive:1 + i*2, burst:2, prio:1}))),
+    together: [
+      {pid:"A", arrive:0, burst:6, prio:2},
+      {pid:"B", arrive:0, burst:8, prio:4},
+      {pid:"C", arrive:0, burst:7, prio:1},
+      {pid:"D", arrive:0, burst:3, prio:3}
+    ]
+  };
+  const COLOURS = ["#E2574C","#20456A","#3FB984","#B47BE5","#D9A32B","#25B7C4","#8FBF4D","#E0699F","#7C8CF8"];
+
+  function merge(tl){
+    const out = [];
+    tl.forEach(s => {
+      const last = out[out.length - 1];
+      if (last && last.pid === s.pid && last.end === s.start) last.end = s.end;
+      else out.push({pid:s.pid, start:s.start, end:s.end});
+    });
+    return out;
+  }
+
+  function schedule(procs, algo, quantum){
+    const ps = procs.map(p => ({...p, rem:p.burst}));
+    const timeline = [];
+    const admitted = new Set();
+    let ready = [], t = 0, done = 0, guard = 0;
+
+    const admitUpTo = time => ps
+      .filter(p => !admitted.has(p.pid) && p.arrive <= time)
+      .sort((a, b) => a.arrive - b.arrive)
+      .forEach(p => { ready.push(p); admitted.add(p.pid); });
+
+    admitUpTo(t);
+    while (done < ps.length && guard++ < 20000){
+      if (!ready.length){
+        const pending = ps.filter(p => !admitted.has(p.pid));
+        if (!pending.length) break;
+        t = Math.min(...pending.map(p => p.arrive));
+        admitUpTo(t);
+        continue;
+      }
+      let pick;
+      if (algo === "fcfs")      pick = ready.reduce((m, p) => p.arrive < m.arrive ? p : m);
+      else if (algo === "sjf")  pick = ready.reduce((m, p) => p.burst < m.burst || (p.burst === m.burst && p.arrive < m.arrive) ? p : m);
+      else if (algo === "srtf") pick = ready.reduce((m, p) => p.rem < m.rem || (p.rem === m.rem && p.arrive < m.arrive) ? p : m);
+      else if (algo === "prio") pick = ready.reduce((m, p) => p.prio < m.prio || (p.prio === m.prio && p.arrive < m.arrive) ? p : m);
+      else                      pick = ready[0];
+
+      const slice = (algo === "fcfs" || algo === "sjf") ? pick.rem
+                  : (algo === "srtf" || algo === "prio") ? 1
+                  : Math.min(quantum, pick.rem);
+
+      timeline.push({pid:pick.pid, start:t, end:t + slice});
+      pick.rem -= slice;
+      t += slice;
+
+      if (algo === "rr"){
+        ready.shift();
+        admitUpTo(t);
+        if (pick.rem > 0) ready.push(pick); else done++;
+      } else {
+        admitUpTo(t);
+        if (pick.rem === 0){ ready = ready.filter(x => x !== pick); done++; }
+      }
+    }
+    return merge(timeline);
+  }
+
+  function metrics(procs, tl){
+    const first = {}, fin = {};
+    tl.forEach(s => { if (first[s.pid] === undefined) first[s.pid] = s.start; fin[s.pid] = s.end; });
+    const rows = procs.map(p => {
+      const completion = fin[p.pid], turnaround = completion - p.arrive;
+      return {pid:p.pid, arrive:p.arrive, burst:p.burst, completion, turnaround,
+              waiting: turnaround - p.burst, response: first[p.pid] - p.arrive};
+    });
+    const avg = k => rows.reduce((n, r) => n + r[k], 0) / rows.length;
+    let switches = 0;
+    for (let i = 1; i < tl.length; i++) if (tl[i].pid !== tl[i-1].pid) switches++;
+    return {rows, tl, switches,
+            avgTurnaround:avg("turnaround"), avgWaiting:avg("waiting"), avgResponse:avg("response"),
+            maxResponse:Math.max(...rows.map(r => r.response)),
+            worstTurn:Math.max(...rows.map(r => r.turnaround)),
+            makespan: tl[tl.length - 1].end};
+  }
+
+  function draw(){
+    const algo = document.getElementById("sc-algo").value;
+    const q = Math.max(1, +document.getElementById("sc-q").value || 2);
+    const procs = LOADS[document.getElementById("sc-load").value];
+    document.getElementById("sc-qlab").hidden = algo !== "rr";
+
+    const tl = schedule(procs, algo, q);
+    const m = metrics(procs, tl);
+    const colour = {};
+    procs.forEach((p, i) => colour[p.pid] = COLOURS[i % COLOURS.length]);
+
+    const jobs = document.getElementById("sc-jobs");
+    jobs.innerHTML = procs.map(p =>
+      "<span style='display:inline-block;margin-right:14px'><span style='display:inline-block;width:9px;height:9px;border-radius:2px;background:" +
+      colour[p.pid] + ";margin-right:5px'></span>" + p.pid + " arrives " + p.arrive + ", burst " + p.burst +
+      (algo === "prio" ? ", priority " + p.prio : "") + "</span>").join("");
+
+    const g = document.getElementById("sc-gantt");
+    g.innerHTML = "";
+    const bar = document.createElement("div");
+    bar.style.cssText = "display:flex;height:34px;border:1px solid #CFD8E0;border-radius:3px;overflow:hidden";
+    tl.forEach(s => {
+      const seg = document.createElement("div");
+      seg.style.cssText = "flex:" + (s.end - s.start) + ";background:" + colour[s.pid] +
+                          ";color:#fff;font-size:11px;display:flex;align-items:center;justify-content:center;" +
+                          "border-right:1px solid rgba(255,255,255,.35);overflow:hidden;white-space:nowrap";
+      seg.textContent = s.pid;
+      seg.title = s.pid + ": " + s.start + " to " + s.end;
+      bar.appendChild(seg);
+    });
+    g.appendChild(bar);
+    const ticks = document.createElement("div");
+    ticks.style.cssText = "display:flex;font-size:10px;color:#7D8EA0;margin-top:3px";
+    tl.forEach(s => {
+      const d = document.createElement("div");
+      d.style.cssText = "flex:" + (s.end - s.start) + ";text-align:right;padding-right:2px";
+      d.textContent = s.end;
+      ticks.appendChild(d);
+    });
+    g.appendChild(ticks);
+
+    const tblHost = document.getElementById("sc-table");
+    const tbl = document.createElement("table");
+    tbl.style.cssText = "border-collapse:collapse;width:100%;font-size:13.5px;min-width:460px";
+    tbl.innerHTML = "<tr style='background:#0C1D30;color:#E9F0F6'>" +
+      ["Job","Arrive","Burst","Finish","Turnaround","Waiting","Response"]
+        .map(h => "<th style='padding:6px 10px;text-align:" + (h === "Job" ? "left" : "right") + ";font-weight:600'>" + h + "</th>").join("") + "</tr>";
+    m.rows.forEach(r => {
+      const tr = document.createElement("tr");
+      tr.style.cssText = "border-bottom:1px solid #E1E7EC";
+      tr.innerHTML = "<td style='padding:6px 10px'><span style='display:inline-block;width:9px;height:9px;border-radius:2px;background:" +
+        colour[r.pid] + ";margin-right:6px'></span>" + r.pid + "</td>" +
+        [r.arrive, r.burst, r.completion, r.turnaround, r.waiting, r.response]
+          .map(v => "<td style='padding:6px 10px;text-align:right;font-variant-numeric:tabular-nums'>" + v + "</td>").join("");
+      tbl.appendChild(tr);
+    });
+    tblHost.innerHTML = "";
+    tblHost.appendChild(tbl);
+
+    setTile("sc-tt", m.avgTurnaround.toFixed(2));
+    setTile("sc-wt", m.avgWaiting.toFixed(2));
+    setTile("sc-rt", m.avgResponse.toFixed(2));
+    setTile("sc-mr", m.maxResponse);
+    setTile("sc-cs", m.switches);
+    setTile("sc-mk", m.makespan);
+
+    const fc = metrics(procs, schedule(procs, "fcfs"));
+    let msg;
+    if (algo === "fcfs"){
+      msg = "Jobs run in arrival order and nothing is ever preempted, so there are only <b>" + m.switches +
+            " context switches</b> — one per job boundary. Average waiting is " + m.avgWaiting.toFixed(2) +
+            ". If a long job arrives first, everything behind it waits: that is the convoy effect.";
+    } else if (algo === "sjf" || algo === "srtf"){
+      msg = "Average waiting is <b>" + m.avgWaiting.toFixed(2) + "</b> against FCFS's " + fc.avgWaiting.toFixed(2) +
+            ", the best of the classic set. The cost is hidden in the table: the worst individual turnaround here is <b>" +
+            m.worstTurn + "</b> against FCFS's " + fc.worstTurn + ", because the longest job is never the one that " +
+            "finishes soonest and keeps being pushed back." +
+            (algo === "srtf" ? " Preempting on every arrival also costs " + m.switches + " switches." : "");
+    } else if (algo === "rr"){
+      msg = "Round robin guarantees nobody waits more than (n−1)×q = <b>" + ((procs.length - 1) * q) +
+            "</b> before its first slice, and the worst response measured here is " + m.maxResponse +
+            ". The bill arrives as <b>" + m.switches + " context switches</b> and an average turnaround of " +
+            m.avgTurnaround.toFixed(2) + " against SRTF's " + metrics(procs, schedule(procs, "srtf")).avgTurnaround.toFixed(2) + ".";
+    } else {
+      msg = "Priority scheduling runs whatever ranks highest, re-deciding on every tick. It expresses intent well " +
+            "and starves anything at the bottom: the worst response here is <b>" + m.maxResponse +
+            "</b>. Real systems add ageing, so a job's priority rises the longer it waits.";
+    }
+    document.getElementById("sc-out").innerHTML = msg;
+  }
+
+  ["sc-algo","sc-load"].forEach(id => document.getElementById(id).addEventListener("change", draw));
+  document.getElementById("sc-q").addEventListener("input", draw);
+  draw();
+})();
+
+/* =============================================================
+   Demo 2 — quantum versus switch cost
+   ============================================================= */
+(function(){
+  const QUANTA = [1, 2, 5, 10, 20, 50, 100];
+
+  function rr({n, burst, quantum, cost}){
+    const ps = Array.from({length:n}, (_, i) => ({pid:i, rem:burst, first:null, done:null}));
+    const q = ps.slice();
+    let t = 0, switches = 0, busy = 0, prev = null, guard = 0;
+    while (q.length && guard++ < 500000){
+      const p = q.shift();
+      if (prev !== null && prev !== p.pid){ t += cost; switches++; }
+      prev = p.pid;
+      if (p.first === null) p.first = t;
+      const slice = Math.min(quantum, p.rem);
+      t += slice; busy += slice; p.rem -= slice;
+      if (p.rem > 0) q.push(p); else p.done = t;
+    }
+    const avg = k => ps.reduce((s, p) => s + p[k], 0) / n;
+    return {total:t, busy, switches, utilisation:busy / t,
+            avgResponse:avg("first"), avgTurnaround:avg("done")};
+  }
+
+  function draw(){
+    const n = Math.max(2, Math.min(200, +document.getElementById("qt-n").value || 10));
+    const burst = Math.max(10, Math.min(1000, +document.getElementById("qt-b").value || 100));
+    const cost = Math.max(0, Math.min(20, +document.getElementById("qt-c").value || 0));
+    const qi = +document.getElementById("qt-q").value;
+    const quantum = QUANTA[qi];
+    document.getElementById("qt-qv").textContent = quantum + " unit" + (quantum > 1 ? "s" : "");
+
+    const r = rr({n, burst, quantum, cost});
+    const sweep = QUANTA.map(q => ({q, r:rr({n, burst, quantum:q, cost})}));
+    const maxResp = Math.max(...sweep.map(s => s.r.avgResponse)) || 1;
+
+    const host = document.getElementById("qt-chart");
+    host.innerHTML = "";
+    const wrap = document.createElement("div");
+    wrap.style.cssText = "display:flex;align-items:flex-end;gap:8px;height:140px";
+    sweep.forEach(({q, r:rr2}) => {
+      const col = document.createElement("div");
+      col.style.cssText = "flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;height:100%;position:relative";
+      const dot = document.createElement("div");
+      dot.style.cssText = "position:absolute;left:50%;transform:translateX(-50%);width:9px;height:9px;border-radius:50%;" +
+                          "background:#D9A32B;border:2px solid #fff;box-shadow:0 0 0 1px #8A5A00;bottom:" +
+                          Math.round((rr2.avgResponse / maxResp) * 88) + "%";
+      dot.title = "avg response " + rr2.avgResponse.toFixed(1);
+      const bar = document.createElement("div");
+      bar.style.cssText = "width:100%;height:" + Math.max(2, Math.round(rr2.utilisation * 100)) +
+                          "%;border-radius:2px 2px 0 0;background:" + (q === quantum ? "#E2574C" : "#20456A");
+      bar.title = "utilisation " + (rr2.utilisation * 100).toFixed(1) + "%";
+      const pct = document.createElement("div");
+      pct.style.cssText = "font-size:9.5px;color:#54677A;margin-bottom:2px";
+      pct.textContent = Math.round(rr2.utilisation * 100) + "%";
+      const lab = document.createElement("div");
+      lab.style.cssText = "font-size:10px;margin-top:4px;color:" + (q === quantum ? "#B8362C" : "#7D8EA0") +
+                          ";font-weight:" + (q === quantum ? "700" : "400");
+      lab.textContent = q;
+      col.append(dot, pct, bar, lab);
+      wrap.appendChild(col);
+    });
+    host.appendChild(wrap);
+    const cap = document.createElement("p");
+    cap.style.cssText = "margin:6px 0 0;font-size:11.5px;color:#7D8EA0;text-align:center";
+    cap.textContent = "quantum — bars are CPU utilisation, dots are average response time";
+    host.appendChild(cap);
+
+    setTile("qt-util", (r.utilisation * 100).toFixed(1) + "%");
+    setTile("qt-sw", commas(r.switches));
+    setTile("qt-lost", commas(r.total - r.busy) + " units");
+    setTile("qt-resp", r.avgResponse.toFixed(1));
+    setTile("qt-turn", r.avgTurnaround.toFixed(1));
+    setTile("qt-total", commas(r.total));
+
+    const formula = cost === 0 ? 1 : quantum / (quantum + cost);
+    let msg;
+    if (cost === 0){
+      msg = "Switching is free, so utilisation is <b>100% at every quantum</b> and only response and turnaround " +
+            "move. That is the control case: any utilisation loss you see with a non-zero cost is genuinely the " +
+            "switch, not an artefact of the model.";
+    } else {
+      msg = "Quantum " + quantum + " with a switch costing " + cost + ": <b>" + commas(r.switches) +
+            " switches</b> burn " + commas(r.total - r.busy) + " units, leaving <b>" +
+            (r.utilisation * 100).toFixed(1) + "%</b> utilisation. The textbook approximation q/(q+c) predicts " +
+            (formula * 100).toFixed(1) + "% — close, and always slightly low, because there is no switch before " +
+            "the first slice. Average response is " + r.avgResponse.toFixed(1) + "; at the largest quantum it is " +
+            sweep[sweep.length - 1].r.avgResponse.toFixed(1) + ", which is the whole trade in one pair of numbers.";
+    }
+    document.getElementById("qt-out").innerHTML = msg;
+  }
+
+  ["qt-n","qt-b","qt-c","qt-q"].forEach(id => document.getElementById(id).addEventListener("input", draw));
+  draw();
+})();
+
+initChapter("ch07-scheduling-and-interrupts.html");
+</script>
+</body>
+</html>

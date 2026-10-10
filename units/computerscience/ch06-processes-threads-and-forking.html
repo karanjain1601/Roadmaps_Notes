@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6. Processes, threads and forking — Computer Science</title>
+<meta name="description" content="Address spaces, the process control block, fork and exec, copy-on-write, what threads share, zombies and orphans, and the cost of each.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span class="sep">/</span> <a href="index.html">Computer Science</a> <span class="sep">/</span> Chapter 6</p>
+    <p class="chapter">Chapter 6 <span class="part">· The operating system</span></p>
+    <h1>Processes, threads and forking</h1>
+    <p class="lede">A program is a file. A process is that file plus an address space, a set of open handles, and permission to run. The operating system's central trick is convincing every process that it owns the whole machine, and <code>fork</code> is the strangest expression of it: a system call that returns twice.</p>
+    <div class="meta">
+      <span><b>8</b> sections</span>
+      <span><b>2</b> demos</span>
+      <span><b>7</b> self-check questions</span>
+      <span>Roughly <b>35</b> minutes</span>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page">
+    <h2>On this page</h2>
+    <div data-sections></div>
+    <h2>Nearby chapters</h2>
+    <div data-nearby></div>
+  </nav>
+
+  <main>
+
+    <!-- ==================================================== -->
+    <section id="s-what">
+      <h2>What a process actually is</h2>
+      <div class="h2rule"></div>
+
+      <p class="big">A process is an address space plus a thread of execution plus the kernel's bookkeeping about both. Take away any one of the three and you have something else: a file, a thread, or a zombie.</p>
+
+      <p>The address space is the part people underestimate. Every process sees memory starting at address zero and running to the top of the virtual range, and every process sees a <em>different</em> physical machine behind those identical addresses. Two processes can both hold a pointer to <code>0x7fff0000</code> and be looking at completely unrelated bytes. Chapter 9 covers the page tables that make this work; what matters here is the consequence: a process cannot corrupt another process's memory even if it tries, because it has no way to name it.</p>
+
+      <div class="tw">
+        <table>
+          <caption>The regions of a typical process address space, low addresses first</caption>
+          <thead><tr><th>Region</th><th>Contents</th><th>Grows</th><th>Permissions</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Text</strong></td><td>Machine code</td><td>Fixed</td><td>Read + execute, shared between processes running the same binary</td></tr>
+            <tr><td><strong>Data</strong></td><td>Initialised globals</td><td>Fixed</td><td>Read + write</td></tr>
+            <tr><td><strong>BSS</strong></td><td>Zero-initialised globals</td><td>Fixed</td><td>Read + write, occupies no space in the file</td></tr>
+            <tr><td><strong>Heap</strong></td><td><code>malloc</code>, <code>new</code>, dynamic allocation</td><td>Upward</td><td>Read + write</td></tr>
+            <tr><td><strong>Memory maps</strong></td><td>Shared libraries, mapped files, large allocations</td><td>Both</td><td>Varies per mapping</td></tr>
+            <tr><td><strong>Stack</strong></td><td>Call frames, locals, return addresses</td><td>Downward</td><td>Read + write, one per thread</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>The process control block</h3>
+
+      <p>Everything the kernel knows about a process lives in one structure, called the process control block or, on Linux, <code>task_struct</code>. It holds the process ID and parent ID, the saved register state for when the process is not running, a pointer to the page tables, the file descriptor table, the current working directory, the user and group IDs, signal handlers and the signal mask, resource limits and accounting, and the exit status. Creating a process means allocating one of these and filling it in; a context switch means saving into one and restoring from another.</p>
+
+      <div class="note key">
+        <b class="tag">Program versus process versus thread</b>
+        <p>A <strong>program</strong> is a passive file on disk. A <strong>process</strong> is a running instance of one, with its own address space. A <strong>thread</strong> is one flow of execution inside a process; a process has at least one and may have thousands, all sharing that address space. Running the same program twice gives you two processes with no shared memory. Starting two threads gives you one process with everything shared except the stacks.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-fork">
+      <h2>fork, exec and the call that returns twice</h2>
+      <div class="h2rule"></div>
+
+      <p>Unix does not have a "create a process running this program" call. It has two calls that compose: <code>fork</code> duplicates the current process, and <code>exec</code> replaces the current process's image with a different program. Everything from a shell running a command to a web server spawning workers is those two, in that order.</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">the shape of every process creation on Unix</span><button class="code-copy">Copy</button></div>
+<pre>pid_t pid = fork();
+
+<span class="k">if</span> (pid &lt; 0) {
+    <span class="c">// fork failed — out of memory or process limit reached</span>
+} <span class="k">else if</span> (pid == 0) {
+    <span class="c">// we are the CHILD. fork() returned 0 here.</span>
+    execvp(<span class="s">"ls"</span>, args);      <span class="c">// never returns if it succeeds</span>
+    _exit(127);                <span class="c">// only reached if exec failed</span>
+} <span class="k">else</span> {
+    <span class="c">// we are the PARENT. fork() returned the child's pid.</span>
+    <span class="k">int</span> status;
+    waitpid(pid, &amp;status, 0);  <span class="c">// reap the child, collect its exit code</span>
+}</pre>
+      </div>
+
+      <p>One call, two returns, in two different processes. The child is a near-exact duplicate: same code, same variables with the same values, same open file descriptors, same program counter pointing at the instruction after <code>fork</code>. The only observable differences are the return value, the process ID, the parent ID, and a few counters that are reset.</p>
+
+      <h3>What the child inherits, and what it does not</h3>
+
+      <div class="cols">
+        <div>
+          <h4>Copied or shared</h4>
+          <p>The entire address space (copy-on-write), all open file descriptors <em>including their shared file offsets</em>, the current working directory, environment variables, user and group IDs, signal dispositions, resource limits.</p>
+        </div>
+        <div>
+          <h4>Reset or not inherited</h4>
+          <p>A new process ID and parent ID. Pending signals are cleared. File locks are not inherited. CPU time counters restart at zero. And critically, <strong>only the calling thread exists in the child</strong> — every other thread is gone.</p>
+        </div>
+      </div>
+
+      <!-- ------------- DEMO 1 ------------- -->
+      <div class="demo" id="demo-fork">
+        <div class="demo-top">
+          <h3>Demo 1 — how many processes, how many lines?</h3>
+          <p>A real simulator: every process runs the same instruction list from its own program counter, and <code>fork</code> duplicates the process state including its unflushed output buffer. Step through it or run it and read the tree.</p>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label style="flex:1 1 320px">Program
+              <select id="fk-prog">
+                <option value="three">fork(); fork(); fork(); printf("hi");</option>
+                <option value="two">fork(); fork();</option>
+                <option value="guard">fork(); if (child) fork();</option>
+                <option value="buffered">printf("hi"); fork(); fork();</option>
+                <option value="flushed">printf("hi"); fflush(stdout); fork(); fork();</option>
+                <option value="exec">printf("hi"); fork(); if (child) exec();</option>
+              </select>
+            </label>
+            <button class="btn go" id="fk-run">Run</button>
+            <button class="btn ghost" id="fk-reset">Reset</button>
+          </div>
+
+          <div class="stage">
+            <p style="margin:0 0 8px;font-size:12.5px;color:#54677A">Source, as every process sees it</p>
+            <div id="fk-src" style="font-family:var(--mono);font-size:12.5px;line-height:1.8"></div>
+          </div>
+
+          <div class="stage">
+            <p style="margin:0 0 8px;font-size:12.5px;color:#54677A">Process tree</p>
+            <div id="fk-tree" style="font-family:var(--mono);font-size:12.5px;line-height:1.7"></div>
+          </div>
+
+          <div class="rgrid">
+            <div class="tile"><span class="k">Processes created</span><span class="v" id="fk-n">1</span></div>
+            <div class="tile"><span class="k">fork() calls executed</span><span class="v" id="fk-calls">0</span></div>
+            <div class="tile"><span class="k">Lines on stdout</span><span class="v" id="fk-lines">0</span></div>
+            <div class="tile"><span class="k">printf statements in source</span><span class="v" id="fk-src-prints">0</span></div>
+          </div>
+
+          <p class="readout" id="fk-out"></p>
+        </div>
+      </div>
+
+      <p>The three-fork program creates <strong>8 processes</strong> and prints <strong>8 lines</strong> from a single <code>printf</code> in the source, because each fork doubles the population and all eight survivors reach the print. Every extra fork doubles it again; <em>n</em> sequential forks give 2<sup><em>n</em></sup> processes.</p>
+
+      <div class="note trap">
+        <b class="tag">The buffered printf trap</b>
+        <p>Compare the <code>buffered</code> and <code>flushed</code> programs. Both create four processes. The buffered one prints <strong>four lines from one printf that ran before any fork existed</strong>, because C's stdio buffer is part of the process's memory and gets duplicated along with everything else; each child later flushes its inherited copy at exit. Calling <code>fflush</code> first, or writing to a terminal where stdio is line-buffered, prints once. This is a real and frequently reported bug: output that appears once when run interactively and several times when piped to a file, because piping switches stdio from line buffering to full buffering.</p>
+      </div>
+
+      <p>The <code>exec</code> program shows the other half of the story. The child inherits the buffer, then <code>exec</code> replaces the entire process image and the buffer goes with it, so the duplicate never appears. That is one reason the fork-then-exec pattern rarely exhibits the bug, and why <code>posix_spawn</code> and <code>vfork</code> exist as shortcuts for the common case where you were going to exec immediately anyway.</p>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-cow">
+      <h2>Copy-on-write</h2>
+      <div class="h2rule"></div>
+
+      <p>Duplicating a process that is using four gigabytes ought to cost four gigabytes and a long pause. It does not, and the reason is that <code>fork</code> does not copy any of it.</p>
+
+      <p>Instead the kernel copies the page tables — which are small — and marks every writable page <strong>read-only in both processes</strong>, recording that the underlying physical frame now has two users. Both processes then run against the same physical memory. The moment either one writes to a page, the hardware raises a protection fault, the kernel notices the page is marked copy-on-write, allocates a fresh frame, copies 4 KiB into it, points the writer's page table at the copy, marks both writable again, and resumes the instruction. Neither process can tell any of this happened.</p>
+
+      <!-- ------------- DEMO 2 ------------- -->
+      <div class="demo" id="demo-cow">
+        <div class="demo-top">
+          <h3>Demo 2 — copy-on-write, page by page</h3>
+          <p>A parent with 64 pages of memory. Fork it, then click pages to write to them from either side and watch physical memory diverge from virtual. Frame accounting is exact, not illustrative.</p>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <button class="btn go" id="cw-fork">fork()</button>
+            <label>Write as
+              <span class="seg" id="cw-who">
+                <button type="button" data-w="parent" aria-pressed="true">parent</button>
+                <button type="button" data-w="child" aria-pressed="false">child</button>
+              </span>
+            </label>
+            <button class="btn ghost" id="cw-rand">Write 8 random pages</button>
+            <button class="btn ghost" id="cw-all">Write every page</button>
+            <button class="btn ghost" id="cw-reset">Reset</button>
+          </div>
+
+          <div class="legend">
+            <span><i style="background:#E4F0F8;border-color:#B9D8EA"></i>private to one process</span>
+            <span><i style="background:#FDEEEC;border-color:#F4C6C1"></i>shared, copy-on-write</span>
+            <span><i style="background:#E2574C"></i>just copied</span>
+          </div>
+
+          <div class="stage">
+            <p style="margin:0 0 6px;font-size:12.5px;color:#54677A" id="cw-plab">Parent pages — click one to write to it</p>
+            <div class="grid-cells" id="cw-parent" style="grid-template-columns:repeat(16,1fr)"></div>
+            <div id="cw-childwrap" hidden>
+              <p style="margin:12px 0 6px;font-size:12.5px;color:#54677A">Child pages</p>
+              <div class="grid-cells" id="cw-child" style="grid-template-columns:repeat(16,1fr)"></div>
+            </div>
+          </div>
+
+          <div class="rgrid">
+            <div class="tile"><span class="k">Virtual pages claimed</span><span class="v" id="cw-virt">64</span></div>
+            <div class="tile"><span class="k">Physical frames used</span><span class="v" id="cw-phys">64</span></div>
+            <div class="tile"><span class="k">Shared frames</span><span class="v" id="cw-shared">0</span></div>
+            <div class="tile"><span class="k">Copies performed</span><span class="v" id="cw-copies">0</span></div>
+            <div class="tile"><span class="k">Real memory</span><span class="v sm" id="cw-real">256 KiB</span></div>
+            <div class="tile"><span class="k">Saved by COW</span><span class="v sm" id="cw-saved">—</span></div>
+          </div>
+
+          <p class="readout" id="cw-out"></p>
+        </div>
+      </div>
+
+      <p>Immediately after the fork, virtual pages double to 128 while physical frames stay at 64. Write eight pages and physical rises to 72, not 128. Only if <em>both</em> sides eventually write every page does copy-on-write degenerate into a full copy, and by then the cost has at least been spread out instead of paid up front in one stall.</p>
+
+      <div class="note warn">
+        <b class="tag">Why your monitoring tool is confused</b>
+        <p>This is exactly why the memory numbers in <code>ps</code> and <code>top</code> mislead. <strong>VSZ</strong> counts virtual pages and can be enormous and meaningless. <strong>RSS</strong> counts resident frames but charges every shared frame in full to every process, so summing RSS across a fork-heavy server double-counts badly. <strong>PSS</strong> divides each shared frame equally among its users and is the number that actually adds up. A pre-fork web server with a 500 MiB parent and 16 workers can show 8.5 GiB of total RSS while using well under 1 GiB.</p>
+      </div>
+
+      <div class="note trap">
+        <b class="tag">Garbage collectors defeat copy-on-write</b>
+        <p>A tracing garbage collector walks the whole heap and often writes mark bits into object headers, which touches nearly every page and forces nearly every page to be copied. Pre-fork servers in Ruby and Python spent years fighting this. The fixes were to move mark bits out of objects into a separate bitmap, and to run a full collection and compaction <em>before</em> forking so the shared pages are as settled as possible.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-threads">
+      <h2>Threads: everything shared but the stack</h2>
+      <div class="h2rule"></div>
+
+      <p>A thread is a second program counter and stack inside an existing address space. Creating one is far cheaper than creating a process, because nothing has to be duplicated.</p>
+
+      <div class="tw">
+        <table>
+          <caption>What is shared between threads of one process, and what each thread owns</caption>
+          <thead><tr><th>Shared by all threads</th><th>Private to each thread</th></tr></thead>
+          <tbody>
+            <tr><td>The address space: code, globals, heap</td><td>Stack, and therefore all local variables</td></tr>
+            <tr><td>The file descriptor table</td><td>Registers and program counter</td></tr>
+            <tr><td>Signal handlers (the dispositions)</td><td>Signal mask (which signals are blocked)</td></tr>
+            <tr><td>Current working directory</td><td>Thread-local storage</td></tr>
+            <tr><td>User and group IDs</td><td><code>errno</code></td></tr>
+            <tr><td>Resource limits and accounting</td><td>Scheduling priority and affinity</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The left column is the reason threads are fast and the reason they are dangerous. Passing a pointer between threads costs nothing because both can dereference it. Two threads writing the same variable is a data race, and chapter 8 is entirely about controlling that.</p>
+
+      <div class="note key">
+        <b class="tag">errno has to be per-thread</b>
+        <p>The C library reports errors through a global called <code>errno</code>. If it were genuinely global, thread A could fail a system call and thread B could overwrite the code before A read it. Modern C libraries define <code>errno</code> as a macro that expands to a thread-local lookup, which is why you can no longer write <code>extern int errno;</code>. It is a small example of a general pattern: any interface with hidden global state has to be redesigned or made thread-local before it can be used concurrently. The same applies to <code>strtok</code>, <code>gmtime</code> and the whole family of functions with <code>_r</code> reentrant variants.</p>
+      </div>
+
+      <h3>User threads, kernel threads and the models</h3>
+
+      <dl class="terms">
+        <dt>1:1 — one kernel thread per user thread</dt>
+        <dd>What Linux (NPTL), Windows and macOS do. The kernel schedules each thread directly, so a blocking call blocks only that thread and threads can run on different cores. The cost is that each thread needs kernel resources and a full stack reservation, typically 8 MiB of virtual address space even though only a few kilobytes are resident.</dd>
+
+        <dt>N:1 — many user threads on one kernel thread</dt>
+        <dd>Green threads, scheduled entirely in userspace. Switching is very cheap, but one blocking system call stalls all of them and they cannot use more than one core. Early Java and Ruby did this.</dd>
+
+        <dt>M:N — many user threads multiplexed onto a pool of kernel threads</dt>
+        <dd>Go's goroutines, Erlang's processes, Rust's async tasks on a work-stealing runtime. You get cheap creation and cheap switching plus real parallelism, at the cost of a runtime that has to intercept blocking operations and reschedule around them. A goroutine starts with about 2 KiB of stack that grows on demand, which is why a Go program can hold a million of them.</dd>
+      </dl>
+
+      <div class="tw">
+        <table>
+          <caption>Rough costs. Vary by kernel, hardware and load; the ratios are the point.</caption>
+          <thead><tr><th>Operation</th><th>Order of magnitude</th></tr></thead>
+          <tbody>
+            <tr><td>Function call</td><td class="num">~1 ns</td></tr>
+            <tr><td>Uncontended mutex lock and unlock</td><td class="num">~20 ns</td></tr>
+            <tr><td>Thread context switch</td><td class="num">~1–2 µs</td></tr>
+            <tr><td>Process context switch (page tables change)</td><td class="num">~2–5 µs, plus cache and TLB damage</td></tr>
+            <tr><td>Creating a thread</td><td class="num">~10–30 µs</td></tr>
+            <tr><td>fork of a small process</td><td class="num">~50–500 µs</td></tr>
+            <tr><td>Creating a goroutine</td><td class="num">~0.2 µs</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The indirect cost of a switch usually exceeds the direct one. Whichever thread runs next arrives to find the caches full of somebody else's data, so it takes hundreds of misses before it is back at full speed. That is why thread pools sized near the core count generally beat thread-per-request, and why a server with ten thousand threads can spend most of its time switching.</p>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-lifecycle">
+      <h2>Lifecycle, zombies and orphans</h2>
+      <div class="h2rule"></div>
+
+      <p>A process moves between a small number of states, and the transitions are worth naming because monitoring tools report them directly.</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">the state machine, with the ps codes</span><button class="code-copy">Copy</button></div>
+<pre>                 admitted            dispatched
+    [ new ] ───────────────&gt; [ ready ] ─────────────&gt; [ running ]
+                                ^   ^                   │  │  │
+                   timeslice up │   │ event done        │  │  │ exit
+                                └───┼───────────────────┘  │  │
+                                    │                      │  ▼
+                          [ blocked ] &lt;────────────────────┘ [ terminated ]
+                             D or S                            Z until reaped
+                                        waiting for I/O,
+                                        a lock, or a signal
+
+  ps codes:  R running or ready   S interruptible sleep   D uninterruptible sleep
+             T stopped            Z zombie</pre>
+      </div>
+
+      <p>Two of these deserve attention.</p>
+
+      <dl class="terms">
+        <dt>Zombie (Z)</dt>
+        <dd>The process has exited but its parent has not called <code>wait</code>. The address space is gone; all that remains is the entry holding the exit status, because the parent may still want it. Zombies use almost no memory but they consume PID table entries, and a parent that never reaps in a loop will exhaust the table. The fix is to call <code>waitpid</code>, or to set <code>SIGCHLD</code> to <code>SIG_IGN</code> so the kernel reaps automatically.</dd>
+
+        <dt>Orphan</dt>
+        <dd>The parent exited first. The child is re-parented to <code>init</code> (PID 1) or to the nearest subreaper, which reaps it when it finishes. Orphans are harmless; this is also the mechanism daemons historically used to detach, by forking and letting the parent exit.</dd>
+
+        <dt>Uninterruptible sleep (D)</dt>
+        <dd>Blocked in the kernel in a way that cannot be interrupted, usually waiting on hardware. A process stuck in D state cannot be killed even with <code>SIGKILL</code>, because signals are delivered on the way back to userspace and it never gets there. A pile of D-state processes almost always means storage or a network filesystem is not responding.</dd>
+      </dl>
+
+      <div class="note warn">
+        <b class="tag">PID 1 in a container</b>
+        <p>Inside a container your application is often PID 1, which inherits init's responsibility for reaping orphans — and most applications do not do it. Zombies accumulate. PID 1 also has special signal semantics: default signal handlers are not installed, so a <code>SIGTERM</code> from <code>docker stop</code> may be ignored entirely and the container gets killed ten seconds later instead of shutting down cleanly. The standard fixes are <code>docker run --init</code>, a small init such as <code>tini</code> or <code>dumb-init</code>, or handling <code>SIGTERM</code> and reaping children yourself.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-choose">
+      <h2>Choosing between them</h2>
+      <div class="h2rule"></div>
+
+      <div class="tw">
+        <table>
+          <caption>Processes and threads, compared on the dimensions that decide it</caption>
+          <thead><tr><th></th><th>Separate processes</th><th>Threads in one process</th></tr></thead>
+          <tbody>
+            <tr><td>Memory</td><td>Isolated; sharing needs explicit shared memory or IPC</td><td>Everything shared by default</td></tr>
+            <tr><td>A crash</td><td>Kills one worker; the rest continue</td><td>Takes down the whole process</td></tr>
+            <tr><td>Communication</td><td>Pipes, sockets, shared memory — serialisation and copies</td><td>A pointer</td></tr>
+            <tr><td>Creation cost</td><td>Tens to hundreds of microseconds</td><td>Tens of microseconds, or under one for green threads</td></tr>
+            <tr><td>Debugging</td><td>Straightforward; failures are localised</td><td>Data races, deadlocks, heisenbugs</td></tr>
+            <tr><td>Security</td><td>Can drop privileges and sandbox per process</td><td>All threads share one privilege set</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The design most modern systems land on uses both: a small number of processes for isolation and fault containment, and threads or green threads inside each for concurrency. Chrome runs each site in its own process precisely so a renderer bug cannot read another site's memory; PostgreSQL uses one process per connection for robustness; nginx runs one worker process per core and handles thousands of connections in each with an event loop rather than threads.</p>
+
+      <div class="note trap">
+        <b class="tag">fork in a multithreaded program is close to unusable</b>
+        <p>Only the calling thread survives into the child. Any lock held by another thread at the moment of the fork stays locked forever in the child, because the thread that would have released it does not exist. If that lock happens to be the allocator's — and it very often is, since every thread calls <code>malloc</code> — the child deadlocks the first time it allocates, which may be inside a library function you did not know allocates. POSIX's rule is that between <code>fork</code> and <code>exec</code> in a multithreaded process you may only call async-signal-safe functions, a list that excludes <code>malloc</code>, <code>printf</code> and almost everything else. Use <code>posix_spawn</code>, or fork before you start any threads.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-check">
+      <h2>Check yourself</h2>
+      <div class="h2rule"></div>
+
+      <div class="check">
+        <details>
+          <summary>How many processes does <code>fork(); fork(); fork();</code> create, and how many exist afterwards?</summary>
+          <div class="ans">
+            <p>Each fork doubles the population, so after three you have 2³ = <strong>8 processes</strong> in total, of which 7 were created and one is the original. A single <code>printf</code> after them prints eight lines. The general rule is 2<sup><em>n</em></sup> for <em>n</em> unconditional sequential forks; guarding a fork with <code>if (pid == 0)</code> so only the child forks again gives you <em>n</em> + 1 instead, which the demo's third preset shows landing at 3.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>A program prints one line when run in a terminal and four lines when its output is redirected to a file. Explain.</summary>
+          <div class="ans">
+            <p>The <code>printf</code> happens before two forks and the output is still sitting in the stdio buffer. When stdout is a terminal, stdio is line-buffered, so the newline flushes it immediately and only one copy is ever written. When stdout is a file or pipe, stdio switches to full buffering, the text stays in the process's memory, <code>fork</code> duplicates that memory along with everything else, and each of the four processes flushes its own inherited copy at exit. The fix is <code>fflush(stdout)</code> before forking, or writing with <code>write()</code>, which is unbuffered.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Why does forking a process using 4 GiB not take 4 GiB or a long time?</summary>
+          <div class="ans">
+            <p>Copy-on-write. The kernel duplicates the page tables, which are a few megabytes at most, marks every writable page read-only in both processes, and records that each physical frame now has two users. No data is copied. A frame is only duplicated when one side writes to it, at which point a protection fault triggers a 4 KiB copy. If the child immediately calls <code>exec</code>, essentially nothing is ever copied, which is why the fork-then-exec pattern is cheap despite looking wasteful.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Summing RSS across a pre-fork server's workers gives a number larger than the machine's memory. What is wrong?</summary>
+          <div class="ans">
+            <p>RSS charges every resident frame in full to every process that maps it, so a copy-on-write frame shared by 17 processes is counted 17 times. Summing RSS across related processes therefore double-counts all the shared text, libraries and un-written heap. Use PSS, which splits each shared frame equally among its users and does sum correctly, or read <code>smaps_rollup</code>. VSZ is worse still — it counts address space that may never have been touched.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Two threads both call a function with a local variable and a global counter. Which is safe?</summary>
+          <div class="ans">
+            <p>The local is safe: locals live on the stack and each thread has its own, so the two calls cannot see each other's copy. The global is not: it lives in the shared data segment, both threads have the same address for it, and an increment is a read-modify-write that can interleave. Note the boundary is <em>storage location</em>, not syntax — a local <code>static</code> variable, or a local whose address has been handed to another thread, is just as shared as a global.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Your service leaks PIDs until the machine cannot start new processes, but memory usage is flat. What is happening?</summary>
+          <div class="ans">
+            <p>Zombie processes. Children have exited but the parent never calls <code>wait</code> or <code>waitpid</code>, so the kernel keeps an entry per child holding the exit status. Zombies hold almost no memory, which is why the memory graph looks fine, but each one occupies a PID and the table is finite. Fix it by reaping — call <code>waitpid(-1, &amp;st, WNOHANG)</code> in a loop from a <code>SIGCHLD</code> handler, or set <code>SIGCHLD</code> to <code>SIG_IGN</code> and let the kernel do it. In a container, also check whether your app is PID 1 and therefore responsible for reaping orphans it never created.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Why is calling <code>fork</code> from a multithreaded program considered dangerous?</summary>
+          <div class="ans">
+            <p>Because only the calling thread exists in the child, but the entire memory image is copied — including any lock that another thread was holding at that instant. That lock will never be released, since its owner does not exist in the child. The allocator's lock is the usual victim, so the child hangs the first time anything calls <code>malloc</code>, which may be deep inside a library. POSIX restricts the child to async-signal-safe functions between <code>fork</code> and <code>exec</code>, a list that excludes almost everything useful. Prefer <code>posix_spawn</code>, or do all your forking before any threads are started.</p>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-recap">
+      <div class="recap">
+        <h2>Ten things to carry forward</h2>
+        <ol>
+          <li><b>A process is an address space plus execution state plus kernel bookkeeping.</b> Isolation is a property of the address space, not of good behaviour.</li>
+          <li><b>Every process sees the same virtual addresses</b> and different physical memory behind them, which is why one cannot name another's data.</li>
+          <li><b>fork returns twice:</b> zero in the child, the child's PID in the parent, and −1 on failure. exec replaces the image and does not return.</li>
+          <li><b><em>n</em> sequential forks make 2<sup><em>n</em></sup> processes.</b> Guard the recursive one and it becomes <em>n</em> + 1.</li>
+          <li><b>The stdio buffer is memory, so fork duplicates it.</b> One printf can produce many lines when output is redirected.</li>
+          <li><b>Copy-on-write makes fork cheap</b> by sharing frames read-only and copying a page only when someone writes to it.</li>
+          <li><b>RSS double-counts shared frames; PSS does not.</b> Memory numbers across related processes need the right metric.</li>
+          <li><b>Threads share everything but the stack, registers, TLS, errno and the signal mask.</b> That is both the speed and the danger.</li>
+          <li><b>A context switch costs more indirectly than directly,</b> because the new thread arrives to cold caches.</li>
+          <li><b>Zombies hold PIDs, not memory,</b> and orphans are re-parented to init. In a container your app is often PID 1 and inherits that duty.</li>
+        </ol>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<footer>
+  <div class="foot-inner">
+    <div class="fi-grid">
+      <div class="fi">
+        <h3>What comes next</h3>
+        <p>Chapter 7 is the other half of the story: given more runnable threads than cores, which one runs? Round robin, priorities and Linux's CFS, plus what actually happens on a timer interrupt, a system call and a page fault.</p>
+      </div>
+      <div class="fi">
+        <h3>If you want to go deeper</h3>
+        <p><em>Operating Systems: Three Easy Pieces</em> by Remzi and Andrea Arpaci-Dusseau is free online and its virtualisation section covers this chapter and the next three better than anything else at this level. For the practical side, read <code>/proc/&lt;pid&gt;/status</code> and <code>smaps_rollup</code> on a running server.</p>
+      </div>
+      <div class="fi">
+        <h3>Connections</h3>
+        <p>Chapter 5 explains why a context switch hurts. Chapter 8 covers the locks threads need. Chapter 9 covers the page tables copy-on-write manipulates.</p>
+      </div>
+    </div>
+    <div class="pager" data-pager></div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">&uarr;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* =============================================================
+   Demo 1 — fork simulator
+   ============================================================= */
+(function(){
+  const F = () => ({k:"fork", src:"fork();"});
+  const P = t => ({k:"print", text:t, src:'printf("' + t + '\\n");'});
+  const FL = () => ({k:"flush", src:"fflush(stdout);"});
+  const IFC = j => ({k:"ifchild", jump:j, src:"if (pid == 0) {"});
+  const END = () => ({k:"nop", src:"}"});
+  const EX = () => ({k:"exec", src:"  execvp(...);"});
+  const EXIT = () => ({k:"exit", src:"exit(0);"});
+
+  const PROGRAMS = {
+    three:    [F(), F(), F(), P("hi")],
+    two:      [F(), F()],
+    guard:    [F(), IFC(4), F(), END(), P("hi")],
+    buffered: [P("hi"), F(), F()],
+    flushed:  [P("hi"), FL(), F(), F()],
+    exec:     [P("hi"), F(), IFC(5), EX(), END(), EXIT()]
+  };
+
+  function simulate(ops){
+    let nextPid = 1000;
+    const root = {pid:nextPid++, ppid:0, pc:0, alive:true, children:[], out:[],
+                  buffer:[], isChild:false, execd:false, depth:0};
+    const all = [root], queue = [root];
+    let forkCalls = 0;
+
+    while (queue.length){
+      const p = queue.shift();
+      while (p.pc < ops.length && p.alive){
+        const op = ops[p.pc++];
+        if (op.k === "fork"){
+          forkCalls++;
+          const child = {pid:nextPid++, ppid:p.pid, pc:p.pc, alive:true, children:[], out:[],
+                         buffer:p.buffer.slice(), isChild:true, execd:false, depth:p.depth + 1};
+          p.children.push(child);
+          all.push(child);
+          queue.push(child);
+        } else if (op.k === "print"){
+          p.buffer.push(op.text);
+        } else if (op.k === "flush"){
+          p.out.push(...p.buffer); p.buffer = [];
+        } else if (op.k === "ifchild"){
+          if (!p.isChild) p.pc = op.jump;
+        } else if (op.k === "exec"){
+          p.execd = true; p.buffer = [];
+        } else if (op.k === "exit"){
+          p.alive = false;
+        }
+      }
+      if (!p.execd){ p.out.push(...p.buffer); }
+      p.buffer = [];
+      p.alive = false;
+    }
+    return {all, root, forkCalls, lines:all.reduce((n, p) => n + p.out.length, 0)};
+  }
+
+  function render(key, result){
+    const ops = PROGRAMS[key];
+    const src = document.getElementById("fk-src");
+    src.innerHTML = "";
+    ops.forEach((op, i) => {
+      const d = document.createElement("div");
+      d.innerHTML = "<span style='color:#7D8EA0'>" + String(i + 1).padStart(2, "0") + "</span>  " +
+                    (op.k === "nop" ? "<span style='color:#7D8EA0'>" + op.src + "</span>" : op.src);
+      src.appendChild(d);
+    });
+    setTile("fk-src-prints", ops.filter(o => o.k === "print").length);
+
+    const tree = document.getElementById("fk-tree");
+    tree.innerHTML = "";
+    if (!result){
+      tree.innerHTML = "<span style='color:#7D8EA0'>Press Run.</span>";
+      setTile("fk-n", 1); setTile("fk-calls", 0); setTile("fk-lines", 0);
+      document.getElementById("fk-out").innerHTML =
+        "The simulator gives every process its own program counter and its own copy of the stdio buffer, " +
+        "exactly as a real fork does. Press <b>Run</b>.";
+      return;
+    }
+
+    (function walk(p, prefix, last){
+      const d = document.createElement("div");
+      const printed = p.out.length ? "  <span style='color:#166B47'>printed " + p.out.length +
+                                     " line" + (p.out.length > 1 ? "s" : "") + "</span>" : "";
+      const tag = p.execd ? "  <span style='color:#8A5A00'>exec'd</span>" : "";
+      d.innerHTML = "<span style='color:#7D8EA0'>" + prefix + (p.ppid === 0 ? "" : (last ? "└─ " : "├─ ")) +
+                    "</span>pid " + p.pid +
+                    (p.ppid ? " <span style='color:#7D8EA0'>(child of " + p.ppid + ")</span>" : " <span style='color:#7D8EA0'>(original)</span>") +
+                    printed + tag;
+      tree.appendChild(d);
+      p.children.forEach((c, i) =>
+        walk(c, prefix + (p.ppid === 0 ? "" : (last ? "   " : "│  ")), i === p.children.length - 1));
+    })(result.root, "", true);
+
+    setTile("fk-n", result.all.length);
+    setTile("fk-calls", result.forkCalls);
+    setTile("fk-lines", result.lines);
+
+    const prints = ops.filter(o => o.k === "print").length;
+    let msg;
+    if (key === "buffered"){
+      msg = "One <code>printf</code> in the source, <b>" + result.lines + " lines on stdout</b>. The text never left " +
+            "the process — it sat in the stdio buffer, which is ordinary memory, so each fork duplicated it. " +
+            "All four processes flush their inherited copy at exit.";
+    } else if (key === "flushed"){
+      msg = "Identical to the previous program except for one <code>fflush</code>, and now the same " + result.all.length +
+            " processes print <b>" + result.lines + " line</b>. Flushing empties the buffer before fork can copy it.";
+    } else if (key === "exec"){
+      msg = "The child inherits the buffered text, then <code>exec</code> replaces its entire image and the buffer goes " +
+            "with it. Only the parent's copy survives: <b>" + result.lines + " line</b> from " + result.all.length +
+            " processes. This is why fork-then-exec rarely shows the duplicate-output bug.";
+    } else if (key === "guard"){
+      msg = "Only the child forks the second time, so instead of doubling twice you get <b>" + result.all.length +
+            " processes</b> in a chain rather than a balanced tree. Guarding a fork is how you build a pipeline " +
+            "rather than an explosion.";
+    } else {
+      msg = "<b>" + result.forkCalls + " fork calls executed</b> across the run, producing <b>" + result.all.length +
+            " processes</b> — every fork doubles the population, so " + (Math.log2(result.all.length)) +
+            " sequential forks give 2<sup>" + Math.log2(result.all.length) + "</sup>. " +
+            (prints ? "The single printf in the source therefore produces " + result.lines + " lines." : "");
+    }
+    document.getElementById("fk-out").innerHTML = msg;
+  }
+
+  let current = "three", result = null;
+  document.getElementById("fk-prog").addEventListener("change", e => {
+    current = e.target.value; result = null; render(current, null);
+  });
+  document.getElementById("fk-run").addEventListener("click", () => {
+    result = simulate(PROGRAMS[current]); render(current, result);
+  });
+  document.getElementById("fk-reset").addEventListener("click", () => { result = null; render(current, null); });
+  render(current, null);
+})();
+
+/* =============================================================
+   Demo 2 — copy-on-write
+   ============================================================= */
+(function(){
+  const PAGES = 64, PAGE_BYTES = 4096;
+  let space, forked, who = "parent", copies = 0, lastTouched = null;
+
+  function reset(){
+    space = {
+      frames: Array.from({length:PAGES}, (_, i) => ({id:i, owners:new Set(["parent"])})),
+      map: {parent: Array.from({length:PAGES}, (_, i) => i)},
+      next: PAGES
+    };
+    forked = false; copies = 0; lastTouched = null;
+    document.getElementById("cw-childwrap").hidden = true;
+    document.getElementById("cw-fork").disabled = false;
+    draw();
+  }
+
+  function doFork(){
+    space.map.child = space.map.parent.slice();
+    space.map.child.forEach(f => space.frames[f].owners.add("child"));
+    forked = true;
+    document.getElementById("cw-childwrap").hidden = false;
+    document.getElementById("cw-fork").disabled = true;
+    lastTouched = null;
+    draw();
+  }
+
+  function writePage(owner, page){
+    if (!space.map[owner]) return false;
+    const frame = space.frames[space.map[owner][page]];
+    if (frame.owners.size === 1){ lastTouched = {owner, page, copied:false}; return false; }
+    frame.owners.delete(owner);
+    const fresh = {id:space.next++, owners:new Set([owner])};
+    space.frames.push(fresh);
+    space.map[owner][page] = fresh.id;
+    copies++;
+    lastTouched = {owner, page, copied:true};
+    return true;
+  }
+
+  function stats(){
+    const live = space.frames.filter(f => f.owners.size > 0);
+    return {
+      phys: live.length,
+      shared: live.filter(f => f.owners.size > 1).length,
+      virt: Object.values(space.map).reduce((n, m) => n + m.length, 0)
+    };
+  }
+
+  function grid(hostId, owner){
+    const host = document.getElementById(hostId);
+    host.innerHTML = "";
+    if (!space.map[owner]) return;
+    for (let p = 0; p < PAGES; p++){
+      const frame = space.frames[space.map[owner][p]];
+      const cell = document.createElement("div");
+      const isLast = lastTouched && lastTouched.owner === owner && lastTouched.page === p && lastTouched.copied;
+      cell.className = "cell " + (isLast ? "hot" : (frame.owners.size > 1 ? "warm" : "cool"));
+      cell.style.cssText += ";padding:5px 2px;font-size:10px;cursor:pointer";
+      cell.textContent = p;
+      cell.title = "page " + p + " → frame " + frame.id + (frame.owners.size > 1 ? " (shared)" : " (private)");
+      cell.addEventListener("click", () => { writePage(owner, p); draw(); });
+      host.appendChild(cell);
+    }
+  }
+
+  function draw(){
+    grid("cw-parent", "parent");
+    grid("cw-child", "child");
+    const s = stats();
+    setTile("cw-virt", s.virt);
+    setTile("cw-phys", s.phys);
+    setTile("cw-shared", s.shared);
+    setTile("cw-copies", copies);
+    setTile("cw-real", ((s.phys * PAGE_BYTES) / 1024) + " KiB");
+    setTile("cw-saved", forked ? (((s.virt - s.phys) * PAGE_BYTES) / 1024) + " KiB" : "—");
+    document.getElementById("cw-plab").textContent =
+      forked ? "Parent pages — click one to write to it" : "Parent pages — fork first, then writing costs nothing to share";
+
+    let msg;
+    if (!forked){
+      msg = "One process, " + PAGES + " pages, " + s.phys + " physical frames. Nothing is shared yet. Press <b>fork()</b>.";
+    } else if (copies === 0){
+      msg = "The fork is done. Virtual pages have doubled to <b>" + s.virt + "</b> and physical frames are still <b>" +
+            s.phys + "</b> — not one byte of memory was copied. Every frame is now marked read-only in both " +
+            "processes, and the kernel is waiting for someone to write.";
+    } else if (s.shared === 0){
+      msg = "Both sides have now written every page, so copy-on-write has degenerated into a full copy: <b>" + s.phys +
+            " frames</b> for " + s.virt + " virtual pages. This is the worst case, and even here the cost was paid " +
+            "gradually rather than as one stall at fork time.";
+    } else {
+      const last = lastTouched;
+      msg = (last && last.copied
+              ? "Writing page " + last.page + " from the " + last.owner + " triggered a protection fault; the kernel " +
+                "allocated a fresh frame, copied 4 KiB into it and resumed the instruction. "
+              : last
+              ? "Page " + last.page + " was already private to the " + last.owner + ", so the write cost nothing extra. "
+              : "") +
+            "<b>" + copies + " page" + (copies > 1 ? "s" : "") + " copied</b> so far. " + s.shared +
+            " frames are still shared, so " + s.virt + " virtual pages are backed by only <b>" + s.phys +
+            " physical frames</b>.";
+    }
+    document.getElementById("cw-out").innerHTML = msg;
+  }
+
+  document.getElementById("cw-fork").addEventListener("click", doFork);
+  document.getElementById("cw-who").addEventListener("click", e => {
+    const b = e.target.closest("button[data-w]");
+    if (!b) return;
+    who = b.dataset.w;
+    [...e.currentTarget.querySelectorAll("button")].forEach(x => x.setAttribute("aria-pressed", String(x === b)));
+  });
+  document.getElementById("cw-rand").addEventListener("click", () => {
+    const target = forked ? who : "parent";
+    for (let i = 0; i < 8; i++) writePage(target, Math.floor(Math.random() * PAGES));
+    draw();
+  });
+  document.getElementById("cw-all").addEventListener("click", () => {
+    const target = forked ? who : "parent";
+    for (let p = 0; p < PAGES; p++) writePage(target, p);
+    draw();
+  });
+  document.getElementById("cw-reset").addEventListener("click", reset);
+
+  reset();
+})();
+
+initChapter("ch06-processes-threads-and-forking.html");
+</script>
+</body>
+</html>

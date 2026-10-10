@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Serving analytics and BI — Data Engineer</title>
+<meta name="description" content="Marts and layering, the semantic layer and metric definitions, query performance for dashboard concurrency, Reverse ETL and self-service.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">Data Engineer</a> <span>/</span> Chapter 17</p>
+    <p class="chnum">CHAPTER 17</p>
+    <h1>Serving analytics and BI</h1>
+    <p class="lede">Chapter 1 opened with two problems: analytical load crushing a transactional database, and two people giving different answers to the same question. Fifteen chapters have been spent on the first. This one is about the second, which turned out to be the harder half and has a technical solution people consistently under-invest in.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~27 min</b> read</div>
+      <div><b>Part 5</b> Serving</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="consumers">
+      <p class="kicker">THE AUDIENCE</p>
+      <h2>Who is actually reading this</h2>
+      <p class="sub">Four consumers with genuinely incompatible needs. Trying to serve them all from one artefact is why so many warehouses have a table nobody understands.</p>
+
+      <div class="tw">
+        <table>
+          <caption>What each consumer needs, and what they will do if they do not get it</caption>
+          <thead>
+            <tr><th>Consumer</th><th>Wants</th><th>Tolerates</th><th>If underserved</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Executive dashboards</strong></td>
+              <td>A handful of numbers, sub-second, always available</td>
+              <td>Hours of staleness</td>
+              <td>Somebody maintains a spreadsheet, and it becomes the real source of truth</td>
+            </tr>
+            <tr>
+              <td><strong>Analysts</strong></td>
+              <td>Flexible SQL over well-modelled tables, ad-hoc joins</td>
+              <td>Seconds to minutes</td>
+              <td>They query raw tables and rebuild your logic, differently</td>
+            </tr>
+            <tr>
+              <td><strong>Operational users</strong></td>
+              <td>Data in the tool they already work in &mdash; CRM, support, ads</td>
+              <td>Minutes to an hour</td>
+              <td>They copy-paste from a dashboard, daily, forever</td>
+            </tr>
+            <tr>
+              <td><strong>Embedded and customer-facing</strong></td>
+              <td>Sub-second at high concurrency, per-tenant isolation</td>
+              <td>Very little</td>
+              <td>Your product is slow, which is a different kind of problem</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>The pattern in the last column</b>
+        <p>Every one of those failure modes is the consumer <em>routing around you</em>, and each creates a second definition of the truth that will drift from yours. The spreadsheet, the analyst's rebuilt logic and the copy-paste are all the metric-drift problem in the next section arriving through the back door.</p>
+        <p>So the serving question is not only "is this fast enough" but "is this convenient enough that nobody builds an alternative". Those are different bars and the second one is higher.</p>
+      </div>
+    </section>
+
+    <section id="layers">
+      <p class="kicker">STRUCTURE</p>
+      <h2>Marts, and what belongs in one</h2>
+      <p class="sub">The last layer of chapter 11's raw / staging / marts progression, and the one with a discipline problem.</p>
+
+      <p>A mart is a set of tables shaped for one audience or one business process, built on the conformed dimensions and facts of <a href="09-modelling.html">chapter 9</a>. Its purpose is to make the common questions easy and to make the answers consistent.</p>
+
+      <p>The discipline problem is that marts multiply. Every request for something slightly different produces another table, and after two years there are four hundred models, of which perhaps sixty are queried. The usual causes:</p>
+
+      <div class="terms">
+        <dt>A mart per requester rather than per process</dt>
+        <dd><code>mart_revenue_for_finance</code> and <code>mart_revenue_for_growth</code> will diverge, and then two teams have different revenue. Build per business process; let audiences filter.</dd>
+
+        <dt>Pre-computing every combination</dt>
+        <dd>Daily, weekly and monthly rollups by three dimensions is twelve tables that could be one, given a warehouse that aggregates quickly. Pre-aggregate where the demo in the next section says you must, not by default.</dd>
+
+        <dt>No deprecation path</dt>
+        <dd>Nothing is ever deleted because nobody knows what depends on it &mdash; <a href="01-what-it-is.html">chapter 1</a>'s blast radius, unresolved. Query logs answer this: a model with no reads in ninety days is a candidate, and saying so publicly for a fortnight before dropping it is a cheap process.</dd>
+      </div>
+
+      <p>A useful rule for what belongs in a mart at all: <strong>if two consumers would compute it the same way, it belongs upstream; if only one would, it belongs in their mart.</strong> Logic that is shared but implemented twice is the drift problem again.</p>
+    </section>
+
+    <section id="semantic">
+      <p class="kicker">THE HARDER HALF</p>
+      <h2>Metric definitions, and what disagreement costs</h2>
+      <p class="sub">Chapter 1 described this in words. Here is the arithmetic, and it is worse than the description suggests.</p>
+
+      <p>Revenue sounds like one number. Computing it requires four decisions that each have two defensible answers: subtract refunds or not, date by order creation or payment settlement, exclude internal test accounts or not, include tax or not. Nobody wrote them down, so every analyst decides independently.</p>
+
+      <p>Four binary decisions produce sixteen definitions. The demo computes what each one actually reports.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>What independent analysts report for the same metric</b>
+          <span>every combination of the edge-case decisions, evaluated</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Analysts asked
+              <input type="range" id="md-n" min="2" max="60" step="1" value="20">
+              <output id="md-n-o">20</output>
+            </label>
+            <label>Chance of picking the house convention
+              <input type="range" id="md-p" min="50" max="100" step="5" value="75">
+              <output id="md-p-o">75%</output>
+            </label>
+            <label>Governance
+              <select id="md-gov">
+                <option value="none" selected>Everyone writes their own SQL</option>
+                <option value="doc">A documented convention</option>
+                <option value="layer">One shared semantic layer</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="md-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>POSSIBLE DEFINITIONS</i><b id="md-defs">16</b><s>2 to the power of 4</s></div>
+            <div class="tile" id="md-dist-tile"><i>DISTINCT ANSWERS GIVEN</i><b id="md-dist">0</b><s id="md-dist-sub"></s></div>
+            <div class="tile" id="md-agree-tile"><i>TWO ANALYSTS AGREE</i><b id="md-agree">0%</b><s>picked at random</s></div>
+            <div class="tile hi"><i>SPREAD</i><b id="md-spread">0%</b><s id="md-spread-sub"></s></div>
+          </div>
+
+          <p class="readout" id="md-note"></p>
+        </div>
+      </div>
+
+      <p>Three results.</p>
+
+      <ol>
+        <li><strong>The spread is 31%.</strong> The lowest defensible definition reports &pound;26,545 and the highest &pound;34,783, from identical underlying data. Not a rounding difference — a third of the number.</li>
+        <li><strong>All sixteen are numerically distinct.</strong> There is no clustering to hide behind: every combination of choices produces its own answer, so two analysts differing on any single decision differ in the reported figure.</li>
+        <li><strong>Twenty analysts produce eight different answers</strong> at a 75% adherence rate, with only four matching the house figure and a 16% chance that any two picked at random agree. The meeting where this surfaces is not a data quality incident; it is the normal operation of a platform with no shared definition.</li>
+      </ol>
+
+      <div class="note key">
+        <b>Why documentation does not fix it and a layer does</b>
+        <p>Set governance to a documented convention and adherence rises, so the spread narrows &mdash; and it does not reach one answer, because a document is advisory and people misremember, join a new team, or copy an old query. Set it to a shared semantic layer and the count collapses to exactly one, because the definition is executed rather than described.</p>
+        <p>This is the same distinction <a href="06-contracts.html">chapter 6</a> drew between documentation and a contract: the useful artefact is the one a machine applies.</p>
+      </div>
+
+      <p>A semantic layer is a definition of metrics and dimensions, in version control, that BI tools and SQL clients query <em>through</em> rather than around. Given "revenue by region last quarter" it generates the SQL, applying the four decisions the same way every time. The tooling varies — dbt's semantic models, Cube, LookML, or a warehouse's own metric definitions — and what matters is the property rather than the product: <strong>one definition, in one place, that everything reads.</strong></p>
+
+      <p>Two honest caveats. A semantic layer only governs queries that go through it, so an analyst with warehouse credentials can always bypass it — which means adoption is a social problem with a technical assist, not a technical solution. And it adds a layer to debug when a number looks wrong. Both are real, and neither is close to the cost of a 31% spread.</p>
+    </section>
+
+    <section id="performance">
+      <p class="kicker">FAST ENOUGH</p>
+      <h2>Serving humans who click</h2>
+      <p class="sub">Dashboard workloads are not analyst workloads. Many small identical queries at once behaves completely differently from a few large distinct ones.</p>
+
+      <p>A dashboard tile is a query. A dashboard with eight tiles refreshed by two hundred people every five minutes is a steady stream of concurrent queries, and the constraint is the queueing behaviour from <a href="01-what-it-is.html">chapter 1</a> — the same <code>1/(1-&rho;)</code> curve, now applied to your warehouse rather than to the database you were protecting.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Dashboard concurrency</b>
+          <span>utilisation and latency against source table, users and caching</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Tiles read from
+              <select id="dc-src">
+                <option value="1200000000" selected>The raw fact table</option>
+                <option value="60000000">A daily rollup</option>
+                <option value="2400000">A pre-aggregated mart</option>
+              </select>
+            </label>
+            <label>Concurrent users
+              <input type="range" id="dc-users" min="10" max="600" step="10" value="200">
+              <output id="dc-users-o">200</output>
+            </label>
+            <label>Tiles per dashboard
+              <input type="range" id="dc-tiles" min="2" max="24" step="1" value="8">
+              <output id="dc-tiles-o">8</output>
+            </label>
+            <label>Refresh every
+              <select id="dc-refresh">
+                <option value="1">1 min</option>
+                <option value="5" selected>5 min</option>
+                <option value="30">30 min</option>
+              </select>
+            </label>
+            <label>Result cache hit rate
+              <input type="range" id="dc-cache" min="0" max="95" step="5" value="0">
+              <output id="dc-cache-o">0%</output>
+            </label>
+          </div>
+
+          <div class="canvas" id="dc-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>QUERIES PER SECOND</i><b id="dc-qps">0</b><s id="dc-qps-sub"></s></div>
+            <div class="tile" id="dc-rho-tile"><i>WAREHOUSE UTILISATION</i><b id="dc-rho">0</b><s>rho</s></div>
+            <div class="tile" id="dc-lat-tile"><i>TILE LATENCY</i><b id="dc-lat">0</b><s id="dc-lat-sub"></s></div>
+            <div class="tile hi"><i>USER CEILING</i><b id="dc-ceil">0</b><s>before saturation</s></div>
+          </div>
+
+          <p class="readout" id="dc-note"></p>
+        </div>
+      </div>
+
+      <p>The numbers make the case for pre-aggregation better than any argument. Reading tiles from the raw fact table saturates the warehouse at <strong>124 concurrent users</strong>. Reading the same tiles from a mart 500 times smaller raises the ceiling to <strong>62,499</strong>. The mart costs one scheduled job and a fraction of the storage.</p>
+
+      <div class="note tip">
+        <b>Three levers, in order of return</b>
+        <p><strong>Pre-aggregate</strong> to the grain the dashboard actually shows. A tile displaying monthly revenue by region does not need row-level orders, and a rollup at that grain is orders of magnitude smaller. This is where nearly all the win is.</p>
+        <p><strong>Cache results.</strong> Two hundred people looking at the same tile is one query and 199 cache hits. An 80% hit rate cuts demand fivefold &mdash; utilisation from 1.60 to 0.32 in the model, which is the difference between saturated and comfortable. Most BI tools do this and most have it configured badly.</p>
+        <p><strong>Stop auto-refresh.</strong> A dashboard refreshing every minute against data updated hourly generates fifty-nine pointless query storms an hour. Set the refresh interval to the data's actual freshness, which <a href="02-lifecycle.html">chapter 2</a> taught you to state as a worst case.</p>
+      </div>
+
+      <p>One structural point. If the workload is genuinely customer-facing — thousands of concurrent users, sub-second, per-tenant — a general-purpose warehouse is the wrong engine, and this is the case <a href="10-engines.html">chapter 10</a>'s decision order would send elsewhere. Real-time OLAP stores such as ClickHouse, Druid or Pinot exist for exactly this shape, and the honest signal that you need one is that you are pre-aggregating aggressively and still saturating.</p>
+    </section>
+
+    <section id="reverse">
+      <p class="kicker">BACK OUT AGAIN</p>
+      <h2>Reverse ETL</h2>
+      <p class="sub">Taking modelled data out of the warehouse and pushing it into the tools people work in. Genuinely useful, and it inverts a dependency you should notice.</p>
+
+      <p>A support agent needs to know a customer's lifetime value while looking at a ticket. That number lives in the warehouse and the agent lives in Zendesk. Reverse ETL syncs it across, so the answer is where the work happens rather than in a dashboard the agent will not open.</p>
+
+      <p>The value is real: it removes the copy-paste failure from the first section, and it makes warehouse modelling directly operational rather than merely informative. Three things to be deliberate about:</p>
+
+      <div class="terms">
+        <dt>The warehouse is now on a critical path</dt>
+        <dd>A dashboard being stale is an annoyance. A CRM field being stale drives a sales conversation, and a wrong one drives a wrong conversation. Reverse ETL upgrades your freshness and correctness obligations without anyone signing off on it &mdash; <a href="22-reliability.html">chapter 22</a>'s SLA discussion should cover these paths explicitly.</dd>
+
+        <dt>Writes need idempotency and rate limits</dt>
+        <dd>You are now an API client of a third party, so <a href="04-source-systems.html">chapter 4</a>'s rate-limit arithmetic applies in reverse, and a retry must not create duplicate records. Sync on a stable external id, upsert, and honour the vendor's limits.</dd>
+
+        <dt>Loops are possible and unpleasant</dt>
+        <dd>If the CRM is also a source you ingest, a field you write can flow back in, be transformed, and be written again. Mark warehouse-owned fields explicitly and never ingest them back.</dd>
+      </div>
+    </section>
+
+    <section id="selfserve">
+      <p class="kicker">THE GOAL, HONESTLY</p>
+      <h2>Self-service</h2>
+      <p class="sub">The stated aim of most data platforms, and a term that hides a real trade.</p>
+
+      <p>The motivation is <a href="01-what-it-is.html">chapter 1</a>'s third maturity stage: a central team becomes a ticket queue and the bottleneck for every question in the company. Self-service means consumers answer their own questions.</p>
+
+      <p>The failure is that "give everyone SQL access to the warehouse" is self-service in the same way that giving everyone a compiler is software engineering. What you get is the 31% spread from the demo above, four hundred untracked models, and a warehouse bill nobody can attribute.</p>
+
+      <p>Self-service that works has four things underneath it, and they are all things this unit has already covered:</p>
+
+      <div class="check">
+        <li><strong>Well-modelled tables</strong> so the easy query is also the correct one &mdash; <a href="09-modelling.html">chapter 9</a>. If getting the right answer requires knowing that you must filter <code>is_test = false</code>, self-service will produce wrong answers at scale.</li>
+        <li><strong>A semantic layer</strong> so shared metrics have one definition, as measured above.</li>
+        <li><strong>Discoverability</strong> &mdash; a catalogue with ownership, freshness and lineage, so a consumer can tell which of four similarly named tables to use. <a href="21-observability.html">Chapter 21</a>.</li>
+        <li><strong>Cost attribution</strong> so a badly written query has a visible owner, without which self-service and an unbounded bill are the same project.</li>
+      </div>
+
+      <div class="note warn">
+        <b>The honest trade</b>
+        <p>Self-service moves work from the data team to the consumer, and consumers are not data engineers. You get faster answers and more wrong ones. That is frequently the right trade &mdash; a fast approximately-right answer often beats a slow exact one &mdash; but it should be a decision rather than a drift, and the four items above are what keep "more wrong ones" from becoming "unusable".</p>
+        <p>The place not to make the trade is anything reported externally: financial reporting, regulatory returns, board numbers. Those should come through a governed path with one definition and an owner, and that is not a failure of self-service, it is knowing which questions are which.</p>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>Every underserved consumer routes around you,</b> and each workaround becomes a second definition of the truth. The bar is convenience, not just speed.</li>
+          <li><b>Build marts per business process, not per requester,</b> or two teams end up with different revenue.</li>
+          <li><b>Four binary decisions about one metric give sixteen definitions,</b> and all sixteen are numerically distinct.</li>
+          <li><b>The spread is 31%</b> &mdash; &pound;26,545 to &pound;34,783 from identical data. Twenty analysts produce eight different answers, and two picked at random agree 16% of the time.</li>
+          <li><b>Documentation narrows the spread; a semantic layer collapses it to one.</b> Same distinction as chapter 6: the useful artefact is the one a machine applies.</li>
+          <li><b>A semantic layer only governs queries that go through it,</b> so adoption is social with a technical assist.</li>
+          <li><b>Dashboard workloads are a concurrency problem,</b> and it is chapter 1's queueing curve applied to your own warehouse.</li>
+          <li><b>Raw fact tables saturate at 124 concurrent users; a mart 500&times; smaller reaches 62,499.</b> One scheduled job buys three orders of magnitude.</li>
+          <li><b>An 80% cache hit rate cuts utilisation from 1.60 to 0.32</b> &mdash; from saturated to comfortable.</li>
+          <li><b>Set refresh intervals from actual data freshness.</b> Refreshing every minute against hourly data is fifty-nine pointless query storms an hour.</li>
+          <li><b>Reverse ETL puts the warehouse on a critical path</b> and makes you an API client, with chapter 4's rate limits and a need for idempotent writes.</li>
+          <li><b>Self-service needs modelled tables, a semantic layer, discoverability and cost attribution.</b> Without them it is just SQL access, and it produces the 31% spread at scale.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="18-serving-ml.html">Chapter 18 &mdash; Serving ML and applications</a>. What a model team needs that a dashboard team does not: point-in-time correctness, feature stores, training-serving skew and vector serving.</p>
+          </div>
+          <div class="fi">
+            <i>CLOSING A LOOP</i>
+            <p>The metric spread here is the quantified version of <a href="01-what-it-is.html">chapter 1</a>'s logic problem, and the concurrency model is that chapter's queueing curve pointed at the warehouse instead of the OLTP database.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>Ask two people in different teams to send you last quarter's revenue and the SQL behind it. Compare both. The gap, if any, is your spread.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Demo 1 — metric definition drift
+   ============================================================ */
+(function () {
+  var BASE = 2847300;    /* pennies, before any decision is applied */
+  var DECISIONS = [
+    { q: "Subtract refunds",      yes: 0.958, no: 1.000, house: true },
+    { q: "Date by settlement",    yes: 0.982, no: 1.018, house: true },
+    { q: "Exclude test accounts", yes: 0.991, no: 1.000, house: true },
+    { q: "Include tax",           yes: 1.200, no: 1.000, house: false }
+  ];
+  var $ = function (id) { return document.getElementById(id); };
+  function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+
+  function valueOf(choices) {
+    var v = BASE;
+    choices.forEach(function (c, i) { v *= c ? DECISIONS[i].yes : DECISIONS[i].no; });
+    return Math.round(v);
+  }
+  function allDefs() {
+    var out = [];
+    for (var m = 0; m < 16; m++) {
+      var ch = [];
+      for (var i = 0; i < 4; i++) ch.push(!!(m & (1 << i)));
+      out.push(valueOf(ch));
+    }
+    return out;
+  }
+  function survey(n, pHouse) {
+    var rnd = lcg(7), vals = [], seen = {};
+    for (var a = 0; a < n; a++) {
+      var ch = [];
+      for (var i = 0; i < 4; i++) {
+        var h = DECISIONS[i].house;
+        ch.push(rnd() < pHouse ? h : !h);
+      }
+      var v = valueOf(ch);
+      vals.push(v); seen[v] = (seen[v] || 0) + 1;
+    }
+    var canonical = valueOf(DECISIONS.map(function (d) { return d.house; }));
+    var pAgree = 0;
+    Object.keys(seen).forEach(function (k) { var c = seen[k]; pAgree += c * (c - 1); });
+    return { vals: vals, seen: seen, distinct: Object.keys(seen).length,
+             agree: seen[canonical] || 0, canonical: canonical,
+             pAgree: n > 1 ? pAgree / (n * (n - 1)) : 1,
+             min: Math.min.apply(null, vals), max: Math.max.apply(null, vals) };
+  }
+  function money(p) { return "\u00a3" + Math.round(p / 100).toLocaleString(); }
+
+  function chart(r, gov) {
+    var W = 700, H = 142, L = 8;
+    var defs = allDefs();
+    var lo = Math.min.apply(null, defs), hi = Math.max.apply(null, defs);
+    var xOf = function (v) { return L + (v - lo) / (hi - lo) * (W - L - 20); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Reported values across analysts">'];
+    svg.push('<text x="' + L + '" y="11" font-size="10" font-weight="700" fill="#7C8B99">EVERY DEFENSIBLE DEFINITION (GREY) AND WHAT THE ANALYSTS ACTUALLY REPORTED (PINK)</text>');
+    svg.push('<line x1="' + L + '" y1="62" x2="' + (W - 20) + '" y2="62" stroke="#CFD8E0" stroke-width="1.5"/>');
+
+    defs.forEach(function (v) {
+      svg.push('<line x1="' + xOf(v).toFixed(1) + '" y1="54" x2="' + xOf(v).toFixed(1) + '" y2="70" stroke="#CFD8E0" stroke-width="2"/>');
+    });
+    var maxC = Math.max.apply(null, Object.keys(r.seen).map(function (k) { return r.seen[k]; }));
+    Object.keys(r.seen).forEach(function (k) {
+      var v = +k, c = r.seen[k];
+      var h = 6 + (c / maxC) * 34;
+      svg.push('<rect x="' + (xOf(v) - 3).toFixed(1) + '" y="' + (62 - h).toFixed(1) + '" width="6" height="' + h.toFixed(1) +
+        '" fill="' + (v === r.canonical ? "#2E8B5F" : "#E0699F") + '"/>');
+      if (c === maxC || v === r.canonical) {
+        svg.push('<text x="' + xOf(v).toFixed(1) + '" y="' + (62 - h - 4).toFixed(1) +
+          '" font-size="9.5" font-weight="700" fill="' + (v === r.canonical ? "#166B47" : "#A8386B") +
+          '" text-anchor="middle">' + c + '</text>');
+      }
+    });
+    svg.push('<text x="' + L + '" y="86" font-size="10.5" font-weight="700" fill="#54677A">' + money(lo) + '</text>');
+    svg.push('<text x="' + (W - 20) + '" y="86" font-size="10.5" font-weight="700" fill="#54677A" text-anchor="end">' + money(hi) + '</text>');
+    svg.push('<text x="' + xOf(r.canonical).toFixed(1) + '" y="100" font-size="10" fill="#166B47" text-anchor="middle">house figure ' +
+      money(r.canonical) + '</text>');
+    svg.push('<text x="' + L + '" y="' + (H - 6) + '" font-size="10" fill="#7C8B99">' +
+      (gov === "layer" ? "with one shared definition every analyst lands on the same tick"
+       : "each grey tick is a combination of choices any of them could defend") + '</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var n = +$("md-n").value, p = +$("md-p").value / 100, gov = $("md-gov").value;
+    $("md-n-o").textContent = n;
+    $("md-p-o").textContent = Math.round(p * 100) + "%";
+
+    var effP = gov === "layer" ? 1 : gov === "doc" ? Math.min(1, p + 0.18) : p;
+    var r = survey(n, effP);
+    var defs = allDefs();
+    var lo = Math.min.apply(null, defs), hi = Math.max.apply(null, defs);
+
+    $("md-dist").textContent = r.distinct;
+    $("md-dist-sub").textContent = r.agree + " of " + n + " match the house figure";
+    $("md-dist-tile").className = "tile " + (r.distinct === 1 ? "good" : r.distinct > 4 ? "bad" : "");
+    $("md-agree").textContent = Math.round(r.pAgree * 100) + "%";
+    $("md-agree-tile").className = "tile " + (r.pAgree > 0.95 ? "good" : r.pAgree < 0.5 ? "bad" : "");
+    $("md-spread").textContent = ((hi / lo - 1) * 100).toFixed(1) + "%";
+    $("md-spread-sub").textContent = money(lo) + " to " + money(hi);
+
+    $("md-canvas").innerHTML = chart(r, gov);
+
+    var lines = [];
+    lines.push("Four binary decisions give sixteen definitions, spanning " + money(lo) + " to " + money(hi) +
+      " \u2014 a spread of " + ((hi / lo - 1) * 100).toFixed(1) +
+      "% on identical underlying data. All sixteen are numerically distinct, so differing on any single decision changes the reported figure.");
+
+    if (gov === "layer") {
+      lines.push("With one shared semantic layer every analyst reports " + money(r.canonical) +
+        ". Not because they agree, but because none of them is deciding: the four choices are made once, in version control, and the layer generates the SQL. The count is " +
+        r.distinct + " because the definition is executed rather than described.");
+      lines.push("The residual risk is bypass. Anyone with warehouse credentials can query around the layer, so adoption is a social problem with a technical assist \u2014 but the technical assist is the part that scales.");
+    } else if (gov === "doc") {
+      lines.push("A documented convention lifts adherence and narrows the outcome to " + r.distinct +
+        " distinct answers, with " + r.agree + " of " + n +
+        " matching the house figure. Better, and not one answer: a document is advisory, people misremember it, new joiners have not read it, and old queries were written before it existed.");
+      lines.push("This is chapter 6's distinction again. Documentation describes; a contract is enforced. Switch to a semantic layer to see the difference collapse the count to one.");
+    } else {
+      lines.push(n + " analysts working independently produce " + r.distinct + " different answers. Only " +
+        r.agree + " match the house figure, and two picked at random agree " + Math.round(r.pAgree * 100) +
+        "% of the time. Every one of them wrote defensible SQL.");
+      lines.push("This is the meeting where two people present different revenue and everyone assumes someone made a mistake. Nobody did. It is the normal behaviour of a platform where the definition lives in people's heads, and no amount of care in the pipeline upstream affects it at all.");
+    }
+    $("md-note").textContent = lines.join("\n\n");
+  }
+
+  ["md-n", "md-p", "md-gov"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — dashboard concurrency
+   ============================================================ */
+(function () {
+  var CAPACITY = 4e9;    /* rows/sec the warehouse can scan */
+  var $ = function (id) { return document.getElementById(id); };
+
+  function model(users, tiles, refreshMin, rowsPerQuery, cacheHit) {
+    var qps = users * tiles / (refreshMin * 60) * (1 - cacheHit);
+    var demand = qps * rowsPerQuery;
+    var rho = demand / CAPACITY;
+    var service = rowsPerQuery / CAPACITY;
+    return { qps: qps, rho: rho, sat: rho >= 1, service: service,
+             latency: rho >= 1 ? Infinity : service / (1 - rho) };
+  }
+  function ceilingUsers(tiles, refreshMin, rows, cacheHit) {
+    var per = tiles / (refreshMin * 60) * (1 - cacheHit) * rows;
+    if (per <= 0) return 999999;
+    /* floor(CAPACITY/per) loses one to floating-point error when the division
+       is exact, so settle on the largest count that genuinely stays below 1 */
+    var u = Math.floor(CAPACITY / per);
+    while (u > 0 && u * per >= CAPACITY) u--;
+    while ((u + 1) * per < CAPACITY) u++;
+    return Math.max(0, u);
+  }
+  function big(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "m";
+    if (n >= 1000) return Math.round(n / 1000) + "k";
+    return String(Math.round(n));
+  }
+
+  function curve(rho) {
+    var W = 700, H = 150, L = 44, B = 26;
+    var xOf = function (r) { return L + r * (W - L - 12); };
+    var CAP = 20;
+    var yOf = function (m) { return (H - B) - Math.min(m, CAP) / CAP * (H - B - 12); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Latency multiplier against warehouse utilisation">'];
+    svg.push('<line x1="' + L + '" y1="' + (H - B) + '" x2="' + (W - 10) + '" y2="' + (H - B) + '" stroke="#CFD8E0"/>');
+    [1, 5, 10, 20].forEach(function (m) {
+      svg.push('<line x1="' + L + '" y1="' + yOf(m) + '" x2="' + (W - 10) + '" y2="' + yOf(m) + '" stroke="#E1E7EC" stroke-dasharray="3 3"/>');
+      svg.push('<text x="6" y="' + (yOf(m) + 4) + '" font-size="10" fill="#7C8B99">' + m + '\u00d7</text>');
+    });
+    var d = [];
+    for (var i = 0; i <= 196; i++) {
+      var r = i / 200;
+      d.push((i ? "L" : "M") + xOf(r).toFixed(1) + " " + yOf(1 / (1 - r)).toFixed(1));
+    }
+    svg.push('<path d="' + d.join(" ") + '" fill="none" stroke="#20456A" stroke-width="2"/>');
+    var rr = Math.min(rho, 0.995);
+    svg.push('<line x1="' + xOf(rr) + '" y1="10" x2="' + xOf(rr) + '" y2="' + (H - B) + '" stroke="' +
+      (rho >= 1 ? "#C0453A" : "#E0699F") + '" stroke-width="1.8" stroke-dasharray="4 3"/>');
+    svg.push('<circle cx="' + xOf(rr) + '" cy="' + yOf(1 / (1 - rr)) + '" r="5" fill="' + (rho >= 1 ? "#C0453A" : "#E0699F") + '"/>');
+    svg.push('<text x="' + (xOf(rr) + 7) + '" y="' + Math.max(22, yOf(1 / (1 - rr)) - 8) + '" font-size="10.5" font-weight="700" fill="' +
+      (rho >= 1 ? "#C0453A" : "#A8386B") + '">' + (rho >= 1 ? "saturated" : "rho " + rho.toFixed(2)) + '</text>');
+    [0, 0.25, 0.5, 0.75, 1].forEach(function (r) {
+      svg.push('<text x="' + xOf(r) + '" y="' + (H - 8) + '" font-size="10" fill="#7C8B99" text-anchor="middle">' + r.toFixed(2) + '</text>');
+    });
+    svg.push('<text x="' + L + '" y="12" font-size="10" font-weight="700" fill="#7C8B99">LATENCY MULTIPLIER AGAINST WAREHOUSE UTILISATION</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var rows = +$("dc-src").value, users = +$("dc-users").value;
+    var tiles = +$("dc-tiles").value, refresh = +$("dc-refresh").value;
+    var cache = +$("dc-cache").value / 100;
+    $("dc-users-o").textContent = users;
+    $("dc-tiles-o").textContent = tiles;
+    $("dc-cache-o").textContent = Math.round(cache * 100) + "%";
+
+    var m = model(users, tiles, refresh, rows, cache);
+    var ceil = ceilingUsers(tiles, refresh, rows, cache);
+    var mart = model(users, tiles, refresh, 2400000, cache);
+    var martCeil = ceilingUsers(tiles, refresh, 2400000, cache);
+
+    $("dc-qps").textContent = m.qps.toFixed(1);
+    $("dc-qps-sub").textContent = big(rows) + " rows each";
+    $("dc-rho").textContent = m.sat ? "\u2265 1.00" : m.rho.toFixed(3);
+    $("dc-rho-tile").className = "tile " + (m.sat ? "bad" : m.rho < 0.5 ? "good" : "");
+    $("dc-lat").textContent = m.sat ? "unbounded" : (m.latency < 1 ? (m.latency * 1000).toFixed(0) + " ms" : m.latency.toFixed(2) + " s");
+    $("dc-lat-sub").textContent = m.sat ? "queue grows without limit" : (1 / (1 - m.rho)).toFixed(1) + "\u00d7 the service time";
+    $("dc-lat-tile").className = "tile " + (m.sat ? "bad" : m.latency < 0.5 ? "good" : "");
+    $("dc-ceil").textContent = ceil.toLocaleString();
+
+    $("dc-canvas").innerHTML = curve(m.rho);
+
+    var lines = [];
+    lines.push(users + " users \u00d7 " + tiles + " tiles every " + refresh + " minutes" +
+      (cache > 0 ? " with a " + Math.round(cache * 100) + "% cache hit rate" : "") + " is " +
+      m.qps.toFixed(1) + " queries a second, each scanning " + big(rows) + " rows. That is " +
+      (m.sat ? "beyond the warehouse's capacity" : "utilisation of " + m.rho.toFixed(3) +
+       " and a tile latency of " + (m.latency < 1 ? (m.latency * 1000).toFixed(0) + " ms" : m.latency.toFixed(2) + " s")) + ".");
+
+    if (m.sat) {
+      lines.push("Arriving work exceeds what the warehouse can retire, so the queue does not settle at a longer latency \u2014 it grows until queries time out. Note that this is the same failure chapter 1 modelled on a transactional database, arriving now on the system built to protect it.");
+    }
+
+    if (rows > 1e8) {
+      lines.push("Reading tiles from the raw fact table caps you at " + ceil.toLocaleString() +
+        " concurrent users. The same tiles served from a pre-aggregated mart " + (rows / 2400000).toFixed(0) +
+        " times smaller would reach " + martCeil.toLocaleString() + " \u2014 utilisation " +
+        m.rho.toFixed(3) + " becomes " + mart.rho.toFixed(4) +
+        ". A dashboard showing monthly revenue by region does not need row-level orders, and the rollup costs one scheduled job.");
+    } else {
+      lines.push("Pre-aggregating to the grain the dashboard actually displays is where nearly all the win is: " +
+        ceil.toLocaleString() + " concurrent users against " + ceilingUsers(tiles, refresh, 1.2e9, cache).toLocaleString() +
+        " on the raw fact table. Three orders of magnitude for one scheduled job.");
+    }
+
+    if (cache === 0) {
+      var c80 = model(users, tiles, refresh, rows, 0.8);
+      lines.push("And nothing is cached. Two hundred people looking at the same tile is one query and 199 cache hits; an 80% hit rate would take utilisation from " +
+        m.rho.toFixed(2) + " to " + c80.rho.toFixed(2) +
+        ". Most BI tools do this and most have it configured badly.");
+    } else if (refresh === 1) {
+      lines.push("Refreshing every minute is worth questioning. If the underlying data updates hourly, fifty-nine of every sixty refreshes recompute an identical answer. Set the interval from the worst-case freshness chapter 2 taught you to state.");
+    }
+    $("dc-note").textContent = lines.join("\n\n");
+  }
+
+  ["dc-src", "dc-users", "dc-tiles", "dc-refresh", "dc-cache"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+initChapter("17-serving-analytics.html");
+</script>
+</body>
+</html>

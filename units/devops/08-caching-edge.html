@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Caching and the edge — DevOps</title>
+<meta name="description" content="The cache layers and what each is good for, HTTP caching semantics, why the last points of hit ratio matter most, cache keys and Vary, the stampede that turns one expiry into hundreds of origin requests, and invalidation.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%237C8CF8' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">DevOps</a><span class="sep">/</span><span>Chapter 08</span></p>
+    <p class="chno">Chapter 08 · Source and servers</p>
+    <h1>Caching and the edge</h1>
+    <p class="lede">A cache is a second copy of an answer, kept somewhere cheaper to reach. That is the whole idea, and it is the highest-leverage performance work available — a 90% hit ratio means your origin handles a tenth of the traffic. It is also where the two hardest problems in the discipline live: knowing when a copy has stopped being true, and surviving the moment a popular copy expires.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapters 06, 07</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="layers">
+<h2>The layers, and what each is actually good for</h2><div class="h2rule"></div>
+
+<p class="lead">Caching happens at half a dozen places between a user and your database, and they are not interchangeable. The rule that orders them: <strong>the closer to the user, the cheaper the hit and the harder the invalidation</strong>. A browser cache costs you nothing and you cannot reach into it; a database query cache is fully under your control and saves you the least.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Layer</th><th>Saves</th><th>Invalidate by</th><th>Best for</th></tr></thead>
+<tbody>
+<tr><td><strong>Browser</strong></td><td class="yes">The entire request. Nothing leaves the device</td><td class="no">Nothing. You cannot purge it — only wait, or change the URL</td><td>Static assets with content-hashed filenames</td></tr>
+<tr><td><strong>CDN / edge</strong></td><td>Origin traffic and most of the latency</td><td>Purge API, surrogate keys</td><td class="yes">Anything public and identical for many users. The biggest single win available</td></tr>
+<tr><td><strong>Reverse proxy</strong></td><td>Application work; still one network hop</td><td>Purge, or a short TTL</td><td>Micro-caching even for a second — see the note below</td></tr>
+<tr><td><strong>Application (Redis)</strong></td><td>Database work and computation</td><td class="yes">Explicit delete on write, which is exact</td><td>Per-user data, session state, expensive aggregates</td></tr>
+<tr><td><strong>In-process</strong></td><td>Even the network hop to Redis</td><td class="no">Hard — every instance holds its own copy and they drift</td><td>Config, feature flags, reference data that rarely changes</td></tr>
+<tr><td><strong>Database buffer pool</strong></td><td>Disk I/O only</td><td>Automatic</td><td>Not your decision; give it memory and leave it alone</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box tip"><b class="tag">One-second micro-caching is absurdly effective and almost nobody uses it</b>
+<p style="margin-bottom:0">Take an endpoint receiving 500 requests a second that is "uncacheable" because the data changes constantly. Cache it at the proxy for <em>one second</em>. The data is now at most one second stale — which for a dashboard, a feed or a product listing is invisible — and the origin goes from 500 requests a second to one. That is a 99.8% reduction for a single line of nginx configuration, and it applies to exactly the endpoints people assume caching cannot help with. The test is not "does this change often" but "does a one-second-old answer harm anyone".</p>
+</div>
+</section>
+
+<section id="httpcache">
+<h2>The HTTP semantics that control all of it</h2><div class="h2rule"></div>
+
+<p>Caches in the browser and at the edge are driven entirely by response headers. Getting these right is what makes the layers above work; getting them wrong is why so many sites either re-download everything or serve two-year-old JavaScript.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Directive</th><th>Means</th><th>Use for</th></tr></thead>
+<tbody>
+<tr><td><code>max-age=N</code></td><td>Fresh for N seconds in any cache</td><td>The basic dial</td></tr>
+<tr><td><code>s-maxage=N</code></td><td>Overrides <code>max-age</code> for <em>shared</em> caches only</td><td class="yes">The key to caching hard at the CDN and briefly in the browser: <code>max-age=60, s-maxage=86400</code></td></tr>
+<tr><td><code>public</code> / <code>private</code></td><td>May / may not be stored by a shared cache</td><td class="no">Anything user-specific must be <code>private</code>, or one user's data is served to another</td></tr>
+<tr><td><code>no-cache</code></td><td>Store it, but revalidate before every use</td><td>Not "do not cache" — that is <code>no-store</code>. The names are genuinely misleading</td></tr>
+<tr><td><code>no-store</code></td><td>Never write it down anywhere</td><td>Genuinely sensitive responses only. It costs you every hit</td></tr>
+<tr><td><code>immutable</code></td><td>Will never change; do not revalidate even on reload</td><td class="yes">Content-hashed assets. Removes the conditional request entirely</td></tr>
+<tr><td><code>stale-while-revalidate=N</code></td><td>Serve the stale copy immediately and refresh in the background</td><td class="yes">The single best directive in the list — see the stampede section</td></tr>
+<tr><td><code>stale-if-error=N</code></td><td>Serve stale rather than an error when the origin is down</td><td class="yes">Free availability. Your CDN keeps serving through an origin outage</td></tr>
+<tr><td><code>ETag</code> / <code>If-None-Match</code></td><td>A version token; a match returns 304 with no body</td><td>Saves bandwidth, not the round trip</td></tr>
+<tr><td><code>Vary</code></td><td>Which request headers form part of the cache key</td><td class="no">Every value multiplies the number of stored copies. See below</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">http — four response patterns worth memorising</span><button class="code-copy">Copy</button></div><pre><span class="c"># content-hashed asset: /static/app.4f2b91c.js — the URL changes when the file does</span>
+Cache-Control: public, max-age=31536000, immutable
+<span class="c">  one year, never revalidated. this is the whole reason build tools hash filenames</span>
+
+<span class="c"># HTML shell that must pick up new asset URLs promptly</span>
+Cache-Control: public, max-age=0, s-maxage=60, stale-while-revalidate=300
+ETag: "a1b2c3"
+<span class="c">  browser revalidates every time (cheap: 304, no body), the CDN absorbs the load,</span>
+<span class="c">  and a stale copy is served instantly for 5 minutes while it refreshes behind the scenes</span>
+
+<span class="c"># a public API list endpoint</span>
+Cache-Control: public, max-age=30, stale-while-revalidate=120, stale-if-error=86400
+<span class="c">  30 s fresh; up to 2 min stale served instantly; and if the origin is DOWN,</span>
+<span class="c">  a day-old copy is still served rather than a 502</span>
+
+<span class="c"># anything belonging to one user</span>
+Cache-Control: private, no-store
+Vary: Authorization
+<span class="c">  `private` alone is one misconfigured proxy away from a data leak; add both</span></pre></div>
+
+<div class="box warn"><b class="tag">The two cache-key failures that become incidents</b>
+<p style="margin-bottom:6px"><strong>Caching a personalised response publicly.</strong> A response containing one user's name is stored by the CDN under a key that does not include their identity, and every subsequent visitor is served it. This is a data breach caused by a missing <code>private</code>, and it is depressingly common on pages that are public except for a logged-in header. The defence is to make personalisation structurally impossible to cache — render the shell publicly and fetch the personal part separately — rather than relying on getting the header right on every endpoint.</p>
+<p style="margin-bottom:0"><strong><code>Vary</code> cardinality explosion.</strong> Each header named in <code>Vary</code> multiplies the number of stored variants. <code>Vary: User-Agent</code> is the notorious one: there are effectively unlimited distinct user-agent strings, so the hit ratio collapses to near zero while storage fills with near-identical copies. <code>Vary: Accept-Encoding</code> is fine — two or three values. <code>Vary: Accept-Language</code> is fine if you normalise to a short list first. Never vary on anything high-cardinality, and check what your CDN adds to the key by default: cookies and query strings are frequently included whole, so one tracking parameter can make every URL unique.</p>
+</div>
+</section>
+
+<section id="hitratio">
+<h2>Hit ratio, and why the last few points matter most</h2><div class="h2rule"></div>
+
+<p>Request popularity is not uniform. It follows something close to a Zipf distribution — the <em>n</em>th most popular object gets roughly <code>1/n<sup>s</sup></code> of the traffic — which has two consequences that pull in opposite directions and are both important.</p>
+
+<div class="eq plain"><code>origin load &nbsp;=&nbsp; 1 − hit ratio</code></div>
+<p class="where">Which looks trivial and is not, because it is a reciprocal relationship. Going from a 90% hit ratio to 95% does not improve things by 5% — it <b>halves</b> the origin load, from 10% of traffic to 5%. From 95% to 99% halves it twice more. The hard-won last points are worth more than all the easy early ones put together, and this is why CDN work that looks like diminishing returns on the hit-ratio chart is nothing of the sort on the origin-capacity chart.</p>
+
+<div class="demo" id="d-hit">
+  <div class="demo-top"><div class="demo-title">Cache size against hit ratio, and what the origin sees</div><div class="demo-hint">Drop the Zipf exponent to 0.6 — the shape of demand beats the size of the cache</div></div>
+  <div class="demo-body">
+    <canvas id="cHit" aria-label="Hit ratio plotted against cache size on a logarithmic scale, with the origin load shown alongside"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Cache holds <b id="hcCo">1,000</b> objects</label><input type="range" id="hcC" min="0" max="1000" value="500"></div>
+      <div class="ctrl"><label>Catalogue <b id="hcNo">1,000,000</b> objects</label><input type="range" id="hcN" min="0" max="3" value="3"></div>
+      <div class="ctrl"><label>Zipf exponent <b id="hcSo">0.90</b></label><input type="range" id="hcS" min="50" max="150" value="90"></div>
+      <div class="ctrl"><label>Traffic <b id="hcRo">5,000</b> req/s</label><input type="range" id="hcR" min="100" max="20000" step="100" value="5000"></div>
+    </div>
+    <div class="rgrid" id="hcOut"></div>
+    <div class="readout" id="hcNote"></div>
+  </div>
+</div>
+
+<p>The other consequence runs the other way. With a million objects and a Zipf exponent of 0.9, a cache holding the thousand most popular gets a 34.6% hit ratio; doubling it to two thousand adds only <b>4.7 points</b>, and going all the way to ten thousand adds <b>17</b>. Cache capacity has logarithmic returns, so buying your way to a high hit ratio is expensive. Meanwhile the same thousand-object cache against a flatter distribution — exponent 0.6 — manages only <b>6.0%</b>. The shape of your demand matters far more than the size of your cache, which is why the productive work is usually making more requests cacheable rather than making the cache bigger.</p>
+
+<div class="box intu"><b class="tag">Where the hit ratio actually comes from</b>
+<p style="margin-bottom:0">In practice you rarely move the number by adding storage. You move it by removing the things that make otherwise identical requests miss: a tracking query parameter that makes every URL unique, a <code>Set-Cookie</code> on a static asset that makes the CDN refuse to store it, a <code>Vary</code> on something high-cardinality, an <code>Authorization</code> header sent on public requests, a missing trailing-slash normalisation. Every one of those turns one cacheable object into thousands of uncacheable ones. Before sizing anything, look at the requests that missed and ask why they were considered distinct.</p>
+</div>
+</section>
+
+<section id="stampede">
+<h2>The stampede</h2><div class="h2rule"></div>
+
+<p>A cached entry expires. The next request misses and goes to the origin, which takes some time to answer. Every request arriving during that window <em>also</em> misses, because the entry is still not there — so they all go to the origin too. One expiry becomes a burst.</p>
+
+<div class="eq plain"><code>requests reaching the origin per expiry &nbsp;=&nbsp; 1 &nbsp;+&nbsp; request rate for that key &nbsp;×&nbsp; origin latency</code></div>
+<p class="where">At 2,000 requests a second for one hot key and a 200&nbsp;ms origin fetch, that is <b>401</b> simultaneous origin requests where you expected one. Note what is <em>not</em> in the formula: the TTL. Making the TTL longer does not make the burst smaller, only rarer — and rarer bursts are harder to diagnose, because the origin looks fine between them.</p>
+
+<div class="demo" id="d-stamp">
+  <div class="demo-top"><div class="demo-title">One expired key against your origin</div><div class="demo-hint">Switch on coalescing, then compare stale-while-revalidate</div></div>
+  <div class="demo-body">
+    <canvas id="cStamp" aria-label="Origin request rate and burst size for each stampede protection mode"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Traffic <b id="stRo">2000</b> req/s</label><input type="range" id="stR" min="50" max="8000" step="50" value="2000"></div>
+      <div class="ctrl"><label>Origin takes <b id="stLo">200</b> ms</label><input type="range" id="stL" min="10" max="2000" step="10" value="200"></div>
+      <div class="ctrl"><label>TTL <b id="stTo">60</b> s</label><input type="range" id="stT" min="1" max="600" value="60"></div>
+      <div class="ctrl"><label>Distinct keys <b id="stKo">1</b></label><input type="range" id="stK" min="1" max="5000" value="1"></div>
+      <div class="ctrl"><label>Protection</label><select id="stM">
+        <option value="none" selected>none — every miss goes to the origin</option>
+        <option value="single">request coalescing (single-flight)</option>
+        <option value="swr">stale-while-revalidate</option>
+      </select></div>
+      <div class="ctrl"><label>TTL jitter <b id="stJo">0</b>%</label><input type="range" id="stJ" min="0" max="50" value="0"></div>
+    </div>
+    <div class="rgrid" id="stOut"></div>
+    <div class="readout" id="stNote"></div>
+  </div>
+</div>
+
+<div class="kv">
+<dt>Request coalescing collapses it to one</dt><dd>Also called single-flight or request collapsing. The cache notices that a fetch for this key is already in progress and makes the other 400 requests wait for that result instead of starting their own. nginx calls it <code>proxy_cache_lock</code>, Varnish does it by default, every serious CDN implements it, and in application code it is <code>singleflight.Group</code> in Go or a promise cache in Node. <strong>This is the fix</strong>, and it usually costs one configuration line.</dd>
+<dt>Stale-while-revalidate removes the wait too</dt><dd>Coalescing still makes 401 clients wait 200&nbsp;ms for the refresh. With <code>stale-while-revalidate</code> the cache serves the slightly stale copy instantly and refreshes in the background, so nobody waits at all and the origin still sees one request. The cost is bounded staleness, which for most content is a trade you would take every time.</dd>
+<dt>Stampedes are a hot-key problem</dt><dd>Spread the same 2,000 requests a second across 5,000 keys and each key sees 0.32 requests a second, so amplification falls to 1.06× — essentially nothing. Bursts come from concentration, so the endpoint worth protecting is the one on the front page, not the long tail.</dd>
+<dt>But synchronised expiry creates a fleet-wide one</dt><dd>If 5,000 keys were all populated at the same instant — a deploy, a cache flush, a cold start — their TTLs expire together and the origin gets <b>5,400</b> requests in one moment even though no individual key is hot. Adding ±20% jitter to each TTL spreads that same load to about <b>450 per second</b> over twelve seconds, which the origin absorbs without noticing. Jitter costs nothing and should be the default on any TTL you set programmatically.</dd>
+</div>
+
+<div class="box trap"><b class="tag">Cold start is the same failure wearing a different hat</b>
+<p style="margin-bottom:0">Flushing the cache, deploying a change that alters the cache key, or bringing up a new CDN region all produce the same event: a full-traffic burst against an origin sized for a fraction of it. An origin comfortably serving 10% of 20,000 requests a second is being asked for all of it, and it will not survive. The mitigations are to warm the cache before shifting traffic, to shift traffic gradually rather than at once (chapter 18), and to have a concurrency limit at the origin that sheds load rather than collapsing — because an origin that returns 503 for the excess recovers, and one that accepts everything and thrashes does not.</p>
+</div>
+</section>
+
+<section id="invalidation">
+<h2>Invalidation, and the strategy that avoids it</h2><div class="h2rule"></div>
+
+<p>Purging is unreliable in a way that is easy to underestimate: it is a best-effort operation against systems you do not control, it takes seconds to minutes to reach every point of presence, and it cannot touch a browser cache at all. Every approach below is really a way of needing it less.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Strategy</th><th>How</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td><strong>Content-hashed URLs</strong></td><td><code>/app.4f2b91c.js</code> — the URL changes when the bytes do</td><td class="yes">The best answer available. Nothing is ever invalidated because nothing is ever overwritten. Cache for a year</td></tr>
+<tr><td><strong>Short TTL</strong></td><td>Let it expire</td><td class="yes">Simple, predictable, needs no API. Combine with <code>stale-while-revalidate</code> and it costs nothing in latency</td></tr>
+<tr><td><strong>Surrogate keys</strong></td><td>Tag responses (<code>product-42</code>, <code>category-shoes</code>) and purge by tag</td><td class="yes">The right tool when one write invalidates many URLs. Fastly and Cloudflare both support it</td></tr>
+<tr><td><strong>Purge by URL</strong></td><td>Call the CDN's API per path</td><td>Works, but you must know every affected URL, and a page can be reachable at several</td></tr>
+<tr><td><strong>Purge everything</strong></td><td>Flush the whole cache</td><td class="no">Converts a small correctness problem into the cold-start incident above. Reserve it for emergencies and expect the origin to feel it</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box tip"><b class="tag">Cache-aside, and the write pattern that avoids a class of bugs</b>
+<p style="margin-bottom:0">For an application cache the standard pattern is cache-aside: on read, check the cache and populate on miss; on write, update the database and then <strong>delete</strong> the cache entry. Deleting rather than updating matters more than it looks. If two concurrent writers both update the cache, they can land in the opposite order to the way they hit the database, leaving the cache permanently holding the older value with nothing to correct it. Deleting has no such ordering hazard: whoever reads next repopulates from the current truth. The residual race — a reader repopulating with a stale value it read just before a write committed — is narrow, and a short TTL bounds how long it can persist.</p>
+</div>
+
+<p>At the CDN layer two more things are worth knowing. <strong>Tiered caching</strong> or an <em>origin shield</em> puts a second cache layer between the edge points of presence and your origin, so a miss at forty PoPs becomes one origin request rather than forty — the same coalescing idea applied geographically, and it often improves origin load more than any TTL change. And <strong>the edge can serve through an origin outage</strong>: <code>stale-if-error</code> plus a generous stale window means your CDN keeps answering with slightly old content while the origin is down, which converts a total outage into a degraded one for free.</p>
+</section>
+
+<section id="close">
+<h2>Check yourself</h2><div class="h2rule"></div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>Your CDN hit ratio is 90% and someone proposes work to reach 95%, arguing it is only a five per cent improvement. Why is that framing wrong?
+<button class="reveal">Show answer</button><div class="ans">Because the number that matters is what reaches the origin, and that is one minus the hit ratio. At 90% the origin handles 10% of traffic; at 95% it handles 5%. The change <em>halves</em> origin load, and therefore halves the capacity you need, the database work you do and the size of the burst if the cache is ever flushed. Going on to 99% halves it twice more. The relationship is reciprocal, so the hard-won last points are worth far more than the easy early ones — the opposite of the diminishing-returns intuition the hit-ratio chart suggests. The corollary is that the same reasoning runs backwards during an incident: a hit ratio quietly dropping from 95% to 90% doubles origin load without any change in user traffic, which is why hit ratio deserves to be an alerting metric rather than a dashboard curiosity.</div></li>
+
+<li>An endpoint serving 500 requests a second is declared uncacheable because its data changes constantly. Is that reasoning sound?
+<button class="reveal">Show answer</button><div class="ans">Usually not. The question is not how often the data changes but whether a slightly old answer harms anyone. Caching for one second takes the origin from 500 requests a second to one — a 99.8% reduction — while making the data at most one second stale, which for a dashboard, a feed, a product listing or a search result is imperceptible. This micro-caching applies precisely to the endpoints people assume caching cannot help with, and it costs one line of proxy configuration. The genuine exceptions are narrow: responses that differ per user, anything where a stale read enables an incorrect action such as a balance check immediately before a transfer, and anything legally required not to be stored. For those, <code>private</code> or <code>no-store</code> is right — but they are a much smaller set than "the data changes often" suggests.</div></li>
+
+<li>A hot key at 2,000 requests a second expires and the origin receives about 400 simultaneous requests. Explain, and give two fixes with their trade-offs.
+<button class="reveal">Show answer</button><div class="ans">During the 200&nbsp;ms the origin takes to answer the first miss, the entry is still absent, so every request arriving in that window also misses and is forwarded — 1 + 2000 × 0.2 = 401 origin requests from one expiry. Note that the TTL does not appear in that calculation: a longer TTL makes the burst rarer, not smaller, and rarer bursts are harder to diagnose because everything looks healthy in between. The first fix is request coalescing, where the cache recognises an in-flight fetch for the key and makes the other 400 requests wait on its result — nginx's <code>proxy_cache_lock</code>, Varnish by default, <code>singleflight</code> in Go. The origin sees one request; the cost is that 401 clients still wait 200&nbsp;ms. The second is <code>stale-while-revalidate</code>, where the cache serves the expiring copy immediately and refreshes in the background: the origin still sees one request and nobody waits at all, at the cost of serving content that is briefly stale. Where the staleness is acceptable, the second is strictly better, and the two compose.</div></li>
+
+<li>No individual key is hot, yet the origin gets a large burst every few minutes. What is happening?
+<button class="reveal">Show answer</button><div class="ans">Synchronised expiry. If many entries were populated at the same instant — after a deploy, a cache flush, a scale-up, or simply because the TTL is set from a fixed configuration value — then they all expire at the same instant too, and the origin receives one request per key simultaneously even though each key individually sees almost no traffic. In the demo, 5,000 keys populated together produce about 5,400 origin requests in a single moment. The fix is jitter: randomise each TTL by ±20% so expiries spread out. That same 5,400 becomes roughly 450 per second over twelve seconds, which the origin absorbs without noticing. Jitter costs nothing, and it should be the default anywhere a TTL is set programmatically — the same reasoning as adding jitter to retry backoff in chapter 6, and for exactly the same reason: synchronisation turns a manageable average into an unmanageable peak.</div></li>
+
+<li>Support reports that a logged-in user briefly saw another user's name on a page. What is the most likely cause?
+<button class="reveal">Show answer</button><div class="ans">A personalised response was cached by a shared cache under a key that does not include the user's identity. Most likely the response was missing <code>Cache-Control: private</code> — or had <code>public</code> explicitly — so the CDN or reverse proxy stored one user's rendered page and served it to everyone requesting the same URL until it expired. It is a data breach rather than a performance bug, and the usual context is a page that is public except for a logged-in header. Adding <code>private</code> fixes the immediate case, and <code>Vary: Authorization</code> or <code>Vary: Cookie</code> makes the key identity-dependent — though varying on a whole cookie header is high-cardinality and destroys the hit ratio, so it is a poor general answer. The structural fix is to make it impossible: render the shell as a genuinely public, identical document and fetch the personalised fragment in a separate request marked <code>private, no-store</code>. Then no header mistake on any endpoint can produce this outcome.</div></li>
+
+<li>Why is <code>Vary: User-Agent</code> almost always a mistake while <code>Vary: Accept-Encoding</code> is fine?
+<button class="reveal">Show answer</button><div class="ans">Because <code>Vary</code> adds the named header to the cache key, so the number of stored variants multiplies by that header's cardinality. <code>Accept-Encoding</code> has effectively three values — gzip, brotli, none — so you store three copies and each still gets a third of the requests: harmless, and necessary for correctness or you serve brotli to a client that cannot decode it. <code>User-Agent</code> has effectively unlimited distinct values, since every browser build, operating system version and bot has its own string. The cache stores a near-identical copy for each, the hit ratio collapses towards zero, and storage fills with duplicates. If you genuinely need to serve different content by device class, normalise first — have the edge compute a small derived value such as mobile/tablet/desktop and vary on that instead. The same reasoning applies to whatever your CDN includes in the key by default: query strings and cookies are frequently included whole, so a single tracking parameter can make every URL unique.</div></li>
+
+<li>You flush the entire CDN cache during business hours to fix one incorrect page. Predict what happens.
+<button class="reveal">Show answer</button><div class="ans">Every subsequent request misses, so the origin — which was sized to handle perhaps 10% of total traffic — is suddenly asked for 100% of it. At 20,000 requests a second that is a tenfold overload arriving instantly, and the likely outcome is that the origin saturates, response times climb, and the cache repopulates slowly with responses that are themselves slow, extending the overload. It is the same event as a cold start, and it can easily be worse than the original incorrect page. The proportionate action is to purge the specific URL, or better to purge by surrogate key so that related URLs go together. If a full flush is genuinely necessary, do it during low traffic, warm the important paths first, and make sure the origin has a concurrency limit that sheds excess load with a 503 rather than accepting everything and thrashing — an origin that rejects the surplus recovers, and one that queues it does not.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin-bottom:0">That closes the second part. Chapter 9 starts on containers, building them from the two kernel features they are actually made of rather than from the command list — and then measuring them honestly against virtual machines.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 08</h2><p>Caching and the edge. Part of the DevOps unit — <a href="index.html">all 24 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 16 (cold starts), 18 (warming before a traffic shift), 22 (hit ratio as an alerting signal), 23 (metastable failure and load shedding).</p></div>
+    <div><h2>Going deeper</h2><p>The Redis unit covers the application cache layer in depth. RFC 9111 is the authoritative reference for HTTP caching semantics and is more readable than its number suggests.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: Zipf hit ratio ============ */
+(function(){
+  const cv=document.getElementById("cHit"); if(!cv) return;
+  const cEl=document.getElementById("hcC"), nEl=document.getElementById("hcN"),
+        sEl=document.getElementById("hcS"), rEl=document.getElementById("hcR");
+  const out=document.getElementById("hcOut"), note=document.getElementById("hcNote");
+  const CATS=[10000,100000,1000000,10000000];
+
+  /* Hit ratio for a cache holding the C most popular of N Zipf-distributed
+     objects = sum of their probabilities. Use the generalised harmonic number
+     rather than materialising ten million weights. */
+  function H(n,s){
+    if(n<=0) return 0;
+    let sum=0;
+    const exact=Math.min(n,2000);
+    for(let i=1;i<=exact;i++) sum+=1/Math.pow(i,s);
+    if(n>exact){                       /* Euler-Maclaurin tail */
+      const a=exact+0.5;
+      sum += s===1 ? Math.log(n/exact)
+                   : (Math.pow(n+0.5,1-s)-Math.pow(a,1-s))/(1-s);
+    }
+    return sum;
+  }
+  const hit=(C,N,s)=> C<=0?0:Math.min(1,H(Math.min(C,N),s)/H(N,s));
+
+  function draw(){
+    const N=CATS[Math.round(+nEl.value)], s=+sEl.value/100, rate=+rEl.value;
+    /* cache-size slider is logarithmic from 10 to N */
+    const C=Math.max(1,Math.round(10*Math.pow(N/10, (+cEl.value)/1000)));
+    document.getElementById("hcCo").textContent=C.toLocaleString();
+    document.getElementById("hcNo").textContent=N.toLocaleString();
+    document.getElementById("hcSo").textContent=s.toFixed(2);
+    document.getElementById("hcRo").textContent=rate.toLocaleString();
+
+    const h=hit(C,N,s), originPct=1-h, originRps=rate*originPct;
+
+    const P=Plot(cv,{pad:[18,16,34,46],ratio:0.38});
+    P.o.xr=[0,1000]; P.o.yr=[0,100]; P.clear();
+    const ctx=P.ctx;
+    ctx.strokeStyle=PC.grid; ctx.lineWidth=1;
+    for(let g=0;g<=4;g++){ const v=g*25, y=Math.round(P.Y(v))+0.5;
+      ctx.beginPath(); ctx.moveTo(P.L,y); ctx.lineTo(P.R,y); ctx.stroke();
+      P.px(P.L-7,P.Y(v),v+"%",PC.text,"right","10.5px Archivo, Arial"); }
+    [10,100,1000,10000,100000,1000000,10000000].forEach(v=>{
+      if(v>N) return;
+      const pos=1000*Math.log(v/10)/Math.log(N/10);
+      if(pos<0||pos>1000) return;
+      const x=P.X(pos);
+      ctx.strokeStyle=PC.grid; ctx.beginPath(); ctx.moveTo(x,P.T); ctx.lineTo(x,P.B); ctx.stroke();
+      P.px(x,P.B+13, v>=1000?(v/1000)+"k":String(v), PC.text,"center","10px Archivo, Arial"); });
+    P.px((P.L+P.R)/2,P.B+27,"objects held in cache",PC.text,"center","600 10px Archivo, Arial");
+    P.px(P.L-7,P.Y(100)-11,"hit ratio",PC.text,"right","600 9.5px Archivo, Arial");
+
+    ctx.beginPath();
+    for(let i=0;i<=140;i++){
+      const cc=10*Math.pow(N/10,i/140), y=hit(cc,N,s)*100;
+      const X=P.X(1000*i/140), Y=P.Y(y); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y);
+    }
+    ctx.strokeStyle=PC.line; ctx.lineWidth=2.4; ctx.stroke();
+
+    /* the 90% line — where origin load reaches a tenth */
+    const y90=P.Y(90);
+    ctx.setLineDash([3,3]); ctx.strokeStyle=PC.ok; ctx.lineWidth=1.2;
+    ctx.beginPath(); ctx.moveTo(P.L,y90); ctx.lineTo(P.R,y90); ctx.stroke(); ctx.setLineDash([]);
+    P.px(P.R-4,y90-9,"90% — origin sees a tenth",PC.ok,"right","600 9.5px Archivo, Arial");
+
+    const cx=P.X(+cEl.value), cy=P.Y(h*100);
+    ctx.strokeStyle=PC.ink; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.arc(cx,cy,5.5,0,7); ctx.stroke();
+    ctx.fillStyle="#fff"; ctx.beginPath(); ctx.arc(cx,cy,3.5,0,7); ctx.fill();
+
+    const dbl=hit(Math.min(N,C*2),N,s)-h;
+    out.innerHTML=
+      '<div><span>hit ratio</span><b style="color:'+(h>0.9?PC.ok:h>0.7?PC.warn:PC.bad)+'">'+(h*100).toFixed(1)+'%</b></div>'+
+      '<div><span>origin sees</span><b>'+(originPct*100).toFixed(1)+'%</b></div>'+
+      '<div><span>origin load</span><b>'+Math.round(originRps).toLocaleString()+' req/s</b></div>'+
+      '<div><span>cache is</span><b>'+(C/N*100).toFixed(3)+'% of catalogue</b></div>'+
+      '<div><span>doubling adds</span><b>'+(dbl*100).toFixed(1)+' pts</b></div>'+
+      '<div><span>origin at 95% hit</span><b>'+Math.round(rate*0.05).toLocaleString()+' req/s</b></div>';
+
+    note.innerHTML=
+      'Holding the <b>'+C.toLocaleString()+'</b> most popular of '+N.toLocaleString()+' objects — '+
+      (C/N*100).toFixed(3)+'% of the catalogue — gives a <b>'+(h*100).toFixed(1)+'%</b> hit ratio, so the origin handles <b>'+
+      Math.round(originRps).toLocaleString()+'</b> of '+rate.toLocaleString()+' req/s. '+
+      'Doubling the cache to '+Math.min(N,C*2).toLocaleString()+' adds only <b>'+(dbl*100).toFixed(1)+
+      ' points</b> — capacity has logarithmic returns. '+
+      (h<0.9
+        ? 'Reaching 90% would take the origin to '+Math.round(rate*0.1).toLocaleString()+' req/s; note that each further halving of origin load is worth more than the last, which is the opposite of how the curve above looks.'
+        : 'From here, moving 90% → 95% halves origin load again and 95% → 99% halves it twice more. The expensive last points are the valuable ones.')+
+      (s<0.75 ? ' <b>At exponent '+s.toFixed(2)+' demand is close to flat</b>, so no realistic cache size helps much — the fix is making more requests cacheable, not buying storage.' : '');
+  }
+  [cEl,nEl,sEl,rEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+
+/* ============ demo 2: cache stampede ============ */
+(function(){
+  const cv=document.getElementById("cStamp"); if(!cv) return;
+  const rEl=document.getElementById("stR"), lEl=document.getElementById("stL"), tEl=document.getElementById("stT"),
+        kEl=document.getElementById("stK"), mEl=document.getElementById("stM"), jEl=document.getElementById("stJ");
+  const out=document.getElementById("stOut"), note=document.getElementById("stNote");
+
+  function model(){
+    const rate=+rEl.value, L=+lEl.value/1000, ttl=Math.max(1,Math.round(+tEl.value));
+    const keys=Math.max(1,Math.round(+kEl.value)), mode=mEl.value, jitter=+jEl.value;
+    /* the hottest key takes a fixed share; the rest split what is left */
+    const hotShare = keys===1 ? 1 : 0.20;
+    const hotRate = rate*hotShare;
+    const coldRate = keys>1 ? (rate-hotRate)/(keys-1) : 0;
+    const amp = r => mode==="none" ? 1+r*L : 1;
+    const hotAmp=amp(hotRate), coldAmp=amp(coldRate);
+    const perCycle = hotAmp + (keys-1)*coldAmp;
+    const originRate = perCycle/ttl;
+    const burst = perCycle;
+    const window = jitter>0 ? ttl*jitter/100 : 0;
+    const spread = window>0 ? burst/window : burst;
+    return {rate,L,ttl,keys,mode,jitter,hotRate,coldRate,hotAmp,coldAmp,
+            perCycle,originRate,burst,window,spread,
+            clientWait: mode==="swr"?0:+lEl.value,
+            noCache: rate};
+  }
+
+  function draw(){
+    const m=model();
+    document.getElementById("stRo").textContent=m.rate.toLocaleString();
+    document.getElementById("stLo").textContent=+lEl.value;
+    document.getElementById("stTo").textContent=m.ttl;
+    document.getElementById("stKo").textContent=m.keys.toLocaleString();
+    document.getElementById("stJo").textContent=m.jitter;
+
+    const w=cv.clientWidth||660, h=118, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("requests reaching the origin, per second, over one TTL cycle", 14, 12);
+
+    const L=14,R=w-14,span=R-L,base=86;
+    const peak = m.window>0 ? m.spread : m.burst;
+    const yScale = v => Math.min(52, 52*Math.log10(1+v)/Math.log10(1+Math.max(10,peak)));
+
+    /* steady trickle across the cycle, then the spike at expiry */
+    ctx.strokeStyle="#D5DDE4"; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(L,base+.5); ctx.lineTo(R,base+.5); ctx.stroke();
+    const spikeX = L+span*0.62;
+    ctx.fillStyle="#C7CEFB";
+    ctx.fillRect(L,base-yScale(0.2),span,yScale(0.2));
+    if(m.window>0){
+      const wpx=Math.min(span*0.3, span*(m.window/m.ttl));
+      ctx.fillStyle=PC.warn;
+      ctx.fillRect(spikeX,base-yScale(m.spread),Math.max(3,wpx),yScale(m.spread));
+      ctx.fillStyle=PC.text; ctx.font="9.5px Archivo, Arial"; ctx.textAlign="left";
+      ctx.fillText(Math.round(m.spread).toLocaleString()+"/s spread over "+m.window.toFixed(1)+"s",
+        spikeX+Math.max(3,wpx)+6, base-yScale(m.spread)+7);
+    } else {
+      const bad=m.burst>50;
+      ctx.fillStyle= bad?PC.bad:PC.ok;
+      ctx.fillRect(spikeX,base-yScale(m.burst),5,yScale(m.burst));
+      ctx.fillStyle= bad?PC.bad:PC.ok; ctx.font="700 10px Archivo, Arial"; ctx.textAlign="left";
+      ctx.fillText(Math.round(m.burst).toLocaleString()+(m.burst>1?" requests at once":" request"),
+        spikeX+10, base-yScale(m.burst)+6);
+    }
+    ctx.fillStyle=PC.text; ctx.font="9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("expiry", spikeX, base+12);
+    ctx.textAlign="right";
+    ctx.fillText("without any cache: "+m.noCache.toLocaleString()+" req/s continuously", R, base+12);
+
+    /* the comparison strip */
+    ctx.textAlign="left"; ctx.font="600 9.5px Archivo, Arial"; ctx.fillStyle=PC.text;
+    ctx.fillText("amplification on the hottest key", L, 26);
+    const bx=L+180, bspan=Math.max(60,R-bx-90);
+    const ampMax=Math.max(m.hotAmp,10);
+    ctx.fillStyle="#EDF1F4"; ctx.fillRect(bx,20,bspan,13);
+    ctx.fillStyle= m.hotAmp>10?PC.bad:m.hotAmp>2?PC.warn:PC.ok;
+    ctx.fillRect(bx,20,bspan*Math.min(1,m.hotAmp/ampMax),13);
+    ctx.fillStyle=PC.ink; ctx.font="700 10px ui-monospace, monospace"; ctx.textAlign="left";
+    ctx.fillText("×"+m.hotAmp.toFixed(0), bx+bspan+7, 27);
+    ctx.font="9.5px Archivo, Arial"; ctx.fillStyle=PC.text;
+    ctx.fillText("hottest key: "+Math.round(m.hotRate).toLocaleString()+" req/s"+
+      (m.keys>1?"   ·   each of the other "+(m.keys-1).toLocaleString()+": "+m.coldRate.toFixed(2)+" req/s  ×"+m.coldAmp.toFixed(2):""),
+      L, 44);
+
+    out.innerHTML=
+      '<div><span>hot-key amplification</span><b style="color:'+(m.hotAmp>10?PC.bad:m.hotAmp>2?PC.warn:PC.ok)+'">×'+m.hotAmp.toFixed(0)+'</b></div>'+
+      '<div><span>origin, steady state</span><b>'+m.originRate.toFixed(1)+' req/s</b></div>'+
+      '<div><span>burst at expiry</span><b style="color:'+(m.burst>200?PC.bad:m.burst>20?PC.warn:PC.ok)+'">'+
+        Math.round(m.window>0?m.spread:m.burst).toLocaleString()+(m.window>0?'/s':'')+'</b></div>'+
+      '<div><span>client waits</span><b style="color:'+(m.clientWait?PC.warn:PC.ok)+'">'+m.clientWait+' ms</b></div>'+
+      '<div><span>vs no cache</span><b>'+(m.noCache/Math.max(0.01,m.originRate)).toFixed(0)+'× less</b></div>'+
+      '<div><span>protection</span><b style="font-size:11px;color:'+(m.mode==="none"?PC.bad:PC.ok)+'">'+
+        (m.mode==="none"?"none":m.mode==="single"?"coalescing":"stale-while-revalidate")+'</b></div>';
+
+    let msg;
+    if(m.mode==="none" && m.keys===1)
+      msg='The origin takes <b>'+(+lEl.value)+' ms</b>, and during that window the entry is still missing — so every one of the '+
+          m.rate.toLocaleString()+' requests arriving in it also misses. That is <b>1 + '+m.rate.toLocaleString()+' × '+m.L.toFixed(2)+
+          ' = '+m.hotAmp.toFixed(0)+'</b> simultaneous origin requests from a single expiry. '+
+          'Raising the TTL does not shrink that burst at all — it only makes it rarer, and therefore harder to catch.';
+    else if(m.mode==="single")
+      msg='Coalescing collapses the burst to <b>one</b> origin request: the cache sees a fetch already in flight for this key and makes the others wait on its result. '+
+          'nginx calls it <code>proxy_cache_lock</code>; in Go it is <code>singleflight</code>. The remaining cost is that those clients still wait <b>'+
+          m.clientWait+' ms</b> for the refresh.';
+    else if(m.mode==="swr")
+      msg='Stale-while-revalidate serves the expiring copy <b>immediately</b> and refreshes behind it, so the origin sees one request and <b>no client waits at all</b>. '+
+          'The price is bounded staleness, which for most content is a trade worth taking every time. It composes with coalescing rather than replacing it.';
+    else
+      msg='';
+    if(m.keys>1)
+      msg+=' Spread across <b>'+m.keys.toLocaleString()+'</b> keys, each cold key sees only '+m.coldRate.toFixed(2)+
+           ' req/s and amplifies just '+m.coldAmp.toFixed(2)+'× — <b>stampedes are a hot-key problem</b>. '+
+           (m.jitter>0
+             ? 'But their TTLs would still expire together if set at the same moment; <b>'+m.jitter+'% jitter</b> spreads that '+
+               Math.round(m.burst).toLocaleString()+'-request burst to about <b>'+Math.round(m.spread).toLocaleString()+'/s</b> over '+m.window.toFixed(1)+' s.'
+             : 'With <b>no jitter</b>, keys populated at the same instant expire at the same instant: <b>'+Math.round(m.burst).toLocaleString()+
+               '</b> origin requests in one moment. Add jitter and watch it flatten.');
+    note.innerHTML=msg;
+  }
+  [rEl,lEl,tEl,kEl,mEl,jEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+</script>
+</body>
+</html>

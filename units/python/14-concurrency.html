@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Concurrency and async — Python</title>
+<meta name="description" content="What the GIL prevents and what it does not, measured comparisons of threads, processes and asyncio, the event loop and the single blocking call that removes all the benefit.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23F2A03D' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">Python</a><span class="sep">/</span><span>Chapter 14</span></p>
+    <p class="chno">Chapter 14 · Working with the world</p>
+    <h1>Concurrency and async</h1>
+    <p class="lede">Python has three concurrency models and picking the wrong one gives you the overhead without the benefit. The choice is decided almost entirely by one question — whether your program is waiting or computing — and by one implementation detail, the global interpreter lock, which is less mysterious than its reputation.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapters 08, 09</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="gil">
+<h2>The GIL, precisely</h2><div class="h2rule"></div>
+
+<p class="lead">One lock in the interpreter, held by whichever thread is currently executing Python bytecode. It is released on I/O, released periodically so other threads get a turn, and released by C extensions that do not touch Python objects — which is why NumPy is not affected the way pure Python is.</p>
+
+<div class="kv">
+<dt>What it prevents</dt><dd>Two threads running Python bytecode simultaneously. So threads give <b>no</b> speedup on CPU-bound Python work, however many cores you have.</dd>
+<dt>What it does not prevent</dt><dd>Concurrency during I/O — the lock is released while a thread waits on a socket, a file or a subprocess, so other threads run. That is why threads work well for I/O.</dd>
+<dt>What it does not give you</dt><dd>Thread safety. The lock guarantees each bytecode is atomic, not that your operation is. <code>counter += 1</code> is several bytecodes and can interleave, so you still need a <code>Lock</code>.</dd>
+<dt>And it is on its way out, slowly</dt><dd>3.13 ships an optional free-threaded build (PEP 703). It is not the default, extension support is incomplete, and single-threaded code is somewhat slower — worth watching, not yet worth planning around.</dd>
+</div>
+
+<div class="demo" id="d-model">
+  <div class="demo-top"><div class="demo-title">Which model for which workload</div><div class="demo-hint">Switch the workload — the ranking inverts completely</div></div>
+  <div class="demo-body">
+    <canvas id="cModel" aria-label="Measured wall-clock time for sequential, threaded, multiprocess and asyncio execution of CPU-bound and IO-bound work"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Workload</label><select id="mdW">
+        <option value="cpu" selected>CPU-bound — 4 × 3M-iteration loop</option>
+        <option value="io">I/O-bound — 20 × 100 ms wait</option>
+      </select></div>
+      <div class="ctrl"><label>Cores <b id="mdCo">1</b></label><input type="range" id="mdC" min="1" max="16" value="1"></div>
+    </div>
+    <div class="rgrid" id="mdOut"></div>
+    <div class="readout" id="mdNote"></div>
+  </div>
+</div>
+
+<div class="box intu"><b class="tag">The measurements, and what this machine could not show</b>
+<p style="margin-bottom:6px">The one-core figures were measured on the machine that built this page. CPU-bound, four tasks: sequential <b>0.67 s</b>, threads <b>0.58 s</b> (1.15×), processes <b>0.65 s</b> (1.04×). I/O-bound, twenty 100 ms waits: sequential <b>2.00 s</b>, threads <b>0.10 s</b> (19.5×), asyncio <b>0.10 s</b> (19.7×).</p>
+<p style="margin-bottom:0">That machine had <b>one CPU</b>, so it cannot demonstrate the multiprocessing speedup — with no second core, four processes just add spawn and pickling overhead. Above one core the demo therefore <em>models</em> the process case rather than reporting a measurement: measured per-task work, divided across the cores you select, plus the measured process overhead. The thread and asyncio curves stay measured, because the GIL makes them independent of core count.</p>
+</div>
+</section>
+
+<section id="async">
+<h2>The event loop</h2><div class="h2rule"></div>
+
+<div class="code"><div class="code-top"><span class="code-lang">python</span><button class="code-copy">Copy</button></div><pre>import asyncio
+
+async def fetch(session, url):        <span class="c"># a coroutine — calling it runs NOTHING,</span>
+    async with session.get(url) as r:  <span class="c"># exactly like chapter 9's generator</span>
+        return await r.json()
+
+async def main():
+    async with aiohttp.ClientSession() as s:
+        results = await asyncio.gather(*(fetch(s, u) for u in urls))
+        <span class="c"># gather: all at once, results in argument order. One failure</span>
+        <span class="c"># cancels nothing else unless you say return_exceptions=True</span>
+
+    async with asyncio.TaskGroup() as tg:      <span class="c"># 3.11+, and the better default:</span>
+        a = tg.create_task(fetch(s, u1))        <span class="c"># if one task fails, the rest are</span>
+        b = tg.create_task(fetch(s, u2))        <span class="c"># CANCELLED and you get an</span>
+    <span class="c"># …all tasks are complete here          ExceptionGroup (chapter 8)</span>
+
+asyncio.run(main())                    <span class="c"># one loop, at the top, once</span>
+
+<span class="c"># bounding concurrency matters — 10,000 tasks against one API is a denial of service</span>
+sem = asyncio.Semaphore(20)
+async def limited(u):
+    async with sem:
+        return await fetch(s, u)
+
+<span class="c"># and a timeout on anything touching a network:</span>
+async with asyncio.timeout(5):         <span class="c"># 3.11+</span>
+    await fetch(s, url)</pre></div>
+
+<div class="demo" id="d-block">
+  <div class="demo-top"><div class="demo-title">What blocks the loop</div><div class="demo-hint">One line's difference, ten times the wall clock</div></div>
+  <div class="demo-body">
+    <canvas id="cBlock" aria-label="Ten concurrent tasks executed with an awaited sleep, a blocking sleep, and an offloaded blocking sleep"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Inside the coroutine</label><select id="blK">
+        <option value="good" selected>await asyncio.sleep(0.1)</option>
+        <option value="bad">time.sleep(0.1) — blocking</option>
+        <option value="thread">await asyncio.to_thread(time.sleep, 0.1)</option>
+      </select></div>
+      <div class="ctrl"><label>Tasks <b id="blNo">10</b></label><input type="range" id="blN" min="2" max="40" value="10"></div>
+    </div>
+    <div class="rgrid" id="blOut"></div>
+    <div class="readout" id="blNote"></div>
+  </div>
+</div>
+
+<div class="kv">
+<dt>Ten tasks, 100 ms each: 0.101 s or 1.002 s</dt><dd>Awaiting <code>asyncio.sleep</code> finishes in one interval; calling <code>time.sleep</code> takes the full ten. One line's difference, and the concurrency is gone.</dd>
+<dt>Because the loop is a single thread</dt><dd>While a blocking call holds it, <em>nothing</em> else runs — not the other tasks, not the timers, not the server accepting connections. The program is not slow, it is serialised.</dd>
+<dt><code>asyncio.to_thread</code> restores it</dt><dd>0.201 s at ten tasks: the blocking work moves to a thread pool and the loop stays free. That is the correct wrapper for any synchronous library you cannot replace.</dd>
+<dt>Which is why one sync driver undoes a whole framework</dt><dd>A synchronous database call inside an async request handler blocks every concurrent request on that worker. The framework's benefit is entirely contingent on nothing in the request path blocking.</dd>
+</div>
+</section>
+
+<section id="pitfalls">
+<h2>Getting it wrong</h2><div class="h2rule"></div>
+
+<div class="kv">
+<dt>Forgetting <code>await</code></dt><dd>Calling a coroutine without awaiting it does nothing at all and returns a coroutine object — like calling a generator function, from chapter 9. Python emits <code>RuntimeWarning: coroutine was never awaited</code>, which is easy to miss in a busy log. Run with <code>-W error::RuntimeWarning</code> in tests.</dd>
+<dt>Fire-and-forget tasks that vanish</dt><dd><code>asyncio.create_task</code> returns a task the loop holds only weakly, so a task nobody keeps a reference to can be garbage-collected mid-flight. Keep the reference, or use a <code>TaskGroup</code>, which is one of several reasons to prefer it.</dd>
+<dt>Assuming the GIL makes you thread-safe</dt><dd>It does not. <code>counter += 1</code> is a read, an add and a write, and the lock can be released between them — so a hundred threads incrementing a shared counter reliably lose updates. Use a <code>Lock</code>, or a <code>queue.Queue</code>, which is designed for it.</dd>
+<dt>Sharing state between processes</dt><dd>Processes have separate memory, so a global modified in a worker is invisible to the parent. Everything crossing the boundary is pickled, which means arguments must be picklable — a lambda is not — and large arguments cost real time to copy.</dd>
+</div>
+
+<div class="box trap"><b class="tag">The colour problem</b>
+<p style="margin-bottom:0">An <code>async</code> function can only be awaited from another <code>async</code> function, so a single async call deep in a call stack forces every caller above it to become async too. That is why adopting asyncio tends to convert a whole codebase rather than a corner of it, and why many libraries maintain two parallel APIs. Two escape hatches, both with costs: <code>asyncio.run()</code> starts a loop to call async code from sync, but cannot be called from inside a running loop; <code>asyncio.to_thread()</code> goes the other way and costs a thread. If you are choosing at the start of a project, <code>concurrent.futures.ThreadPoolExecutor</code> handles a great deal of I/O concurrency with none of this, and is genuinely the right answer more often than its reputation suggests — asyncio's advantage appears at thousands of concurrent connections, not dozens.</p>
+</div>
+</section>
+
+<section id="close">
+<h2>Check yourself</h2><div class="h2rule"></div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>You move CPU-bound work into four threads and it does not get faster. Why?
+<button class="reveal">Show answer</button><div class="ans">The global interpreter lock. Only one thread executes Python bytecode at a time, so four threads doing arithmetic take the same wall-clock time as doing it four times in a row — measured at 0.67 s sequential against 0.58 s with threads, which is within noise of no improvement. The lock is released on I/O and released periodically to let other threads have a turn, but that only reorders the work, it does not parallelise it. For CPU-bound Python the answer is <code>ProcessPoolExecutor</code>, which sidesteps the lock by using separate interpreters — at the cost of process spawn time and pickling everything that crosses the boundary, so it only pays for tasks large enough to amortise that. Two important exceptions: C extensions such as NumPy release the lock while computing, so threads do help there; and 3.13's optional free-threaded build removes the lock entirely, though it is not the default yet.</div></li>
+
+<li>An async endpoint calls a synchronous database driver. What happens to the other requests?
+<button class="reveal">Show answer</button><div class="ans">They stop. The event loop is a single thread, so while a blocking call holds it nothing else progresses — not the other in-flight requests, not the timers, not the socket accepting new connections. The measurement is stark: ten tasks each waiting 100 ms take 0.101 s when they await properly and 1.002 s when they call <code>time.sleep</code> instead. One line's difference, and the concurrency is entirely gone. The service is not slow in the usual sense; it is serialised, and it will look fine under single-request testing and collapse under load. The fix is either an async driver, or wrapping the synchronous call in <code>asyncio.to_thread</code>, which moved the same workload back to 0.201 s by keeping the loop free. This is why one synchronous dependency in the request path can cost more throughput than the entire framework gained.</div></li>
+
+<li>Does the GIL make your code thread-safe?
+<button class="reveal">Show answer</button><div class="ans">No, and this is the most consequential misunderstanding of it. The lock guarantees that a single bytecode instruction is atomic — it does not guarantee that your <em>operation</em> is. <code>counter += 1</code> compiles to a load, an add and a store, and the interpreter can release the lock between them, so two threads can both read 5, both compute 6, and both write 6: one increment is lost. With enough threads and iterations this is not theoretical, it is reliable. You still need a <code>threading.Lock</code> around any read-modify-write on shared state, or better, a design that avoids shared mutable state at all — <code>queue.Queue</code> is built for handing work between threads safely, and having each thread own its data and return a result is simpler than locking. The rule of thumb: if you would need a lock in a language without a GIL, you need one in Python.</div></li>
+
+<li>When is asyncio genuinely better than a thread pool?
+<button class="reveal">Show answer</button><div class="ans">At high connection counts, and when you need fine control over cancellation and timeouts. The measurements make the point about the ordinary case: twenty concurrent 100 ms waits took 0.10 s with threads and 0.10 s with asyncio — identical, because both simply wait. The difference is cost per unit of concurrency. A thread carries an OS stack, typically a megabyte of reserved address space, and every switch goes through the kernel; an asyncio task is a Python object of a few hundred bytes and switches are function calls. So a few dozen concurrent operations are equally well served by <code>ThreadPoolExecutor</code>, and tens of thousands of open sockets are practical only with asyncio. Against that, asyncio brings the colour problem, requires async-native libraries throughout, and makes a single blocking call catastrophic rather than merely slow. For most applications a thread pool is the right answer and the boring one.</div></li>
+
+<li>Why might a task created with <code>asyncio.create_task</code> never finish?
+<button class="reveal">Show answer</button><div class="ans">Because the event loop keeps only a weak reference to it, so if you do not keep the returned task somewhere it can be garbage-collected mid-flight — the work simply stops, usually with no error anywhere. The documented fix is to store tasks in a set and discard them in a done-callback, which is tedious enough that the real answer is <code>asyncio.TaskGroup</code> from 3.11: it holds its tasks, waits for them all at the end of the <code>async with</code> block, and cancels the remainder if one fails, delivering an <code>ExceptionGroup</code> that chapter 8's <code>except*</code> can pick apart. That failure behaviour is the second reason to prefer it over <code>gather</code>, where by default one exception propagates while the other tasks keep running unsupervised. If you do use <code>gather</code>, <code>return_exceptions=True</code> at least makes the outcomes explicit rather than partial.</div></li>
+
+<li>You pass a lambda to <code>ProcessPoolExecutor.map</code> and get a pickling error. Why?
+<button class="reveal">Show answer</button><div class="ans">Because processes have separate memory, so everything crossing the boundary is serialised with <code>pickle</code>, and a lambda has no importable qualified name to pickle by reference. The same applies to nested functions, most closures, open file handles and locks. Use a module-level function, and <code>functools.partial</code> to bind arguments — that pickles fine. The wider point is that the process boundary is a copy, not a share: a global modified in a worker is invisible to the parent, and large arguments cost real time to serialise, transfer and deserialise, which is why process pools only pay for tasks big enough to amortise it. That cost is exactly what the one-core measurement showed — four processes were 1.04× against sequential, meaning the overhead ate the entire benefit when there was no second core to exploit.</div></li>
+
+<li>Your program prints <code>RuntimeWarning: coroutine 'fetch' was never awaited</code>. What did you do?
+<button class="reveal">Show answer</button><div class="ans">Called an async function without awaiting it. Calling a coroutine function runs none of its body — it builds a coroutine object, exactly as calling a generator function builds a generator in chapter 9 — so the work never happens and the return value is the coroutine rather than the result. Common shapes: forgetting <code>await</code> on a call whose result you discard, passing a coroutine where a value was expected, or calling one inside a synchronous callback that cannot await. The warning is easy to lose in a busy log, so run tests with <code>-W error::RuntimeWarning</code> to turn it into a failure. Note the related case that produces no warning at all: <code>asyncio.gather(*(fetch(u) for u in urls))</code> is correct because <code>gather</code> awaits them, while forgetting the <code>await</code> on <code>gather</code> itself leaves everything unstarted — and a type checker with async support will catch that one where the runtime will not.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin-bottom:0">Chapter 15 turns to testing — what pytest gives you over unittest, fixtures, what to mock and what not to, and how to test the concurrent code this chapter introduced.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 14</h2><p>Concurrency and async. Part of the Python unit — <a href="index.html">all 20 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 15 (testing async code), 17 (profiling concurrent work, where wall clock and CPU time diverge).</p></div>
+    <div><h2>Going deeper</h2><p>David Beazley's <em>Understanding the GIL</em> is still the clearest explanation of the mechanism. PEP 703 sets out the free-threading plan and its trade-offs honestly.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: which model for which workload ============ */
+(function(){
+  const cv=document.getElementById("cModel"); if(!cv) return;
+  const wEl=document.getElementById("mdW"), cEl=document.getElementById("mdC");
+  const out=document.getElementById("mdOut"), note=document.getElementById("mdNote");
+
+  /* MEASURED on the one-CPU machine that built this page, CPython 3.12:
+       CPU-bound 4 tasks: sequential 0.67s, threads 0.58s, processes 0.65s
+       I/O-bound 20×100ms: sequential 2.00s, threads 0.10s, asyncio 0.10s
+     Above one core the process figure is MODELLED, and labelled as such. */
+  const M={
+    cpu:{ tasks:4, seq:0.67, thr:0.58, procMeasured:0.65, aio:null,
+          perTask:0.67/4, procOverhead:0.65-0.67 },
+    io:{ tasks:20, seq:2.00, thr:0.10, procMeasured:null, aio:0.10 }
+  };
+
+  function model(){
+    const k=wEl.value, cores=Math.max(1,Math.min(16,Math.round(+cEl.value)));
+    const B=M[k];
+    if(k==="io")
+      return {k,cores,tasks:B.tasks,rows:[
+        ["sequential",B.seq,true],["threads",B.thr,true],["asyncio",B.aio,true]],
+        best:"threads or asyncio", modelled:false};
+    /* processes: measured overhead (0.65 - 0.67 for 4 tasks on 1 core) plus the
+       work divided across cores. At cores=1 this reproduces the measurement. */
+    const workPerCore=B.perTask*Math.ceil(B.tasks/cores);
+    const proc = cores===1 ? B.procMeasured : workPerCore + (B.procMeasured - B.seq) + 0.0;
+    return {k,cores,tasks:B.tasks,rows:[
+      ["sequential",B.seq,true],["threads",B.thr,true],
+      ["processes",Math.max(0.02,proc),cores===1]],
+      best: cores===1?"none of them help":"processes", modelled:cores>1};
+  }
+
+  function draw(){
+    const m=model();
+    document.getElementById("mdCo").textContent=m.cores;
+    cEl.disabled = m.k==="io";
+
+    const w=cv.clientWidth||660, h=26+m.rows.length*22+22, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+    ctx.textAlign="left"; ctx.font="600 9.5px Archivo, Arial"; ctx.fillStyle=PC.text;
+    ctx.fillText(m.k==="cpu"? m.tasks+" CPU-bound tasks — wall clock"
+                            : m.tasks+" tasks each waiting 100 ms — wall clock", 14, 12);
+
+    const worst=Math.max(...m.rows.map(r=>r[1]));
+    const L=Math.min(112,w*0.21), span=Math.min(300,w-L-118);
+    m.rows.forEach(([lab,t,measured],i)=>{
+      const y=24+i*22, speed=m.rows[0][1]/t;
+      ctx.textAlign="right"; ctx.font="10px Archivo, Arial"; ctx.fillStyle=PC.ink;
+      ctx.fillText(lab, L-8, y+8);
+      ctx.fillStyle="#EDF1F4"; ctx.fillRect(L,y,span,15);
+      ctx.fillStyle= speed>=2?PC.ok : speed>=1.4?PC.warn : PC.bad;
+      ctx.fillRect(L,y,Math.max(3,span*t/worst),15);
+      ctx.textAlign="left"; ctx.font="700 9.5px ui-monospace, monospace";
+      ctx.fillStyle= speed>=2?PC.ok : speed>=1.4?PC.warn : PC.bad;
+      ctx.fillText(t.toFixed(2)+"s  "+speed.toFixed(1)+"\u00d7", L+span+8, y+8);
+      if(!measured){ ctx.font="8.5px Archivo, Arial"; ctx.fillStyle="#9AA8B5";
+        ctx.fillText("modelled", L+4, y+8); }
+    });
+    const yb=24+m.rows.length*22+4;
+    ctx.textAlign="left"; ctx.font="600 10px Archivo, Arial"; ctx.fillStyle=PC.ink;
+    ctx.fillText(m.k==="io"
+      ? "both help enormously — the GIL is released while waiting"
+      : m.cores===1 ? "on one core, nothing helps: measured on the machine that built this page"
+                    : "only processes help, and only because they escape the GIL", 14, yb+4);
+
+    const thrSpeed=m.rows[0][1]/m.rows[1][1];
+    const bestT=Math.min(...m.rows.map(r=>r[1]));
+    out.innerHTML=
+      '<div><span>workload</span><b style="font-size:11px">'+(m.k==="cpu"?"CPU-bound":"I/O-bound")+'</b></div>'+
+      '<div><span>sequential</span><b>'+m.rows[0][1].toFixed(2)+'s</b></div>'+
+      '<div><span>threads</span><b style="color:'+(thrSpeed>=2?PC.ok:PC.bad)+'">'+
+        thrSpeed.toFixed(1)+'\u00d7</b></div>'+
+      '<div><span>'+(m.k==="cpu"?"processes":"asyncio")+'</span><b style="color:'+
+        (m.rows[0][1]/m.rows[2][1]>=2?PC.ok:PC.bad)+'">'+
+        (m.rows[0][1]/m.rows[2][1]).toFixed(1)+'\u00d7</b></div>'+
+      '<div><span>best</span><b style="font-size:10.5px">'+bestT.toFixed(2)+'s</b></div>'+
+      '<div><span>figures</span><b style="font-size:10.5px;color:'+(m.modelled?PC.warn:PC.ok)+'">'+
+        (m.modelled?"partly modelled":"measured")+'</b></div>';
+
+    let msg;
+    if(m.k==="io")
+      msg='<b>Both help enormously</b> — 20 waits of 100 ms take 2.00 s in sequence and about 0.10 s either way, because the GIL is <em>released</em> while a thread waits on I/O. '+
+          'The cores slider is disabled here because core count is irrelevant: nothing is computing. Threads and asyncio are equally fast at this scale; asyncio\u2019s advantage is cost per unit of concurrency — a task is a few hundred bytes against a thread\u2019s megabyte of stack — which matters at thousands of connections, not twenty.';
+    else if(m.cores===1)
+      msg='<b>Measured on this machine, which has one CPU.</b> Threads give 1.2\u00d7, within noise of nothing, because the GIL lets only one thread run Python bytecode at a time. '+
+          'And processes give 1.0\u00d7 — with no second core they add spawn and pickling overhead for no gain. Drag the slider up to model what more cores would do.';
+    else
+      msg='With <b>'+m.cores+' cores</b>, processes escape the GIL and the work divides — <b>'+
+          (m.rows[0][1]/m.rows[2][1]).toFixed(1)+'\u00d7</b>. Threads are unchanged at 1.2\u00d7, because the lock does not care how many cores exist. '+
+          '<span style="color:#7C8B99">The process row is modelled here: measured per-task work divided across cores, plus the measured overhead. The machine that built this page had one CPU, so the multi-core speedup could not be measured directly.</span>';
+    note.innerHTML=msg;
+  }
+  [wEl,cEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+
+/* ============ demo 2: blocking the event loop ============ */
+(function(){
+  const cv=document.getElementById("cBlock"); if(!cv) return;
+  const kEl=document.getElementById("blK"), nEl=document.getElementById("blN");
+  const out=document.getElementById("blOut"), note=document.getElementById("blNote");
+
+  /* MEASURED at 10 tasks × 100 ms on CPython 3.12:
+       await asyncio.sleep 0.101s · time.sleep 1.002s
+       to_thread swept at n = 5,10,15,20,40 → 0.102, 0.201, 0.302, 0.402, 0.804 s,
+       i.e. batches of 5 (the default executor is min(32, cpu_count+4) = 5 here) */
+  const BASE={ good:{fixed:0.101}, bad:{per:0.1002}, thread:{perBatch:0.1005} };
+
+  function model(){
+    const k=kEl.value, n=Math.max(2,Math.min(40,Math.round(+nEl.value)));
+    if(k==="good")  return {k,n,t:0.101, concurrent:true, blocks:false};
+    if(k==="bad")   return {k,n,t:BASE.bad.per*n, concurrent:false, blocks:true};
+    /* to_thread: the default executor is min(32, cpu_count+4) = 5 here, so above
+       that the waits queue in batches of 5 */
+    const workers=5;
+    return {k,n,t:0.1005*Math.ceil(n/workers), concurrent:true, blocks:false, workers};
+  }
+
+  function draw(){
+    const m=model();
+    document.getElementById("blNo").textContent=m.n;
+    const seq=0.1002*m.n;
+
+    const w=cv.clientWidth||660, h=30+Math.min(m.n,12)*7+34, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+    ctx.textAlign="left"; ctx.font="600 9.5px Archivo, Arial"; ctx.fillStyle=PC.text;
+    ctx.fillText(m.n+" tasks, each 100 ms of waiting", 14, 12);
+
+    const L=52, span=w-L-70, shown=Math.min(m.n,12);
+    for(let i=0;i<shown;i++){
+      const y=24+i*7;
+      let start, dur;
+      if(m.k==="bad"){ start=(0.1002*i)/m.t; dur=0.1002/m.t; }
+      else if(m.k==="thread"){ const batch=Math.floor(i/m.workers);
+        start=(0.102*batch)/m.t; dur=0.102/m.t; }
+      else { start=0; dur=0.101/m.t; }
+      ctx.fillStyle="#EDF1F4"; ctx.fillRect(L,y,span,5);
+      ctx.fillStyle= m.k==="bad"?PC.bad : m.k==="thread"?PC.warn : PC.ok;
+      ctx.fillRect(L+span*start,y,Math.max(2,span*dur),5);
+    }
+    if(m.n>12){ ctx.font="8.5px Archivo, Arial"; ctx.fillStyle="#9AA8B5";
+      ctx.textAlign="left"; ctx.fillText("… "+(m.n-12)+" more", L, 24+shown*7+4); }
+    ctx.textAlign="right"; ctx.font="9px Archivo, Arial"; ctx.fillStyle="#9AA8B5";
+    ctx.fillText("task 1", L-6, 26); ctx.fillText("task "+shown, L-6, 24+(shown-1)*7+2);
+
+    const yb=24+shown*7+(m.n>12?14:6);
+    ctx.textAlign="left"; ctx.font="700 11px Archivo, Arial";
+    ctx.fillStyle= m.blocks?PC.bad:PC.ok;
+    ctx.fillText(m.t.toFixed(3)+" s total", 14, yb+8);
+    ctx.font="10px Archivo, Arial"; ctx.fillStyle=PC.text;
+    ctx.fillText("(sequential would be "+seq.toFixed(2)+" s)", 110, yb+8);
+
+    out.innerHTML=
+      '<div><span>tasks</span><b>'+m.n+'</b></div>'+
+      '<div><span>wall clock</span><b style="color:'+(m.blocks?PC.bad:PC.ok)+'">'+
+        m.t.toFixed(3)+'s</b></div>'+
+      '<div><span>vs sequential</span><b style="color:'+(seq/m.t>=2?PC.ok:PC.bad)+'">'+
+        (seq/m.t).toFixed(1)+'\u00d7</b></div>'+
+      '<div><span>loop free</span><b style="font-size:11.5px;color:'+(m.blocks?PC.bad:PC.ok)+'">'+
+        (m.blocks?"NO":"yes")+'</b></div>'+
+      '<div><span>runs concurrently</span><b style="font-size:11.5px;color:'+
+        (m.concurrent?PC.ok:PC.bad)+'">'+(m.concurrent?"yes":"no")+'</b></div>'+
+      '<div><span>thread pool</span><b style="font-size:10.5px">'+
+        (m.workers?m.workers+" workers":"not used")+'</b></div>';
+
+    let msg;
+    if(m.k==="good")
+      msg='<b>0.101 s regardless of how many tasks</b> — measured at 10, and the shape does not change, because every task spends its 100 ms suspended and the loop runs the others meanwhile. This is what asyncio is for.';
+    else if(m.k==="bad")
+      msg='<b style="color:#D9534F">The concurrency is gone.</b> <code>time.sleep</code> is a blocking call, and the event loop is a single thread — so while it holds the loop, <em>nothing</em> else runs: not the other tasks, not the timers, not the socket accepting connections. '+
+          'Ten tasks measured 1.002 s against 0.101 s properly awaited. The program is not slow, it is serialised, and it looks fine under single-request testing.';
+    else
+      msg='<code>asyncio.to_thread</code> moves the blocking call to the default executor and keeps the loop free — <b>'+m.t.toFixed(3)+' s</b> here. '+
+          'Note the staircase: the default pool here is <b>'+m.workers+'</b> workers (<code>min(32, cpu_count + 4)</code>), so beyond that the calls queue in batches. It restores concurrency, it does not make it free — which is the honest reason to prefer an async-native library where one exists.';
+    note.innerHTML=msg;
+  }
+  [kEl,nEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+</script>
+</body>
+</html>

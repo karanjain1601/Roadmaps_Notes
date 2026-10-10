@@ -157,23 +157,118 @@ addEventListener("load", () => {
 const C = { ink:"#0C1D30", line:"#E2574C", lineDk:"#A93A31", grid:"#E4EAEF", axis:"#94A3B8",
             text:"#54677A", ok:"#2E9E6B", bad:"#D9534F", info:"#3E8FD0", warn:"#D98324",
             purple:"#8B6FD4", card:"#FFFFFF" };
+/* Plot ported from the machine-learning unit. The minimal version here
+   provided only size/X/Y/clear/px, but 02-complexity, 06-hash-tables and
+   09-searching were written against the richer API and called p.axes,
+   p.path, p.dot, p.seg, p.label and p.legend — so those three chapters
+   threw on load in every browser and their demos never rendered. C is
+   this unit's own palette, so the colours stay DSA's. */
 function Plot(canvas, opts) {
-  const o = Object.assign({ xr:[0,1], yr:[0,1], pad:[30,14,30,44], grid:true, ratio:0.58 }, opts||{});
-  const ctx = canvas.getContext("2d"); const api = { ctx, canvas, o, C };
-  api.size = function(){
-    const dpr=Math.min(devicePixelRatio||1,2), w=canvas.clientWidth||640,
-          h=o.height||Math.round(w*o.ratio);
-    canvas.width=w*dpr; canvas.height=h*dpr; canvas.style.height=h+"px";
-    ctx.setTransform(dpr,0,0,dpr,0,0);
-    api.w=w; api.h=h; api.L=o.pad[3]; api.R=w-o.pad[1]; api.T=o.pad[0]; api.B=h-o.pad[2];
+  const o = Object.assign({ xr: [0, 1], yr: [0, 1], pad: [30, 14, 30, 44], grid: true, ratio: 0.58 }, opts || {});
+  const ctx = canvas.getContext("2d");
+  const api = { ctx, canvas, o, C };
+
+  api.size = function () {
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    const w = canvas.clientWidth || 640;
+    const h = o.height || Math.round(w * o.ratio);
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    canvas.style.height = h + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    api.w = w; api.h = h;
+    api.L = o.pad[3]; api.R = w - o.pad[1]; api.T = o.pad[0]; api.B = h - o.pad[2];
     return api;
   };
-  api.X=v=>api.L+(v-o.xr[0])/(o.xr[1]-o.xr[0])*(api.R-api.L);
-  api.Y=v=>api.B-(v-o.yr[0])/(o.yr[1]-o.yr[0])*(api.B-api.T);
-  api.clear=function(bg){ ctx.clearRect(0,0,api.w,api.h);
-    if(bg!==false){ ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,api.w,api.h);} return api; };
-  api.px=function(x,y,t,c,al,f){ ctx.save(); ctx.fillStyle=c||C.text; ctx.textAlign=al||"left";
-    ctx.font=f||"11.5px Archivo, Arial, sans-serif"; ctx.textBaseline="middle"; ctx.fillText(t,x,y); ctx.restore(); return api; };
+  api.X = v => api.L + (v - o.xr[0]) / (o.xr[1] - o.xr[0]) * (api.R - api.L);
+  api.Y = v => api.B - (v - o.yr[0]) / (o.yr[1] - o.yr[0]) * (api.B - api.T);
+  api.invX = px => o.xr[0] + (px - api.L) / (api.R - api.L) * (o.xr[1] - o.xr[0]);
+  api.invY = py => o.yr[0] + (api.B - py) / (api.B - api.T) * (o.yr[1] - o.yr[0]);
+
+  api.clear = function (bg) {
+    ctx.clearRect(0, 0, api.w, api.h);
+    if (bg !== false) { ctx.fillStyle = "#FBFCFD"; ctx.fillRect(0, 0, api.w, api.h); }
+    return api;
+  };
+  api.axes = function (cfg) {
+    const c = Object.assign({ xt: 5, yt: 5, xl: "", yl: "", fmt: v => (Math.abs(v) < 1e-9 ? "0" : (+v.toFixed(2)).toString()) }, cfg || {});
+    ctx.save(); ctx.font = "11px Archivo, Arial, sans-serif"; ctx.textBaseline = "middle";
+    for (let i = 0; i <= c.xt; i++) {
+      const v = o.xr[0] + (o.xr[1] - o.xr[0]) * i / c.xt, x = api.X(v);
+      if (o.grid) { ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x, api.T); ctx.lineTo(x, api.B); ctx.stroke(); }
+      ctx.fillStyle = C.text; ctx.textAlign = "center"; ctx.fillText(c.fmt(v), x, api.B + 13);
+    }
+    for (let i = 0; i <= c.yt; i++) {
+      const v = o.yr[0] + (o.yr[1] - o.yr[0]) * i / c.yt, y = api.Y(v);
+      if (o.grid) { ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(api.L, y); ctx.lineTo(api.R, y); ctx.stroke(); }
+      ctx.fillStyle = C.text; ctx.textAlign = "right"; ctx.fillText(c.fmt(v), api.L - 7, y);
+    }
+    ctx.strokeStyle = C.axis; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(api.L, api.T); ctx.lineTo(api.L, api.B); ctx.lineTo(api.R, api.B); ctx.stroke();
+    if (c.xl) { ctx.fillStyle = C.text; ctx.textAlign = "center"; ctx.font = "600 11.5px Archivo, Arial"; ctx.fillText(c.xl, (api.L + api.R) / 2, api.B + 26); }
+    if (c.yl) { ctx.save(); ctx.translate(13, (api.T + api.B) / 2); ctx.rotate(-Math.PI / 2); ctx.fillStyle = C.text; ctx.textAlign = "center"; ctx.font = "600 11.5px Archivo, Arial"; ctx.fillText(c.yl, 0, 0); ctx.restore(); }
+    ctx.restore(); return api;
+  };
+  api.fn = function (f, color, width, dash) {
+    ctx.save(); ctx.strokeStyle = color || C.line; ctx.lineWidth = width || 2;
+    if (dash) ctx.setLineDash(dash);
+    ctx.beginPath(); let started = false;
+    for (let px = api.L; px <= api.R; px += 1) {
+      const y = f(api.invX(px));
+      if (!isFinite(y)) { started = false; continue; }
+      const py = api.Y(y);
+      if (py < api.T - 400 || py > api.B + 400) { started = false; continue; }
+      started ? ctx.lineTo(px, py) : (ctx.moveTo(px, py), started = true);
+    }
+    ctx.stroke(); ctx.restore(); return api;
+  };
+  api.path = function (pts, color, width, dash) {
+    if (!pts.length) return api;
+    ctx.save(); ctx.strokeStyle = color || C.line; ctx.lineWidth = width || 2;
+    if (dash) ctx.setLineDash(dash);
+    ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(api.X(p[0]), api.Y(p[1])) : ctx.moveTo(api.X(p[0]), api.Y(p[1])));
+    ctx.stroke(); ctx.restore(); return api;
+  };
+  api.dot = function (x, y, r, fill, stroke) {
+    ctx.save(); ctx.beginPath(); ctx.arc(api.X(x), api.Y(y), r || 4, 0, 7);
+    ctx.fillStyle = fill || C.line; ctx.fill();
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 1.6; ctx.stroke(); }
+    ctx.restore(); return api;
+  };
+  api.seg = function (x1, y1, x2, y2, color, width, dash) {
+    ctx.save(); ctx.strokeStyle = color || C.axis; ctx.lineWidth = width || 1.4;
+    if (dash) ctx.setLineDash(dash);
+    ctx.beginPath(); ctx.moveTo(api.X(x1), api.Y(y1)); ctx.lineTo(api.X(x2), api.Y(y2)); ctx.stroke(); ctx.restore(); return api;
+  };
+  api.arrow = function (x1, y1, x2, y2, color, width) {
+    const X1 = api.X(x1), Y1 = api.Y(y1), X2 = api.X(x2), Y2 = api.Y(y2);
+    const a = Math.atan2(Y2 - Y1, X2 - X1), hl = 9;
+    ctx.save(); ctx.strokeStyle = ctx.fillStyle = color || C.ink; ctx.lineWidth = width || 2;
+    ctx.beginPath(); ctx.moveTo(X1, Y1); ctx.lineTo(X2 - Math.cos(a) * hl * .8, Y2 - Math.sin(a) * hl * .8); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(X2, Y2);
+    ctx.lineTo(X2 - hl * Math.cos(a - .38), Y2 - hl * Math.sin(a - .38));
+    ctx.lineTo(X2 - hl * Math.cos(a + .38), Y2 - hl * Math.sin(a + .38));
+    ctx.closePath(); ctx.fill(); ctx.restore(); return api;
+  };
+  api.label = function (x, y, text, color, align, font) {
+    ctx.save(); ctx.fillStyle = color || C.text; ctx.textAlign = align || "left";
+    ctx.font = font || "600 11.5px Archivo, Arial, sans-serif"; ctx.textBaseline = "middle";
+    ctx.fillText(text, api.X(x), api.Y(y)); ctx.restore(); return api;
+  };
+  api.px = function (x, y, text, color, align, font) {
+    ctx.save(); ctx.fillStyle = color || C.text; ctx.textAlign = align || "left";
+    ctx.font = font || "11.5px Archivo, Arial, sans-serif"; ctx.textBaseline = "middle";
+    ctx.fillText(text, x, y); ctx.restore(); return api;
+  };
+  api.legend = function (items, x, y) {
+    ctx.save(); ctx.font = "11.5px Archivo, Arial, sans-serif"; ctx.textBaseline = "middle";
+    let cx = x == null ? api.L + 8 : x, cy = y == null ? api.T + 10 : y;
+    items.forEach(it => {
+      ctx.fillStyle = it[1]; ctx.fillRect(cx, cy - 4, 14, 3.5);
+      ctx.fillStyle = C.text; ctx.textAlign = "left"; ctx.fillText(it[0], cx + 19, cy);
+      cx += 19 + ctx.measureText(it[0]).width + 16;
+    });
+    ctx.restore(); return api;
+  };
   return api.size();
 }
 function RNG(seed){ let s=seed||42;

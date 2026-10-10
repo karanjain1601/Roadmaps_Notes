@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Retraining — MLOps</title>
+<meta name="description" content="The square-root rule for retraining cadence, why a trigger is only as good as your detection lag, and why the best training window shrinks as drift speeds up.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">MLOps</a> <span>/</span> Chapter 17</p>
+    <p class="chnum">CHAPTER 17</p>
+    <h1>Retraining</h1>
+    <p class="lede">The optimal cadence is <strong>√(2 · cost · 365 / (decay · value))</strong>, matched by simulation within 15% at every setting — and because it is a square root, being roughly right is enough. The training window is less forgiving: under fast drift, using all 365 days of history gives <strong>22.9 times</strong> the error of the right window.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~28 min</b> read</div>
+      <div><b>Part 5</b> Operating</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="why">
+      <p class="kicker">FIRST</p>
+      <h2>Retraining fixes one thing</h2>
+      <p class="sub">It is the default response to a model behaving badly, and it is the right response to a specific and narrow cause.</p>
+
+      <div class="tw">
+        <table>
+          <caption>What retraining does and does not address</caption>
+          <thead>
+            <tr><th>Problem</th><th>Does retraining fix it?</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>The world has moved and the old relationship no longer holds</td><td><strong>Yes</strong> &mdash; this is what it is for</td></tr>
+            <tr><td>New categories, new products, new user behaviour</td><td>Yes</td></tr>
+            <tr><td>A feature pipeline is broken</td><td><strong>No</strong> &mdash; it trains on the broken feature</td></tr>
+            <tr><td>Training-serving skew</td><td><strong>No</strong> &mdash; and it may deepen it</td></tr>
+            <tr><td>A point-in-time leak</td><td><strong>No</strong> &mdash; it relearns the leak</td></tr>
+            <tr><td>The metric was never right</td><td>No</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note warn">
+        <b>Retraining on a broken pipeline bakes the break in</b>
+        <p>The rows that say no are the reason <a href="06-data-contracts.html">chapter 6</a>'s validation runs before training rather than after. A retrain triggered by a quality drop that was actually caused by a stalled feature job produces a model fitted to the stalled feature — and now the problem survives fixing the pipeline.</p>
+        <p>So the first question on any automated retrain is not "how often" but <strong>"what does it check before it starts"</strong>.</p>
+      </div>
+    </section>
+
+    <section id="cadence">
+      <p class="kicker">FREQUENCY</p>
+      <h2>How often to retrain</h2>
+      <p class="sub">Quality decays between retrains. Each retrain costs compute and carries the deployment risk <a href="10-registry.html">chapter 10</a> priced.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Four years, simulated day by day</b>
+          <span>one point of AUC is worth &pound;180,000 a year; a retrain costs &pound;900 all-in</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Retrain every
+              <select id="cd-t">
+                <option value="7">7 days</option>
+                <option value="14">14 days</option>
+                <option value="30">30 days</option>
+                <option value="60">60 days</option>
+                <option value="105" selected>105 days</option>
+                <option value="180">180 days</option>
+                <option value="300">300 days</option>
+              </select>
+            </label>
+            <label>How fast quality decays
+              <select id="cd-d">
+                <option value="0.00015">Slowly</option>
+                <option value="0.00035" selected>Typically</option>
+                <option value="0.0008">Fast</option>
+              </select>
+            </label>
+            <label>Cost of a retrain
+              <select id="cd-c">
+                <option value="300">&pound;300</option>
+                <option value="900" selected>&pound;900</option>
+                <option value="3000">&pound;3,000</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="cd-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>MEAN AUC</i><b id="cd-q">0</b><s id="cd-q-sub"></s></div>
+            <div class="tile"><i>RETRAINS PER YEAR</i><b id="cd-n">0</b><s id="cd-n-sub"></s></div>
+            <div class="tile" id="cd-cost-tile"><i>TOTAL ANNUAL COST</i><b id="cd-cost">0</b><s id="cd-cost-sub"></s></div>
+            <div class="tile hi" id="cd-best-tile"><i>BEST CADENCE HERE</i><b id="cd-best">0</b><s id="cd-best-sub"></s></div>
+          </div>
+
+          <p class="readout" id="cd-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Typical decay, &pound;900 per retrain</caption>
+          <thead>
+            <tr><th>Every</th><th>Retrains/yr</th><th>Mean AUC</th><th>Quality lost/yr</th><th>Retrain cost/yr</th><th>Total</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>7 d</strong></td><td>52</td><td>0.8586</td><td>&pound;252</td><td><strong>&pound;46,800</strong></td><td>&pound;47,052</td></tr>
+            <tr><td>30 d</td><td>12</td><td>0.8546</td><td>&pound;972</td><td>&pound;10,800</td><td>&pound;11,772</td></tr>
+            <tr><td>60 d</td><td>6</td><td>0.8494</td><td>&pound;1,904</td><td>&pound;5,400</td><td>&pound;7,304</td></tr>
+            <tr><td><strong>105 d</strong></td><td>3</td><td>0.8416</td><td>&pound;3,319</td><td>&pound;2,925</td><td><strong>&pound;6,244</strong></td></tr>
+            <tr><td>180 d</td><td>2</td><td>0.8287</td><td>&pound;5,632</td><td>&pound;1,800</td><td>&pound;7,432</td></tr>
+            <tr><td><strong>300 d</strong></td><td>1</td><td>0.8086</td><td><strong>&pound;9,257</strong></td><td>&pound;900</td><td>&pound;10,157</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>The square-root rule</b>
+        <p>The optimum is <strong>√(2 · cost · 365 / (decay · value))</strong>, and the simulation matches it within 15% at every combination tested — 156 days against 163, 102 against 105, 68 against 70, 59 against 61, 186 against 183.</p>
+        <p>Two numbers decide it: how fast your model decays and what a retrain costs all-in. Both are measurable — decay from holding out a model and scoring it weekly, cost from your own billing plus <a href="10-registry.html">chapter 10</a>'s deployment price.</p>
+        <p>And because it is a square root, it is forgiving. Retraining twice as often as optimal costs <strong>13%</strong>; half as often costs <strong>19%</strong>. Being roughly right is enough, which is worth knowing before anyone spends a fortnight tuning a schedule.</p>
+        <p>Note the asymmetry though: going long hurts more than going short. <strong>When in doubt, err short.</strong></p>
+      </div>
+    </section>
+
+    <section id="triggers">
+      <p class="kicker">SCHEDULE OR TRIGGER</p>
+      <h2>A trigger is only as good as your detection lag</h2>
+      <p class="sub">When drift arrives in jumps rather than steadily, a trigger should beat a schedule. Whether it does depends on how fast you can see the jump.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Trigger against a schedule retraining just as often</b>
+          <span>drift arrives as occasional jumps; the trigger fires after a detection lag</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Detection lag
+              <select id="tg-lag">
+                <option value="0" selected>Instant &mdash; hypothetical</option>
+                <option value="3">3 days</option>
+                <option value="10">10 days</option>
+                <option value="21">21 days &mdash; a realistic label delay</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="tg-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>TRIGGER MEAN AUC</i><b id="tg-q">0</b><s id="tg-q-sub"></s></div>
+            <div class="tile"><i>SCHEDULE AT THE SAME FREQUENCY</i><b id="tg-s">0</b><s id="tg-s-sub"></s></div>
+            <div class="tile" id="tg-adv-tile"><i>TRIGGER ADVANTAGE</i><b id="tg-adv">0</b><s>of AUC, like for like</s></div>
+            <div class="tile hi" id="tg-verd-tile"><i>WORTH BUILDING?</i><b id="tg-verd">&mdash;</b><s id="tg-verd-sub"></s></div>
+          </div>
+
+          <p class="readout" id="tg-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Compared with a schedule retraining the same number of times a year</caption>
+          <thead>
+            <tr><th>Detection lag</th><th>Retrains/yr</th><th>Trigger AUC</th><th>Matched schedule AUC</th><th>Trigger advantage</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>Instant</strong></td><td>7.8</td><td>0.8596</td><td>0.8499</td><td><strong>&plus;0.0097</strong></td></tr>
+            <tr><td>3 days</td><td>7.5</td><td>0.8585</td><td>0.8505</td><td>&plus;0.0080</td></tr>
+            <tr><td>10 days</td><td>7.0</td><td>0.8560</td><td>0.8508</td><td>&plus;0.0053</td></tr>
+            <tr><td><strong>21 days</strong></td><td>5.3</td><td><strong>0.8532</strong></td><td>0.8478</td><td><strong>&plus;0.0054</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <b>The comparison people make is not like for like</b>
+        <p>A laggy trigger has a lower total cost than an instant one, which looks like good news. It is not — <strong>a lazy trigger simply retrains less often</strong>, and that saving was available from a schedule without the degraded weeks in between.</p>
+        <p>Matched on retrain frequency, the trigger's real advantage is <strong>+0.0097</strong> of AUC with instant detection and <strong>+0.0054</strong> at a 21-day lag. And the quality it actually delivers falls monotonically: 0.8596 → 0.8585 → 0.8560 → 0.8532.</p>
+        <p><a href="16-monitoring.html">Chapter 16</a> established that model monitoring detects in days, bounded below by the label delay. So the label delay is the number that decides whether a trigger is worth building at all — and for a churn model with a month-long label, the honest answer is usually no.</p>
+      </div>
+
+      <div class="note key">
+        <b>What to trigger on instead</b>
+        <p>If the slow signal cannot fire a useful trigger, fire on the fast ones. A retrain triggered by <strong>a new category appearing</strong>, <strong>an input distribution shift</strong>, or <strong>a step change in prediction distribution</strong> arrives in hours rather than weeks, and those are exactly the events a scheduled retrain handles worst — it either catches them immediately by luck or three months late.</p>
+        <p>The practical arrangement is both: a schedule at roughly the square-root cadence as the floor, plus fast-signal triggers for the discrete events. That is one policy, two mechanisms, and it needs no label delay to work.</p>
+      </div>
+    </section>
+
+    <section id="window">
+      <p class="kicker">HISTORY</p>
+      <h2>How much data to train on</h2>
+      <p class="sub">More rows reduce estimation error. Older rows describe a world that has moved on. The two pull in opposite directions and there is a minimum.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Variance against staleness</b>
+          <span>4,000 rows a day; error is estimation error plus average staleness of the window</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Training window
+              <select id="wn-w">
+                <option value="7">7 days</option>
+                <option value="14">14 days</option>
+                <option value="30" selected>30 days</option>
+                <option value="60">60 days</option>
+                <option value="120">120 days</option>
+                <option value="365">365 days &mdash; everything</option>
+              </select>
+            </label>
+            <label>How fast the world moves
+              <select id="wn-d">
+                <option value="0">Not at all &mdash; stationary</option>
+                <option value="0.000015">Slowly</option>
+                <option value="0.000075" selected>Typically</option>
+                <option value="0.00025">Fast</option>
+                <option value="0.0008">Very fast</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="wn-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>ESTIMATION ERROR</i><b id="wn-var">0</b><s id="wn-var-sub"></s></div>
+            <div class="tile"><i>STALENESS</i><b id="wn-bias">0</b><s>average age of the window</s></div>
+            <div class="tile" id="wn-tot-tile"><i>TOTAL ERROR</i><b id="wn-tot">0</b><s id="wn-tot-sub"></s></div>
+            <div class="tile hi" id="wn-best-tile"><i>BEST WINDOW HERE</i><b id="wn-best">0</b><s id="wn-best-sub"></s></div>
+          </div>
+
+          <p class="readout" id="wn-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Typical drift, 4,000 rows a day</caption>
+          <thead>
+            <tr><th>Window</th><th>Rows</th><th>Estimation error</th><th>Staleness</th><th>Total</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>7 d</strong></td><td>28,000</td><td><strong>0.00371</strong></td><td>0.00026</td><td>0.00397</td></tr>
+            <tr><td>14 d</td><td>56,000</td><td>0.00262</td><td>0.00052</td><td>0.00314</td></tr>
+            <tr><td><strong>30 d</strong></td><td>120,000</td><td>0.00179</td><td>0.00112</td><td><strong>0.00291</strong></td></tr>
+            <tr><td>60 d</td><td>240,000</td><td>0.00127</td><td>0.00225</td><td>0.00352</td></tr>
+            <tr><td><strong>365 d</strong></td><td>1,460,000</td><td>0.00051</td><td><strong>0.01369</strong></td><td>0.01420</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>How fast the world moves decides the window</caption>
+          <thead>
+            <tr><th>Drift per day</th><th>Best window</th><th>Error there</th><th>Error using all 365 days</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>0.000015</td><td>75 d</td><td>0.00169</td><td>0.00325</td></tr>
+            <tr><td>0.000075</td><td>26 d</td><td>0.00290</td><td>0.01420</td></tr>
+            <tr><td>0.000250</td><td>12 d</td><td>0.00433</td><td>0.04614</td></tr>
+            <tr><td><strong>0.000800</strong></td><td><strong>5 d</strong></td><td>0.00638</td><td><strong>0.14651</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <b>Using all the data is right only when nothing changes</b>
+        <p>With <em>no</em> drift, the optimal window is the entire history — that is the case the instinct is built for. Every day of drift moves it shorter, and the window falls from <strong>75 days to 5</strong> as drift rises fifty-fold.</p>
+        <p>Under fast drift, training on all 365 days gives <strong>22.9 times</strong> the error of the right window. That is a larger effect than most model changes anyone spends a quarter on, and unlike those it costs nothing to test: retrain on several window lengths and compare on a recent holdout.</p>
+        <p>It also interacts with cadence. Retraining more often does not help if the window still reaches back a year — the new model is fitted to mostly the same stale data, which is why "we retrain weekly" and "our model is stale" are perfectly compatible statements.</p>
+      </div>
+
+      <div class="note tip">
+        <b>Weighting is the softer version</b>
+        <p>A hard cutoff throws away everything older than the window. Exponential time-weighting keeps old rows at reduced influence, which is usually better and has one parameter instead of one threshold.</p>
+        <p>The half-life plays the role the window did, and the same test finds it: fit at several half-lives, compare on a recent holdout. For seasonal effects the hybrid is a short recent window plus the same period last year at full weight, which is a small amount of code and often the largest single improvement available to a retraining pipeline.</p>
+      </div>
+    </section>
+
+    <section id="validate">
+      <p class="kicker">BEFORE IT SHIPS</p>
+      <h2>Validating the candidate</h2>
+
+      <div class="check">
+        <li><strong>Re-measure the incumbent on the same fresh data.</strong> <a href="10-registry.html">Chapter 10</a>: comparing against the recorded metric promoted 6.0 times in twenty cycles against re-measurement's 10.0, because the recorded figure is inflated by exactly what got it promoted.</li>
+        <li><strong>Evaluate on a recent holdout, not a random split.</strong> A random split over a drifting year measures the wrong thing &mdash; <a href="07-features.html">chapter 7</a>'s point-in-time argument applied to evaluation.</li>
+        <li><strong>Check the same slices every time.</strong> A retrain that improves the aggregate while collapsing on a segment is common, and the aggregate will not show it.</li>
+        <li><strong>Compare prediction distributions, not just metrics.</strong> A large distribution shift with an unchanged metric means something structural changed, and it is worth understanding before it ships.</li>
+        <li><strong>Run the automated gates.</strong> Chapter 10's arithmetic applies unchanged: order them by bad-blocked per good-blocked, and be suspicious of anything below 1.</li>
+        <li><strong>Keep the deployment margin honest.</strong> The margin is a price on deployment risk, not a statistical correction, and it should reflect what a deployment actually costs you.</li>
+      </div>
+    </section>
+
+    <section id="reading">
+      <p class="kicker">JUDGEMENT</p>
+      <h2>Five questions about a retraining setup</h2>
+
+      <div class="check">
+        <li><strong>What is your decay rate?</strong> Without it the cadence is a guess; with it the square-root rule gives an answer in one line.</li>
+        <li><strong>What does a retrain cost all-in?</strong> Compute plus deployment risk, not just the GPU bill.</li>
+        <li><strong>What does the retrain check before it starts?</strong> Retraining on a stalled feature bakes the stall in.</li>
+        <li><strong>How long is your training window, and when was that chosen?</strong> Under fast drift, all-history was 22.9&times; worse than the right window.</li>
+        <li><strong>If you retrain on a trigger, what is the detection lag?</strong> The trigger's advantage fell from &plus;0.0097 to &plus;0.0054 across a three-week lag.</li>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>Retraining fixes a moved world.</b> It does not fix a broken pipeline, skew, a leak, or a wrong metric.</li>
+          <li><b>Retraining on a broken pipeline bakes the break in,</b> so validate before training.</li>
+          <li><b>The optimal cadence is &radic;(2 &middot; cost &middot; 365 / (decay &middot; value)),</b> matched by simulation within 15%.</li>
+          <li><b>Two measurable numbers decide it:</b> decay rate and all-in retrain cost.</li>
+          <li><b>It is forgiving</b> &mdash; twice as often costs 13%, half as often costs 19%.</li>
+          <li><b>But asymmetric: going long hurts more than going short.</b> When in doubt, err short.</li>
+          <li><b>A laggy trigger looks cheap only because it retrains less often.</b></li>
+          <li><b>Matched on frequency, the trigger's advantage is &plus;0.0097 instant and &plus;0.0054 at 21 days.</b></li>
+          <li><b>Quality delivered falls monotonically with the lag:</b> 0.8596, 0.8585, 0.8560, 0.8532.</li>
+          <li><b>So the label delay decides whether a trigger is worth building.</b></li>
+          <li><b>Trigger on fast signals instead</b> &mdash; new categories, input shifts, prediction-distribution steps.</li>
+          <li><b>The best window is 30 days at typical drift,</b> balancing estimation error against staleness.</li>
+          <li><b>It shrinks from 75 days to 5 as drift rises fifty-fold.</b></li>
+          <li><b>All-history is right only when nothing changes;</b> under fast drift it is 22.9&times; worse.</li>
+          <li><b>Retraining often does not help if the window still reaches back a year.</b></li>
+          <li><b>Re-measure the incumbent, evaluate on a recent holdout, and check the same slices.</b></li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="18-incidents.html">Chapter 18 &mdash; Incidents and debugging</a>. Rollback for models, narrowing a failure to a layer, and the post-mortem questions specific to ML systems.</p>
+          </div>
+          <div class="fi">
+            <i>PICKED UP FROM</i>
+            <p><a href="16-monitoring.html">Chapter 16</a>'s detection lag, which turns out to be the parameter that decides between a trigger and a schedule.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>Retrain your current model on three window lengths &mdash; a quarter, a month, a fortnight &mdash; and compare them on last week's data.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   shared helpers
+   ============================================================ */
+function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+function avg(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i]; return s / a.length; }
+var Q0 = 0.860, VALUE_PER_AUC = 180000, RCOST_DEFAULT = 900;
+
+/* the simulator is shared by both retraining demos */
+function cadenceSim(intervalDays, decayPerDay, retrainCost, days, jumpy, detectLag, seed) {
+  var rnd = lcg(seed), q = Q0, qs = [], retrains = 0, since = 0, pending = null, trace = [];
+  for (var d = 0; d < days; d++) {
+    if (jumpy) { if (rnd() < 0.02) q -= decayPerDay * 50 * (0.5 + rnd()); }
+    else q -= decayPerDay;
+    qs.push(q);
+    if (d < 730) trace.push(q);
+    since++;
+    var due = false;
+    if (intervalDays > 0) due = since >= intervalDays;
+    else {
+      /* a trigger fires only after the detection lag chapter 16 measured */
+      if (pending === null && q < Q0 - decayPerDay * 14) pending = d + detectLag;
+      if (pending !== null && d >= pending) { due = true; pending = null; }
+    }
+    if (due) { q = Q0; retrains++; since = 0; }
+  }
+  var perYear = retrains * 365 / days, meanQ = avg(qs);
+  return {
+    meanQ: meanQ, retrains: retrains, perYear: perYear, trace: trace,
+    qualityLoss: (Q0 - meanQ) * VALUE_PER_AUC,
+    retrainCost: perYear * retrainCost,
+    totalCost: (Q0 - meanQ) * VALUE_PER_AUC + perYear * retrainCost
+  };
+}
+
+/* ============================================================
+   Demo 1 — how often to retrain
+   ============================================================ */
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var TS = [7, 14, 30, 60, 105, 180, 300];
+
+  function optimalT(decay, cost) {
+    return Math.sqrt(2 * cost * 365 / (decay * VALUE_PER_AUC));
+  }
+  var cache = {};
+  function run(T, decay, cost) {
+    var key = T + "|" + decay + "|" + cost;
+    if (!cache[key]) cache[key] = cadenceSim(T, decay, cost, 1460, false, 0, 3001);
+    return cache[key];
+  }
+
+  function chart(T, decay, cost) {
+    var W = 700, H = 190, B = 30, L = 52;
+    var xOf = function (i) { return L + i / (TS.length - 1) * (W - L - 150); };
+    var costs = TS.map(function (t) { return run(t, decay, cost).totalCost; });
+    var hi = Math.max.apply(null, costs) * 1.05;
+    var yOf = function (v) { return (H - B) - v / hi * (H - B - 26); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Annual cost against retraining interval">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">ANNUAL COST AGAINST RETRAINING INTERVAL</text>');
+    [["quality lost", "qualityLoss", "#C0453A"], ["retrain cost", "retrainCost", "#F2A03D"],
+     ["total", "totalCost", "#20456A"]].forEach(function (c) {
+      var pts = TS.map(function (t, i) { return [i, run(t, decay, cost)[c[1]]]; });
+      svg.push('<path d="' + pts.map(function (p, i) {
+        return (i ? "L" : "M") + xOf(p[0]).toFixed(1) + " " + yOf(p[1]).toFixed(1);
+      }).join(" ") + '" fill="none" stroke="' + c[2] + '" stroke-width="' + (c[1] === "totalCost" ? 3.2 : 1.8) + '"/>');
+    });
+    var bi = costs.indexOf(Math.min.apply(null, costs));
+    TS.forEach(function (t, i) {
+      var on = t === T;
+      svg.push('<circle cx="' + xOf(i).toFixed(1) + '" cy="' + yOf(costs[i]).toFixed(1) + '" r="' +
+        (on ? 6 : i === bi ? 4.5 : 3) + '" fill="' + (i === bi ? "#2E8B5F" : "#20456A") + '"/>');
+      svg.push('<text x="' + xOf(i).toFixed(1) + '" y="' + (H - 12) + '" font-size="9" fill="' +
+        (on ? "#A8386B" : "#7C8B99") + '" font-weight="' + (on ? 700 : 400) + '" text-anchor="middle">' + t + 'd</text>');
+    });
+    svg.push('<text x="' + xOf(bi).toFixed(1) + '" y="' + (yOf(costs[bi]) - 11).toFixed(1) +
+      '" font-size="9" font-weight="700" fill="#166B47" text-anchor="middle">cheapest</text>');
+    var f = optimalT(decay, cost);
+    svg.push('<text x="' + (L - 6) + '" y="' + (yOf(0) + 4).toFixed(1) + '" font-size="9" fill="#7C8B99" text-anchor="end">\u00a30</text>');
+    svg.push('<text x="' + (L - 6) + '" y="' + (yOf(hi / 2) + 4).toFixed(1) + '" font-size="9" fill="#7C8B99" text-anchor="end">\u00a3' +
+      Math.round(hi / 2 / 1000) + 'k</text>');
+    var px = W - 142;
+    [["quality lost", "#C0453A"], ["retrain cost", "#F2A03D"], ["total", "#20456A"]].forEach(function (c, i) {
+      svg.push('<line x1="' + px + '" y1="' + (32 + i * 15) + '" x2="' + (px + 14) + '" y2="' + (32 + i * 15) +
+        '" stroke="' + c[1] + '" stroke-width="2.4"/>');
+      svg.push('<text x="' + (px + 19) + '" y="' + (36 + i * 15) + '" font-size="8.5" fill="#54677A">' + c[0] + '</text>');
+    });
+    svg.push('<text x="' + px + '" y="98" font-size="9.5" fill="#7C8B99">formula says</text>');
+    svg.push('<text x="' + px + '" y="118" font-size="17" font-weight="700" fill="#166B47">' + f.toFixed(0) + ' d</text>');
+    svg.push('<text x="0" y="' + (H - 1) + '" font-size="9.5" fill="#7C8B99">the total curve is flat near its minimum \u2014 which is why being roughly right is enough</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var T = +$("cd-t").value, decay = +$("cd-d").value, cost = +$("cd-c").value;
+    var d = run(T, decay, cost);
+    var costs = TS.map(function (t) { return run(t, decay, cost).totalCost; });
+    var bestT = TS[costs.indexOf(Math.min.apply(null, costs))];
+    var f = optimalT(decay, cost);
+
+    $("cd-q").textContent = d.meanQ.toFixed(4);
+    $("cd-q-sub").textContent = "starts at " + Q0.toFixed(3) + " after each retrain";
+    $("cd-n").textContent = d.perYear.toFixed(0);
+    $("cd-n-sub").textContent = "\u00a3" + Math.round(d.retrainCost).toLocaleString() + " a year";
+    $("cd-cost").textContent = "\u00a3" + Math.round(d.totalCost).toLocaleString();
+    $("cd-cost-sub").textContent = "\u00a3" + Math.round(d.qualityLoss).toLocaleString() + " quality, \u00a3" +
+      Math.round(d.retrainCost).toLocaleString() + " retrains";
+    $("cd-cost-tile").className = "tile " + (T === bestT ? "good" : "bad");
+    $("cd-best").textContent = bestT + " d";
+    $("cd-best-sub").textContent = "formula says " + f.toFixed(0) + " d";
+    $("cd-best-tile").className = "tile " + (T === bestT ? "good" : "");
+
+    $("cd-canvas").innerHTML = chart(T, decay, cost);
+
+    var atBest = run(bestT, decay, cost).totalCost;
+    var half = TS.reduce(function (a, t) { return Math.abs(t - bestT / 2) < Math.abs(a - bestT / 2) ? t : a; }, TS[0]);
+    var dbl = TS.reduce(function (a, t) { return Math.abs(t - bestT * 2) < Math.abs(a - bestT * 2) ? t : a; }, TS[0]);
+    var lines = [];
+    lines.push("Retraining every " + T + " days at this decay rate gives a mean AUC of " +
+      d.meanQ.toFixed(4) + " and costs \u00a3" + Math.round(d.totalCost).toLocaleString() +
+      " a year \u2014 \u00a3" + Math.round(d.qualityLoss).toLocaleString() +
+      " of forgone quality and \u00a3" + Math.round(d.retrainCost).toLocaleString() + " of retraining.");
+    lines.push("The cheapest cadence here is every " + bestT + " days, and the closed form \u221a(2\u00b7cost\u00b7365/(decay\u00b7value)) says " +
+      f.toFixed(0) +
+      " \u2014 the simulation matches it within 15% at every combination of decay and cost tested. Two measurable numbers decide the whole question: how fast your model decays and what a retrain costs all-in.");
+    lines.push("And because it is a square root, it is forgiving. Retraining at " + half +
+      " days costs " + (Math.abs(run(half, decay, cost).totalCost - atBest) / atBest * 100).toFixed(0) +
+      "% more than optimal and at " + dbl + " days costs " +
+      (Math.abs(run(dbl, decay, cost).totalCost - atBest) / atBest * 100).toFixed(0) +
+      "% more. Being roughly right is enough, which is worth knowing before anyone spends a fortnight tuning a schedule.");
+    lines.push("Note the asymmetry though: the curve rises faster to the right of the minimum than to the left. Going long costs more than going short by the same factor, so when in doubt, err short.");
+    $("cd-note").textContent = lines.join("\n\n");
+  }
+
+  ["cd-t", "cd-d", "cd-c"].forEach(function (id) { $(id).addEventListener("change", render); });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — trigger against a matched schedule
+   ============================================================ */
+(function () {
+  var DECAY = 0.00035;
+  var $ = function (id) { return document.getElementById(id); };
+
+  var cache = {};
+  function trigger(lag) {
+    if (!cache["t" + lag]) cache["t" + lag] = cadenceSim(0, DECAY, RCOST_DEFAULT, 1460, true, lag, 3001);
+    return cache["t" + lag];
+  }
+  /* a laggy trigger simply retrains less often, so match the frequency to compare */
+  function matched(targetPerYear) {
+    var key = "m" + targetPerYear.toFixed(3);
+    if (cache[key]) return cache[key];
+    var best = null;
+    for (var t = 2; t <= 400; t++) {
+      var r = cadenceSim(t, DECAY, RCOST_DEFAULT, 1460, true, 0, 3001);
+      if (best === null || Math.abs(r.perYear - targetPerYear) < Math.abs(best.perYear - targetPerYear)) best = r;
+    }
+    cache[key] = best;
+    return best;
+  }
+
+  function chart(lag) {
+    var W = 700, H = 190, B = 30, L = 44;
+    var t = trigger(lag), m = matched(t.perYear);
+    var n = Math.min(t.trace.length, 730);
+    var xOf = function (i) { return L + i / n * (W - L - 150); };
+    var lo = 0.80, hi = 0.866;
+    var yOf = function (v) { return (H - B) - (v - lo) / (hi - lo) * (H - B - 26); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Quality over two years, trigger against matched schedule">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">TWO YEARS OF QUALITY \u2014 TRIGGER AGAINST A SCHEDULE RETRAINING AS OFTEN</text>');
+    svg.push('<path d="' + m.trace.slice(0, n).map(function (q, i) {
+      return (i ? "L" : "M") + xOf(i).toFixed(1) + " " + yOf(Math.max(lo, q)).toFixed(1);
+    }).join(" ") + '" fill="none" stroke="#8FA0AF" stroke-width="1.6"/>');
+    svg.push('<path d="' + t.trace.slice(0, n).map(function (q, i) {
+      return (i ? "L" : "M") + xOf(i).toFixed(1) + " " + yOf(Math.max(lo, q)).toFixed(1);
+    }).join(" ") + '" fill="none" stroke="#20456A" stroke-width="2.2"/>');
+    [0, 182, 365, 548, 730].forEach(function (dd) {
+      if (dd <= n) svg.push('<text x="' + xOf(dd).toFixed(1) + '" y="' + (H - 12) +
+        '" font-size="9" fill="#7C8B99" text-anchor="middle">' + (dd / 30).toFixed(0) + 'm</text>');
+    });
+    [0.81, 0.84, 0.86].forEach(function (v) {
+      svg.push('<text x="' + (L - 6) + '" y="' + (yOf(v) + 4).toFixed(1) + '" font-size="9" fill="#7C8B99" text-anchor="end">' +
+        v.toFixed(2) + '</text>');
+    });
+    var px = W - 142;
+    svg.push('<line x1="' + px + '" y1="32" x2="' + (px + 16) + '" y2="32" stroke="#20456A" stroke-width="2.2"/>');
+    svg.push('<text x="' + (px + 21) + '" y="36" font-size="9" fill="#54677A">trigger</text>');
+    svg.push('<line x1="' + px + '" y1="50" x2="' + (px + 16) + '" y2="50" stroke="#8FA0AF" stroke-width="1.6"/>');
+    svg.push('<text x="' + (px + 21) + '" y="54" font-size="9" fill="#54677A">matched schedule</text>');
+    svg.push('<text x="' + px + '" y="86" font-size="9.5" fill="#7C8B99">advantage</text>');
+    svg.push('<text x="' + px + '" y="106" font-size="17" font-weight="700" fill="' +
+      (t.meanQ - m.meanQ > 0.008 ? "#166B47" : "#9B2C22") + '">+' + (t.meanQ - m.meanQ).toFixed(4) + '</text>');
+    svg.push('<text x="0" y="' + (H - 1) + '" font-size="9.5" fill="#7C8B99">the trigger tracks the jumps; the schedule retrains whether or not anything moved</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var lag = +$("tg-lag").value;
+    var t = trigger(lag), m = matched(t.perYear);
+    var adv = t.meanQ - m.meanQ, adv0 = trigger(0).meanQ - matched(trigger(0).perYear).meanQ;
+
+    $("tg-q").textContent = t.meanQ.toFixed(4);
+    $("tg-q-sub").textContent = t.perYear.toFixed(1) + " retrains a year";
+    $("tg-s").textContent = m.meanQ.toFixed(4);
+    $("tg-s-sub").textContent = m.perYear.toFixed(1) + " retrains a year";
+    $("tg-adv").textContent = "+" + adv.toFixed(4);
+    $("tg-adv-tile").className = "tile " + (adv > 0.008 ? "good" : "bad");
+    $("tg-verd").textContent = adv > 0.008 ? "Yes" : "Marginal";
+    $("tg-verd-sub").textContent = lag === 0 ? "if you could detect instantly" : "at a " + lag + "-day lag";
+    $("tg-verd-tile").className = "tile " + (adv > 0.008 ? "good" : "bad");
+
+    $("tg-canvas").innerHTML = chart(lag);
+
+    var lines = [];
+    lines.push("Drift arriving as occasional jumps rather than steadily. A trigger with a " +
+      (lag === 0 ? "hypothetical instant" : lag + "-day") + " detection lag retrains " +
+      t.perYear.toFixed(1) + " times a year and delivers a mean AUC of " + t.meanQ.toFixed(4) +
+      "; a schedule retraining just as often delivers " + m.meanQ.toFixed(4) +
+      ", so the trigger is worth +" + adv.toFixed(4) + ".");
+    lines.push("Matching the frequency is what makes this a fair comparison. A laggy trigger has a LOWER total cost than an instant one, which looks like good news \u2014 it is not. A lazy trigger simply retrains less often, and that saving was available from a schedule without the degraded weeks in between.");
+    lines.push("The quality a trigger actually delivers falls monotonically with the lag: " +
+      [0, 3, 10, 21].map(function (l) { return trigger(l).meanQ.toFixed(4); }).join(" \u2192 ") +
+      ". And its like-for-like advantage falls from +" + adv0.toFixed(4) + " to +" +
+      (trigger(21).meanQ - matched(trigger(21).perYear).meanQ).toFixed(4) + ".");
+    lines.push("Chapter 16 established that model monitoring detects in days, bounded below by the label delay. So the label delay is the number that decides whether a trigger is worth building at all \u2014 and for a churn model with a month-long label, the honest answer is usually no.");
+    lines.push("If the slow signal cannot fire a useful trigger, fire on the fast ones: a new category appearing, an input distribution shift, a step change in the prediction distribution. Those arrive in hours, and they are exactly the events a schedule handles worst. The practical arrangement is both \u2014 a schedule at roughly the square-root cadence as the floor, plus fast-signal triggers for the discrete events.");
+    $("tg-note").textContent = lines.join("\n\n");
+  }
+
+  $("tg-lag").addEventListener("change", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 3 — how much history to train on
+   ============================================================ */
+(function () {
+  var ROWS = 4000, VARC = 0.62;
+  var $ = function (id) { return document.getElementById(id); };
+  var WS = [7, 14, 30, 60, 120, 365];
+
+  function windowError(W, drift) {
+    var n = W * ROWS;
+    var variance = VARC / Math.sqrt(n);   /* estimation error falls with n */
+    var bias = drift * W / 2;             /* average staleness of the window */
+    return { variance: variance, bias: bias, total: variance + bias, n: n };
+  }
+  function bestWindow(drift) {
+    var best = 3, bv = Infinity;
+    for (var w = 3; w <= 365; w++) {
+      var e = windowError(w, drift).total;
+      if (e < bv) { bv = e; best = w; }
+    }
+    return best;
+  }
+
+  function chart(W, drift) {
+    var W2 = 700, H = 190, B = 30, L = 52;
+    var xOf = function (w) { return L + Math.log(w / 3) / Math.log(365 / 3) * (W2 - L - 150); };
+    var hi = windowError(365, drift).total * 1.05;
+    var yOf = function (v) { return (H - B) - Math.min(v, hi) / hi * (H - B - 26); };
+    var pts = [];
+    for (var w = 3; w <= 365; w += 2) pts.push(w);
+    var svg = ['<svg viewBox="0 0 ' + W2 + ' ' + H + '" width="' + W2 + '" height="' + H + '" role="img" aria-label="Error against training window length">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">ERROR AGAINST TRAINING WINDOW \u2014 LOG SCALE ON WINDOW</text>');
+    [["variance", "#20456A"], ["bias", "#F2A03D"], ["total", "#C0453A"]].forEach(function (c) {
+      svg.push('<path d="' + pts.map(function (w, i) {
+        return (i ? "L" : "M") + xOf(w).toFixed(1) + " " + yOf(windowError(w, drift)[c[0]]).toFixed(1);
+      }).join(" ") + '" fill="none" stroke="' + c[1] + '" stroke-width="' + (c[0] === "total" ? 3 : 1.8) + '"/>');
+    });
+    var bw = bestWindow(drift);
+    svg.push('<line x1="' + xOf(bw).toFixed(1) + '" y1="20" x2="' + xOf(bw).toFixed(1) + '" y2="' + (H - B) +
+      '" stroke="#2E8B5F" stroke-width="1.8" stroke-dasharray="3 3"/>');
+    svg.push('<text x="' + (xOf(bw) + 5).toFixed(1) + '" y="30" font-size="9" font-weight="700" fill="#166B47">best ' + bw + 'd</text>');
+    svg.push('<circle cx="' + xOf(W).toFixed(1) + '" cy="' + yOf(windowError(W, drift).total).toFixed(1) +
+      '" r="6" fill="none" stroke="#E0699F" stroke-width="2.5"/>');
+    [7, 30, 120, 365].forEach(function (w) {
+      svg.push('<text x="' + xOf(w).toFixed(1) + '" y="' + (H - 12) + '" font-size="9" fill="#7C8B99" text-anchor="middle">' + w + 'd</text>');
+    });
+    var px = W2 - 142;
+    [["estimation error", "#20456A"], ["staleness", "#F2A03D"], ["total", "#C0453A"]].forEach(function (c, i) {
+      svg.push('<line x1="' + px + '" y1="' + (34 + i * 15) + '" x2="' + (px + 14) + '" y2="' + (34 + i * 15) +
+        '" stroke="' + c[1] + '" stroke-width="2.4"/>');
+      svg.push('<text x="' + (px + 19) + '" y="' + (38 + i * 15) + '" font-size="8.5" fill="#54677A">' + c[0] + '</text>');
+    });
+    svg.push('<text x="' + px + '" y="100" font-size="9.5" fill="#7C8B99">all-history penalty</text>');
+    svg.push('<text x="' + px + '" y="120" font-size="17" font-weight="700" fill="' +
+      (windowError(365, drift).total / windowError(bw, drift).total > 2 ? "#9B2C22" : "#166B47") + '">' +
+      (windowError(365, drift).total / windowError(bw, drift).total).toFixed(1) + '\u00d7</text>');
+    svg.push('<text x="0" y="' + (H - 1) + '" font-size="9.5" fill="#7C8B99">the two terms cross \u2014 more data stops helping once it is describing a different world</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var W = +$("wn-w").value, drift = +$("wn-d").value;
+    var e = windowError(W, drift), bw = bestWindow(drift);
+    var penalty = windowError(365, drift).total / windowError(bw, drift).total;
+
+    $("wn-var").textContent = e.variance.toFixed(5);
+    $("wn-var-sub").textContent = e.n.toLocaleString() + " rows";
+    $("wn-bias").textContent = e.bias.toFixed(5);
+    $("wn-tot").textContent = e.total.toFixed(5);
+    $("wn-tot-sub").textContent = W === bw ? "the minimum" :
+      (e.total / windowError(bw, drift).total).toFixed(2) + "\u00d7 the minimum";
+    $("wn-tot-tile").className = "tile " + (Math.abs(W - bw) < 8 ? "good" : "bad");
+    $("wn-best").textContent = bw + " d";
+    $("wn-best-sub").textContent = drift === 0 ? "everything, since nothing changes" :
+      "all-history is " + penalty.toFixed(1) + "\u00d7 worse";
+    $("wn-best-tile").className = "tile " + (Math.abs(W - bw) < 8 ? "good" : "");
+
+    $("wn-canvas").innerHTML = chart(W, drift);
+
+    var lines = [];
+    lines.push("Training on " + W + " days of history \u2014 " + e.n.toLocaleString() +
+      " rows \u2014 gives an estimation error of " + e.variance.toFixed(5) + " and a staleness of " +
+      e.bias.toFixed(5) + ", for a total of " + e.total.toFixed(5) +
+      ". The best window at this drift rate is " + bw + " days.");
+
+    if (drift === 0) {
+      lines.push("With no drift at all the best window is the ENTIRE history, because the staleness term is zero and more rows only ever help. That is the case the instinct \u201cuse all the data\u201d is built for, and it is the only case where it is right.");
+      lines.push("Now introduce some drift and watch the optimum move.");
+    } else {
+      lines.push("The two terms pull in opposite directions: more rows cut estimation error, older rows describe a world that has moved on. The window falls from " +
+        bestWindow(0.000015) + " days at slow drift to " + bestWindow(0.0008) +
+        " at very fast drift \u2014 a fifty-fold change in drift rate.");
+      lines.push("Training on all 365 days here gives " + penalty.toFixed(1) +
+        " times the error of the right window. That is a larger effect than most model changes anyone spends a quarter on, and unlike those it costs nothing to test: retrain on several window lengths and compare on a recent holdout.");
+      lines.push("It also interacts with cadence. Retraining more often does not help if the window still reaches back a year \u2014 the new model is fitted to mostly the same stale data, which is why \u201cwe retrain weekly\u201d and \u201cour model is stale\u201d are perfectly compatible statements.");
+    }
+    $("wn-note").textContent = lines.join("\n\n");
+  }
+
+  ["wn-w", "wn-d"].forEach(function (id) { $(id).addEventListener("change", render); });
+  render();
+})();
+
+initChapter("17-retraining.html");
+</script>
+</body>
+</html>

@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>22 · Reliability, backfills and incidents — Data Engineer</title>
+<meta name="description" content="SLAs and error budgets for freshness, running a data incident when the output is wrong rather than absent, recovery time, RPO and disaster recovery.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">Data Engineer</a> <span>/</span> Chapter 22</p>
+    <p class="chnum">CHAPTER 22</p>
+    <h1>Reliability, backfills and incidents</h1>
+    <p class="lede">Site reliability practice was built for systems that are either up or down. Data systems have a third state that is worse than both: available, responsive, and wrong. This chapter adapts the useful parts of that practice to a discipline where the incident frequently begins with somebody saying "this number looks odd" three days after it stopped being right.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~26 min</b> read</div>
+      <div><b>Part 6</b> Running it</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="slo">
+      <p class="kicker">THE BUDGET</p>
+      <h2>Error budgets, applied to freshness</h2>
+      <p class="sub">An availability target is a statement about how much failure you have decided to accept. Making that explicit turns arguments about reliability into arithmetic.</p>
+
+      <p>Three terms, used loosely everywhere and worth separating. An <strong>SLA</strong> is a contractual promise with a consequence attached. An <strong>SLO</strong> is an internal target you manage against. An <strong>SLI</strong> is the thing you actually measure. For data the useful SLI is almost always freshness — is the newest row recent enough — measured once per interval.</p>
+
+      <p>The arithmetic that follows is the useful part. Measure hourly over a month and you have about 730 windows. A 99% target permits 1% of them to fail, which is <strong>7.3 hours of staleness a month, in total</strong>. That is your error budget, and it is much smaller than it sounds.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Freshness error budget</b>
+          <span>hourly measurement over a month, against incident frequency and repair time</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Freshness target
+              <select id="eb-target">
+                <option value="99.9">99.9%</option>
+                <option value="99.5">99.5%</option>
+                <option value="99" selected>99%</option>
+                <option value="98">98%</option>
+                <option value="95">95%</option>
+              </select>
+            </label>
+            <label>Incidents per month
+              <input type="range" id="eb-inc" min="0" max="8" step="1" value="2">
+              <output id="eb-inc-o">2</output>
+            </label>
+            <label>Mean time to repair
+              <input type="range" id="eb-mttr" min="1" max="24" step="1" value="4">
+              <output id="eb-mttr-o">4 h</output>
+            </label>
+          </div>
+
+          <div class="canvas" id="eb-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>BUDGET</i><b id="eb-budget">0</b><s>hours a month</s></div>
+            <div class="tile" id="eb-used-tile"><i>CONSUMED</i><b id="eb-used">0</b><s id="eb-used-sub"></s></div>
+            <div class="tile" id="eb-burn-tile"><i>BURN</i><b id="eb-burn">0%</b><s>of the budget</s></div>
+            <div class="tile hi"><i>MTTR CEILING</i><b id="eb-max">0</b><s id="eb-max-sub"></s></div>
+          </div>
+
+          <p class="readout" id="eb-note"></p>
+        </div>
+      </div>
+
+      <p>Three results worth internalising.</p>
+
+      <ol>
+        <li><strong>A 99% monthly freshness target is 7.3 hours.</strong> Two incidents at four hours each consumes 8 hours — 110% of the budget, blown by the second one. A single bad night spends most of a month's allowance.</li>
+        <li><strong>The target implies a hard ceiling on repair time.</strong> At two incidents a month, 99% permits a mean repair of 3.7 hours and no more. That converts "we should be faster" into a number you can plan against, and it is the most useful thing an SLO produces.</li>
+        <li><strong>99.9% is almost certainly not achievable.</strong> It allows 0.7 hours a month — 44 minutes — so a single one-hour incident breaks it. If somebody asks for three nines on a batch pipeline, this is the arithmetic to show them.</li>
+      </ol>
+
+      <div class="note key">
+        <b>Why the budget framing beats a promise</b>
+        <p>An unquantified promise produces two bad behaviours: every incident is treated as a failure of the whole system, and nobody can say when reliability work should stop. A budget makes both tractable. Budget remaining means you can ship changes; budget exhausted means the next work item is reliability rather than features.</p>
+        <p>It also makes the honest trade visible. Reliability is bought with engineering time, and past a point the marginal nine costs more than it is worth. Choosing 98% deliberately is a legitimate engineering decision; drifting to 98% while claiming 99.9% is not.</p>
+      </div>
+    </section>
+
+    <section id="define">
+      <p class="kicker">WRITING IT DOWN</p>
+      <h2>What a data SLO should actually say</h2>
+      <p class="sub">Freshness alone is not enough, because every silent failure in this unit had perfect freshness.</p>
+
+      <p>A pipeline that runs on time and writes complete-looking but wrong data satisfies a freshness SLO entirely. So a useful data SLO has three clauses:</p>
+
+      <div class="terms">
+        <dt>Timeliness</dt>
+        <dd>"Available by 07:00 on 99% of business days." Measurable, and the clause people write.</dd>
+
+        <dt>Completeness</dt>
+        <dd>"Within 0.1% of the source count, and not revised downward after publication." This is where <a href="12-batch-ingestion.html">chapter 12</a>'s late-data gap becomes a violation rather than an unremarked fact &mdash; a naive daily job at 36% completeness satisfies any freshness target and breaches this one every day.</dd>
+
+        <dt>Correctness</dt>
+        <dd>"Reconciles to the source system within 0.1%." The clause almost nobody writes and the one that would have caught most of the failures in <a href="20-cicd-testing.html">chapter 20</a>'s matrix.</dd>
+      </div>
+
+      <p>Two further points make an SLO operable rather than decorative.</p>
+
+      <p><strong>Scope it to specific tables, not the platform.</strong> "The data platform is 99% reliable" cannot be measured or defended. Four named tables with individual targets can, and the exercise of choosing which four is itself valuable — it forces someone to say which outputs actually matter.</p>
+
+      <p><strong>Publish the worst case, not the average.</strong> <a href="02-lifecycle.html">Chapter 2</a>'s finding: teams quote average freshness because it sounds better and get judged on the worst case, because the complaint always arrives on the bad day.</p>
+
+      <div class="note warn">
+        <b>Every serving path inherits an SLO whether you write one or not</b>
+        <p><a href="17-serving-analytics.html">Chapter 17</a>'s Reverse ETL and <a href="18-serving-ml.html">chapter 18</a>'s application paths quietly put the warehouse on a critical path. A stale dashboard is an annoyance; a stale CRM field drives a sales conversation and a stale risk score touches a customer.</p>
+        <p>Those paths have an availability requirement inherited from the product, and the requirement exists whether or not anyone agreed to it. Discovering it during an incident is the expensive way to find out.</p>
+      </div>
+    </section>
+
+    <section id="incident">
+      <p class="kicker">WHEN IT BREAKS</p>
+      <h2>Running a data incident</h2>
+      <p class="sub">Two differences from a service incident change the whole procedure: the damage is already downstream, and you cannot simply roll back.</p>
+
+      <p>When a service breaks, the harm stops when you fix it. When a pipeline produces wrong data, the wrong data has already been read, exported, emailed and acted upon — and fixing the pipeline does not unfix the decisions. So the response has an extra step at the front and an extra one at the back.</p>
+
+      <div class="terms">
+        <dt>1. Contain, before diagnosing</dt>
+        <dd>Stop the bad data spreading. Pause the downstream DAG, disable the affected dashboards or mark them stale, halt any Reverse ETL sync writing into an operational tool. Every minute of diagnosis is a minute more consumption, and this step is routinely skipped in the rush to understand.</dd>
+
+        <dt>2. Establish the blast radius</dt>
+        <dd>Which tables, dashboards, models and external systems are affected, and since when. <a href="21-observability.html">Chapter 21</a> made the case: with lineage this is a query, without it you ask around during the incident and get an incomplete answer.</dd>
+
+        <dt>3. Communicate before you know the cause</dt>
+        <dd>"The revenue dashboard has been understated since Tuesday; we are investigating; do not use it for the board pack" is enormously more useful than silence followed by a full explanation. Consumers need to stop acting on it, which requires only the first clause.</dd>
+
+        <dt>4. Diagnose and fix the code</dt>
+        <dd>The familiar part, and usually the quickest.</dd>
+
+        <dt>5. Repair the data</dt>
+        <dd><a href="12-batch-ingestion.html">Chapter 12</a>'s backfill, and the step with no equivalent in service incidents. Its cost was set months ago by a layout decision &mdash; <a href="02-lifecycle.html">chapter 2</a> measured the same fourteen-day correction at 8.8 seconds or 6.8 hours depending on partitioning.</dd>
+
+        <dt>6. Tell people it is fixed, and what changed</dt>
+        <dd>Including whether historical numbers have moved. Somebody has a figure in a deck that is now different, and they need to know before they present it.</dd>
+      </div>
+
+      <div class="note trap">
+        <b>The detection gap is the number to track</b>
+        <p>A service outage is detected in seconds because users complain immediately. A data defect is detected when somebody notices a number looks odd, which is frequently days. That gap &mdash; not the repair time &mdash; is where the damage accumulates, because decisions were being made throughout it.</p>
+        <p>So the reliability investment that pays best is rarely faster repair. It is the checks from <a href="20-cicd-testing.html">chapter 20</a> that shorten detection, and specifically the two comparison checks, because they are the only ones that catch a plausible wrong answer.</p>
+      </div>
+    </section>
+
+    <section id="recovery">
+      <p class="kicker">GETTING IT BACK</p>
+      <h2>Recovery, retention and the cliff</h2>
+      <p class="sub">How much data you can recover is determined entirely by what you kept, and there is a hard edge rather than a gradual decline.</p>
+
+      <p>Two standard terms are worth borrowing precisely. <strong>RPO</strong>, the recovery point objective, is how much data you can afford to lose. <strong>RTO</strong>, the recovery time objective, is how long you can afford to take. For a data platform both are set by your retention windows.</p>
+
+      <p>The mechanism matters. If a consumer fails and the outage is shorter than your log retention, you replay from the log and lose nothing — <a href="13-messaging.html">chapter 13</a>'s property. If the outage exceeds retention, the broker has already deleted the messages, and no amount of rebuild time recovers them.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Recovery from an extended outage</b>
+          <span>200 GB a day, replayed at 400 GB an hour</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Outage length
+              <input type="range" id="rc-out" min="6" max="336" step="6" value="72">
+              <output id="rc-out-o">72 h</output>
+            </label>
+            <label>Log retention
+              <select id="rc-ret">
+                <option value="1">1 day</option>
+                <option value="7" selected>7 days</option>
+                <option value="30">30 days</option>
+              </select>
+            </label>
+            <label>Landing zone retained
+              <select id="rc-land">
+                <option value="no" selected>No</option>
+                <option value="yes">Yes &mdash; raw kept on object storage</option>
+              </select>
+            </label>
+            <label>Daily volume
+              <select id="rc-vol">
+                <option value="50">50 GB</option>
+                <option value="200" selected>200 GB</option>
+                <option value="1000">1 TB</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="rc-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="rc-rpo-tile"><i>DATA LOST</i><b id="rc-rpo">0</b><s>unrecoverable</s></div>
+            <div class="tile"><i>TO REPLAY</i><b id="rc-vol2">0</b><s id="rc-vol2-sub"></s></div>
+            <div class="tile"><i>REBUILD TIME</i><b id="rc-rto">0</b><s>at full throughput</s></div>
+            <div class="tile" id="rc-tot-tile"><i>TOTAL IMPACT</i><b id="rc-tot">0</b><s id="rc-tot-sub"></s></div>
+          </div>
+
+          <p class="readout" id="rc-note"></p>
+        </div>
+      </div>
+
+      <p>The shape of this is the point. Recovery is not a gradual degradation — it is fine, fine, fine, and then a cliff. A ten-day outage against seven days of retention loses <strong>72 hours of data permanently</strong>, and the loss has nothing to do with how fast you can rebuild.</p>
+
+      <div class="note key">
+        <b>A landing zone removes the cliff</b>
+        <p>Turn the landing zone on and the loss goes to zero regardless of outage length, because the raw bytes are on object storage and object storage retention is a policy you set rather than a broker default. This is <a href="12-batch-ingestion.html">chapter 12</a>'s argument arriving as a recovery guarantee rather than a convenience.</p>
+        <p>It is also the cheapest reliability purchase in this unit. Object storage at <a href="07-storage-foundations.html">chapter 7</a>'s prices costs a rounding error against the engineering time of an unrecoverable gap, and unlike most reliability work it requires no ongoing effort &mdash; just a bucket and a retention policy.</p>
+      </div>
+
+      <p>Two further points on rebuild time. It is <strong>bounded by throughput, and throughput is a design property</strong>: chapter 12's layout arithmetic determines whether replaying a week is minutes or a weekend. And <strong>the recovery consumes the same error budget</strong> as the outage — a 24-hour outage plus half an hour of rebuild is 24.5 hours against a 99% monthly budget of 7.3, so a single day-long outage exceeds a month's allowance more than threefold.</p>
+    </section>
+
+    <section id="dr">
+      <p class="kicker">THE LARGER FAILURES</p>
+      <h2>Beyond the pipeline</h2>
+      <p class="sub">Chapter 7's eleven nines describe uncorrelated hardware failure. These are the failures that actually destroy data.</p>
+
+      <div class="tw">
+        <table>
+          <caption>What durability guarantees do and do not cover</caption>
+          <thead>
+            <tr><th>Failure</th><th>Covered by object durability</th><th>What actually protects you</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Disk or node failure</td><td>Yes, entirely</td><td>Nothing further needed</td></tr>
+            <tr><td>Datacentre loss</td><td>Yes, within a region</td><td>Cross-region replication for regional loss</td></tr>
+            <tr><td>Accidental deletion</td><td><strong>No</strong></td><td>Versioning, and a delay before permanent removal</td></tr>
+            <tr><td>Malicious deletion</td><td><strong>No</strong></td><td>Object lock, and a backup in a separate account</td></tr>
+            <tr><td>A bad job overwriting a table</td><td><strong>No</strong></td><td>Table-format time travel; <a href="11-warehouse-lake.html">chapter 11</a></td></tr>
+            <tr><td>Credential compromise</td><td><strong>No</strong></td><td>A backup the compromised credential cannot reach</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note warn">
+        <b>The one that catches people</b>
+        <p>A backup in the same account as production, reachable by the same credentials, protects against hardware and nothing else. If an attacker or a mistaken script has permission to delete your data, it usually has permission to delete the backup too.</p>
+        <p>The defence is separation: a different account, different credentials, write-only from production, with object lock so that even an administrator cannot remove an object before its retention expires. This is unglamorous, takes an afternoon, and is the difference between a bad day and a company-ending one.</p>
+      </div>
+
+      <p>Two habits matter more than the configuration. <strong>Versioning on every bucket holding anything you cannot regenerate</strong> — it converts an overwrite or delete into something recoverable, and it is a single setting. And <strong>test the restore</strong>, because an untested backup is a hypothesis. <a href="19-infrastructure.html">Chapter 19</a>'s drift result applies identically here: a rebuild you have never performed will differ from production in exactly the places nobody documented.</p>
+    </section>
+
+    <section id="postmortem">
+      <p class="kicker">THE LOOP</p>
+      <h2>Postmortems that change something</h2>
+      <p class="sub">The purpose is not explanation. It is to make the class of failure detectable faster next time.</p>
+
+      <p>Most of the value is in two questions, and the second is the one usually skipped.</p>
+
+      <div class="check">
+        <li><strong>How long was it wrong before we knew?</strong> Not how long the fix took. If a defect existed for nine days and was found by an analyst, the action item is a check that would have caught it, not a faster runbook.</li>
+        <li><strong>Which check from the coverage matrix would have caught this?</strong> <a href="20-cicd-testing.html">Chapter 20</a> gives you the vocabulary: was this a completeness failure a recompute-and-compare would have found, or an accuracy failure needing reconciliation? Naming it makes the action item concrete instead of "improve monitoring".</li>
+        <li><strong>Did the blast radius surprise us?</strong> If the affected consumers were not knowable, the action is lineage rather than anything about this specific pipeline.</li>
+        <li><strong>Was the repair harder than it should have been?</strong> A backfill that took a weekend points at a layout decision, and chapter 2's arithmetic says what to change.</li>
+        <li><strong>What did consumers do with the wrong data?</strong> Uncomfortable and important, because it sizes the actual cost and calibrates how much reliability is worth buying.</li>
+      </div>
+
+      <p>Two structural notes. Postmortems should be <strong>blameless and specific</strong> — the failures in this unit were overwhelmingly structural, not carelessness: nobody chooses the timestamp watermark from <a href="04-source-systems.html">chapter 4</a> knowing it loses rows, and nobody staggers cron jobs from <a href="16-orchestration.html">chapter 16</a> intending to read stale input. And they should produce <strong>at most two or three action items that actually get done</strong>, because a list of fifteen is a list of zero.</p>
+
+      <div class="note tip">
+        <b>The pattern that emerges after a dozen of these</b>
+        <p>Keep a simple log of incidents with the failure class from chapter 20's matrix attached to each. After a while the distribution is informative in a way individual incidents are not: if six of your last ten were completeness failures, the answer is a lookback window and a recompute check, not ten separate fixes.</p>
+        <p>That is the correction loop working &mdash; incidents becoming a measurement of where your coverage is weakest rather than a series of unrelated bad days.</p>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>Data systems have a third state:</b> available, responsive and wrong. It is worse than being down, because nothing signals it.</li>
+          <li><b>A 99% monthly freshness target is 7.3 hours of budget.</b> Two four-hour incidents consume 8 hours &mdash; 110% &mdash; so one bad night spends most of a month.</li>
+          <li><b>The target implies a hard MTTR ceiling:</b> 3.7 hours at two incidents a month. That converts "we should be faster" into a number.</li>
+          <li><b>99.9% allows 44 minutes a month</b> and is almost certainly not achievable on a batch pipeline.</li>
+          <li><b>A budget makes the trade explicit:</b> budget remaining means ship, budget exhausted means fix. Choosing 98% deliberately is legitimate; drifting there while claiming 99.9% is not.</li>
+          <li><b>A useful SLO has three clauses</b> &mdash; timeliness, completeness and correctness. Freshness alone is satisfied by every silent failure in this unit.</li>
+          <li><b>Scope SLOs to named tables and publish the worst case,</b> not the platform and not the average.</li>
+          <li><b>Contain before diagnosing.</b> Every minute of investigation is a minute more consumption of wrong data.</li>
+          <li><b>Communicate before you know the cause.</b> Consumers need only the first clause to stop acting on it.</li>
+          <li><b>Track the detection gap, not the repair time.</b> That is where the damage accumulates, and shortening it is what the comparison checks buy.</li>
+          <li><b>Recovery has a cliff, not a slope.</b> A ten-day outage against seven days of retention loses 72 hours permanently, independent of rebuild speed.</li>
+          <li><b>A landing zone removes the cliff entirely</b> and is the cheapest reliability purchase available.</li>
+          <li><b>The recovery consumes the same error budget as the outage:</b> a day-long outage plus rebuild is 24.5 hours against a 7.3-hour monthly allowance.</li>
+          <li><b>Eleven nines does not cover deletion.</b> Versioning, object lock, and a backup in a separate account that production's credentials cannot reach.</li>
+          <li><b>Test the restore.</b> An untested backup is a hypothesis, and chapter 19's drift result says where it will differ.</li>
+          <li><b>Postmortems should name the failure class</b> from chapter 20's matrix, and produce two or three action items rather than fifteen.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="23-governance.html">Chapter 23 &mdash; Security, privacy and governance</a>. Part 7 opens on access and obligation: authentication against authorisation, encryption, masking, and what the regulations actually require of a pipeline.</p>
+          </div>
+          <div class="fi">
+            <i>PART 6 IS NOW COMPLETE</i>
+            <p>Chapters 19 to 22 covered infrastructure, testing, observability and reliability &mdash; everything about operating a platform rather than building one. Two chapters remain.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>Work out your busiest pipeline's error budget for the target you would be willing to publish, then compare it against last quarter's actual downtime. Most teams find they are already over.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Demo 1 — freshness error budget
+   ============================================================ */
+(function () {
+  var MONTH = 730;      /* hourly measurement windows in a month */
+  var $ = function (id) { return document.getElementById(id); };
+
+  function budget(targetPct, incidents, mttr) {
+    var allowed = MONTH * (1 - targetPct / 100);
+    var used = incidents * mttr;
+    return {
+      windows: MONTH, allowed: allowed, used: used,
+      attainment: (MONTH - used) / MONTH * 100,
+      burn: allowed > 0 ? used / allowed * 100 : Infinity,
+      met: used <= allowed,
+      maxMttr: incidents > 0 ? allowed / incidents : Infinity
+    };
+  }
+  function hrs(h) {
+    if (h < 1) return (h * 60).toFixed(0) + " min";
+    return h.toFixed(1) + " h";
+  }
+
+  function chart(target, incidents, mttr) {
+    var W = 700, H = 128, L = 8;
+    var b = budget(target, incidents, mttr);
+    var scale = Math.max(b.allowed, b.used) * 1.15 || 1;
+    var wOf = function (v) { return v / scale * (W - L - 130); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Error budget against consumption">'];
+    svg.push('<text x="' + L + '" y="11" font-size="10" font-weight="700" fill="#7C8B99">MONTHLY ERROR BUDGET AGAINST WHAT THE INCIDENTS CONSUME</text>');
+
+    svg.push('<text x="' + L + '" y="34" font-size="11" font-weight="600" fill="#16232F">budget</text>');
+    svg.push('<rect x="' + (L + 58) + '" y="20" width="' + Math.max(2, wOf(b.allowed)).toFixed(1) +
+      '" height="20" rx="2" fill="#2E8B5F"/>');
+    svg.push('<text x="' + (L + 64 + wOf(b.allowed)) + '" y="34" font-size="10.5" font-weight="600" fill="#166B47">' +
+      hrs(b.allowed) + ' of staleness allowed</text>');
+
+    svg.push('<text x="' + L + '" y="62" font-size="11" font-weight="600" fill="#16232F">used</text>');
+    var over = b.used > b.allowed;
+    svg.push('<rect x="' + (L + 58) + '" y="48" width="' + Math.max(2, wOf(Math.min(b.used, b.allowed))).toFixed(1) +
+      '" height="20" rx="2" fill="#20456A"/>');
+    if (over) {
+      svg.push('<rect x="' + (L + 58 + wOf(b.allowed)) + '" y="48" width="' + Math.max(2, wOf(b.used - b.allowed)).toFixed(1) +
+        '" height="20" rx="2" fill="#C0453A"/>');
+    }
+    svg.push('<text x="' + (L + 64 + wOf(b.used)) + '" y="62" font-size="10.5" font-weight="600" fill="' +
+      (over ? "#C0453A" : "#20456A") + '">' + incidents + ' \u00d7 ' + hrs(mttr) + ' = ' + hrs(b.used) +
+      (over ? '  \u2014 over by ' + hrs(b.used - b.allowed) : '') + '</text>');
+
+    /* the line marking the budget edge */
+    svg.push('<line x1="' + (L + 58 + wOf(b.allowed)) + '" y1="16" x2="' + (L + 58 + wOf(b.allowed)) +
+      '" y2="74" stroke="#0C1D30" stroke-width="1.6" stroke-dasharray="3 2"/>');
+
+    svg.push('<text x="' + L + '" y="94" font-size="10" fill="#7C8B99">' +
+      MONTH + ' hourly windows a month; a ' + target + '% target permits ' + b.allowed.toFixed(1) + ' of them to fail</text>');
+    svg.push('<text x="' + L + '" y="' + (H - 6) + '" font-size="10.5" font-weight="700" fill="' +
+      (b.met ? "#166B47" : "#C0453A") + '">' + (b.met ? "within budget \u2014 " +
+      hrs(b.allowed - b.used) + " remaining" : "budget exhausted") + '</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var target = +$("eb-target").value;
+    var incidents = +$("eb-inc").value, mttr = +$("eb-mttr").value;
+    $("eb-inc-o").textContent = incidents;
+    $("eb-mttr-o").textContent = mttr + " h";
+
+    var b = budget(target, incidents, mttr);
+
+    $("eb-budget").textContent = hrs(b.allowed);
+    $("eb-used").textContent = hrs(b.used);
+    $("eb-used-sub").textContent = incidents + " \u00d7 " + mttr + " h";
+    $("eb-used-tile").className = "tile " + (b.met ? "good" : "bad");
+    $("eb-burn").textContent = incidents === 0 ? "0%" : b.burn.toFixed(0) + "%";
+    $("eb-burn-tile").className = "tile " + (b.burn <= 100 ? "good" : "bad");
+    $("eb-max").textContent = incidents === 0 ? "\u2014" : hrs(b.maxMttr);
+    $("eb-max-sub").textContent = incidents === 0 ? "no incidents" : "at " + incidents + " a month";
+
+    $("eb-canvas").innerHTML = chart(target, incidents, mttr);
+
+    var lines = [];
+    lines.push("A " + target + "% freshness target measured hourly gives " + hrs(b.allowed) +
+      " of permitted staleness a month. " + (incidents === 0
+        ? "With no incidents the whole budget is intact."
+        : incidents + " incident" + (incidents === 1 ? "" : "s") + " at " + mttr +
+          " hours consumes " + hrs(b.used) + ", which is " + b.burn.toFixed(0) + "% of it."));
+
+    if (incidents > 0) {
+      lines.push("Turned around, the target implies a ceiling on repair time: at " + incidents +
+        " incidents a month you can afford a mean of " + hrs(b.maxMttr) +
+        " and no more. That is the most useful thing an SLO produces \u2014 it converts \u201cwe should be faster\u201d into a number you can plan against, and it makes clear whether the lever is fewer incidents or quicker repair.");
+    }
+
+    if (!b.met) {
+      lines.push("The budget is exhausted, by " + hrs(b.used - b.allowed) +
+        ". Under a budget discipline that is the signal to stop shipping changes to this pipeline and spend the next work item on reliability instead \u2014 which is the point of quantifying it. An unquantified promise gives you no way to decide when reliability work should start or stop.");
+    }
+
+    if (target >= 99.9) {
+      lines.push("Note what three nines means here: " + hrs(b.allowed) +
+        " a month. A single one-hour incident breaks it. If somebody asks for 99.9% on a batch pipeline, this is the arithmetic to show them before agreeing.");
+    } else if (target <= 95) {
+      lines.push("At " + target + "% the budget is generous \u2014 " + hrs(b.allowed) +
+        " \u2014 and that is a legitimate choice for a table nobody reads before 10am. The failure is not picking a low target deliberately; it is drifting to one while publishing a higher number.");
+    }
+    $("eb-note").textContent = lines.join("\n\n");
+  }
+
+  ["eb-target", "eb-inc", "eb-mttr"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — recovery, retention and the cliff
+   ============================================================ */
+(function () {
+  var THROUGHPUT = 400;    /* GB an hour of replay */
+  var MONTH_BUDGET = 730 * 0.01;
+  var $ = function (id) { return document.getElementById(id); };
+
+  function recover(outageHours, retentionDays, dailyGB, landingZone) {
+    var retHours = retentionDays * 24;
+    var lostHours = landingZone ? 0 : Math.max(0, outageHours - retHours);
+    var replayHours = landingZone ? outageHours : Math.min(outageHours, retHours);
+    var replayGB = replayHours / 24 * dailyGB;
+    return { lostHours: lostHours, replayGB: replayGB,
+             rtoHours: replayGB / THROUGHPUT, retHours: retHours,
+             recoverable: lostHours === 0 };
+  }
+  function hrs(h) {
+    if (h < 1) return (h * 60).toFixed(0) + " min";
+    if (h < 48) return h.toFixed(1) + " h";
+    return (h / 24).toFixed(1) + " days";
+  }
+  function gb(v) {
+    if (v >= 1000) return (v / 1000).toFixed(1) + " TB";
+    return Math.round(v) + " GB";
+  }
+
+  function chart(outage, retentionDays, dailyGB, landing) {
+    var W = 700, H = 138, L = 8, maxH = 336;
+    var xOf = function (h) { return L + h / maxH * (W - L - 14); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Recoverable and lost data against outage length">'];
+    svg.push('<text x="' + L + '" y="11" font-size="10" font-weight="700" fill="#7C8B99">DATA PERMANENTLY LOST AGAINST OUTAGE LENGTH</text>');
+
+    var retH = retentionDays * 24;
+    var yTop = 24, yH = 40;
+    /* recoverable region */
+    svg.push('<rect x="' + L + '" y="' + yTop + '" width="' + (xOf(Math.min(retH, maxH)) - L).toFixed(1) +
+      '" height="' + yH + '" fill="#DFF3E9" stroke="#B6E2CD"/>');
+    if (!landing && retH < maxH) {
+      svg.push('<rect x="' + xOf(retH).toFixed(1) + '" y="' + yTop + '" width="' + (xOf(maxH) - xOf(retH)).toFixed(1) +
+        '" height="' + yH + '" fill="#FBEAE7" stroke="#F0C9C2"/>');
+      svg.push('<line x1="' + xOf(retH).toFixed(1) + '" y1="' + (yTop - 6) + '" x2="' + xOf(retH).toFixed(1) +
+        '" y2="' + (yTop + yH + 6) + '" stroke="#C0453A" stroke-width="2"/>');
+      svg.push('<text x="' + (xOf(retH) + 5) + '" y="' + (yTop - 9) + '" font-size="10" font-weight="700" fill="#C0453A">retention ends &mdash; the cliff</text>');
+    } else if (landing) {
+      svg.push('<rect x="' + L + '" y="' + yTop + '" width="' + (xOf(maxH) - L).toFixed(1) +
+        '" height="' + yH + '" fill="#DFF3E9" stroke="#B6E2CD"/>');
+      svg.push('<text x="' + (L + 8) + '" y="' + (yTop - 9) + '" font-size="10" font-weight="700" fill="#166B47">landing zone: recoverable at any length</text>');
+    }
+    svg.push('<text x="' + (L + 8) + '" y="' + (yTop + 25) + '" font-size="10.5" fill="#166B47">replayable</text>');
+    if (!landing && retH < maxH) {
+      svg.push('<text x="' + (xOf(retH) + 8) + '" y="' + (yTop + 25) + '" font-size="10.5" fill="#9B2C22">permanently lost</text>');
+    }
+
+    /* the current outage */
+    svg.push('<line x1="' + xOf(outage).toFixed(1) + '" y1="18" x2="' + xOf(outage).toFixed(1) +
+      '" y2="' + (yTop + yH + 16) + '" stroke="#0C1D30" stroke-width="2.2"/>');
+    svg.push('<text x="' + (xOf(outage) + 5) + '" y="' + (yTop + yH + 26) + '" font-size="10.5" font-weight="700" fill="#0C1D30">outage ' +
+      hrs(outage) + '</text>');
+
+    [0, 72, 168, 240, 336].forEach(function (h) {
+      svg.push('<text x="' + xOf(h) + '" y="' + (H - 4) + '" font-size="9.5" fill="#7C8B99" text-anchor="middle">' +
+        (h / 24).toFixed(0) + 'd</text>');
+    });
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var outage = +$("rc-out").value, ret = +$("rc-ret").value;
+    var landing = $("rc-land").value === "yes", vol = +$("rc-vol").value;
+    $("rc-out-o").textContent = outage + " h";
+
+    var r = recover(outage, ret, vol, landing);
+    var total = outage + r.rtoHours;
+
+    $("rc-rpo").textContent = r.lostHours ? hrs(r.lostHours) : "none";
+    $("rc-rpo-tile").className = "tile " + (r.lostHours ? "bad" : "good");
+    $("rc-vol2").textContent = gb(r.replayGB);
+    $("rc-vol2-sub").textContent = "at " + THROUGHPUT + " GB/hour";
+    $("rc-rto").textContent = hrs(r.rtoHours);
+    $("rc-tot").textContent = hrs(total);
+    $("rc-tot-sub").textContent = (total / MONTH_BUDGET).toFixed(1) + "\u00d7 a 99% monthly budget";
+    $("rc-tot-tile").className = "tile " + (total > MONTH_BUDGET ? "bad" : "good");
+
+    $("rc-canvas").innerHTML = chart(outage, ret, vol, landing);
+
+    var lines = [];
+    if (r.recoverable) {
+      lines.push("An outage of " + hrs(outage) + " against " + ret + " days of retention" +
+        (landing ? " with a landing zone" : "") + " is fully recoverable: " + gb(r.replayGB) +
+        " to replay, " + hrs(r.rtoHours) + " to rebuild at " + THROUGHPUT + " GB an hour, and nothing lost.");
+    } else {
+      lines.push("The outage of " + hrs(outage) + " exceeds " + ret + " days of retention by " +
+        hrs(r.lostHours) + ", and that data is gone. The broker deleted it while the consumer was down, so " +
+        hrs(r.lostHours) + " of history is unrecoverable regardless of how fast you can rebuild the rest.");
+      lines.push("This is the shape to remember: recovery is not a gradual degradation but a cliff. Everything inside retention is fine and everything past it is permanently absent, with no warning at the boundary and no amount of throughput that helps.");
+    }
+
+    if (!landing) {
+      var withLZ = recover(outage, ret, vol, true);
+      lines.push("With a landing zone retaining raw bytes on object storage, the loss would be " +
+        (withLZ.lostHours ? hrs(withLZ.lostHours) : "zero") +
+        " at any outage length, because object storage retention is a policy you set rather than a broker default. Chapter 7's prices make that a rounding error against the engineering cost of an unrecoverable gap, and unlike most reliability work it needs no ongoing effort.");
+    }
+
+    lines.push("Note also that the recovery spends the same error budget as the outage. " + hrs(outage) +
+      " down plus " + hrs(r.rtoHours) + " rebuilding is " + hrs(total) + " of staleness against a 99% monthly allowance of " +
+      MONTH_BUDGET.toFixed(1) + " hours \u2014 " + (total / MONTH_BUDGET).toFixed(1) +
+      " times the whole month's budget. Which is why rebuild throughput, set by chapter 12's layout decisions, is a reliability property rather than a performance one.");
+
+    $("rc-note").textContent = lines.join("\n\n");
+  }
+
+  ["rc-out", "rc-ret", "rc-land", "rc-vol"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+initChapter("22-reliability.html");
+</script>
+</body>
+</html>

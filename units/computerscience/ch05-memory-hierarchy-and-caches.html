@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5. The memory hierarchy — Computer Science</title>
+<meta name="description" content="Registers, L1 to L3, DRAM and disk; cache lines, associativity, the three Cs, locality, data layout, false sharing and prefetching.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E2574C' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span class="sep">/</span> <a href="index.html">Computer Science</a> <span class="sep">/</span> Chapter 5</p>
+    <p class="chapter">Chapter 5 <span class="part">· The machine</span></p>
+    <h1>The memory hierarchy</h1>
+    <p class="lede">A modern core can issue several instructions per nanosecond and has to wait roughly eighty nanoseconds for a value from main memory. Everything between those two numbers — three levels of cache, prefetchers, out-of-order execution — exists to hide one gap. Where your data sits matters more than what your code does to it.</p>
+    <div class="meta">
+      <span><b>8</b> sections</span>
+      <span><b>2</b> demos</span>
+      <span><b>7</b> self-check questions</span>
+      <span>Roughly <b>35</b> minutes</span>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="side" aria-label="On this page">
+    <h2>On this page</h2>
+    <div data-sections></div>
+    <h2>Nearby chapters</h2>
+    <div data-nearby></div>
+  </nav>
+
+  <main>
+
+    <!-- ==================================================== -->
+    <section id="s-gap">
+      <h2>The gap, and why it exists</h2>
+      <div class="h2rule"></div>
+
+      <p class="big">Memory that is fast is small and expensive. Memory that is large is slow and cheap. Nobody has solved this, so instead we stack several kinds and hope the fast one is usually enough.</p>
+
+      <p>The constraint is physical. SRAM, used for cache, needs six transistors per bit and holds its value as long as it has power. DRAM, used for main memory, needs one transistor and one capacitor per bit, which is far denser and far cheaper, but the capacitor leaks so every row has to be refreshed thousands of times a second, and reading it is a slow analogue operation. On top of that, signals travel at a finite speed: light covers about 30 cm in a nanosecond, and electrical signals in silicon rather less, so a DRAM chip several centimetres away has a hard latency floor no engineering can remove.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Approximate latencies on a current desktop core. Orders of magnitude, not exact figures.</caption>
+          <thead><tr><th>Level</th><th>Typical size</th><th>Latency</th><th>Scaled: if L1 took 1 second</th></tr></thead>
+          <tbody>
+            <tr><td>Register</td><td class="num">a few hundred bytes</td><td class="num">0 cycles</td><td>immediate</td></tr>
+            <tr><td>L1 cache</td><td class="num">32–64 KiB per core</td><td class="num">~4 cycles, ~1 ns</td><td class="num">1 second</td></tr>
+            <tr><td>L2 cache</td><td class="num">512 KiB – 2 MiB per core</td><td class="num">~12 cycles, ~4 ns</td><td class="num">4 seconds</td></tr>
+            <tr><td>L3 cache</td><td class="num">8–64 MiB shared</td><td class="num">~40 cycles, ~12 ns</td><td class="num">12 seconds</td></tr>
+            <tr><td>DRAM</td><td class="num">8–128 GiB</td><td class="num">~200–300 cycles, ~80 ns</td><td class="num">80 seconds</td></tr>
+            <tr><td>NVMe SSD</td><td class="num">0.5–8 TB</td><td class="num">~100 µs</td><td class="num">a day and a bit</td></tr>
+            <tr><td>Spinning disk seek</td><td class="num">1–20 TB</td><td class="num">~8 ms</td><td class="num">three months</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Those ratios are the point. DRAM is about <strong>80 times</strong> slower than an L1 hit. An SSD read is about <strong>1,250 times</strong> slower than a DRAM read. A disk seek is another <strong>80 times</strong> beyond that. Any optimisation that moves work up one level beats almost any optimisation that reduces instruction count at the same level.</p>
+
+      <div class="note key">
+        <b class="tag">The bet the hierarchy makes</b>
+        <p>Caches only work because real programs do not access memory at random. They reuse the same data soon after touching it, and they touch neighbouring addresses. Those two observations are called <strong>temporal locality</strong> and <strong>spatial locality</strong>, and every level of the hierarchy is a bet on them. Write a program that violates both and the hierarchy collapses to the speed of DRAM.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-cache">
+      <h2>How a cache actually works</h2>
+      <div class="h2rule"></div>
+
+      <p>A cache never stores single bytes. It stores fixed-size blocks called <strong>cache lines</strong>, almost universally 64 bytes on x86-64 and ARM64. Ask for one byte and the hardware fetches the whole aligned 64-byte block containing it. That single design choice is where spatial locality gets cashed in, and where it gets punished.</p>
+
+      <h3>Splitting the address</h3>
+
+      <p>Given an address, the cache splits it into three fields with no arithmetic beyond shifting and masking:</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">a 32 KiB, 8-way, 64-byte-line cache decoding an address</span><button class="code-copy">Copy</button></div>
+<pre>32768 bytes / 64-byte lines           = 512 lines
+512 lines / 8 ways                    = <span class="n">64 sets</span>
+
+  ┌──────────── tag ────────────┬─ set index ─┬─ offset ─┐
+  │        upper bits           │   6 bits    │  6 bits  │
+  └─────────────────────────────┴─────────────┴──────────┘
+
+offset     which byte inside the 64-byte line   (log2 64  = 6 bits)
+set index  which of the 64 sets to look in      (log2 64  = 6 bits)
+tag        everything else, stored alongside the data so the
+           cache can tell which of many possible blocks it holds</pre>
+      </div>
+
+      <p>Lookup is then: use the set index to pick one set, compare the tag against all 8 entries in that set in parallel, and if one matches, use the offset to pick the byte. All of it is a fixed, small amount of work, which is why an L1 hit costs about four cycles rather than a search.</p>
+
+      <h3>Associativity</h3>
+
+      <dl class="terms">
+        <dt>Direct-mapped (1 way)</dt>
+        <dd>Every block has exactly one place it can live. Lookup is one comparison, which is fast and cheap. Two hot blocks that map to the same slot evict each other endlessly, even if the rest of the cache is empty.</dd>
+
+        <dt>Fully associative</dt>
+        <dd>A block can live anywhere. No block ever evicts another unnecessarily. Requires comparing the tag against every entry, which is only feasible for very small caches — the TLB is usually built this way.</dd>
+
+        <dt>N-way set associative</dt>
+        <dd>The compromise everybody ships. A block maps to one set and can occupy any of the N ways within it. Typical numbers today are 8-way for L1 and 16-way for L2 and L3. Replacement within a set is approximately least-recently-used.</dd>
+      </dl>
+
+      <div class="note tip">
+        <b class="tag">Where a way-slice boundary falls</b>
+        <p>In the cache above, 64 sets × 64-byte lines means addresses <strong>4096 bytes apart map to the same set</strong>. Any access pattern with a stride that is a multiple of 4096 bytes will pile everything into one set and use 8 lines out of 512. Power-of-two array dimensions are extremely good at producing exactly this pattern, which is why matrix code sometimes gets dramatically faster when you pad a 1024-wide row to 1032.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-locality">
+      <h2>Stride, and the cliff</h2>
+      <div class="h2rule"></div>
+
+      <p>Because a miss fetches 64 bytes whether you want them or not, the useful question is how many of those bytes you go on to use before the line is evicted. Walking an array of 8-byte doubles one element at a time uses all eight. Walking it eight elements at a time uses one and throws away seven, so you pay the same memory traffic for one eighth of the work.</p>
+
+      <!-- ------------- DEMO 1 ------------- -->
+      <div class="demo" id="demo-stride">
+        <div class="demo-top">
+          <h3>Demo 1 — the stride cliff</h3>
+          <p>A real cache simulator: set-associative, LRU, tag-and-set decoded from actual addresses. It walks an array with the stride you choose and counts every hit and miss. The bar chart sweeps a range of strides through the same simulator.</p>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Array size
+              <select id="st-arr">
+                <option value="16384">16 KiB (fits in L1)</option>
+                <option value="262144">256 KiB</option>
+                <option value="1048576" selected>1 MiB (32× the cache)</option>
+                <option value="8388608">8 MiB</option>
+              </select>
+            </label>
+            <label>Element <select id="st-el">
+                <option value="4">4 bytes (int32)</option>
+                <option value="8" selected>8 bytes (double)</option>
+              </select>
+            </label>
+            <label>Stride (elements) <input type="range" id="st-stride" min="0" max="9" value="0" step="1"><span id="st-stride-v" style="font-size:12px;color:#54677A"></span></label>
+          </div>
+          <div class="ctrl">
+            <label>Cache <select id="st-cache">
+                <option value="32768" selected>32 KiB</option>
+                <option value="262144">256 KiB</option>
+                <option value="2097152">2 MiB</option>
+              </select>
+            </label>
+            <label>Line <select id="st-line">
+                <option value="32">32 B</option>
+                <option value="64" selected>64 B</option>
+                <option value="128">128 B</option>
+              </select>
+            </label>
+            <label>Ways <select id="st-ways">
+                <option value="1">1 (direct-mapped)</option>
+                <option value="2">2</option>
+                <option value="8" selected>8</option>
+                <option value="16">16</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="stage">
+            <p style="margin:0 0 8px;font-size:12.5px;color:#54677A">Hit rate across strides, same simulator, same settings</p>
+            <div id="st-chart"></div>
+          </div>
+
+          <div class="rgrid">
+            <div class="tile"><span class="k">Hit rate</span><span class="v" id="st-hr">—</span></div>
+            <div class="tile"><span class="k">Misses</span><span class="v" id="st-miss">—</span></div>
+            <div class="tile"><span class="k">Bytes actually used</span><span class="v sm" id="st-used">—</span></div>
+            <div class="tile"><span class="k">Bytes fetched from memory</span><span class="v sm" id="st-fetched">—</span></div>
+            <div class="tile"><span class="k">Waste factor</span><span class="v" id="st-waste">—</span></div>
+            <div class="tile"><span class="k">Cache geometry</span><span class="v sm" id="st-geo">—</span></div>
+          </div>
+
+          <p class="readout" id="st-out"></p>
+        </div>
+      </div>
+
+      <p>With the defaults — a 1 MiB array of doubles through a 32 KiB, 8-way, 64-byte-line cache — the hit rates fall in exactly the pattern the line size predicts. Stride 1 uses all eight doubles in each line and hits <strong>87.5%</strong> of the time. Stride 2 uses four and hits 75%. Stride 4 uses two and hits 50%. At stride 8 each access lands in a different line and the hit rate goes to <strong>zero</strong>, where it stays for every larger stride. The cliff is at stride = line size ÷ element size, and it does not get any worse after that, because you cannot waste more than a whole line.</p>
+
+      <p>Two settings are worth changing deliberately. Shrink the array to 16 KiB so it fits inside the cache and the hit rate is above 99% at <em>every</em> stride, because after the first pass nothing needs to be fetched again. And set ways to 1 to see how a direct-mapped cache behaves at strides that are powers of two.</p>
+
+      <h3>The same effect, in the form you will meet it</h3>
+
+      <p>Traversing a 512 × 512 matrix of doubles by rows and by columns is the classic demonstration, and it is the stride cliff wearing a different hat: row-major traversal has stride 1, column-major has stride 512.</p>
+
+      <div class="tw">
+        <table>
+          <caption>512 × 512 doubles (2 MiB) through a 32 KiB, 8-way, 64-byte-line cache — simulated, not estimated</caption>
+          <thead><tr><th>Traversal</th><th>Accesses</th><th>Misses</th><th>Hit rate</th><th>Memory traffic</th></tr></thead>
+          <tbody>
+            <tr><td>Row-major, <code>a[i][j]</code> with <code>j</code> inner</td><td class="num">262,144</td><td class="num">32,768</td><td class="num">87.5%</td><td class="num">2 MiB</td></tr>
+            <tr><td>Column-major, <code>a[i][j]</code> with <code>i</code> inner</td><td class="num">262,144</td><td class="num">262,144</td><td class="num">0%</td><td class="num">16 MiB</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Eight times the memory traffic for identical arithmetic. In C, C++, Python's NumPy default and most other languages, arrays are row-major, so the inner loop should walk the last index. Fortran, MATLAB, R and Julia are column-major, so the rule inverts. Getting it backwards is one of the most common causes of numeric code running an order of magnitude slower than it should.</p>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-misses">
+      <h2>Why a miss happened: the three Cs</h2>
+      <div class="h2rule"></div>
+
+      <p>Not all misses are the same, and the fix differs. Mark Hill's classification splits them into three causes, distinguished by asking what a different cache would have done.</p>
+
+      <dl class="terms">
+        <dt>Compulsory (cold) miss</dt>
+        <dd>The first ever reference to this block. No cache of any size or shape could have avoided it. The only fixes are prefetching it earlier or touching less data.</dd>
+
+        <dt>Capacity miss</dt>
+        <dd>The block was evicted because the working set is larger than the cache. A fully associative cache of the same size would also have missed. The fix is to shrink the working set — blocking, tiling, smaller types.</dd>
+
+        <dt>Conflict miss</dt>
+        <dd>The block was evicted even though a fully associative cache of the same size would have kept it. Too many hot blocks mapped to one set. The fix is to change the addresses: pad arrays, offset allocations, or increase associativity.</dd>
+      </dl>
+
+      <p>The definitions are operational, which is what makes them measurable: run the same address stream through a fully associative cache of the same capacity, and any miss the real cache suffers that the ideal one did not is a conflict miss.</p>
+
+      <!-- ------------- DEMO 2 ------------- -->
+      <div class="demo" id="demo-3c">
+        <div class="demo-top">
+          <h3>Demo 2 — watch a cache fill, and classify every miss</h3>
+          <p>A small cache you can see all of at once. Each access is classified by running the same stream through a fully associative cache of identical capacity alongside, which is exactly how the three Cs are defined.</p>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Access pattern
+              <select id="cc-pat">
+                <option value="seq">Sequential walk through 128 bytes</option>
+                <option value="conflict">Three arrays 64 bytes apart, in a loop</option>
+                <option value="capacity">Nine distinct lines, looped three times</option>
+                <option value="reuse">Walk, then immediately walk again</option>
+              </select>
+            </label>
+            <label>Sets <select id="cc-sets"><option value="2">2</option><option value="4" selected>4</option><option value="8">8</option></select></label>
+            <label>Ways <select id="cc-ways"><option value="1">1</option><option value="2" selected>2</option><option value="4">4</option></select></label>
+            <label>Line <select id="cc-line"><option value="16" selected>16</option><option value="32">32</option></select></label>
+          </div>
+          <div class="ctrl">
+            <button class="btn go" id="cc-step">Next access</button>
+            <button class="btn" id="cc-run">Run to the end</button>
+            <button class="btn ghost" id="cc-reset">Reset</button>
+          </div>
+
+          <div class="legend">
+            <span><i style="background:#E2574C"></i>just accessed</span>
+            <span><i style="background:#FDEEEC;border-color:#F4C6C1"></i>resident</span>
+            <span><i style="background:#F4F6F8"></i>empty way</span>
+          </div>
+
+          <div class="stage">
+            <div id="cc-grid"></div>
+            <p style="margin:12px 0 6px;font-size:12.5px;color:#54677A">Access log</p>
+            <div id="cc-log" style="max-height:170px;overflow-y:auto;font-family:var(--mono);font-size:11.5px;line-height:1.7"></div>
+          </div>
+
+          <div class="rgrid">
+            <div class="tile"><span class="k">Accesses</span><span class="v" id="cc-n">0</span></div>
+            <div class="tile"><span class="k">Hits</span><span class="v" id="cc-hit">0</span></div>
+            <div class="tile"><span class="k">Compulsory</span><span class="v" id="cc-comp">0</span></div>
+            <div class="tile"><span class="k">Capacity</span><span class="v" id="cc-cap">0</span></div>
+            <div class="tile"><span class="k">Conflict</span><span class="v" id="cc-con">0</span></div>
+            <div class="tile"><span class="k">Cache holds</span><span class="v sm" id="cc-size">—</span></div>
+          </div>
+
+          <p class="readout" id="cc-out"></p>
+        </div>
+      </div>
+
+      <p>Three patterns are worth stepping through. The sequential walk over 128 bytes produces exactly <strong>8 compulsory misses and 24 hits</strong> with 16-byte lines — one miss per line, then three free accesses inside it. The conflict pattern touches three blocks that all map to set 0 in a 2-way cache, so after the three compulsory misses every subsequent access is a <strong>conflict miss</strong>, and the classifier proves it by noting a fully associative cache of the same size would have held all three comfortably. Raise ways to 4 and the conflicts vanish without changing the total capacity at all.</p>
+
+      <p>The nine-lines pattern is the contrast: nine distinct blocks into an eight-line cache. Now even a perfect cache would miss, so those misses are classified as <strong>capacity</strong>, not conflict, and adding associativity does not help. The fix there is algorithmic — process the data in blocks that fit.</p>
+
+      <div class="note key">
+        <b class="tag">A fourth C, for multicore</b>
+        <p>The original list has three. On a multiprocessor there is a fourth: <strong>coherence misses</strong>, caused by another core invalidating your copy of a line. They are indistinguishable from conflict misses in a single-core simulator, and they are the subject of the false sharing section below.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-layout">
+      <h2>Data layout beats cleverness</h2>
+      <div class="h2rule"></div>
+
+      <p>Once you accept that memory moves in 64-byte units, several familiar design choices look different.</p>
+
+      <h3>Array of structs versus struct of arrays</h3>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">the same data, two layouts</span><button class="code-copy">Copy</button></div>
+<pre><span class="c">// Array of structs — one particle is contiguous</span>
+<span class="k">struct</span> Particle { <span class="k">double</span> x, y, z, vx, vy, vz; <span class="k">int</span> id; <span class="k">bool</span> alive; };
+Particle p[100000];                <span class="c">// 56–64 bytes each</span>
+
+<span class="c">// Struct of arrays — one field is contiguous</span>
+<span class="k">struct</span> Particles {
+  <span class="k">double</span> x[100000], y[100000], z[100000];
+  <span class="k">double</span> vx[100000], vy[100000], vz[100000];
+  <span class="k">int</span> id[100000]; <span class="k">bool</span> alive[100000];
+};</pre>
+      </div>
+
+      <p>A loop that sums every <code>x</code> reads 8 useful bytes out of each 64-byte line in the array-of-structs layout, wasting seven eighths of every fetch. In the struct-of-arrays layout the same loop is a stride-1 walk that uses every byte, and it vectorises cleanly because the values are adjacent. If instead you process whole particles one at a time, array-of-structs is the better layout, because everything you need arrives together.</p>
+
+      <p>Neither is universally right. The question is which fields your hot loop touches together. Game engines and physics code usually go struct-of-arrays for the simulation step; anything that iterates whole records keeps array-of-structs.</p>
+
+      <h3>Padding and alignment</h3>
+
+      <p>Compilers insert padding so each field sits at an address that is a multiple of its size, because unaligned accesses are slower or, on some architectures, illegal. Field order therefore changes the size of a struct:</p>
+
+      <div class="tw">
+        <table>
+          <caption>The same three fields, two orders, on a typical 64-bit ABI</caption>
+          <thead><tr><th>Declaration order</th><th>Layout</th><th>Total</th></tr></thead>
+          <tbody>
+            <tr><td><code>char a; long b; char c;</code></td><td><code>a</code> + 7 pad + <code>b</code> + <code>c</code> + 7 pad</td><td class="num">24 bytes</td></tr>
+            <tr><td><code>long b; char a; char c;</code></td><td><code>b</code> + <code>a</code> + <code>c</code> + 6 pad</td><td class="num">16 bytes</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>A third of the memory saved by reordering two declarations. Across a million-element array that is 8 MB, which is the difference between fitting in L3 and not. Sorting struct fields from largest to smallest is a reliable habit; Rust reorders fields automatically unless you ask for C layout, and Go and C do not.</p>
+
+      <h3>False sharing</h3>
+
+      <div class="note warn">
+        <b class="tag">The bug that makes threads slower than one thread</b>
+        <p>Cache coherence works at line granularity, not variable granularity. Eight <code>int64</code> counters fit in one 64-byte line, so eight threads each incrementing their <em>own</em> counter are all writing to the same line. Every write invalidates the other seven cores' copies, and the line ping-pongs between cores over the interconnect. The variables are private, the contention is total. The fix is to pad each counter to its own cache line, which costs <strong>eight times</strong> the memory and can be worth it many times over. Look for <code>alignas(64)</code> in C++, <code>@Contended</code> in Java, <code>CachePadded</code> in Rust's crossbeam.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-prefetch">
+      <h2>Prefetchers, TLBs and the other caches</h2>
+      <div class="h2rule"></div>
+
+      <p>Hardware does not wait passively for misses. Every modern core has <strong>prefetchers</strong> that watch the address stream and speculatively fetch lines they expect you to want. They reliably detect sequential forward and backward walks and simple constant strides within a page. They cannot follow a linked list, because the next address is not known until the current node has arrived.</p>
+
+      <p>This is the real reason a linked list loses to an array so badly. It is not only that nodes are scattered; it is that each node's address depends on the previous load, so the misses are <em>serialised</em>. A hundred sequential array misses can be in flight at once; a hundred linked-list misses happen strictly one after another, each paying the full DRAM latency. That effect is called a dependent load chain or pointer chasing, and it is why an array-backed structure often beats a pointer-based one even when the pointer-based one has better asymptotic complexity at small sizes.</p>
+
+      <h3>The TLB</h3>
+
+      <p>Virtual addresses have to be translated to physical ones, and the page table that does it lives in memory. To avoid a memory access per memory access, translations are cached in the <strong>translation lookaside buffer</strong>, a small fully associative cache of typically a few hundred to a couple of thousand entries. With 4 KiB pages, 1,536 entries covers about 6 MiB of address space.</p>
+
+      <p>Exceed that and you start taking TLB misses, which cost a page-table walk — several dependent memory accesses — on top of any data cache miss. Workloads with large, randomly accessed data structures often spend more time on TLB misses than data misses, which is what <strong>huge pages</strong> (2 MiB instead of 4 KiB) exist to fix: the same TLB then covers 512 times as much memory.</p>
+
+      <div class="note tip">
+        <b class="tag">Other caches with the same shape</b>
+        <p>The pattern generalises. Branch target buffers cache jump destinations. The micro-op cache stores already-decoded instructions. Your database has a buffer pool; your web app has Redis in front of Postgres; your browser has an HTTP cache; a CDN is a cache with geography. All of them have a line size, an associativity, a replacement policy and the three Cs. Chapter 23 works through replacement policies in general, and everything there applies here.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-practice">
+      <h2>What to do about it</h2>
+      <div class="h2rule"></div>
+
+      <p>Cache-conscious programming is a small number of habits, applied only where a profiler says it matters.</p>
+
+      <ol>
+        <li><strong>Prefer contiguous storage.</strong> A vector of values beats a list of pointers to values for almost any traversal-heavy workload, and usually beats it for insertion too until the sizes get large.</li>
+        <li><strong>Walk memory in the order it is laid out.</strong> Inner loop over the last index in row-major languages. This is the single highest-value rule.</li>
+        <li><strong>Block or tile large computations</strong> so the working set of each block fits in cache. Matrix multiply goes from <em>O</em>(<em>n</em>³) memory traffic to <em>O</em>(<em>n</em>³/√<em>C</em>) with tiling, and the speed-up is several-fold on real hardware.</li>
+        <li><strong>Shrink your data.</strong> An <code>int32</code> instead of <code>int64</code> halves the traffic. So does removing a field you never read in the hot loop.</li>
+        <li><strong>Order struct fields large to small</strong> and check the actual size rather than assuming.</li>
+        <li><strong>Pad shared-but-independent data</strong> to cache lines when threads write to it.</li>
+        <li><strong>Avoid power-of-two strides</strong> in multi-dimensional arrays. Padding a row from 1024 to 1032 elements can eliminate a set of conflict misses entirely.</li>
+        <li><strong>Measure, do not guess.</strong> <code>perf stat</code> on Linux reports cache misses and references directly; <code>cachegrind</code> simulates; Instruments and VTune do the same on other platforms.</li>
+      </ol>
+
+      <div class="note trap">
+        <b class="tag">The complexity table lies about constants</b>
+        <p>Big-O counts operations and treats every memory access as equal. On real hardware an access can cost 4 cycles or 300, a difference of nearly two orders of magnitude that the notation cannot see. This is why a linear scan of a sorted array often beats a binary search tree for a few thousand elements, why <code>std::vector</code> usually beats <code>std::list</code>, and why B-trees with hundreds of children per node beat binary search trees on disk. Chapter 10 explains what asymptotic notation does say; this chapter is the reason you cannot stop there.</p>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-check">
+      <h2>Check yourself</h2>
+      <div class="h2rule"></div>
+
+      <div class="check">
+        <details>
+          <summary>A 64 KiB, 4-way set-associative cache has 64-byte lines. How many sets, and which address bits select one?</summary>
+          <div class="ans">
+            <p>65536 ÷ 64 = 1024 lines; 1024 ÷ 4 ways = <strong>256 sets</strong>. The low 6 bits are the byte offset within the line (2<sup>6</sup> = 64), the next 8 bits are the set index (2<sup>8</sup> = 256), and everything above is the tag. Addresses 256 × 64 = 16,384 bytes apart therefore land in the same set, so a stride of 16 KiB will use 4 lines out of 1024.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Why does the hit rate stop getting worse once the stride exceeds the line size?</summary>
+          <div class="ans">
+            <p>Because the worst case is already reached. At stride = line size ÷ element size, each access lands in a different line and no line is ever reused, so the hit rate is zero and one full line is fetched per useful element. Larger strides cannot waste more than a whole line per access. Confirm it in demo 1: with 8-byte doubles and 64-byte lines, strides 8, 16, 64 and 512 all report 0% and a waste factor of exactly 8.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>A loop over a 512 × 512 double matrix runs eight times slower one way round than the other, with identical arithmetic. Explain in terms of bytes.</summary>
+          <div class="ans">
+            <p>Row-major storage puts <code>a[i][0..511]</code> contiguously. Iterating <code>j</code> in the inner loop walks with stride 8 bytes, so each 64-byte line serves eight accesses: 262,144 accesses cause 32,768 misses and 2 MiB of traffic. Iterating <code>i</code> in the inner loop walks with stride 512 × 8 = 4,096 bytes, so every access is a new line: 262,144 misses and 16 MiB of traffic. Eight times the bytes moved for the same additions. The 4,096-byte stride is also exactly one way-slice on a 32 KiB 8-way cache, so the misses are conflict misses on top of everything else.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>How would you tell a conflict miss from a capacity miss, and why does the distinction matter?</summary>
+          <div class="ans">
+            <p>Run the same address stream through a fully associative cache of identical capacity. If that cache would have hit, the miss was caused by the mapping, not the size, so it is a conflict miss. If it would also have missed, the working set is genuinely too large and the miss is a capacity miss. It matters because the fixes are different: conflict misses go away with more associativity or by changing addresses (padding an array, offsetting an allocation), while capacity misses only go away if you touch less data — blocking, tiling, or smaller types.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Eight threads each increment their own private counter and the program runs slower than a single thread doing all eight. What is happening?</summary>
+          <div class="ans">
+            <p>False sharing. Eight <code>int64</code> counters occupy 64 bytes, which is one cache line. Coherence operates on lines, so when core 0 writes its counter it invalidates that line in the other seven cores' caches, and they must re-fetch it before their next write. The line ping-pongs across the interconnect on every increment. Nothing is logically shared and every access still contends. Padding each counter to its own 64-byte line fixes it at eight times the memory, which is almost always the right trade.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Why is a linked list so much worse than an array here, beyond just poor spatial locality?</summary>
+          <div class="ans">
+            <p>Because the misses are serialised. To find node <em>n</em> + 1 you must first have node <em>n</em> in hand, so each miss cannot begin until the previous one has completed and you pay the full latency every time. An array walk has no such dependency: the prefetcher recognises the stride and issues many fetches concurrently, and the core's memory-level parallelism overlaps them. Ten misses on an array can cost barely more than one; ten misses down a list cost ten. That is why the practical break-even point between contiguous and pointer-based structures sits at much larger sizes than complexity analysis suggests.</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Your struct is <code>{char flag; double value; char kind;}</code> and you have ten million of them. What would you change, and what does it buy?</summary>
+          <div class="ans">
+            <p>Reorder to put the <code>double</code> first: <code>{double value; char flag; char kind;}</code>. The original needs 7 bytes of padding after <code>flag</code> to align <code>value</code>, then 7 more at the end to keep the struct's alignment, giving 24 bytes. The reordered version needs only 6 bytes of trailing padding, giving 16. Across ten million elements that is 240 MB versus 160 MB — 80 MB saved, and a third less memory traffic for any traversal. If the hot loop only reads <code>value</code>, going further to a struct-of-arrays layout would cut the traffic again by another third.</p>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <!-- ==================================================== -->
+    <section id="s-recap">
+      <div class="recap">
+        <h2>Ten things to carry forward</h2>
+        <ol>
+          <li><b>Fast memory is small, large memory is slow,</b> and the hierarchy is a stack of compromises rather than a solution.</li>
+          <li><b>DRAM is roughly 80× an L1 hit; an SSD is another 1,250× beyond that.</b> Moving work up one level beats almost any instruction-level optimisation.</li>
+          <li><b>Caches store 64-byte lines, never single bytes.</b> Every miss fetches a whole line whether you use it or not.</li>
+          <li><b>An address decodes into tag, set index and offset,</b> so lookup is a fixed amount of shifting, masking and parallel comparison.</li>
+          <li><b>The stride cliff is at line size ÷ element size.</b> Past that point the hit rate is zero and cannot get worse.</li>
+          <li><b>Row-major versus column-major is an eight-times traffic difference</b> on a matrix of doubles, for identical arithmetic.</li>
+          <li><b>Misses are compulsory, capacity or conflict,</b> and each has a different fix: prefetch, shrink the working set, or change the addresses.</li>
+          <li><b>Layout is a performance decision.</b> Array-of-structs versus struct-of-arrays, field order, and element width all change how many useful bytes ride in each line.</li>
+          <li><b>False sharing makes private data contended,</b> because coherence works on lines and not on variables.</li>
+          <li><b>Prefetchers follow strides but cannot follow pointers,</b> so pointer chasing serialises its misses and pays full latency on every one.</li>
+        </ol>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<footer>
+  <div class="foot-inner">
+    <div class="fi-grid">
+      <div class="fi">
+        <h3>What comes next</h3>
+        <p>Part 1 is done. Chapter 6 starts the operating system: what a process actually is, how <code>fork</code> creates one out of nothing but a copy, what threads share that processes do not, and why copy-on-write makes a duplicate of a gigabyte almost free.</p>
+      </div>
+      <div class="fi">
+        <h3>If you want to go deeper</h3>
+        <p>Ulrich Drepper's <em>What Every Programmer Should Know About Memory</em> is long, occasionally dated and still the best single treatment. For the practical side, run <code>perf stat -e cache-references,cache-misses</code> on your own hot loop and then try the row/column swap.</p>
+      </div>
+      <div class="fi">
+        <h3>Connections</h3>
+        <p>Chapter 9 covers virtual memory and page tables, which is what the TLB caches. Chapter 12 compares contiguous and linked storage with these costs in mind. Chapter 23 generalises replacement policies. Chapter 10 explains what complexity analysis measures, and therefore what it misses.</p>
+      </div>
+    </div>
+    <div class="pager" data-pager></div>
+  </div>
+</footer>
+
+<button class="top" aria-label="Back to top">&uarr;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* shared cache simulator ------------------------------------------ */
+function makeCache(bytes, lineBytes, ways){
+  const lines = bytes / lineBytes;
+  const sets = Math.max(1, lines / ways);
+  return {bytes, lineBytes, ways, sets,
+          tags: Array.from({length:sets}, () => []),
+          hits:0, misses:0};
+}
+function cacheAccess(c, addr){
+  const block = Math.floor(addr / c.lineBytes);
+  const set = block % c.sets;
+  const way = c.tags[set];
+  const i = way.indexOf(block);
+  if (i >= 0){ way.splice(i, 1); way.unshift(block); c.hits++; return {hit:true, set, block, evicted:null}; }
+  way.unshift(block);
+  let evicted = null;
+  if (way.length > c.ways) evicted = way.pop();
+  c.misses++;
+  return {hit:false, set, block, evicted};
+}
+function kib(n){
+  if (n >= 1048576) return (n / 1048576) + " MiB";
+  if (n >= 1024) return (n / 1024) + " KiB";
+  return n + " B";
+}
+
+/* =============================================================
+   Demo 1 — the stride cliff
+   ============================================================= */
+(function(){
+  const STRIDES = [1, 2, 4, 8, 16, 32, 64, 128, 512, 1024];
+
+  function run(stride){
+    const arrayBytes = +document.getElementById("st-arr").value;
+    const elemBytes  = +document.getElementById("st-el").value;
+    const cacheBytes = +document.getElementById("st-cache").value;
+    const lineBytes  = +document.getElementById("st-line").value;
+    const ways       = +document.getElementById("st-ways").value;
+    const elems = arrayBytes / elemBytes;
+    const accesses = Math.min(131072, elems * 4);
+    const c = makeCache(cacheBytes, lineBytes, ways);
+    let idx = 0;
+    for (let k = 0; k < accesses; k++){
+      cacheAccess(c, idx * elemBytes);
+      idx = (idx + stride) % elems;
+    }
+    const total = c.hits + c.misses;
+    return {
+      hits:c.hits, misses:c.misses, total,
+      hitRate: c.hits / total,
+      used: total * elemBytes,
+      fetched: c.misses * lineBytes,
+      waste: (c.misses * lineBytes) / (total * elemBytes),
+      geo: {sets:c.sets, ways, lineBytes, cacheBytes, elemBytes}
+    };
+  }
+
+  function draw(){
+    const si = +document.getElementById("st-stride").value;
+    const stride = STRIDES[si];
+    document.getElementById("st-stride-v").textContent = stride + (stride === 1 ? " element" : " elements");
+
+    const r = run(stride);
+    const results = STRIDES.map(s => ({s, r:run(s)}));
+
+    const host = document.getElementById("st-chart");
+    host.innerHTML = "";
+    const wrap = document.createElement("div");
+    wrap.style.cssText = "display:flex;align-items:flex-end;gap:6px;height:130px";
+    results.forEach(({s, r:rr}) => {
+      const col = document.createElement("div");
+      col.style.cssText = "flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;height:100%";
+      const bar = document.createElement("div");
+      const h = Math.max(2, Math.round(rr.hitRate * 100));
+      bar.style.cssText = "width:100%;height:" + h + "%;border-radius:2px 2px 0 0;background:" +
+                          (s === stride ? "#E2574C" : "#20456A");
+      bar.title = "stride " + s + ": " + (rr.hitRate * 100).toFixed(1) + "% hit";
+      const pct = document.createElement("div");
+      pct.style.cssText = "font-size:9.5px;color:#54677A;margin-bottom:2px";
+      pct.textContent = Math.round(rr.hitRate * 100) + "%";
+      const lab = document.createElement("div");
+      lab.style.cssText = "font-size:10px;color:" + (s === stride ? "#B8362C" : "#7D8EA0") +
+                          ";margin-top:4px;font-weight:" + (s === stride ? "700" : "400");
+      lab.textContent = s;
+      col.append(pct, bar, lab);
+      wrap.appendChild(col);
+    });
+    host.appendChild(wrap);
+    const cap = document.createElement("p");
+    cap.style.cssText = "margin:6px 0 0;font-size:11.5px;color:#7D8EA0;text-align:center";
+    cap.textContent = "stride, in elements";
+    host.appendChild(cap);
+
+    setTile("st-hr", (r.hitRate * 100).toFixed(2) + "%");
+    setTile("st-miss", commas(r.misses));
+    setTile("st-used", kib(r.used));
+    setTile("st-fetched", kib(r.fetched));
+    setTile("st-waste", r.waste.toFixed(2) + "×");
+    setTile("st-geo", r.geo.sets + " sets × " + r.geo.ways + " ways × " + r.geo.lineBytes + " B");
+
+    const perLine = r.geo.lineBytes / r.geo.elemBytes;
+    const arrayBytes = +document.getElementById("st-arr").value;
+    const fits = arrayBytes <= r.geo.cacheBytes;
+    const waySlice = r.geo.sets * r.geo.lineBytes;
+    const strideBytes = stride * r.geo.elemBytes;
+
+    let msg;
+    if (fits){
+      msg = "The whole array is " + kib(arrayBytes) + ", which fits inside a " + kib(r.geo.cacheBytes) +
+            " cache. After the first pass nothing needs fetching again, so the hit rate stays above 99% at " +
+            "<b>every stride</b>. Locality only matters once the working set exceeds the cache.";
+    } else if (stride * r.geo.elemBytes >= r.geo.lineBytes){
+      msg = "Stride " + stride + " is " + strideBytes + " bytes, at or past the " + r.geo.lineBytes +
+            "-byte line size, so every access lands in a fresh line and <b>nothing is ever reused</b>. " +
+            "The cache still fetches " + r.geo.lineBytes + " bytes to deliver " + r.geo.elemBytes +
+            ", a waste factor of <b>" + r.waste.toFixed(0) + "×</b>." +
+            (strideBytes % waySlice === 0
+              ? " Worse, " + strideBytes + " is a multiple of the " + waySlice +
+                "-byte way-slice, so every single access maps to the same set and only " + r.geo.ways +
+                " lines of the cache are usable at all."
+              : "");
+    } else {
+      msg = "Stride " + stride + " touches one element every " + strideBytes + " bytes, so <b>" +
+            Math.round(r.geo.lineBytes / strideBytes) + " of the " + perLine +
+            " elements in each line</b> get used before it is evicted. That predicts a hit rate of " +
+            (100 * (1 - strideBytes / r.geo.lineBytes)).toFixed(1) + "%, and the simulator measures " +
+            (r.hitRate * 100).toFixed(2) + "%.";
+    }
+    document.getElementById("st-out").innerHTML = msg;
+  }
+
+  ["st-arr","st-el","st-cache","st-line","st-ways"].forEach(id =>
+    document.getElementById(id).addEventListener("change", draw));
+  document.getElementById("st-stride").addEventListener("input", draw);
+  draw();
+})();
+
+/* =============================================================
+   Demo 2 — the three Cs, stepped
+   ============================================================= */
+(function(){
+  let cache = null, fa = null, seen = null, stream = [], pos = 0,
+      counts = {hit:0, compulsory:0, capacity:0, conflict:0}, log = [], lastSet = -1, lastBlock = -1;
+
+  function patternStream(kind, lineBytes){
+    const a = [];
+    if (kind === "seq"){ for (let i = 0; i < 32; i++) a.push(i * 4); }
+    else if (kind === "conflict"){
+      const slice = 4 * lineBytes;
+      for (let p = 0; p < 4; p++) for (const b of [0, slice, slice * 2]) a.push(b);
+    }
+    else if (kind === "capacity"){ for (let p = 0; p < 3; p++) for (let b = 0; b < 9; b++) a.push(b * lineBytes); }
+    else { for (let p = 0; p < 2; p++) for (let i = 0; i < 8; i++) a.push(i * lineBytes); }
+    return a;
+  }
+
+  function reset(){
+    const sets = +document.getElementById("cc-sets").value || 4;
+    const ways = +document.getElementById("cc-ways").value || 2;
+    const line = +document.getElementById("cc-line").value || 16;
+    const bytes = sets * ways * line;
+    cache = makeCache(bytes, line, ways);
+    fa = {lines: bytes / line, order: []};
+    seen = new Set();
+    stream = patternStream(document.getElementById("cc-pat").value, line);
+    pos = 0;
+    counts = {hit:0, compulsory:0, capacity:0, conflict:0};
+    log = [];
+    lastSet = -1; lastBlock = -1;
+    draw();
+  }
+
+  function faAccess(block){
+    const i = fa.order.indexOf(block);
+    if (i >= 0){ fa.order.splice(i, 1); fa.order.unshift(block); return true; }
+    fa.order.unshift(block);
+    if (fa.order.length > fa.lines) fa.order.pop();
+    return false;
+  }
+
+  function step(){
+    if (pos >= stream.length) return false;
+    const addr = stream[pos++];
+    const block = Math.floor(addr / cache.lineBytes);
+    const res = cacheAccess(cache, addr);
+    const hitFA = faAccess(block);
+    let kind;
+    if (res.hit) kind = "hit";
+    else if (!seen.has(block)) kind = "compulsory";
+    else if (!hitFA) kind = "capacity";
+    else kind = "conflict";
+    seen.add(block);
+    counts[kind]++;
+    lastSet = res.set; lastBlock = block;
+    log.unshift({n:pos, addr, block, set:res.set, kind, evicted:res.evicted});
+    return true;
+  }
+
+  function draw(){
+    const host = document.getElementById("cc-grid");
+    host.innerHTML = "";
+    const tbl = document.createElement("div");
+    tbl.style.cssText = "display:flex;flex-direction:column;gap:4px";
+    for (let s = 0; s < cache.sets; s++){
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;gap:4px;align-items:center";
+      const lab = document.createElement("span");
+      lab.style.cssText = "font-size:11px;color:#54677A;min-width:44px;font-family:var(--mono)";
+      lab.textContent = "set " + s;
+      row.appendChild(lab);
+      for (let w = 0; w < cache.ways; w++){
+        const block = cache.tags[s][w];
+        const cell = document.createElement("div");
+        const isLast = block === lastBlock && s === lastSet;
+        cell.className = "cell " + (block === undefined ? "dim" : (isLast ? "hot" : "warm"));
+        cell.style.cssText += ";min-width:74px;padding:6px 4px;font-size:11.5px";
+        cell.textContent = block === undefined ? "—" : "block " + block;
+        row.appendChild(cell);
+      }
+      tbl.appendChild(row);
+    }
+    host.appendChild(tbl);
+
+    const lh = document.getElementById("cc-log");
+    lh.innerHTML = "";
+    log.slice(0, 40).forEach(e => {
+      const colour = e.kind === "hit" ? "#166B47"
+                   : e.kind === "compulsory" ? "#1C5A82"
+                   : e.kind === "capacity" ? "#8A5A00" : "#B8362C";
+      const div = document.createElement("div");
+      div.innerHTML = "<span style='color:#7D8EA0'>" + String(e.n).padStart(2, "0") + "</span> " +
+                      "addr " + String(e.addr).padStart(4) + " → block " + String(e.block).padStart(2) +
+                      ", set " + e.set + "  <b style='color:" + colour + "'>" + e.kind + "</b>" +
+                      (e.evicted !== null && e.evicted !== undefined ? "  <span style='color:#7D8EA0'>(evicted block " + e.evicted + ")</span>" : "");
+      lh.appendChild(div);
+    });
+
+    setTile("cc-n", pos + " of " + stream.length);
+    setTile("cc-hit", counts.hit);
+    setTile("cc-comp", counts.compulsory);
+    setTile("cc-cap", counts.capacity);
+    setTile("cc-con", counts.conflict);
+    setTile("cc-size", cache.sets + "×" + cache.ways + "×" + cache.lineBytes + " B = " + cache.bytes + " B");
+
+    document.getElementById("cc-step").disabled = pos >= stream.length;
+    document.getElementById("cc-run").disabled = pos >= stream.length;
+
+    let msg;
+    if (pos === 0){
+      msg = "The cache is empty. Press <b>Next access</b> to walk the address stream one reference at a time, " +
+            "or run it to the end and read the classification.";
+    } else if (pos < stream.length){
+      const last = log[0];
+      msg = "Access " + last.n + " touched address " + last.addr + ", which is block " + last.block +
+            " and maps to set " + last.set + " (block number modulo " + cache.sets + " sets). Result: <b>" +
+            last.kind + "</b>.";
+    } else {
+      const kind = document.getElementById("cc-pat").value;
+      const tot = counts.compulsory + counts.capacity + counts.conflict;
+      msg = "Finished. <b>" + counts.hit + " hits</b> and " + tot + " misses: " + counts.compulsory +
+            " compulsory, " + counts.capacity + " capacity, " + counts.conflict + " conflict. ";
+      if (kind === "conflict" && counts.conflict > 0){
+        msg += "Every repeat miss here is a <b>conflict</b> miss — a fully associative cache of the same " +
+               cache.bytes + " bytes would have held all three blocks. Raise ways to " + (cache.ways * 2) +
+               " and they disappear without adding any capacity.";
+      } else if (kind === "capacity" && counts.capacity > 0){
+        msg += "These are <b>capacity</b> misses: nine distinct lines will not fit in a cache that holds " +
+               (cache.bytes / cache.lineBytes) + ". More associativity cannot help, because even a perfect " +
+               "cache of this size would evict something. The fix is to touch less data per pass.";
+      } else if (counts.conflict === 0 && counts.capacity === 0){
+        msg += "Every miss was <b>compulsory</b> — unavoidable first touches. This is the best a cache of any " +
+               "shape could do on this stream, and the only remaining lever is prefetching.";
+      }
+    }
+    document.getElementById("cc-out").innerHTML = msg;
+  }
+
+  document.getElementById("cc-step").addEventListener("click", () => { step(); draw(); });
+  document.getElementById("cc-run").addEventListener("click", () => { let g = 0; while (step() && g++ < 500); draw(); });
+  document.getElementById("cc-reset").addEventListener("click", reset);
+  ["cc-pat","cc-sets","cc-ways","cc-line"].forEach(id =>
+    document.getElementById(id).addEventListener("change", reset));
+
+  reset();
+})();
+
+initChapter("ch05-memory-hierarchy-and-caches.html");
+</script>
+</body>
+</html>

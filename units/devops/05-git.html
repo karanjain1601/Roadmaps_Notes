@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Version control as infrastructure — DevOps</title>
+<meta name="description" content="The content-addressed object model under git, branching strategies compared on their actual cost, merge against rebase, hooks and protected branches, monorepos, and getting a secret out of history.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%237C8CF8' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">DevOps</a><span class="sep">/</span><span>Chapter 05</span></p>
+    <p class="chno">Chapter 05 · Source and servers</p>
+    <h1>Version control as infrastructure</h1>
+    <p class="lede">Git is not a tool you use alongside your delivery system — it is the substrate the whole thing is built on. The commit is the unit of change that chapter 1 was counting, the branch is the batch, and from chapter 19 onward the repository stops describing the software and starts <em>being</em> the desired state of production. That makes the object model and the branching strategy operational decisions rather than developer preferences.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapter 01</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="objects">
+<h2>Four object types, and everything else is a consequence</h2><div class="h2rule"></div>
+
+<p class="lead">Git stores exactly four kinds of object, each identified by the hash of its own contents. That single design choice — <strong>content addressing</strong> — explains deduplication, why branches are free, why history cannot be quietly altered, and why the recovery story is so much better than it appears when you have just destroyed something.</p>
+
+<div class="kv">
+<dt><code>blob</code></dt><dd>The contents of one file. No name, no permissions, no history — just bytes. Two files with identical contents anywhere in the repository, at any point in history, are the same blob stored once.</dd>
+<dt><code>tree</code></dt><dd>A directory: a sorted list of names, each paired with a mode and the id of a blob or another tree. The tree is what gives a blob its filename.</dd>
+<dt><code>commit</code></dt><dd>One tree id (the complete snapshot, not a diff), zero or more parent commit ids, author, committer, timestamp and message. A merge commit is simply one with two parents.</dd>
+<dt><code>tag</code></dt><dd>An annotated tag object pointing at a commit, with its own message and optional signature. A lightweight tag is not an object at all — just a ref.</dd>
+<dt>A <em>ref</em> is not an object</dt><dd><code>refs/heads/main</code> is a file containing a commit id. That is the entire implementation of a branch: 41 bytes. Creating one is instant and costs nothing, which is why the argument against feature branches is never about the branch and always about how long it lives.</dd>
+</div>
+
+<div class="box intu"><b class="tag">Git does not store diffs</b>
+<p style="margin-bottom:0">Every commit references a complete tree of the whole project. Diffs are computed on demand, which is why <code>git log -p</code> is slower than <code>git log</code> and why <code>git checkout</code> of a hundred-commit-old revision is instant. The reason this does not explode on disk is deduplication: an unchanged file across a thousand commits is one blob referenced a thousand times, and packfiles later apply delta compression <em>across</em> objects regardless of which commit they belong to. The demo below counts the objects for a real sequence of operations.</p>
+</div>
+
+<div class="demo" id="d-obj">
+  <div class="demo-top"><div class="demo-title">What each operation actually writes to the object store</div><div class="demo-hint">Step to 5 — amend does not edit anything, it writes a new commit</div></div>
+  <div class="demo-body">
+    <canvas id="cObj" aria-label="The git object graph after each step, showing reachable and unreachable commits"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Step <b id="obSo">1</b> of 8</label><input type="range" id="obS" min="1" max="8" value="1"></div>
+      <button class="btn primary" id="obNext">Next step</button>
+      <button class="btn" id="obRst">Restart</button>
+    </div>
+    <div class="rgrid" id="obOut"></div>
+    <div class="readout" id="obNote"></div>
+  </div>
+</div>
+
+<div class="box tip"><b class="tag">Almost nothing is ever really lost</b>
+<p style="margin-bottom:0">A destroyed branch, a bad <code>reset --hard</code>, a rebase that went wrong, an amended commit you needed — in every case the original objects are still in <code>.git</code>, merely unreachable from any ref. <code>git reflog</code> records where <code>HEAD</code> and each branch pointed after every operation, typically for 90 days, and <code>git reset --hard HEAD@{3}</code> puts it back. The genuinely unrecoverable cases are narrow and worth knowing precisely: work that was never committed at all, and objects removed by <code>git gc --prune</code> after they aged out of the reflog. Everything else is a lookup, and the first thing to do after any accident is <code>git reflog</code> — before anything else, because further commands can push the entry you need out of the window.</p>
+</div>
+</section>
+
+<section id="branching">
+<h2>Branching strategies, priced rather than argued</h2><div class="h2rule"></div>
+
+<p>The branching debate is usually conducted as a matter of taste. It is not: a branching strategy sets a hard ceiling on the deploy cadence from chapter 1, and its cost is calculable. A branch that lives for <em>L</em> days accumulates two things simultaneously — your changes, and everyone else's changes to the same trunk — and the chance they collide grows with the product of the two.</p>
+
+<div class="eq plain"><code>daily integration cost &nbsp;=&nbsp; (devs / L) &nbsp;×&nbsp; ( fixed merge cost &nbsp;+&nbsp; conflict cost × conflicts(L) )</code></div>
+<p class="where">Merges happen once per branch per developer, so their number falls as <b>1/L</b> — that term punishes very short branches, because each merge carries a fixed cost in CI runs, review round trips and ceremony. Conflicts grow roughly as <b>L²</b>, because both the size of your branch and the amount of trunk drift you must reconcile against are each proportional to <em>L</em>. A term falling as 1/L plus a term rising as L is convex, so there is a minimum — and it is the same shape as the deploy-cadence curve in chapter 1, for the same underlying reason.</p>
+
+<div class="demo" id="d-branch">
+  <div class="demo-top"><div class="demo-title">How long should a branch live?</div><div class="demo-hint">Drop the merge cost to 0.1 h and watch the optimum move left</div></div>
+  <div class="demo-body">
+    <canvas id="cBranch" aria-label="Integration overhead in hours per day plotted against branch lifetime, showing a minimum"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Branch lives <b id="brLo">5.0</b> days</label><input type="range" id="brL" min="0" max="1000" value="617"></div>
+      <div class="ctrl"><label>Developers <b id="brDo">8</b></label><input type="range" id="brD" min="1" max="40" value="8"></div>
+      <div class="ctrl"><label>Files each touches/day <b id="brFo">6</b></label><input type="range" id="brF" min="1" max="20" value="6"></div>
+      <div class="ctrl"><label>Actively-edited files <b id="brHo">400</b></label><input type="range" id="brH" min="50" max="4000" step="50" value="400"></div>
+      <div class="ctrl"><label>Cost of a merge</label><select id="brM">
+        <option value="3">3.0 h — manual QA, release ticket, a meeting</option>
+        <option value="0.5" selected>0.5 h — review plus a slow CI run</option>
+        <option value="0.1">0.1 h — automated checks, trusted small changes</option>
+      </select></div>
+      <button class="btn primary" id="brOpt">Jump to the minimum</button>
+    </div>
+    <div class="rgrid" id="brOut"></div>
+    <div class="readout" id="brNote"></div>
+  </div>
+</div>
+
+<p>With a team of eight, six files each per day and a moderately automated merge, the model puts the optimum at about <b>1.5 days</b> — and the shape around it matters more than the exact number. A one-day branch costs 9.2% of the team's capacity in integration and a two-day branch 8.8%, so anything in that region is fine. A ten-day branch costs <b>20.1%</b> and a twenty-day branch <b>26.6%</b>: at that point a quarter of the team exists to reconcile the other three quarters.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Strategy</th><th>Typical branch lifetime</th><th>Deploy cadence it permits</th><th>Where it genuinely fits</th></tr></thead>
+<tbody>
+<tr><td><strong>Trunk-based</strong></td><td class="yes">Hours to 2 days, or no branch at all</td><td class="yes">Many per day</td><td>The default for a service you deploy yourself. Requires feature flags for anything that spans more than a couple of days</td></tr>
+<tr><td><strong>GitHub flow</strong></td><td>Days</td><td>Daily</td><td>Trunk-based with a pull request attached. Fine as long as the PR is small and merged quickly — the review queue is the risk</td></tr>
+<tr><td><strong>Release branches</strong></td><td>Weeks, but cut <em>from</em> a healthy trunk</td><td>Per release</td><td class="yes">Genuinely necessary when you must support several versions at once: on-premise software, mobile apps, anything with a certification cycle</td></tr>
+<tr><td><strong>Git flow</strong></td><td class="no">Weeks, with develop, release and hotfix branches all diverging</td><td class="no">Weekly at best</td><td>Designed in 2010 for versioned desktop software. Its own author now recommends against it for continuously delivered web services, and the model above shows why</td></tr>
+<tr><td><strong>Long-lived environment branches</strong></td><td class="no">Permanent <code>dev</code>, <code>staging</code>, <code>prod</code> branches</td><td class="no">Whatever cherry-picking allows</td><td class="no">An antipattern. The branches drift apart permanently, so what you tested is never what you shipped. Promote an <em>artefact</em> between environments, not a merge — chapters 18 and 20</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn"><b class="tag">Feature flags are what make short branches possible</b>
+<p style="margin-bottom:0">The obvious objection to trunk-based development is that some features take three weeks to build and cannot be released half-finished. The answer is to separate <em>merging</em> from <em>releasing</em>: merge the incomplete work behind a flag that is off, so the code is integrated continuously while the behaviour stays hidden. That keeps <em>L</em> small while the feature takes as long as it takes. It is not free — flags are conditional branches that need testing on both sides, and a flag left in the code for two years is technical debt with a name — so the discipline is a removal deadline written down at the moment the flag is created. Chapter 18 covers the operational side.</p>
+</div>
+</section>
+
+<section id="mergerebase">
+<h2>Merge, rebase and the shape of history</h2><div class="h2rule"></div>
+
+<p>Both integrate one line of work into another; they differ in what they leave behind, and the choice has practical rather than aesthetic consequences.</p>
+
+<div class="cards">
+<div>
+<h5>Merge</h5>
+<p>Creates a commit with two parents. Preserves exactly what happened, including the fact that two lines of work existed concurrently. Never rewrites anything, so it is always safe on a shared branch. Produces a graph that is honest and can be hard to read.</p>
+</div>
+<div>
+<h5>Rebase</h5>
+<p>Replays your commits on top of the new base, creating <em>new</em> commits with new ids. Produces a linear history where every commit's parent is the state it was actually tested against. Rewrites history, so it must never be done to commits others have pulled.</p>
+</div>
+<div>
+<h5>Squash merge</h5>
+<p>Collapses the branch into a single commit on the target. Trunk gets one commit per unit of work, which makes <code>git bisect</code> and revert trivial. The intermediate commits are discarded, so the branch's development detail is lost — usually a fair trade.</p>
+</div>
+</div>
+
+<p>Two operational consequences are worth stating plainly, because they are what makes this a delivery concern rather than a style guide.</p>
+
+<div class="kv">
+<dt>A linear trunk makes <code>git bisect</code> work properly</dt><dd>Bisect finds the commit that introduced a defect in log₂(n) steps — twelve builds to search four thousand commits. It needs each commit to be individually buildable and testable, which a merge-heavy trunk full of half-integrated states is not. This is the same isolation cost that appears as the log₂ term in chapter 1's recovery model, and it is why "one commit per change on trunk" pays off during an incident rather than during development.</dd>
+<dt>Revert is your fastest rollback, and it needs the same property</dt><dd><code>git revert &lt;sha&gt;</code> produces a new commit undoing exactly one change, which can then flow through the normal pipeline. It works cleanly when trunk has one commit per unit of work and becomes an archaeology exercise when it does not. Chapter 18 treats reverting forward as a first-class deployment strategy rather than an emergency measure.</dd>
+</div>
+
+<div class="box trap"><b class="tag">The golden rule, and the one legitimate exception</b>
+<p style="margin-bottom:6px">Never rewrite history that someone else has based work on. A rebase or amend of published commits gives everyone else a divergent copy, and the usual recovery — a merge — reintroduces the original commits alongside the rewritten ones, doubling the history and producing conflicts in code nobody changed.</p>
+<p style="margin-bottom:0">The exception is your own unmerged branch, where rebasing onto the latest trunk before opening a pull request is exactly right: it resolves conflicts on your time rather than the reviewer's, and it means CI tested the code against the base it will actually land on. If you must force-push a shared branch, use <code>--force-with-lease</code>, which refuses when the remote has moved since you last fetched. Plain <code>--force</code> silently discards a colleague's commits.</p>
+</div>
+</section>
+
+<section id="hooks">
+<h2>Hooks, protected branches and what CI attaches to</h2><div class="h2rule"></div>
+
+<p>The repository is the natural enforcement point for everything downstream, because it is the one place every change passes through. There are three layers, and they are not interchangeable.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Layer</th><th>Runs where</th><th>Good for</th><th>Cannot be relied on for</th></tr></thead>
+<tbody>
+<tr><td><strong>Client hooks</strong> (<code>pre-commit</code>, <code>pre-push</code>)</td><td>The developer's machine</td><td class="yes">Fast feedback: formatting, linting, an obvious secret scan. Seconds, not minutes</td><td class="no">Enforcement. They live in <code>.git/hooks</code>, are not cloned, and <code>--no-verify</code> skips them</td></tr>
+<tr><td><strong>Server hooks</strong> / branch protection</td><td>The forge</td><td class="yes">Actual enforcement: required checks, required reviews, signed commits, linear history, no force-push</td><td>Fast feedback — the developer has already pushed</td></tr>
+<tr><td><strong>CI pipeline</strong></td><td>A runner</td><td>Everything expensive: tests, builds, scans, artefact publication</td><td>Anything that must be instant</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">yaml — .pre-commit-config.yaml, the hooks worth having everywhere</span><button class="code-copy">Copy</button></div><pre>repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-added-large-files      <span class="c">← a 200 MB file in history is permanent. this is the</span>
+        args: [--maxkb=1024]             <span class="c">  cheapest guard in the entire list</span>
+      - id: check-merge-conflict         <span class="c">← catches committed &lt;&lt;&lt;&lt;&lt;&lt;&lt; markers</span>
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-yaml                   <span class="c">← a malformed manifest fails here, not in the cluster</span>
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks                     <span class="c">← the only hook that prevents an unfixable mistake</span>
+  - repo: https://github.com/koalaman/shellcheck-precommit
+    rev: v0.10.0
+    hooks:
+      - id: shellcheck                   <span class="c">← chapter 3</span>
+
+<span class="c"># the same checks MUST also run in CI. the client hook is for speed,</span>
+<span class="c"># the CI job is for enforcement, and they are not substitutes</span></pre></div>
+
+<p>On the protection side, four settings do most of the work: require a pull request before merging, require named status checks to pass, require the branch to be up to date with its base before merging, and forbid force-pushes and deletions. The third is the one people skip, and it is the one that prevents two branches that each pass CI independently from breaking trunk when combined — a semantic conflict that no textual merge can detect.</p>
+
+<div class="box tip"><b class="tag">CODEOWNERS is the cheapest review routing there is</b>
+<p style="margin-bottom:0">A <code>CODEOWNERS</code> file maps path patterns to teams and automatically requests review from the right people. It removes the "who should look at this?" delay, which in the chapter 1 flow model is pure queue time at the review stage. It is also how you make a monorepo navigable: <code>/infra/ @platform</code>, <code>/services/payments/ @payments</code>, <code>*.tf @platform @security</code>. Combined with required review from code owners, it turns an informal norm into something that cannot be forgotten at 6pm on a Friday.</p>
+</div>
+</section>
+
+<section id="monorepo">
+<h2>Monorepo or many</h2><div class="h2rule"></div>
+
+<p>This is a genuine trade-off rather than a solved question, and the deciding factor is usually not scale but how often changes need to cross a boundary.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th>Monorepo</th><th>Repo per service</th></tr></thead>
+<tbody>
+<tr><td>A change spanning two services</td><td class="yes">One commit, one review, atomic</td><td class="no">Two PRs, ordered deploys, a compatibility window in between</td></tr>
+<tr><td>Shared library upgrade</td><td class="yes">Change it and every caller together; the build proves it</td><td class="no">Publish a version, then chase N consumers. Some never upgrade</td></tr>
+<tr><td>CI cost</td><td class="no">Needs change detection, or every push builds everything</td><td class="yes">Naturally scoped</td></tr>
+<tr><td>Access control</td><td class="no">Path-based at best; anyone who can clone gets everything</td><td class="yes">Per repository, and it actually holds</td></tr>
+<tr><td>Tooling</td><td class="no">Beyond a certain size you need Bazel, Nx, Turborepo or sparse checkouts</td><td class="yes">Plain git works forever</td></tr>
+<tr><td>Ownership clarity</td><td>CODEOWNERS, and it needs maintaining</td><td class="yes">Obvious from the repository name</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box intu"><b class="tag">The failure modes are mirror images</b>
+<p style="margin-bottom:0">A monorepo fails by making CI slow enough that people stop trusting it — the fix is affected-target detection so a change to one service does not rebuild forty. Many repos fail by making cross-cutting change so expensive that it stops happening: a security patch to a shared library sits unapplied in eleven services for six months, and nobody can say which of them are affected. The monorepo problem is a tooling problem with known solutions. The polyrepo problem is an organisational one, and it is considerably harder to fix once it has set in.</p>
+</div>
+</section>
+
+<section id="secrets">
+<h2>A secret in history is a secret that is gone</h2><div class="h2rule"></div>
+
+<p>This deserves its own section because the instinct is wrong. Deleting a file and committing the deletion removes it from the working tree and leaves the blob permanently in history, reachable from every earlier commit, present in every clone, and served happily by the forge's API to anyone who asks for that revision.</p>
+
+<ol class="steps">
+<li><strong>Rotate the credential first.</strong> Before touching the repository at all. Assume it is compromised the moment it was pushed, because scanning bots find public keys within seconds and internal repositories are not much slower. Everything after this step is cleanup, not remediation — and if you do it in the other order, you spend an hour rewriting history while the live key is still valid.</li>
+<li><strong>Then remove it from history</strong> with <code>git filter-repo</code> (or BFG). <code>filter-branch</code> is deprecated and hundreds of times slower.</li>
+<li><strong>Force-push every branch and tag</strong>, and tell everyone to re-clone. Rewriting history changes every commit id from the touched commit forward, so anyone who pulls and merges reintroduces the old objects.</li>
+<li><strong>Ask the forge to garbage-collect.</strong> GitHub and GitLab keep unreachable objects accessible by SHA on their servers even after your force-push; you have to open a support request to have them purged. Until then the secret is still fetchable by anyone who noted the commit id.</li>
+<li><strong>Add the scanner so it cannot happen again</strong> — gitleaks or trufflehog, as a pre-commit hook for speed and as a required CI check for enforcement.</li>
+</ol>
+
+<div class="box warn"><b class="tag">The real fix is that the secret should never have been committable</b>
+<p style="margin-bottom:0">Every step above is expensive and none is fully reliable. The structural answer is that application configuration comes from the environment or a secret store at runtime, so there is nothing sensitive in the repository to leak — <code>.env</code> in <code>.gitignore</code>, a committed <code>.env.example</code> with the key names and no values, and real values injected by the platform. Chapter 21 covers the secret store; chapter 19 covers the awkward case that GitOps creates, where the desired state genuinely does live in git and therefore needs encryption at rest inside the repository.</p>
+</div>
+</section>
+
+<section id="close">
+<h2>Check yourself</h2><div class="h2rule"></div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>A colleague argues that feature branches are fine because "branches are free in git". What is right about that and what is wrong?
+<button class="reveal">Show answer</button><div class="ans">Right: creating a branch really is free — a ref is a 41-byte file containing a commit id, and no objects are copied. The cost is nothing at creation. Wrong: the cost is in the branch's <em>lifetime</em>, not its existence. While it lives, your changes accumulate and so does trunk drift, and the chance of collision grows with the product of the two, so conflict cost rises roughly as the square of the lifetime. The model in this chapter shows a ten-day branch consuming about 20% of a team's capacity in integration against about 9% for a one-day branch. The correct conclusion is that branching is free and <em>not merging</em> is expensive, which is an argument for many short branches rather than for no branches.</div></li>
+
+<li>You run <code>git commit --amend</code> on a commit you had already pushed, then force-push. What happened to the original commit, and what happens to a colleague who had pulled it?
+<button class="reveal">Show answer</button><div class="ans">Amend does not modify anything: commit objects are immutable and identified by the hash of their content, so changing the message or the tree necessarily produces a different id. A new commit was written and the branch ref moved to it, leaving the original object present in the repository but unreachable — still recoverable from your reflog until it is pruned. A colleague who had already pulled the original now has a branch whose tip is a commit that no longer exists upstream. If they pull, git merges the two lines, and both the original and the amended commit appear in history with the same changes, producing duplicate work and conflicts in code neither of them touched. This is why history rewriting is confined to unpublished branches, and why <code>--force-with-lease</code> — which refuses when the remote has moved since your last fetch — is the safer force.</div></li>
+
+<li>Your team ships one release a month from a <code>develop</code> branch that merges to <code>main</code> at release time. Deployment frequency is the metric management wants improved. What is actually constraining it?
+<button class="reveal">Show answer</button><div class="ans">The branching model, and no amount of pipeline automation will move it. If work is integrated into <code>develop</code> and only reaches <code>main</code> at release time, the batch size is one month of changes by definition, and chapter 1's model says the incident recovery cost scales with the log of that batch while lead time is roughly half the release interval — several weeks. You can make the deploy itself take ninety seconds and change nothing. The constraint moves only when trunk becomes releasable continuously, which means merging small changes directly into it, hiding incomplete work behind feature flags rather than behind a branch, and treating <code>main</code> as deployable at every commit. The pipeline work matters afterwards, because chapter 1 also shows that release-mechanism reliability is what sets the safe cadence once batch size is no longer the limit.</div></li>
+
+<li>Two pull requests each pass CI independently. Merged together, trunk breaks. Which protection setting would have caught it, and why do the others not?
+<button class="reveal">Show answer</button><div class="ans">"Require branches to be up to date before merging." Each PR was tested against the base as it was when the branch was created, so neither run ever saw the other's changes — the conflict is semantic rather than textual, which is exactly the class no merge algorithm can detect: one PR renames a function, the other adds a caller of the old name, and the files may not even overlap. Requiring the branch to be current forces a rebase or merge of the latest base and a re-run of CI against the combination, so the second PR is tested against a trunk that already contains the first. Required reviews do not help because a human reading one diff cannot see the other. Required status checks do not help because they already passed — against the wrong base. The cost is a re-run per merge, which is precisely the fixed merge cost in this chapter's model, and it is why making CI fast is what makes this setting affordable.</div></li>
+
+<li>Someone reports that <code>git reset --hard</code> destroyed two days of committed work. Walk through the recovery, and name the case where it genuinely would be lost.
+<button class="reveal">Show answer</button><div class="ans">The commits are almost certainly intact. <code>reset --hard</code> moves a branch ref and overwrites the working tree; it does not delete objects, so the old commits are still present and merely unreachable. <code>git reflog</code> lists where HEAD pointed after every operation, so find the entry from before the reset and <code>git reset --hard HEAD@{n}</code>, or safer, <code>git branch recover HEAD@{n}</code> to create a new branch without moving the current one. If the reflog entry is gone, <code>git fsck --lost-found</code> lists dangling commits. It is genuinely unrecoverable in two cases: changes that were never committed at all — <code>reset --hard</code> discards uncommitted work in the working tree and index with no record anywhere — and objects that both fell out of the reflog window, typically 90 days, and were then removed by <code>git gc --prune</code>. The practical lesson is to run <code>git reflog</code> as the very first command after any accident, before anything else pushes the entry you need out of view.</div></li>
+
+<li>A one-file change to a repository with 3,000 files adds how many objects, and why does that matter operationally?
+<button class="reveal">Show answer</button><div class="ans">Three: a new blob for the changed file, a new tree for each directory on the path from the root to that file (one, in the simplest case), and the commit. Every other blob and every unaffected subtree is referenced by id and stored once. It matters because it is why a repository with a decade of history and thousands of files clones in seconds, why branching and checking out old revisions are cheap, and why the storage cost of committing frequently is close to zero — which removes the last technical argument for batching work into large commits. It also explains the opposite case: a large binary that changes every build shares nothing between versions, so each commit adds its full size permanently. That is what Git LFS exists for, and why <code>check-added-large-files</code> is worth having as a hook.</div></li>
+
+<li>A production API key was committed and pushed to a private repository three weeks ago. Give the order of operations.
+<button class="reveal">Show answer</button><div class="ans">Rotate the key first, before touching the repository. Everything else is cleanup; until the credential is invalid you have an exposure, and history rewriting takes time you should not be spending while a live key is readable by anyone with clone access, in every existing clone, and in every CI cache and backup. Then remove the blob from history with <code>git filter-repo</code>, force-push all branches and tags, and have the team re-clone rather than pull — a pull would merge the old objects back in. Then ask the forge to garbage-collect: GitHub and GitLab keep unreachable objects fetchable by SHA on their side even after a force-push, so the secret remains retrievable by anyone who noted the commit id until support purges it. Finally add a scanner as both a pre-commit hook and a required CI check. Note that "private repository" changes the urgency slightly and nothing else: the credential has been readable by everyone with access, present in forks and CI logs, and it must still be treated as compromised.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin-bottom:0">Chapter 6 moves to the thing in front of your application: reverse proxies, the load-balancing algorithms and how much the choice actually costs at the tail, health checks, and the timeout configuration that decides whether one slow dependency takes down everything.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 05</h2><p>Version control as infrastructure. Part of the DevOps unit — <a href="index.html">all 24 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 17 (what CI attaches to), 18 (revert as a rollback), 19 (the repository as desired state), 20 (tagging artefacts), 21 (secrets that must live in a repo).</p></div>
+    <div><h2>Going deeper</h2><p>The Git &amp; GitHub unit on this site covers the commands and the forge in full. <em>Pro Git</em>, chapter 10, documents the object model from the plumbing up.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: the object store ============ */
+(function(){
+  const cv=document.getElementById("cObj"); if(!cv) return;
+  const sEl=document.getElementById("obS"), next=document.getElementById("obNext"), rst=document.getElementById("obRst");
+  const out=document.getElementById("obOut"), note=document.getElementById("obNote");
+
+  /* a real content-addressed store: FNV-1a with an avalanche finish so short
+     hex prefixes stay distinct (plain FNV has weak low bits) */
+  function h32(s){ let h=0x811c9dc5;
+    for(let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,0x01000193)>>>0; }
+    h^=h>>>15; h=Math.imul(h,0x2545f491)>>>0; h^=h>>>13; return h>>>0; }
+  const oid=s=>h32(s).toString(16).padStart(8,"0");
+
+  const STEPS=[
+    "git commit  — three files, first commit",
+    "git commit  — edit README.md only",
+    "git switch -c feature",
+    "git commit  — add feature.py on the branch",
+    "git commit --amend  — fix the message",
+    "git switch main && git reset --hard HEAD~1",
+    "git reflog  — the unreachable commits are still here",
+    "git gc --prune=now  — now they are not"
+  ];
+
+  function build(step){
+    const store=new Map(), log=[];
+    const put=(type,content)=>{ const id=oid(type+"\0"+content); const isNew=!store.has(id);
+      if(isNew) store.set(id,{type,bytes:content.length});
+      return {id,isNew}; };
+    const commits=[];              /* {id, msg, parent, reachable} */
+    const mk=(files,parent,msg)=>{
+      let added=0;
+      const entries=Object.entries(files).map(([n,c])=>{
+        const b=put("blob",c); if(b.isNew) added++;
+        return n+" "+b.id; }).sort().join("\n");
+      const tr=put("tree",entries); if(tr.isNew) added++;
+      const cm=put("commit","tree "+tr.id+"\nparent "+(parent||"")+"\n\n"+msg);
+      if(cm.isNew) added++;
+      commits.push({id:cm.id,msg,parent,reachable:true});
+      return {id:cm.id,added};
+    };
+
+    const f1={"README.md":"# project\n","app.py":"print(1)\n","util.py":"def f(): pass\n"};
+    const c1=mk(f1,null,"initial"); log.push([1,c1.added,"3 blobs + 1 tree + 1 commit"]);
+    let head=c1.id, refs={main:c1.id}, branch="main";
+    let pruned=false, reflog=[];
+
+    if(step>=2){ const f2=Object.assign({},f1,{"README.md":"# project\n\nnow with docs\n"});
+      const c2=mk(f2,head,"docs"); head=c2.id; refs.main=head;
+      log.push([2,c2.added,"1 new blob, 1 new tree, 1 commit — app.py and util.py reused"]);
+      var files=f2; } else var files=f1;
+
+    if(step>=3){ refs.feature=head; branch="feature"; log.push([3,0,"a ref is a file holding a commit id"]); }
+
+    let featTip=null;
+    if(step>=4){ const f3=Object.assign({},files,{"feature.py":"def g(): pass\n"});
+      const c3=mk(f3,head,"add feature"); featTip=c3.id; refs.feature=featTip; files=f3;
+      log.push([4,c3.added,"1 blob + 1 tree + 1 commit"]); }
+
+    if(step>=5){ const old=featTip;
+      const c4=mk(files,refs.main,"add feature (better message)");
+      featTip=c4.id; refs.feature=featTip;
+      const oc=commits.find(c=>c.id===old); if(oc) oc.reachable=false;
+      reflog.push(old);
+      log.push([5,c4.added,"amend wrote a NEW commit; the old one is now unreachable"]); }
+
+    if(step>=6){ const old=refs.main;
+      refs.main=commits.find(c=>c.id===old).parent;
+      const oc=commits.find(c=>c.id===old); if(oc) oc.reachable=false;
+      reflog.push(old);
+      log.push([6,0,"reset moved a ref. no objects were written or deleted"]); }
+
+    if(step>=8){ pruned=true;
+      for(const c of commits) if(!c.reachable) store.delete(c.id);
+      log.push([8,0,"unreachable objects deleted — this is the point of no return"]); }
+
+    /* mark reachability from the surviving refs */
+    const live=new Set();
+    for(const r of Object.values(refs)){ let cur=r;
+      while(cur){ live.add(cur); const c=commits.find(x=>x.id===cur); cur=c?c.parent:null; } }
+    commits.forEach(c=>c.reachable=live.has(c.id));
+
+    const naive=commits.filter(c=>c.reachable).length*Object.keys(files).length;
+    return {store,commits,refs,log,step,pruned,reflog,files,
+            blobs:[...store.values()].filter(o=>o.type==="blob").length,
+            naiveBlobs:naive};
+  }
+
+  function draw(){
+    const step=Math.max(1,Math.min(8,Math.round(+sEl.value)));
+    document.getElementById("obSo").textContent=step;
+    const m=build(step);
+    const w=cv.clientWidth||660, h=132, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("step "+step+":  "+STEPS[step-1], 14, 12);
+
+    /* commit graph, oldest left */
+    const cs=m.commits;
+    const bw=Math.min(96,(w-28)/Math.max(1,cs.length)-10);
+    cs.forEach((c,i)=>{
+      const x=14+i*(bw+10), gone=m.pruned&&!c.reachable;
+      ctx.globalAlpha=gone?0.25:1;
+      ctx.fillStyle= c.reachable?"#EFF1FE":"#FBE9E8";
+      ctx.strokeStyle= c.reachable?PC.line:PC.bad; ctx.lineWidth=1.4;
+      ctx.fillRect(x,30,bw,34); ctx.strokeRect(x+.5,30.5,bw,34);
+      ctx.fillStyle=PC.ink; ctx.font="10px ui-monospace, monospace"; ctx.textAlign="left";
+      ctx.fillText(c.id.slice(0,7), x+6, 41);
+      ctx.fillStyle=PC.text; ctx.font="9px Archivo, Arial";
+      const msg=c.msg.length>Math.floor(bw/5)?c.msg.slice(0,Math.floor(bw/5)-1)+"…":c.msg;
+      ctx.fillText(msg, x+6, 54);
+      if(!c.reachable){ ctx.fillStyle=PC.bad; ctx.font="700 8px Archivo, Arial";
+        ctx.fillText(m.pruned?"DELETED":"unreachable", x+6, 72); }
+      /* ref labels */
+      Object.entries(m.refs).forEach(([r,id],k)=>{
+        if(id===c.id){ ctx.fillStyle=PC.line; ctx.fillRect(x,16-k*13,Math.min(bw,r.length*5.6+10),11);
+          ctx.fillStyle="#fff"; ctx.font="700 8px Archivo, Arial"; ctx.fillText(r,x+4,22-k*13); } });
+      if(i>0){ ctx.globalAlpha=0.5; ctx.strokeStyle="#B9C4CE"; ctx.lineWidth=1.2;
+        ctx.beginPath(); ctx.moveTo(x-9,47); ctx.lineTo(x-1,47); ctx.stroke(); }
+      ctx.globalAlpha=1;
+    });
+
+    /* object counts by type */
+    const byType={blob:0,tree:0,commit:0};
+    for(const o of m.store.values()) byType[o.type]++;
+    ctx.textAlign="left"; ctx.font="10px Archivo, Arial"; ctx.fillStyle=PC.text;
+    ctx.fillText("object store: "+byType.blob+" blobs · "+byType.tree+" trees · "+byType.commit+" commits", 14, 96);
+    const unreach=m.commits.filter(c=>!c.reachable).length;
+    ctx.fillStyle= unreach&&!m.pruned?PC.warn:PC.text; ctx.font="600 10px Archivo, Arial";
+    ctx.fillText(m.pruned
+      ? "reflog cleared, unreachable objects pruned — recovery is no longer possible"
+      : unreach
+        ? unreach+" unreachable commit"+(unreach>1?"s":"")+" — still recoverable via `git reflog`"
+        : "everything reachable from a ref", 14, 114);
+
+    const dedup = m.naiveBlobs>0 ? m.naiveBlobs/Math.max(1,byType.blob) : 1;
+    out.innerHTML=
+      '<div><span>objects</span><b>'+m.store.size+'</b></div>'+
+      '<div><span>blobs</span><b>'+byType.blob+'</b></div>'+
+      '<div><span>trees</span><b>'+byType.tree+'</b></div>'+
+      '<div><span>commits</span><b>'+byType.commit+'</b></div>'+
+      '<div><span>unreachable</span><b style="color:'+(unreach?(m.pruned?PC.bad:PC.warn):PC.ok)+'">'+unreach+'</b></div>'+
+      '<div><span>recoverable</span><b style="font-size:12px;color:'+(m.pruned&&unreach?PC.bad:PC.ok)+'">'+
+        (m.pruned&&unreach?"no":"yes")+'</b></div>';
+
+    const last=m.log[m.log.length-1];
+    let msg='<b>'+STEPS[step-1]+'</b> — '+(last[1]?last[1]+" object"+(last[1]>1?"s":"")+" written. ":"no objects written. ")+last[2]+'.';
+    if(step===2) msg+=' A one-file change costs exactly three objects no matter how many files the repository has: the new blob, the tree that names it, and the commit.';
+    if(step===5) msg+=' Commit objects are immutable — their id <em>is</em> the hash of their content — so amending necessarily creates a new one and leaves the original behind, unreferenced.';
+    if(step===6) msg+=' <code>reset --hard</code> is a ref update plus a working-tree overwrite. Nothing was deleted, which is why this is recoverable and why uncommitted changes are not.';
+    if(step===7) msg+=' The reflog records where every ref pointed after every operation, for 90 days by default. <code>git reset --hard HEAD@{1}</code> puts it back.';
+    if(step===8) msg+=' <b style="color:#D9534F">This is the only destructive step in the sequence.</b> Everything before it could be undone.';
+    note.innerHTML=msg;
+  }
+  next.addEventListener("click",()=>{ sEl.value=Math.min(8,+sEl.value+1); draw(); });
+  rst.addEventListener("click",()=>{ sEl.value=1; draw(); });
+  sEl.addEventListener("input",draw);
+  debounceResize(draw); draw();
+})();
+
+/* ============ demo 2: branch lifetime ============ */
+(function(){
+  const cv=document.getElementById("cBranch"); if(!cv) return;
+  const lEl=document.getElementById("brL"), dEl=document.getElementById("brD"), fEl=document.getElementById("brF"),
+        hEl=document.getElementById("brH"), mEl=document.getElementById("brM"), optBtn=document.getElementById("brOpt");
+  const out=document.getElementById("brOut"), note=document.getElementById("brNote");
+  const LMIN=0.25, LMAX=40, K=0.4;                    /* hours to resolve one conflicting file */
+  const posToL=p=>LMIN*Math.pow(LMAX/LMIN,p/1000);
+  const lToPos=L=>1000*Math.log(L/LMIN)/Math.log(LMAX/LMIN);
+
+  function model(L,o){
+    const b=Math.min(o.hot, o.files*L);
+    const t=(o.devs-1)*o.files*L;
+    const pUn=Math.pow(1-1/o.hot, t);
+    const conflicts=b*(1-pUn);
+    const pAny=1-Math.pow(pUn,b);
+    const perMerge=o.merge+K*conflicts;
+    const merges=o.devs/L;
+    const daily=merges*perMerge;
+    const cap=o.devs*8;
+    return {L,b,conflicts,pAny,perMerge,merges,daily,cap,lost:daily/cap};
+  }
+  const opts=()=>({devs:+dEl.value, files:+fEl.value, hot:+hEl.value, merge:+mEl.value});
+  function best(o){ let b=null;
+    for(let i=0;i<=1000;i++){ const r=model(posToL(i),o); if(!b||r.daily<b.daily) b=r; } return b; }
+
+  function draw(){
+    const o=opts(), L=posToL(+lEl.value), m=model(L,o), bst=best(o);
+    document.getElementById("brLo").textContent = L<1?L.toFixed(2):L.toFixed(1);
+    document.getElementById("brDo").textContent = o.devs;
+    document.getElementById("brFo").textContent = o.files;
+    document.getElementById("brHo").textContent = o.hot;
+
+    const P=Plot(cv,{pad:[18,16,34,52],ratio:0.40});
+    const pts=[]; let ymax=0;
+    for(let i=0;i<=1000;i++){ const y=model(posToL(i),o).daily; pts.push([i,y]); if(y>ymax) ymax=y; }
+    ymax=Math.min(ymax, bst.daily*5);
+    P.o.xr=[0,1000]; P.o.yr=[0,ymax*1.05]; P.clear();
+    const ctx=P.ctx;
+
+    ctx.strokeStyle=PC.grid; ctx.lineWidth=1;
+    for(let g=0;g<=4;g++){ const v=ymax*1.05*g/4, y=Math.round(P.Y(v))+0.5;
+      ctx.beginPath(); ctx.moveTo(P.L,y); ctx.lineTo(P.R,y); ctx.stroke();
+      P.px(P.L-7,P.Y(v),v.toFixed(0),PC.text,"right","10.5px Archivo, Arial"); }
+    P.px(P.L-7,P.Y(ymax*1.05)-10,"h/day",PC.text,"right","600 9.5px Archivo, Arial");
+    [0.25,1,2,5,10,40].forEach(d=>{ if(d<LMIN||d>LMAX) return; const x=P.X(lToPos(d));
+      ctx.strokeStyle=PC.grid; ctx.beginPath(); ctx.moveTo(x,P.T); ctx.lineTo(x,P.B); ctx.stroke();
+      P.px(x,P.B+13,d<1?String(d):d+"d",PC.text,"center","10.5px Archivo, Arial"); });
+    P.px((P.L+P.R)/2,P.B+27,"branch lifetime",PC.text,"center","600 10px Archivo, Arial");
+
+    ctx.beginPath();
+    pts.forEach(([i,y],k)=>{ const X=P.X(i), Y=P.Y(Math.min(y,ymax*1.05)); k?ctx.lineTo(X,Y):ctx.moveTo(X,Y); });
+    ctx.strokeStyle=PC.line; ctx.lineWidth=2.4; ctx.stroke();
+
+    const bx=P.X(lToPos(bst.L)), by=P.Y(bst.daily);
+    ctx.setLineDash([3,3]); ctx.strokeStyle=PC.ok; ctx.lineWidth=1.2;
+    ctx.beginPath(); ctx.moveTo(bx,P.B); ctx.lineTo(bx,by); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle=PC.ok; ctx.beginPath(); ctx.arc(bx,by,4,0,7); ctx.fill();
+    P.px(bx+7,by-9,"minimum at "+(bst.L<1?bst.L.toFixed(2):bst.L.toFixed(1))+" days",PC.ok,"left","600 10.5px Archivo, Arial");
+
+    const cx=P.X(+lEl.value), cy=P.Y(Math.min(m.daily,ymax*1.05));
+    ctx.strokeStyle=PC.ink; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.arc(cx,cy,5.5,0,7); ctx.stroke();
+    ctx.fillStyle="#fff"; ctx.beginPath(); ctx.arc(cx,cy,3.5,0,7); ctx.fill();
+
+    const col = m.lost<0.10?PC.ok : m.lost<0.18?PC.warn : PC.bad;
+    out.innerHTML=
+      '<div><span>files touched</span><b>'+m.b.toFixed(0)+'</b></div>'+
+      '<div><span>conflicting files</span><b>'+m.conflicts.toFixed(1)+'</b></div>'+
+      '<div><span>chance of a conflict</span><b>'+(m.pAny*100).toFixed(0)+'%</b></div>'+
+      '<div><span>hours per merge</span><b>'+m.perMerge.toFixed(2)+'</b></div>'+
+      '<div><span>merges per day</span><b>'+m.merges.toFixed(1)+'</b></div>'+
+      '<div><span>capacity lost</span><b style="color:'+col+'">'+(m.lost*100).toFixed(1)+'%</b></div>';
+
+    const ratio=m.daily/bst.daily;
+    note.innerHTML =
+      'A branch open for <b>'+(L<1?L.toFixed(2):L.toFixed(1))+' days</b> touches '+m.b.toFixed(0)+
+      ' files while the other '+(o.devs-1)+' developer'+(o.devs===2?"":"s")+' land '+
+      ((o.devs-1)*o.files*L).toFixed(0)+' file-changes on trunk, so <b>'+m.conflicts.toFixed(1)+
+      '</b> files are expected to collide and the chance of at least one conflict is <b>'+(m.pAny*100).toFixed(0)+'%</b>. '+
+      (ratio<1.03
+        ? 'You are at the minimum for this team.'
+        : 'That costs <b>'+(m.lost*100).toFixed(1)+'%</b> of the team\u2019s capacity, <b>'+((ratio-1)*100).toFixed(0)+
+          '%</b> above the minimum of '+(bst.lost*100).toFixed(1)+'% at '+(bst.L<1?bst.L.toFixed(2):bst.L.toFixed(1))+' days.')+
+      ' Note the asymmetry: halving the branch length from the optimum is much cheaper than doubling it, because merge cost falls as 1/L while conflict cost rises as L\u00b2.';
+  }
+  optBtn.addEventListener("click",()=>{ lEl.value=Math.round(lToPos(best(opts()).L)); draw(); });
+  [lEl,dEl,fEl,hEl,mEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · DNS, TLS and certificates — DevOps</title>
+<meta name="description" content="How a name becomes an address, why TTL is not propagation, record types and the traps around them, the TLS handshake, certificate chain validation, ACME renewal and mTLS.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%237C8CF8' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">DevOps</a><span class="sep">/</span><span>Chapter 07</span></p>
+    <p class="chno">Chapter 07 · Source and servers</p>
+    <h1>DNS, TLS and certificates</h1>
+    <p class="lede">Two systems sit in front of every request, both mostly invisible until they are not. DNS decides where the request goes and caches that decision in more places than you control. TLS decides whether the connection is allowed at all, and fails on a schedule you set months earlier and then forgot. Between them they account for a startling share of outages, and almost all of those are avoidable with the material in this chapter.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapters 04, 06</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="resolution">
+<h2>How a name becomes an address</h2><div class="h2rule"></div>
+
+<p class="lead">Resolution is a chain of caches with an authority at the end of it. Your application asks a stub resolver, which asks a recursive resolver, which — if nobody in the chain already knows — walks down from the root to the TLD to the authoritative server for the zone. Every step along the way is allowed to remember the answer for as long as the record's TTL says, and this is where all the operational surprises live.</p>
+
+<ol class="steps">
+<li><strong>The application asks.</strong> Usually through <code>getaddrinfo()</code>, which consults <code>/etc/nsswitch.conf</code>, then <code>/etc/hosts</code>, then DNS. Some runtimes bypass this entirely and speak DNS themselves, which is why <code>/etc/hosts</code> sometimes does not work for a Go binary or a JVM.</li>
+<li><strong>The stub resolver</strong> — <code>systemd-resolved</code>, <code>dnsmasq</code>, or nothing at all — may answer from its own cache. In a container this is normally the cluster's DNS service instead.</li>
+<li><strong>The recursive resolver</strong> answers from cache if it can. This is the layer whose cache you have the least visibility into and the most dependence on.</li>
+<li><strong>Otherwise it walks the tree.</strong> Root servers say who handles <code>.com</code>; the <code>.com</code> servers say who is authoritative for <code>example.com</code>; that server gives the answer. Each of those referrals is itself cached, usually for a long time.</li>
+<li><strong>Everyone on the path caches the answer</strong> for its TTL — and, critically, they cache <em>negative</em> answers too, governed by the SOA record's minimum field rather than by the TTL of the record that does not exist.</li>
+</ol>
+
+<div class="box trap"><b class="tag">"DNS propagation" is not a thing</b>
+<p style="margin-bottom:0">Nothing is pushed anywhere. When you change a record, the authoritative server has the new answer immediately and every cache in the world keeps serving the old one until <em>its own</em> entry expires. So the delay you experience is not propagation, it is <strong>expiry</strong> — and that has a very different practical consequence: the fix is not to wait, it is to have lowered the TTL beforehand. Once you have made the change with a one-hour TTL in place, there is nothing you can do to speed it up.</p>
+</div>
+
+<div class="demo" id="d-dns">
+  <div class="demo-top"><div class="demo-title">A record change, and who is still on the old answer</div><div class="demo-hint">Compare a 3600 s TTL against 60 s, then enable the JVM that caches forever</div></div>
+  <div class="demo-body">
+    <canvas id="cDns" aria-label="The share of clients still resolving to the old address over time after a record change"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Record TTL <b id="dnTo">3600</b> s</label><input type="range" id="dnT" min="0" max="6" value="5"></div>
+      <div class="ctrl"><label>Stub / OS cache <b id="dnOo">3600</b> s</label><input type="range" id="dnO" min="0" max="6" value="5"></div>
+      <div class="ctrl"><label>Browser or client cache <b id="dnBo">60</b> s</label><input type="range" id="dnB" min="0" max="4" value="2"></div>
+      <div class="ctrl"><label><input type="checkbox" id="dnJ"> one client caches forever (old JVM default)</label></div>
+    </div>
+    <div class="rgrid" id="dnOut"></div>
+    <div class="readout" id="dnNote"></div>
+  </div>
+</div>
+
+<div class="box tip"><b class="tag">The cutover procedure that actually works</b>
+<p style="margin-bottom:0">Lower the TTL to 60 seconds <em>at least one old-TTL period before</em> the change — 24 hours ahead if the record is currently on a day-long TTL, because the caches have to expire once at the old value before they pick up the short one. Make the change. Verify against several public resolvers, not just your own. Keep the old target serving for well beyond the worst case, since a resolver that ignores TTLs is common and a client that caches forever is not rare. Then raise the TTL back once traffic on the old target has stopped. The demo shows the payoff: with a 3600 s TTL the worst-case client is stale for <b>two hours</b>; with 60 s it is <b>under three minutes</b>.</p>
+</div>
+</section>
+
+<section id="records">
+<h2>Record types, and where each one bites</h2><div class="h2rule"></div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Type</th><th>Holds</th><th>Operational note</th></tr></thead>
+<tbody>
+<tr><td><code>A</code> / <code>AAAA</code></td><td>An IPv4 / IPv6 address</td><td>Multiple records give crude round-robin, with no health awareness at all — the client just picks one</td></tr>
+<tr><td><code>CNAME</code></td><td>An alias to another name</td><td class="no">Cannot coexist with any other record at the same name, so it is <strong>illegal at the zone apex</strong> (<code>example.com</code>), which already has SOA and NS. Providers offer <code>ALIAS</code> or <code>ANAME</code> to work around this</td></tr>
+<tr><td><code>MX</code></td><td>Mail exchangers with priorities</td><td>Deleting one when moving providers causes mail to bounce with no way to recover it</td></tr>
+<tr><td><code>TXT</code></td><td>Arbitrary text</td><td>Carries SPF, DKIM and DMARC, plus domain-ownership proofs. A malformed SPF record silently sends your mail to spam</td></tr>
+<tr><td><code>NS</code></td><td>The authoritative servers for a zone</td><td class="yes">Changing these at the registrar is the slowest change in DNS — TLD-level TTLs are typically 48 hours</td></tr>
+<tr><td><code>SOA</code></td><td>Zone metadata</td><td>Its <em>minimum</em> field sets how long <strong>negative</strong> answers are cached. A typo that resolves to NXDOMAIN can therefore outlive the fix by hours</td></tr>
+<tr><td><code>CAA</code></td><td>Which CAs may issue for this domain</td><td class="yes">Cheap to add and it blocks mis-issuance. Also a common cause of a Let's Encrypt renewal suddenly failing after someone tightened it</td></tr>
+<tr><td><code>SRV</code></td><td>Service, port and target</td><td>How Kubernetes exposes named ports, and how some service discovery works</td></tr>
+<tr><td><code>PTR</code></td><td>Reverse lookup</td><td>Mail servers check it. Set it or your outbound mail is treated as suspicious</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn"><b class="tag">Three DNS traps worth recognising by sight</b>
+<p style="margin-bottom:6px"><strong>Negative caching outlives your fix.</strong> Someone typos a hostname, the resolver caches NXDOMAIN for the SOA minimum — often an hour or more — and the correction appears to do nothing. This is why a broken deploy that referenced a wrong name keeps failing after you have fixed the name, and why the SOA minimum is worth setting to something modest.</p>
+<p style="margin-bottom:6px"><strong>Split horizon disagreeing with itself.</strong> The same name resolves to a private address internally and a public one externally. It works until a workload runs somewhere that gets the wrong view — a CI runner, a VPN client, a pod using the cluster resolver instead of the corporate one — and you get a connection to the wrong environment or a mystifying timeout. Always check resolution <em>from the host that is failing</em>, never from your laptop.</p>
+<p style="margin-bottom:0"><strong>The <code>ndots</code> amplifier in Kubernetes.</strong> The default <code>ndots:5</code> means any name with fewer than five dots is first tried against every entry in the search path. So <code>api.example.com</code> — two dots — produces lookups for <code>api.example.com.default.svc.cluster.local</code>, then <code>.svc.cluster.local</code>, then <code>.cluster.local</code>, and only then the real name: four or five queries where one was needed, and for external names all but the last are NXDOMAIN. It shows up as inexplicable DNS load and added latency on every outbound call. Fix it with a trailing dot on the name to make it fully qualified, or by setting <code>ndots:2</code> in the pod's <code>dnsConfig</code>.</p>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">bash — the DNS questions worth being able to answer quickly</span><button class="code-copy">Copy</button></div><pre>dig +short api.example.com              <span class="c">← just the answer</span>
+dig +trace api.example.com              <span class="c">← the full walk from the root. shows WHICH server is wrong</span>
+dig @1.1.1.1 api.example.com            <span class="c">← ask a specific resolver. compare several before</span>
+dig @8.8.8.8 api.example.com            <span class="c">  concluding a change has "not propagated"</span>
+dig +nocmd api.example.com +noall +answer   <span class="c">← shows the REMAINING TTL, counting down.</span>
+                                            <span class="c">  that number tells you how long this cache stays stale</span>
+dig SOA example.com +short              <span class="c">← last field is the negative-cache duration</span>
+dig CAA example.com +short              <span class="c">← why your certificate issuance is failing</span>
+
+<span class="c"># what the machine will ACTUALLY do — which is not always what dig does</span>
+getent hosts api.example.com            <span class="c">← goes through nsswitch, so it sees /etc/hosts too</span>
+resolvectl query api.example.com        <span class="c">← systemd-resolved's view, including which link answered</span>
+resolvectl statistics                   <span class="c">← cache hit rate; a sudden miss rate spike is the ndots problem</span></pre></div>
+</section>
+
+<section id="tls">
+<h2>What TLS actually establishes</h2><div class="h2rule"></div>
+
+<p>A TLS handshake does three things: agrees a cipher suite and protocol version, proves the server's identity, and derives session keys. TLS 1.3 completes it in one round trip — down from two in 1.2 — which is why it is worth insisting on: over a 60&nbsp;ms path that is 60&nbsp;ms saved on every new connection, and chapter 4 showed how many new connections a busy service makes.</p>
+
+<div class="kv">
+<dt>ClientHello</dt><dd>Supported versions and cipher suites, and — importantly — <strong>SNI</strong>: the hostname the client wants. SNI is sent in the clear, and it is how one IP address serves certificates for hundreds of names. A client that omits it gets whatever default certificate the server chooses.</dd>
+<dt>ServerHello and Certificate</dt><dd>The chosen suite plus the server's certificate <em>and the intermediates it wants you to use</em>. The root is not sent; it must already be in your trust store.</dd>
+<dt>Key exchange</dt><dd>Ephemeral Diffie-Hellman, which gives forward secrecy: recording the traffic and stealing the private key later does not decrypt it. Non-ephemeral suites are gone from TLS 1.3 for exactly this reason.</dd>
+<dt>Validation, on the client</dt><dd>Build a chain from the leaf to something in the trust store; check every certificate's validity window against the local clock; check the hostname against the leaf's <strong>SAN</strong> list — the Common Name has been ignored by browsers for years; check revocation, weakly.</dd>
+</div>
+
+<p>Nearly every certificate incident is one of a handful of specific failures in that last step, and they are distinguishable by which clients break.</p>
+
+<div class="demo" id="d-cert">
+  <div class="demo-top"><div class="demo-title">Break the chain, and see who notices</div><div class="demo-hint">Try "intermediate not served" — the browser is fine and curl is not</div></div>
+  <div class="demo-body">
+    <canvas id="cCert" aria-label="A certificate chain with per-client validation verdicts"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Fault</label><select id="ctF">
+        <option value="none" selected>everything correct</option>
+        <option value="leafexp">leaf expired yesterday</option>
+        <option value="nointer">intermediate not served by the server</option>
+        <option value="interexp">intermediate expired</option>
+        <option value="nosni">client sent no SNI, default vhost served</option>
+        <option value="badname">requested a name not in the SAN list</option>
+        <option value="clock">client clock is 90 days fast</option>
+        <option value="selfsigned">self-signed certificate</option>
+        <option value="rotated">certificate rotated, mobile app pins the old one</option>
+      </select></div>
+      <div class="ctrl"><label>Days until the leaf expires <b id="ctDo">60</b></label><input type="range" id="ctD" min="-5" max="90" value="60"></div>
+    </div>
+    <div class="rgrid" id="ctOut"></div>
+    <div class="readout" id="ctNote"></div>
+  </div>
+</div>
+
+<div class="box trap"><b class="tag">"It works in my browser but not from the server"</b>
+<p style="margin-bottom:0">This is almost always a missing intermediate. Browsers implement <em>AIA chasing</em>: when the chain is incomplete they read the Authority Information Access extension and fetch the missing certificate themselves, so the page loads and you conclude the certificate is fine. <code>curl</code>, OpenSSL, Java and Go do not do this by default, so every server-to-server call fails with <code>unable to get local issuer certificate</code>. The server is misconfigured in both cases; only one of the two clients is forgiving enough to hide it. Check with <code>openssl s_client -connect host:443 -servername host</code> and count the certificates in the chain it prints — if there is only one, the server is not sending the intermediate.</p>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">bash — certificate triage</span><button class="code-copy">Copy</button></div><pre><span class="c"># the whole chain, as the server actually sends it</span>
+openssl s_client -connect api.example.com:443 -servername api.example.com -showcerts &lt;/dev/null
+
+<span class="c"># just the dates and names — the two things that are usually wrong</span>
+openssl s_client -connect api.example.com:443 -servername api.example.com &lt;/dev/null 2&gt;/dev/null \
+  | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+
+<span class="c"># does the chain verify WITHOUT the browser's help?</span>
+curl -vI https://api.example.com 2&gt;&amp;1 | grep -E 'SSL|subject|issuer|expire'
+
+<span class="c"># is SNI what makes it work? compare these two</span>
+openssl s_client -connect 203.0.113.10:443 -servername api.example.com &lt;/dev/null
+openssl s_client -connect 203.0.113.10:443 &lt;/dev/null      <span class="c">← no SNI: default vhost</span>
+
+<span class="c"># days remaining, for a monitor</span>
+echo | openssl s_client -connect api.example.com:443 -servername api.example.com 2&gt;/dev/null \
+  | openssl x509 -noout -enddate</pre></div>
+</section>
+
+<section id="acme">
+<h2>ACME, renewal and the failure that is always the same</h2><div class="h2rule"></div>
+
+<p>ACME automates issuance: you prove control of the domain, the CA issues a certificate, and a client renews it before expiry without anyone involved. Let's Encrypt issues for 90 days and clients renew at 30 days remaining, which gives a full month of failed attempts before anything breaks — the design is deliberately forgiving. Certificates still expire in production regularly, and the causes are a short list.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Challenge</th><th>Proves control by</th><th>Suits</th><th>Fails when</th></tr></thead>
+<tbody>
+<tr><td><code>HTTP-01</code></td><td>Serving a token at <code>/.well-known/acme-challenge/</code> on port 80</td><td>A single public web server</td><td class="no">Port 80 is closed, a redirect to HTTPS breaks the path, or the load balancer sends the challenge to a different instance than the one holding the token</td></tr>
+<tr><td><code>DNS-01</code></td><td>Publishing a TXT record</td><td class="yes">Wildcards, internal hosts with no public port, and anything behind a firewall</td><td>The DNS provider's API credentials expire, or a long TTL on the challenge record slows validation</td></tr>
+<tr><td><code>TLS-ALPN-01</code></td><td>A special certificate on port 443</td><td>Servers that cannot use port 80</td><td>Anything terminating TLS in front of you</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box warn"><b class="tag">The five reasons certificates expire despite automation</b>
+<p style="margin-bottom:6px"><strong>Renewal succeeded and nothing reloaded.</strong> The new file is on disk and the process is still serving the old one from memory. Every renewal hook must reload the server — <code>systemctl reload nginx</code> — and the monitoring must check what is <em>served</em> on port 443, not what is in the file.</p>
+<p style="margin-bottom:6px"><strong>The renewal timer stopped.</strong> A host rebuilt without re-enabling it, a cron removed, a container that renews at start-up and then runs for six months. Alert on the timer's last success, not only on the expiry date.</p>
+<p style="margin-bottom:6px"><strong>A CAA record was tightened.</strong> Someone adds <code>CAA</code> naming one CA and every other issuer starts refusing. It fails silently for 30 days and then the site goes down.</p>
+<p style="margin-bottom:6px"><strong>Rate limits during an incident.</strong> Let's Encrypt allows 5 duplicate certificates per week. A crash-looping container that requests on every start burns through that in minutes, and then cannot renew for a week.</p>
+<p style="margin-bottom:0"><strong>The one certificate nobody automated.</strong> A partner's mutual-TLS client certificate, an internal CA-issued certificate on a database, a code-signing key. Automation covers the public web endpoint and the outage comes from somewhere else. Inventory every certificate and alert on all of them at 30, 14 and 7 days — and make the alert page someone, because an email to a departed employee is the classic ending to this story.</p>
+</div>
+
+<p>On the private side, <strong>mutual TLS</strong> reverses the check: the client presents a certificate too, and the server validates it against its own CA. That gives cryptographic service identity rather than "whoever can reach this port", which is the foundation of zero-trust networking between services. It also multiplies the certificate problem by the number of workloads, which is precisely why it is only practical when something issues and rotates them automatically — chapter 12 covers the service mesh doing exactly that, with certificate lifetimes measured in hours rather than months.</p>
+</section>
+
+<section id="close">
+<h2>Check yourself</h2><div class="h2rule"></div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>You changed an A record forty minutes ago. The TTL is 3600. Some users reach the new server, most do not, and a colleague says it is "still propagating". What is actually happening, and what should you have done?
+<button class="reveal">Show answer</button><div class="ans">Nothing is propagating, because nothing is pushed. The authoritative server has had the new answer since the moment you saved it; every cache between your users and it is serving the old one until its own entry expires. Because caches populate at random moments, the remaining life of any given entry is roughly uniform between zero and the TTL, so after forty minutes of a 3600&nbsp;s TTL about a third of resolvers have picked up the change — and the chain of caches below them adds more delay on top, so the worst case is closer to two hours than to one. There is no action that speeds this up. The fix belongs earlier: lower the TTL to 60&nbsp;s at least one full old-TTL period before the change, so that every cache is already holding a short-lived entry when you make it. Keep the old target serving well past the worst case, because some resolvers ignore TTLs and some clients cache forever.</div></li>
+
+<li>An old Java service still connects to the decommissioned database an hour after the DNS change, while everything else moved immediately. Why?
+<button class="reveal">Show answer</button><div class="ans">The JVM has its own DNS cache, and historically <code>networkaddress.cache.ttl</code> defaulted to caching successful lookups <em>forever</em> when a security manager was installed — and to 30 seconds otherwise, which is fine. A long-running process that resolved the name at start-up therefore never asks again, and no TTL you set on the record has any effect on it at all. The general lesson is that any cache in the chain which ignores TTLs makes the record's TTL irrelevant for that client: your control ends at the last layer that honours it. Fix by setting <code>networkaddress.cache.ttl</code> explicitly to something small, restarting the process, or — structurally — putting a load balancer in front so the address never needs to change. The demo makes this visible: enable the caching client and the "fully switched over" time becomes never.</div></li>
+
+<li>Your certificate works in every browser and every server-to-server call fails with "unable to get local issuer certificate". Diagnose it.
+<button class="reveal">Show answer</button><div class="ans">The server is not sending the intermediate certificate, so the chain from the leaf to the trusted root is incomplete. Browsers hide this: they read the Authority Information Access extension on the leaf and fetch the missing intermediate themselves, a behaviour called AIA chasing. <code>curl</code>, OpenSSL, Java and Go do not do that by default, so they cannot build a path to anything in their trust store and reject the connection. Confirm with <code>openssl s_client -connect host:443 -servername host -showcerts</code> and count the certificates returned — one means the intermediate is missing. The fix is on the server: serve the full chain file rather than the leaf alone. Note the direction of the error: it is a server misconfiguration that only some clients are strict enough to notice, so "it works in Chrome" is not evidence that it is correct.</div></li>
+
+<li>A client reports certificate errors from one machine only. Everything else is fine and the certificate has 45 days left. What do you check first?
+<button class="reveal">Show answer</button><div class="ans">The clock. If the machine's time is significantly ahead, a perfectly valid certificate reads as expired; if significantly behind, it reads as not yet valid. Both present as certificate errors with no hint that time is involved, and both are common on machines that have lost NTP, on virtual machines resumed from a snapshot, and on hardware with a dead RTC battery. Check with <code>timedatectl</code> and compare against a known-good source. Two other single-machine causes are worth ruling out next: an outdated or damaged trust store missing the issuing root, and a corporate TLS-inspecting proxy substituting its own certificate — which produces an unknown-issuer error on any machine whose trust store lacks the proxy's CA. Chapter 4 makes the same point about NTP: clock skew silently breaks TLS validation, token expiry and log correlation together.</div></li>
+
+<li>Why is a CNAME illegal at the zone apex, and what do providers offer instead?
+<button class="reveal">Show answer</button><div class="ans">A CNAME says "this name is an alias; look up the target instead", and the standard requires that a name with a CNAME have <em>no other records at all</em>. The apex — <code>example.com</code> itself — necessarily has an SOA record and NS records, so a CNAME there would contradict the requirement, and resolvers behave unpredictably if you force one in. This matters because most managed load balancers and CDNs give you a hostname rather than a fixed IP, so the obvious configuration is exactly the illegal one. Providers solve it with a non-standard record type — <code>ALIAS</code>, <code>ANAME</code> or "CNAME flattening" — where the authoritative server resolves the target itself and returns the resulting A records, so what the client sees is a valid apex A record. It works well; just be aware it is provider-specific behaviour rather than something the protocol guarantees, and that it means your DNS provider is now doing a lookup on every query.</div></li>
+
+<li>Kubernetes pods are generating five times the expected DNS query volume and outbound calls have an extra 10&nbsp;ms. Explain.
+<button class="reveal">Show answer</button><div class="ans">The <code>ndots:5</code> default in the pod's <code>/etc/resolv.conf</code>. Any name containing fewer than five dots is treated as possibly relative, so the resolver tries it against every entry in the search path before trying it as absolute. For <code>api.example.com</code> — two dots — that means queries for <code>api.example.com.&lt;namespace&gt;.svc.cluster.local</code>, then <code>.svc.cluster.local</code>, then <code>.cluster.local</code>, each returning NXDOMAIN, before the real query is finally sent. Four or five round trips where one was needed, on every resolution, multiplied by every pod: it shows up as load on the cluster DNS service and as latency on every external call. Two fixes: append a trailing dot to make the name fully qualified so the search path is skipped entirely, or set <code>dnsConfig.options ndots:2</code> on the pod. Also worth checking is whether negative caching is enabled in the cluster resolver, since without it those NXDOMAIN answers are re-fetched every time.</div></li>
+
+<li>Certificate renewal is automated and has been running for a year. The site goes down on expiry day anyway. Give three plausible causes.
+<button class="reveal">Show answer</button><div class="ans">First and most common: renewal succeeded but nothing reloaded. The new certificate is on disk while the running process continues serving the old one from memory, so file-based monitoring reports everything as fine right up to the moment it expires. Every renewal hook must reload the server, and the monitoring must check what is served on port 443 rather than what is in the file. Second: the timer stopped some months ago — a rebuilt host, a removed cron entry, or a container that only renews at start-up and has been running since. The failure is thirty days old and nobody alerted on it, which is why you alert on the renewal's last success rather than only on the expiry date. Third: something started refusing issuance — a CAA record tightened to name a different CA, expired DNS provider credentials for the DNS-01 challenge, or a rate limit consumed by a crash-looping container requesting a certificate on every restart. A fourth worth adding is that the expiring certificate was never in the automation at all: a mutual-TLS client certificate or an internal CA-issued one that somebody installed by hand.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin-bottom:0">Chapter 8 closes this part with caching: what each layer is good for, the HTTP semantics that control it, why the last few points of hit ratio matter most, and the stampede that turns one expired key into four hundred simultaneous origin requests.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 07</h2><p>DNS, TLS and certificates. Part of the DevOps unit — <a href="index.html">all 24 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 08 (the CDN edge), 12 (cluster DNS and mesh mTLS), 18 (DNS-based traffic shifting and why it is slow), 21 (certificates as secrets), 22 (what to alert on).</p></div>
+    <div><h2>Going deeper</h2><p>The Network Engineer unit covers DNS infrastructure; the Cyber Security unit covers PKI. Mozilla's SSL Configuration Generator produces sound server configuration by default.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: DNS TTL and staleness ============ */
+(function(){
+  const cv=document.getElementById("cDns"); if(!cv) return;
+  const tEl=document.getElementById("dnT"), oEl=document.getElementById("dnO"),
+        bEl=document.getElementById("dnB"), jEl=document.getElementById("dnJ");
+  const out=document.getElementById("dnOut"), note=document.getElementById("dnNote");
+  const TTLS=[30,60,300,900,1800,3600,86400];
+  const CLIENTS=6000;
+
+  function rng(seed){ let s=seed>>>0;
+    return ()=> (s=(Math.imul(s,1664525)+1013904223)>>>0)/4294967296; }
+
+  /* Nothing is pushed. Each cache holds the old answer until its own entry
+     expires, then asks the layer above — which may itself still be stale. */
+  function simulate(layers){
+    const R=rng(20260912); const times=[];
+    for(let c=0;c<CLIENTS;c++){
+      let upstreamNewAt=0;                    /* authoritative is new at t=0 */
+      let infinite=false;
+      for(const L of layers){
+        if(!isFinite(L)){ infinite=true; break; }
+        let refresh=R()*L;                    /* age at cutover is uniform on [0, ttl] */
+        while(refresh<upstreamNewAt) refresh+=L;
+        upstreamNewAt=refresh;
+      }
+      times.push(infinite?Infinity:upstreamNewAt);
+    }
+    times.sort((a,b)=>a-b);
+    const finite=times.filter(isFinite);
+    const q=p=>times[Math.min(times.length-1,Math.floor(times.length*p))];
+    return {times, p50:q(0.5), p95:q(0.95),
+            max: times[times.length-1],
+            everStale: times.length-finite.length,
+            staleAt: t=>times.filter(x=>x>t).length/times.length};
+  }
+
+  const fmt=v=>!isFinite(v)?"never":v<90?v.toFixed(0)+" s":v<5400?(v/60).toFixed(1)+" min":(v/3600).toFixed(1)+" h";
+
+  function draw(){
+    const ttl=TTLS[Math.round(+tEl.value)], os=TTLS[Math.round(+oEl.value)], br=TTLS[Math.round(+bEl.value)];
+    document.getElementById("dnTo").textContent=ttl;
+    document.getElementById("dnOo").textContent=os;
+    document.getElementById("dnBo").textContent=br;
+    const layers=[ttl,os,br].concat(jEl.checked?[Infinity]:[]);
+    const m=simulate(layers);
+
+    /* horizon: show up to the finite worst case, or 2h if everything is infinite */
+    const finiteMax=m.times.filter(isFinite).pop()||3600;
+    const horizon=Math.max(60,Math.min(finiteMax*1.15, 3*3600));
+
+    const P=Plot(cv,{pad:[18,16,34,46],ratio:0.38});
+    P.o.xr=[0,horizon]; P.o.yr=[0,100]; P.clear();
+    const ctx=P.ctx;
+    ctx.strokeStyle=PC.grid; ctx.lineWidth=1;
+    for(let g=0;g<=4;g++){ const v=g*25, y=Math.round(P.Y(v))+0.5;
+      ctx.beginPath(); ctx.moveTo(P.L,y); ctx.lineTo(P.R,y); ctx.stroke();
+      P.px(P.L-7,P.Y(v),v+"%",PC.text,"right","10.5px Archivo, Arial"); }
+    const ticks=6;
+    for(let i=0;i<=ticks;i++){ const t=horizon*i/ticks, x=P.X(t);
+      P.px(x,P.B+13, t<90?t.toFixed(0)+"s":(t/60).toFixed(0)+"m", PC.text,"center","10.5px Archivo, Arial"); }
+    P.px((P.L+P.R)/2,P.B+27,"time since the record changed",PC.text,"center","600 10px Archivo, Arial");
+    P.px(P.L-7,P.Y(100)-11,"still stale",PC.text,"right","600 9.5px Archivo, Arial");
+
+    ctx.beginPath();
+    for(let i=0;i<=180;i++){ const t=horizon*i/180, y=m.staleAt(t)*100;
+      const X=P.X(t), Y=P.Y(y); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y); }
+    ctx.lineTo(P.R,P.Y(m.staleAt(horizon)*100)); ctx.lineTo(P.R,P.B); ctx.lineTo(P.L,P.B); ctx.closePath();
+    ctx.fillStyle="rgba(124,140,248,.18)"; ctx.fill();
+    ctx.beginPath();
+    for(let i=0;i<=180;i++){ const t=horizon*i/180;
+      const X=P.X(t), Y=P.Y(m.staleAt(t)*100); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y); }
+    ctx.strokeStyle=PC.line; ctx.lineWidth=2.4; ctx.stroke();
+
+    /* 5-minute marker, the moment people start asking whether it worked */
+    if(horizon>300){ const x=P.X(300);
+      ctx.setLineDash([3,3]); ctx.strokeStyle=PC.warn; ctx.lineWidth=1.2;
+      ctx.beginPath(); ctx.moveTo(x,P.T); ctx.lineTo(x,P.B); ctx.stroke(); ctx.setLineDash([]);
+      P.px(x+5,P.T+10,"5 min: "+(m.staleAt(300)*100).toFixed(0)+"% still stale",PC.warn,"left","600 10px Archivo, Arial"); }
+
+    out.innerHTML=
+      '<div><span>half of clients by</span><b>'+fmt(m.p50)+'</b></div>'+
+      '<div><span>95% of clients by</span><b>'+fmt(m.p95)+'</b></div>'+
+      '<div><span>fully switched over</span><b style="color:'+(isFinite(m.max)?PC.ink:PC.bad)+'">'+fmt(m.max)+'</b></div>'+
+      '<div><span>stale after 5 min</span><b style="color:'+(m.staleAt(300)>0.5?PC.bad:m.staleAt(300)>0?PC.warn:PC.ok)+'">'+
+        (m.staleAt(300)*100).toFixed(0)+'%</b></div>'+
+      '<div><span>stale after 1 h</span><b style="color:'+(m.staleAt(3600)>0.01?PC.bad:PC.ok)+'">'+
+        (m.staleAt(3600)*100).toFixed(1)+'%</b></div>'+
+      '<div><span>never switch</span><b style="color:'+(m.everStale?PC.bad:PC.ok)+'">'+
+        (m.everStale?(m.everStale/CLIENTS*100).toFixed(0)+"%":"none")+'</b></div>';
+
+    let msg='Three caches in series, each holding its own copy: the resolver for '+ttl+' s, the OS for '+os+
+      ' s, the client for '+br+' s. Because entries were populated at random moments, remaining life at the cutover is spread evenly across each TTL — '+
+      'so half of clients see the change by <b>'+fmt(m.p50)+'</b> and the last by <b>'+fmt(m.max)+'</b>. ';
+    if(jEl.checked)
+      msg+='<b style="color:#D9534F">And one client caches forever</b>, so it never sees the change at all no matter what TTL you set. Your control ends at the last layer that honours it.';
+    else if(ttl>=1800)
+      msg+='Note that <b>'+(m.staleAt(300)*100).toFixed(0)+'%</b> are still on the old answer five minutes in — which is when someone will ask whether the change worked. Nothing you do now speeds this up; the lever was lowering the TTL beforehand.';
+    else
+      msg+='Short TTLs cost you extra queries but buy a cutover measured in minutes. This is the state you want to be in <em>before</em> you need to move anything.';
+    note.innerHTML=msg;
+  }
+  [tEl,oEl,bEl,jEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+
+/* ============ demo 2: certificate chain validation ============ */
+(function(){
+  const cv=document.getElementById("cCert"); if(!cv) return;
+  const fEl=document.getElementById("ctF"), dEl=document.getElementById("ctD");
+  const out=document.getElementById("ctOut"), note=document.getElementById("ctNote");
+  const DAY=86400, T0=1700000000;
+  const CLIENTS=[
+    ["browser","browser",  {aia:true,  pin:null}],
+    ["curl","curl / openssl",{aia:false, pin:null}],
+    ["java","java service",{aia:false, pin:null}],
+    ["pinned","pinned mobile app",{aia:true, pin:"leaf-v1"}]
+  ];
+
+  function config(){
+    const fault=fEl.value, days=Math.round(+dEl.value);
+    const c={ now:T0, leafFrom:T0-10*DAY, leafTo:T0+days*DAY,
+              intFrom:T0-900*DAY, intTo:T0+900*DAY,
+              sans:["api.example.com","www.example.com"], sni:"api.example.com",
+              serveIntermediate:true, selfSigned:false, leafId:"leaf-v1" };
+    if(fault==="leafexp")   c.leafTo=T0-DAY;
+    if(fault==="nointer")   c.serveIntermediate=false;
+    if(fault==="interexp")  c.intTo=T0-DAY;
+    if(fault==="nosni")     c.sni="";
+    if(fault==="badname")   c.sni="internal.example.com";
+    if(fault==="clock")     c.now=T0+90*DAY;
+    if(fault==="selfsigned")c.selfSigned=true;
+    if(fault==="rotated")   c.leafId="leaf-v2";
+    return c;
+  }
+  function validate(c,cl){
+    if(c.selfSigned) return "self-signed certificate in certificate chain";
+    if(c.now<c.leafFrom) return "certificate is not yet valid";
+    if(c.now>c.leafTo)   return "certificate has expired";
+    if(!c.serveIntermediate && !cl.aia) return "unable to get local issuer certificate";
+    if(c.now>c.intTo)    return "intermediate certificate has expired";
+    if(c.now<c.intFrom)  return "intermediate is not yet valid";
+    if(!c.sans.includes(c.sni))
+      return c.sni ? "hostname mismatch — valid for "+c.sans.join(", ")
+                   : "no SNI sent; default vhost served, hostname mismatch";
+    if(cl.pin && cl.pin!==c.leafId) return "pinned certificate mismatch";
+    return null;
+  }
+
+  function draw(){
+    const c=config();
+    document.getElementById("ctDo").textContent=Math.round(+dEl.value);
+    dEl.disabled = fEl.value!=="none";
+    const res=CLIENTS.map(([k,label,cl])=>[k,label,validate(c,cl)]);
+    const okCount=res.filter(r=>!r[2]).length;
+
+    const w=cv.clientWidth||660, h=128, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+
+    /* the chain, leaf -> intermediate -> root */
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("chain as the server presents it", 14, 12);
+    const daysLeft=Math.round((c.leafTo-c.now)/DAY);
+    const parts=[
+      ["leaf  "+c.sans[0], daysLeft<0?"expired "+(-daysLeft)+"d ago":daysLeft+"d left",
+        c.selfSigned?"self-signed":"", daysLeft<0||c.selfSigned],
+      ["intermediate", c.now>c.intTo?"expired":"valid", c.serveIntermediate?"":"NOT SERVED",
+        c.now>c.intTo||!c.serveIntermediate],
+      ["root CA", "in trust store", c.selfSigned?"unreachable":"", c.selfSigned]
+    ];
+    const bw=Math.min(178,(w-28-2*22)/3);
+    parts.forEach((p,i)=>{
+      const x=14+i*(bw+22), bad=p[3];
+      ctx.fillStyle= bad?"#FBE9E8":"#FFFFFF";
+      ctx.strokeStyle= bad?PC.bad:PC.line; ctx.lineWidth=bad?1.6:1.2;
+      ctx.fillRect(x,22,bw,38); ctx.strokeRect(x+.5,22.5,bw,38);
+      ctx.fillStyle=PC.ink; ctx.font="10.5px ui-monospace, monospace"; ctx.textAlign="left";
+      const nm=p[0].length>Math.floor(bw/6.1)?p[0].slice(0,Math.floor(bw/6.1)-1)+"…":p[0];
+      ctx.fillText(nm, x+7, 34);
+      ctx.fillStyle= bad?PC.bad:PC.text; ctx.font="9.5px Archivo, Arial";
+      ctx.fillText(p[1], x+7, 47);
+      if(p[2]){ ctx.fillStyle=PC.bad; ctx.font="700 8.5px Archivo, Arial"; ctx.fillText(p[2], x+7, 56); }
+      if(i<2){ ctx.strokeStyle= (i===1&&!c.serveIntermediate)?PC.bad:"#B9C4CE";
+        ctx.lineWidth=1.4;
+        if(i===1&&!c.serveIntermediate) ctx.setLineDash([3,3]);
+        ctx.beginPath(); ctx.moveTo(x+bw+4,41); ctx.lineTo(x+bw+18,41); ctx.stroke(); ctx.setLineDash([]); }
+    });
+
+    /* per-client verdicts */
+    res.forEach(([k,label,err],i)=>{
+      const y=74+Math.floor(i/2)*24, x=14+(i%2)*Math.floor((w-28)/2);
+      ctx.textAlign="left"; ctx.font="700 9px Archivo, Arial";
+      ctx.fillStyle= err?PC.bad:PC.ok;
+      ctx.fillText(err?"FAIL":"OK", x, y+9);
+      ctx.font="10.5px Archivo, Arial"; ctx.fillStyle=PC.ink;
+      ctx.fillText(label, x+28, y+9);
+      if(err){ ctx.font="9px Archivo, Arial"; ctx.fillStyle=PC.text;
+        const room=Math.floor((w/2-60)/4.9);
+        ctx.fillText(err.length>room?err.slice(0,room-1)+"…":err, x+28, y+19); }
+    });
+
+    out.innerHTML=
+      '<div><span>browser</span><b style="font-size:12px;color:'+(res[0][2]?PC.bad:PC.ok)+'">'+(res[0][2]?"fails":"works")+'</b></div>'+
+      '<div><span>curl / openssl</span><b style="font-size:12px;color:'+(res[1][2]?PC.bad:PC.ok)+'">'+(res[1][2]?"fails":"works")+'</b></div>'+
+      '<div><span>java service</span><b style="font-size:12px;color:'+(res[2][2]?PC.bad:PC.ok)+'">'+(res[2][2]?"fails":"works")+'</b></div>'+
+      '<div><span>pinned app</span><b style="font-size:12px;color:'+(res[3][2]?PC.bad:PC.ok)+'">'+(res[3][2]?"fails":"works")+'</b></div>'+
+      '<div><span>clients working</span><b style="color:'+(okCount===4?PC.ok:okCount?PC.warn:PC.bad)+'">'+okCount+' / 4</b></div>'+
+      '<div><span>days on the leaf</span><b>'+daysLeft+'</b></div>';
+
+    const EX={
+      none:'Everything validates. Drag the expiry slider below zero to see what a lapsed certificate looks like from each client.',
+      leafexp:'An expired leaf fails <b>everywhere</b> — there is no client that forgives it and no configuration that works around it. This is why the alert must fire on days remaining, and page a human rather than email one.',
+      nointer:'<b>The classic split.</b> The browser performs AIA chasing: it reads the leaf\u2019s Authority Information Access extension and fetches the missing intermediate itself, so the page loads. curl, OpenSSL, Java and Go do not, so every server-to-server call fails. The server is misconfigured in both cases — only one client is forgiving enough to hide it.',
+      interexp:'An expired intermediate is rarer and more confusing, because your own certificate looks fine when you inspect it. It usually means the CA rotated and your stored chain file was never updated.',
+      nosni:'With no SNI the server cannot tell which virtual host was wanted, so it serves its default certificate — which is for some other name. Presents as a hostname mismatch, and is the standard result of connecting by IP address rather than by name.',
+      badname:'The name requested is not in the certificate\u2019s SAN list. Note that browsers have ignored the Common Name field for years, so adding the name there and not to the SANs changes nothing at all.',
+      clock:'The certificate is valid; the client\u2019s clock is 90 days ahead, so it reads as expired. Nothing about the error message mentions time. A single machine failing while everything else works is the signature — check <code>timedatectl</code> before the certificate.',
+      selfsigned:'No path exists from the leaf to anything in the trust store. Fine for a lab, and the reason <code>-k</code> exists — but reaching for <code>-k</code> in production disables the entire point of the exercise.',
+      rotated:'Everything works except the client that pinned the old certificate. Pinning defends against a compromised CA and breaks on every legitimate rotation, so it needs a backup pin and a rotation plan, and it is the reason a mobile app can be bricked by a routine renewal.'
+    };
+    note.innerHTML=EX[fEl.value];
+  }
+  [fEl,dEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+</script>
+</body>
+</html>

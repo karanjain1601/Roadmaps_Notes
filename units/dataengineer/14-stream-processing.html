@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Stream processing — Data Engineer</title>
+<meta name="description" content="Event time against processing time, tumbling sliding and session windows, watermarks and late data, and the stateful joins that make streaming hard.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">Data Engineer</a> <span>/</span> Chapter 14</p>
+    <p class="chnum">CHAPTER 14</p>
+    <h1>Stream processing</h1>
+    <p class="lede">Batch has a luxury streaming does not: a batch job for yesterday runs when yesterday is definitively over. A streaming job has to decide, continuously and without ever being certain, that it has seen enough of a period to publish an answer. Every difficult thing in this chapter is a consequence of that one problem.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~28 min</b> read</div>
+      <div><b>Part 4</b> Moving data</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="time">
+      <p class="kicker">TWO CLOCKS</p>
+      <h2>Event time and processing time</h2>
+      <p class="sub">The distinction looked pedantic in chapter 12. In streaming it is the whole subject.</p>
+
+      <p><strong>Event time</strong> is when the thing happened, recorded by whatever produced it. <strong>Processing time</strong> is when your job saw it. The gap between them is unbounded in principle and irregular in practice: a phone offline in a tunnel, a queue backlog, a retry, a third-party feed that batches hourly.</p>
+
+      <p>Which clock you use decides what the answer means:</p>
+
+      <div class="cols">
+        <div>
+          <h4>Processing-time windows</h4>
+          <p>Group by when you saw it. Trivial to implement, never late, never incomplete &mdash; and the numbers are <strong>not reproducible</strong>. Replay the same input and a different set of events lands in each window, so the same job over the same data gives different answers.</p>
+          <p>Fine for operational monitoring: throughput, error rates, queue depth.</p>
+        </div>
+        <div>
+          <h4>Event-time windows</h4>
+          <p>Group by when it happened. Reproducible, correct, and requires deciding when a window is finished, which you can never know for certain. Everything hard is here.</p>
+          <p>Required for anything a business will act on: revenue per minute, sessions, conversion rates.</p>
+        </div>
+      </div>
+
+      <div class="note key">
+        <b>The test for which you need</b>
+        <p>Ask whether re-running the job over the same input must produce the same output. If yes &mdash; because someone will reconcile it, audit it, or compare it against a batch pipeline &mdash; you need event time, and you have signed up for watermarks. If the number is only meaningful as "what is happening right now", processing time is simpler and honest.</p>
+        <p>Getting this wrong in the reproducible direction is the more common error: a revenue-per-minute dashboard on processing time disagrees with the warehouse every day, and nobody can say which is right.</p>
+      </div>
+    </section>
+
+    <section id="windows">
+      <p class="kicker">GROUPING</p>
+      <h2>Window types</h2>
+      <p class="sub">An unbounded stream has no end, so aggregation requires cutting it into finite pieces. Four ways.</p>
+
+      <div class="terms">
+        <dt>Tumbling</dt>
+        <dd>Fixed size, non-overlapping. Every event belongs to exactly one window. The default, and the direct analogue of a batch partition &mdash; a one-day tumbling window <em>is</em> a daily batch job.</dd>
+
+        <dt>Sliding (hopping)</dt>
+        <dd>Fixed size, advancing by a smaller step, so windows overlap and an event belongs to several. A five-minute window every minute gives a smooth rolling average. The cost is duplication: with a size-to-slide ratio of five, every event is held in five windows and state is five times larger.</dd>
+
+        <dt>Session</dt>
+        <dd>Boundaries defined by inactivity: a window closes when no event for a key arrives within a gap. Size is data-dependent and unbounded &mdash; a user clicking every twenty seconds for four hours produces one four-hour session. The right shape for user behaviour and the most awkward operationally, because you cannot bound the state.</dd>
+
+        <dt>Global</dt>
+        <dd>One window over all time, emitting on a trigger rather than a boundary. Running totals, all-time counts. State grows forever unless you can express the aggregate incrementally.</dd>
+      </div>
+
+      <p>Two properties determine the cost of a window choice. <strong>How many windows an event belongs to</strong> multiplies state directly. And <strong>whether the aggregate is incremental</strong> — a sum or count needs one number per window, whereas a median or an exact distinct count needs every value retained, which is why streaming systems push you towards approximate sketches such as HyperLogLog.</p>
+    </section>
+
+    <section id="watermarks">
+      <p class="kicker">THE CENTRAL MECHANISM</p>
+      <h2>Watermarks</h2>
+      <p class="sub">A watermark is the system's claim that it has probably seen everything up to a point in event time. It is a heuristic, and knowing exactly how it is wrong is the point.</p>
+
+      <p>The usual construction is simple: <strong>watermark = the highest event time seen so far, minus an allowed lateness</strong>. When the watermark passes a window's end, the window fires and emits its result. Anything arriving afterwards is late: dropped, or diverted to a side output, or used to update an already-emitted result if the sink supports it.</p>
+
+      <p>The allowed lateness is the only real dial, and it is a direct trade between how complete the answer is and how long you wait for it.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Completeness against latency, as allowed lateness varies</b>
+          <span>12,000 events across 60 one-minute windows, with a realistic lateness tail</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Allowed lateness
+              <select id="wm-delta">
+                <option value="0">0 s</option>
+                <option value="10">10 s</option>
+                <option value="20" selected>20 s</option>
+                <option value="40">40 s</option>
+                <option value="80">80 s</option>
+                <option value="160">160 s</option>
+              </select>
+            </label>
+            <label>Mean event lateness
+              <select id="wm-late">
+                <option value="5">5 s</option>
+                <option value="20" selected>20 s</option>
+                <option value="60">60 s</option>
+              </select>
+            </label>
+            <label>Source partitions
+              <input type="range" id="wm-parts" min="1" max="8" step="1" value="4">
+              <output id="wm-parts-o">4</output>
+            </label>
+            <label>One partition idle
+              <select id="wm-idle">
+                <option value="no" selected>No</option>
+                <option value="yes">Yes &mdash; produces nothing</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="wm-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="wm-fired-tile"><i>WINDOWS EMITTED</i><b id="wm-fired">0</b><s>of 60</s></div>
+            <div class="tile" id="wm-comp-tile"><i>COMPLETENESS</i><b id="wm-comp">0%</b><s>events in their window</s></div>
+            <div class="tile"><i>LATE, DROPPED</i><b id="wm-drop">0</b><s id="wm-drop-sub"></s></div>
+            <div class="tile hi"><i>FIRING LATENCY</i><b id="wm-lat">0</b><s>after the window closed</s></div>
+          </div>
+
+          <p class="readout" id="wm-note"></p>
+        </div>
+      </div>
+
+      <p>Three results.</p>
+
+      <ol>
+        <li><strong>Completeness and latency rise together, with diminishing returns on one and none on the other.</strong> At zero allowed lateness the job emits 81.5% of each window's events after 10.8 seconds; at 40 seconds it emits 97.5% after 51 seconds; at 160 seconds it emits 100% after 171 seconds. Completeness flattens and latency does not, so there is a sensible stopping point.</li>
+        <li><strong>This is chapter 12's lookback window, paid in a different currency.</strong> Batch bought completeness with compute — reprocessing three days each night at three times the cost. Streaming buys the same completeness with latency. The lateness distribution is the same distribution, and the percentile you choose to lose is the same decision.</li>
+        <li><strong>An idle partition stalls everything.</strong> Because the watermark is the <em>minimum</em> across partitions — it must be, or one fast partition would advance it past data still to come from a slow one — a partition producing nothing holds the watermark still. Set the toggle and zero of sixty windows ever fire. The job is healthy by every other measure: consuming, no lag, no errors, and silently emitting nothing.</li>
+      </ol>
+
+      <div class="note trap">
+        <b>The idle-partition failure is the classic streaming outage</b>
+        <p>It happens whenever a topic is partitioned more finely than the data justifies, or when a key range goes quiet overnight, or after a partition count increase leaves some partitions empty. The symptom is that output stops while every dashboard says the job is fine.</p>
+        <p>The fix is an <strong>idleness timeout</strong>: after a configured period with no data, a partition is excluded from the watermark calculation. Every serious stream processor offers this and it is off by default, because enabling it means accepting that data from a resumed partition will be late. Know which of the two failures you have chosen.</p>
+      </div>
+    </section>
+
+    <section id="state">
+      <p class="kicker">WHERE IT GETS HARD</p>
+      <h2>State, and stream-to-stream joins</h2>
+      <p class="sub">Aggregating a stream needs a little state. Joining two streams needs a lot, and the amount is set by how long you are willing to wait.</p>
+
+      <p>A stateless transformation — parse, filter, enrich from a static lookup — is easy and scales trivially. State is what makes streaming an operational discipline: it has to be checkpointed to survive a restart, redistributed when the job rescales, and kept small enough to fit.</p>
+
+      <p>The hardest case is joining two streams, because neither side is complete. Joining clicks to impressions means the impression must be held in memory until its click arrives, and you have no way to know whether a click is coming.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Stream-to-stream join: recall against state</b>
+          <span>200,000 impressions an hour, 12% clicked, with a realistic click delay</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Join window
+              <select id="sj-win">
+                <option value="10">10 s</option>
+                <option value="30">30 s</option>
+                <option value="60" selected>60 s</option>
+                <option value="120">120 s</option>
+                <option value="300">300 s</option>
+                <option value="900">900 s</option>
+              </select>
+            </label>
+            <label>Mean click delay
+              <select id="sj-delay">
+                <option value="15">15 s</option>
+                <option value="45" selected>45 s</option>
+                <option value="180">180 s</option>
+              </select>
+            </label>
+            <label>Impressions per hour
+              <select id="sj-rate">
+                <option value="200000" selected>200,000</option>
+                <option value="2000000">2 million</option>
+                <option value="20000000">20 million</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="sj-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="sj-recall-tile"><i>CLICKS MATCHED</i><b id="sj-recall">0%</b><s id="sj-recall-sub"></s></div>
+            <div class="tile"><i>CLICKS MISSED</i><b id="sj-miss">0</b><s>arrived after the window</s></div>
+            <div class="tile" id="sj-state-tile"><i>ROWS BUFFERED</i><b id="sj-state">0</b><s>impressions held in state</s></div>
+            <div class="tile hi"><i>STATE SIZE</i><b id="sj-mem">0</b><s id="sj-mem-sub">at 200 bytes a row</s></div>
+          </div>
+
+          <p class="readout" id="sj-note"></p>
+        </div>
+      </div>
+
+      <p>The shape of the trade is the important part. Recall rises with the window and flattens — 20% at ten seconds, 74% at a minute, 93% at two minutes, effectively 100% at five. State rises <strong>strictly linearly</strong>: ten times the window is exactly ten times the memory, with no flattening at all. So the marginal cost of the last few percent of recall is enormous, and the decision is where on that curve you stop.</p>
+
+      <div class="note warn">
+        <b>Why an unmatched join is worse than a slow one</b>
+        <p>A click that arrives after its window does not merely go unjoined &mdash; depending on the join type it either disappears or emerges with null impression attributes, and either way the attribution is wrong rather than absent. With a sixty-second window, 26% of clicks are affected, and the resulting conversion rate is quietly understated by roughly that much.</p>
+        <p>This is why an equivalent batch job over the same data frequently disagrees with the stream, and why the batch answer is usually the right one: it had the luxury of waiting.</p>
+      </div>
+
+      <p>Two mitigations worth knowing. A <strong>stream-to-table join</strong> — enriching a stream from a slowly changing dimension held as a compacted topic or a local store — has none of this difficulty, because the table side is complete by construction. Prefer it wherever the second stream is really a lookup. And where you genuinely need the late matches, the honest pattern is <strong>a stream for the fast approximate answer and a batch job for the correct one</strong>, with the batch result treated as authoritative. That is the practical core of what used to be called a lambda architecture, and it survives because the underlying trade is real.</p>
+    </section>
+
+    <section id="guarantees">
+      <p class="kicker">CORRECTNESS</p>
+      <h2>Exactly-once, in a stream processor</h2>
+      <p class="sub">Chapter 13 said this claim is bounded by one system. Here is what the boundary looks like in practice.</p>
+
+      <p>A stream processor achieves exactly-once processing by <strong>checkpointing</strong>: it periodically snapshots all operator state together with the input offsets that state corresponds to. On failure it restores the snapshot and rewinds the input to the matching offsets. State and position are always consistent, so no input is counted twice and none is skipped.</p>
+
+      <p>That is genuinely exactly-once <em>for the internal state</em>. The boundary is the sink:</p>
+
+      <div class="tw">
+        <table>
+          <caption>What a checkpoint can and cannot protect</caption>
+          <thead>
+            <tr><th>Sink</th><th>Guarantee available</th><th>Mechanism</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Kafka topic</td><td>Exactly-once</td><td>Transactional writes committed with the checkpoint</td></tr>
+            <tr><td>Table format or warehouse</td><td>Exactly-once</td><td>Atomic commit tied to the checkpoint &mdash; chapter 11's pointer swap</td></tr>
+            <tr><td>Database with an upsert key</td><td>Effectively-once</td><td>Idempotent write, so a replay overwrites</td></tr>
+            <tr><td>Append-only file or table</td><td>At-least-once</td><td>A replay after a checkpoint duplicates rows</td></tr>
+            <tr><td>HTTP call, email, payment</td><td>At-least-once</td><td>Nothing can un-send it; needs an idempotency key at the far end</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>So the guarantee is a property of the whole path rather than of the processor, and it lands in the same place as chapters 5, 12 and 13: the strongest thing available end to end is an idempotent effect. Checkpointing means you get that without also having to make the internal aggregation idempotent, which is a real and substantial benefit — just not the one the marketing implies.</p>
+
+      <p>Two operational consequences of checkpointing. The <strong>interval is a trade</strong>: frequent checkpoints mean less reprocessing after a failure and more steady-state overhead. And <strong>checkpoint size is state size</strong>, so a job with a large session-window state or a wide join window takes a long time to snapshot and a long time to restore — which is the same state the previous section priced, showing up as recovery time.</p>
+    </section>
+
+    <section id="batchstream">
+      <p class="kicker">THE DECISION</p>
+      <h2>When streaming earns its cost</h2>
+      <p class="sub">Streaming is strictly harder to build and operate than batch. That is worth it sometimes, and the test is narrower than enthusiasm suggests.</p>
+
+      <p>Chapter 2 established the ceiling on what streaming can buy: end-to-end freshness is the sum of every stage's wait plus its runtime, and continuous stages contribute only their runtime. A stream feeding a nightly mart is a nightly pipeline with extra operational surface.</p>
+
+      <div class="check">
+        <li><strong>Is a decision made on this data within minutes?</strong> Fraud blocking, dynamic pricing, alerting, live personalisation. If the consumer is a human reading a dashboard once a morning, the answer is no.</li>
+        <li><strong>Does the whole path support it?</strong> If any downstream stage is scheduled hourly, streaming the earlier stages changes nothing a consumer can perceive.</li>
+        <li><strong>Is the volume such that batch cannot keep up?</strong> A genuine reason, and rarer than claimed &mdash; chapter 10 noted a single machine handles a great deal.</li>
+        <li><strong>Can you operate stateful infrastructure?</strong> Checkpoint storage, rescaling, state migration on code change, replay procedures. This is the cost people underestimate, and it is ongoing.</li>
+        <li><strong>Is the answer allowed to be approximate?</strong> If the number must reconcile exactly with a batch pipeline, you are signing up to run both and explain the difference.</li>
+      </div>
+
+      <div class="note tip">
+        <b>The middle option people skip</b>
+        <p>Micro-batching &mdash; a batch job every one to five minutes &mdash; captures most of the freshness benefit with almost none of the operational cost. No watermarks, no checkpointed state, no rescaling procedure; just chapter 12's idempotent partition write on a short schedule. Chapter 2's model puts a five-minute chain at well under half an hour of worst-case staleness, which is current enough for the large majority of things people build streaming systems for.</p>
+        <p>Reach for genuine streaming when you need seconds, when you need session windows, or when the volume makes repeated small batches wasteful. Otherwise micro-batch and spend the saved effort on correctness.</p>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>Processing-time windows are simple and not reproducible;</b> event-time windows are reproducible and require deciding when a window is done. If anyone will reconcile the number, you need event time.</li>
+          <li><b>Window choice sets state cost.</b> How many windows an event belongs to multiplies state; a non-incremental aggregate like an exact distinct count retains every value.</li>
+          <li><b>Session windows are unbounded by construction,</b> which is why they are the hardest to operate.</li>
+          <li><b>A watermark is a heuristic:</b> highest event time seen, minus an allowed lateness.</li>
+          <li><b>Completeness flattens and latency does not.</b> Measured: 81.5% complete at 10.8 s, 97.5% at 51 s, 100% at 171 s. So there is a defensible stopping point.</li>
+          <li><b>This is chapter 12's lookback window in a different currency</b> &mdash; batch pays in compute, streaming pays in latency, and the underlying lateness distribution is the same.</li>
+          <li><b>An idle partition stalls the watermark completely.</b> Zero of sixty windows fire, while the job reports healthy with no lag and no errors. An idleness timeout is the fix, and it trades the stall for late data on resume.</li>
+          <li><b>Stream-to-stream join recall flattens while state rises strictly linearly.</b> 20% recall at 10 s, 74% at 60 s, 93% at 120 s; ten times the window is exactly ten times the memory.</li>
+          <li><b>A missed join is wrong, not absent.</b> At a sixty-second window 26% of clicks are affected and the conversion rate is understated by about that much, which is why a batch equivalent disagrees.</li>
+          <li><b>Prefer a stream-to-table join</b> where the second side is really a lookup; it has none of the incompleteness problem.</li>
+          <li><b>Checkpointing gives exactly-once for internal state</b> and stops at the sink. End to end, the strongest available guarantee is still an idempotent effect.</li>
+          <li><b>Micro-batching is the option people skip,</b> and it captures most of the freshness with almost none of the operational cost.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="15-distributed-processing.html">Chapter 15 &mdash; Distributed processing</a>. MapReduce's idea, Spark's execution model, and the shuffle &mdash; plus partitioning, skew, spill and small files, the four things that make a job slow.</p>
+          </div>
+          <div class="fi">
+            <i>BUILDS ON</i>
+            <p>The partition-as-unit-of-ordering constraint is <a href="13-messaging.html">chapter 13</a>; the lateness trade is <a href="12-batch-ingestion.html">chapter 12</a>; the freshness ceiling is <a href="02-lifecycle.html">chapter 2</a>.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>If you run a streaming job with event-time windows, check whether an idleness timeout is configured. If not, you have an outage waiting for the first quiet partition.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Demo 1 — watermarks: completeness against latency
+   ============================================================ */
+(function () {
+  var WINS = 60, WIN = 60, PER_WIN = 200;
+  var $ = function (id) { return document.getElementById(id); };
+  function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+
+  var cache = {};
+  function stream(meanLate, parts, idle) {
+    var k = meanLate + "|" + parts + "|" + idle;
+    if (cache[k]) return cache[k];
+    var rnd = lcg(4), evs = [];
+    for (var w = 0; w < WINS; w++) {
+      for (var i = 0; i < PER_WIN; i++) {
+        var et = w * WIN + rnd() * WIN;
+        var late = -Math.log(1 - rnd() * 0.999) * meanLate;
+        var p = Math.floor(rnd() * parts);
+        if (idle && p === parts - 1) continue;          /* this partition never produces */
+        evs.push({ et: et, pt: et + late, part: p });
+      }
+    }
+    evs.sort(function (a, b) { return a.pt - b.pt; });
+    cache[k] = evs;
+    return evs;
+  }
+
+  function run(evs, delta, parts) {
+    var maxPer = [];
+    for (var i = 0; i < parts; i++) maxPer.push(-Infinity);
+    var fired = [], included = [], dropped = [], fireAt = [], total = [];
+    for (var w = 0; w < WINS; w++) { fired.push(false); included.push(0); dropped.push(0); fireAt.push(null); total.push(0); }
+    evs.forEach(function (e) { total[Math.min(WINS - 1, Math.floor(e.et / WIN))]++; });
+
+    var lowest = 0;                                      /* first window not yet fired */
+    evs.forEach(function (e) {
+      maxPer[e.part] = Math.max(maxPer[e.part], e.et);
+      var wm = Math.min.apply(null, maxPer) - delta;
+      while (lowest < WINS && wm >= (lowest + 1) * WIN) {
+        fired[lowest] = true; fireAt[lowest] = e.pt; lowest++;
+      }
+      var wi = Math.min(WINS - 1, Math.floor(e.et / WIN));
+      if (fired[wi]) dropped[wi]++; else included[wi]++;
+    });
+
+    var inc = 0, tot = 0, drp = 0, lat = [];
+    for (var w2 = 0; w2 < WINS; w2++) {
+      if (!fired[w2]) continue;
+      inc += included[w2]; tot += total[w2]; drp += dropped[w2];
+      lat.push(fireAt[w2] - (w2 + 1) * WIN);
+    }
+    return {
+      firedWindows: fired.filter(Boolean).length,
+      completeness: tot ? inc / tot * 100 : 0,
+      dropped: drp,
+      latency: lat.length ? lat.reduce(function (a, b) { return a + b; }, 0) / lat.length : null,
+      perWindow: included.map(function (v, i) { return total[i] ? v / total[i] * 100 : 0; }),
+      fired: fired
+    };
+  }
+
+  function chart(meanLate, parts, idle, delta) {
+    var W = 700, H = 162, L = 46, B = 30;
+    var deltas = [0, 10, 20, 40, 80, 160];
+    var evs = stream(meanLate, parts, idle);
+    var pts = deltas.map(function (d) { return { d: d, r: run(evs, d, parts) }; });
+    var maxLat = Math.max.apply(null, pts.map(function (p) { return p.r.latency === null ? 0 : p.r.latency; })) || 1;
+    var xOf = function (i) { return L + i / (deltas.length - 1) * (W - L - 66); };
+    var yC = function (v) { return (H - B) - v / 100 * (H - B - 22); };
+    var yL = function (v) { return (H - B) - v / maxLat * (H - B - 22); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Completeness and firing latency against allowed lateness">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">COMPLETENESS (GREEN) AND FIRING LATENCY (PINK) AGAINST ALLOWED LATENESS</text>');
+    svg.push('<line x1="' + L + '" y1="' + (H - B) + '" x2="' + (W - 62) + '" y2="' + (H - B) + '" stroke="#CFD8E0"/>');
+    [50, 90, 100].forEach(function (v) {
+      svg.push('<line x1="' + L + '" y1="' + yC(v) + '" x2="' + (W - 62) + '" y2="' + yC(v) + '" stroke="#E1E7EC" stroke-dasharray="3 3"/>');
+      svg.push('<text x="2" y="' + (yC(v) + 4) + '" font-size="9.5" fill="#166B47">' + v + '%</text>');
+    });
+
+    if (pts[0].r.latency !== null) {
+      var dC = pts.map(function (p, i) { return (i ? "L" : "M") + xOf(i).toFixed(1) + " " + yC(p.r.completeness).toFixed(1); }).join(" ");
+      svg.push('<path d="' + dC + '" fill="none" stroke="#2E8B5F" stroke-width="2.4"/>');
+      var dL = pts.map(function (p, i) { return (i ? "L" : "M") + xOf(i).toFixed(1) + " " + yL(p.r.latency).toFixed(1); }).join(" ");
+      svg.push('<path d="' + dL + '" fill="none" stroke="#E0699F" stroke-width="2.4"/>');
+      pts.forEach(function (p, i) {
+        var on = p.d === delta;
+        svg.push('<circle cx="' + xOf(i).toFixed(1) + '" cy="' + yC(p.r.completeness).toFixed(1) + '" r="' + (on ? 5 : 3) + '" fill="#2E8B5F"/>');
+        svg.push('<circle cx="' + xOf(i).toFixed(1) + '" cy="' + yL(p.r.latency).toFixed(1) + '" r="' + (on ? 5 : 3) + '" fill="#E0699F"/>');
+      });
+      svg.push('<text x="' + (W - 58) + '" y="' + (yL(pts[pts.length - 1].r.latency) + 4) + '" font-size="10" fill="#A8386B">' +
+        Math.round(pts[pts.length - 1].r.latency) + 's</text>');
+    } else {
+      svg.push('<text x="' + (W / 2) + '" y="' + (H / 2) + '" font-size="13" font-weight="700" fill="#C0453A" text-anchor="middle">no window ever fires &mdash; the watermark is stalled</text>');
+    }
+    deltas.forEach(function (d, i) {
+      svg.push('<text x="' + xOf(i) + '" y="' + (H - 10) + '" font-size="9.5" fill="' + (d === delta ? "#A8386B" : "#7C8B99") +
+        '" font-weight="' + (d === delta ? 700 : 400) + '" text-anchor="middle">' + d + 's</text>');
+    });
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var delta = +$("wm-delta").value, meanLate = +$("wm-late").value;
+    var parts = +$("wm-parts").value, idle = $("wm-idle").value === "yes";
+    $("wm-parts-o").textContent = parts;
+
+    var evs = stream(meanLate, parts, idle);
+    var r = run(evs, delta, parts);
+
+    $("wm-fired").textContent = r.firedWindows + " / " + WINS;
+    $("wm-fired-tile").className = "tile " + (r.firedWindows === 0 ? "bad" : r.firedWindows === WINS ? "good" : "");
+    $("wm-comp").textContent = r.completeness.toFixed(1) + "%";
+    $("wm-comp-tile").className = "tile " + (r.completeness >= 99 ? "good" : r.completeness < 85 ? "bad" : "");
+    $("wm-drop").textContent = r.dropped.toLocaleString();
+    $("wm-drop-sub").textContent = "arrived after firing";
+    $("wm-lat").textContent = r.latency === null ? "never" : r.latency.toFixed(1) + "s";
+
+    $("wm-canvas").innerHTML = chart(meanLate, parts, idle, delta);
+
+    var lines = [];
+    if (idle) {
+      lines.push("One of the " + parts + " partitions produces nothing at all, and " + r.firedWindows +
+        " of " + WINS + " windows ever fire. The watermark has to be the minimum across partitions \u2014 otherwise a fast partition would advance it past data still to come from a slow one \u2014 so a partition with no data holds it permanently at negative infinity.");
+      lines.push("Note what this looks like operationally. The job is consuming, there is no lag on the active partitions, no errors, no restarts, and no output. Every health signal is green. The fix is an idleness timeout that drops a quiet partition out of the watermark calculation, which every serious processor offers and which is off by default \u2014 because enabling it means accepting that data from a resumed partition arrives late.");
+    } else {
+      var r0 = run(evs, 0, parts), r160 = run(evs, 160, parts);
+      lines.push("Allowed lateness of " + delta + "s emits " + r.completeness.toFixed(1) +
+        "% of each window's events, " + r.latency.toFixed(1) + "s after the window closed, dropping " +
+        r.dropped.toLocaleString() + " late arrivals. With a mean event lateness of " + meanLate + "s.");
+
+      lines.push("The two curves behave differently, which is what makes the choice tractable: completeness flattens (" +
+        r0.completeness.toFixed(1) + "% at 0s, " + run(evs, 40, parts).completeness.toFixed(1) + "% at 40s, " +
+        r160.completeness.toFixed(1) + "% at 160s) while latency rises without flattening (" +
+        r0.latency.toFixed(1) + "s, " + run(evs, 40, parts).latency.toFixed(1) + "s, " +
+        r160.latency.toFixed(1) + "s). The last few percent of completeness costs far more waiting than the first eighty.");
+
+      lines.push("This is exactly chapter 12's lookback window in a different currency. Batch bought completeness with compute \u2014 reprocessing three days a night at three times the cost. Streaming buys the same completeness with latency. Same lateness distribution, same decision about which percentile you are willing to lose.");
+    }
+    $("wm-note").textContent = lines.join("\n\n");
+  }
+
+  ["wm-delta", "wm-late", "wm-parts", "wm-idle"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — stream-to-stream join: recall against state
+   ============================================================ */
+(function () {
+  var CTR = 0.12, SAMPLE = 200000, ROW_BYTES = 200;
+  var $ = function (id) { return document.getElementById(id); };
+  function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+
+  var cache = {};
+  function delays(meanDelay) {
+    if (cache[meanDelay]) return cache[meanDelay];
+    var rnd = lcg(3), out = [];
+    for (var i = 0; i < SAMPLE; i++) {
+      if (rnd() < CTR) out.push(-Math.log(1 - rnd() * 0.999) * meanDelay);
+      else rnd();
+    }
+    cache[meanDelay] = out;
+    return out;
+  }
+
+  function join(win, meanDelay, rate) {
+    var d = delays(meanDelay);
+    var matched = 0;
+    for (var i = 0; i < d.length; i++) if (d[i] <= win) matched++;
+    var clicksAtRate = Math.round(rate * CTR);
+    var scale = clicksAtRate / d.length;
+    return {
+      recall: d.length ? matched / d.length * 100 : 0,
+      clicks: clicksAtRate,
+      missed: Math.round((d.length - matched) * scale),
+      state: Math.round(rate / 3600 * win),
+      bytes: Math.round(rate / 3600 * win) * ROW_BYTES
+    };
+  }
+
+  function bytes(b) {
+    if (b >= 1e9) return (b / 1e9).toFixed(2) + " GB";
+    if (b >= 1e6) return (b / 1e6).toFixed(1) + " MB";
+    return Math.round(b / 1e3) + " KB";
+  }
+
+  function chart(win, meanDelay, rate) {
+    var W = 700, H = 162, L = 46, B = 30;
+    var wins = [10, 30, 60, 120, 300, 900];
+    var pts = wins.map(function (w) { return { w: w, j: join(w, meanDelay, rate) }; });
+    var maxState = Math.max.apply(null, pts.map(function (p) { return p.j.state; }));
+    var xOf = function (i) { return L + i / (wins.length - 1) * (W - L - 66); };
+    var yR = function (v) { return (H - B) - v / 100 * (H - B - 22); };
+    var yS = function (v) { return (H - B) - v / maxState * (H - B - 22); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Recall and buffered state against join window">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">RECALL (GREEN, FLATTENS) AND BUFFERED STATE (PINK, STRICTLY LINEAR)</text>');
+    svg.push('<line x1="' + L + '" y1="' + (H - B) + '" x2="' + (W - 62) + '" y2="' + (H - B) + '" stroke="#CFD8E0"/>');
+    [50, 90, 100].forEach(function (v) {
+      svg.push('<line x1="' + L + '" y1="' + yR(v) + '" x2="' + (W - 62) + '" y2="' + yR(v) + '" stroke="#E1E7EC" stroke-dasharray="3 3"/>');
+      svg.push('<text x="2" y="' + (yR(v) + 4) + '" font-size="9.5" fill="#166B47">' + v + '%</text>');
+    });
+    var dR = pts.map(function (p, i) { return (i ? "L" : "M") + xOf(i).toFixed(1) + " " + yR(p.j.recall).toFixed(1); }).join(" ");
+    svg.push('<path d="' + dR + '" fill="none" stroke="#2E8B5F" stroke-width="2.4"/>');
+    var dS = pts.map(function (p, i) { return (i ? "L" : "M") + xOf(i).toFixed(1) + " " + yS(p.j.state).toFixed(1); }).join(" ");
+    svg.push('<path d="' + dS + '" fill="none" stroke="#E0699F" stroke-width="2.4"/>');
+    pts.forEach(function (p, i) {
+      var on = p.w === win;
+      svg.push('<circle cx="' + xOf(i).toFixed(1) + '" cy="' + yR(p.j.recall).toFixed(1) + '" r="' + (on ? 5 : 3) + '" fill="#2E8B5F"/>');
+      svg.push('<circle cx="' + xOf(i).toFixed(1) + '" cy="' + yS(p.j.state).toFixed(1) + '" r="' + (on ? 5 : 3) + '" fill="#E0699F"/>');
+      svg.push('<text x="' + xOf(i) + '" y="' + (H - 10) + '" font-size="9.5" fill="' + (on ? "#A8386B" : "#7C8B99") +
+        '" font-weight="' + (on ? 700 : 400) + '" text-anchor="middle">' + p.w + 's</text>');
+    });
+    svg.push('<text x="' + (W - 58) + '" y="' + (yS(maxState) + 4) + '" font-size="10" fill="#A8386B">' +
+      bytes(maxState * ROW_BYTES) + '</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var win = +$("sj-win").value, meanDelay = +$("sj-delay").value, rate = +$("sj-rate").value;
+    var j = join(win, meanDelay, rate);
+    var j10 = join(10, meanDelay, rate), j900 = join(900, meanDelay, rate);
+
+    $("sj-recall").textContent = j.recall.toFixed(1) + "%";
+    $("sj-recall-sub").textContent = "of " + j.clicks.toLocaleString() + " clicks";
+    $("sj-recall-tile").className = "tile " + (j.recall >= 99 ? "good" : j.recall < 70 ? "bad" : "");
+    $("sj-miss").textContent = j.missed.toLocaleString();
+    $("sj-state").textContent = j.state.toLocaleString();
+    $("sj-state-tile").className = "tile " + (j.bytes > 2e9 ? "bad" : "");
+    $("sj-mem").textContent = bytes(j.bytes);
+    $("sj-mem-sub").textContent = "at " + ROW_BYTES + " bytes a row";
+
+    $("sj-canvas").innerHTML = chart(win, meanDelay, rate);
+
+    var lines = [];
+    lines.push("A " + win + "s join window against a mean click delay of " + meanDelay + "s matches " +
+      j.recall.toFixed(1) + "% of clicks and misses " + j.missed.toLocaleString() +
+      ", holding " + j.state.toLocaleString() + " impressions in state \u2014 about " + bytes(j.bytes) + ".");
+
+    lines.push("The two curves differ in kind. Recall flattens: " + j10.recall.toFixed(1) + "% at 10s, " +
+      join(60, meanDelay, rate).recall.toFixed(1) + "% at 60s, " + join(300, meanDelay, rate).recall.toFixed(1) +
+      "% at 300s. State does not flatten at all \u2014 it is exactly linear in the window, so 900s holds " +
+      (j900.state / j10.state).toFixed(0) +
+      " times the rows of 10s for " + (j900.recall - j10.recall).toFixed(1) +
+      " more points of recall. The marginal cost of the last few percent is enormous.");
+
+    if (j.recall < 99) {
+      lines.push("And a missed click is not simply absent. Depending on the join type it either vanishes or emerges with null impression attributes, so the attribution is wrong rather than missing: at this window the conversion rate is understated by roughly " +
+        (100 - j.recall).toFixed(0) + "%. That is why an equivalent batch job over the same data disagrees with the stream, and why the batch answer is usually the one to trust \u2014 it could afford to wait.");
+    } else {
+      lines.push("At this window essentially every click is matched, and the price is " + bytes(j.bytes) +
+        " of checkpointed state. Remember that state size is also recovery time: this is what has to be snapshotted on every checkpoint and restored after every failure, which is the operational cost the previous section priced.");
+    }
+    $("sj-note").textContent = lines.join("\n\n");
+  }
+
+  ["sj-win", "sj-delay", "sj-rate"].forEach(function (id) { $(id).addEventListener("change", render); });
+  render();
+})();
+
+initChapter("14-stream-processing.html");
+</script>
+</body>
+</html>

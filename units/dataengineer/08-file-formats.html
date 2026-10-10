@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · File formats and columnar layout — Data Engineer</title>
+<meta name="description" content="CSV and JSON against Parquet, ORC and Avro: row groups, dictionary, run-length and delta encoding, and predicate pushdown, all measured on real data.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">Data Engineer</a> <span>/</span> Chapter 08</p>
+    <p class="chnum">CHAPTER 08</p>
+    <h1>File formats and columnar layout</h1>
+    <p class="lede">Chapter 2 claimed columnar storage compresses about fourfold and lets a reader skip columns it does not need. Those were placeholders. This chapter runs a real encoder on real data in your browser and measures both, and the measurement turns up something the rule of thumb hides: sorting your data to improve compression can make it substantially worse.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~28 min</b> read</div>
+      <div><b>Part 3</b> Storage</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="why">
+      <p class="kicker">THE PHYSICAL ARGUMENT</p>
+      <h2>Why columns, and why only sometimes</h2>
+      <p class="sub">Row and column layouts are the same data in a different order. The order decides which queries are cheap.</p>
+
+      <p>A table has to be laid out linearly on a device. Two choices:</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">layout.txt</span><button class="code-copy">Copy</button></div>
+        <pre><code data-lang="python"># row-oriented: one record's fields are adjacent
+1,GB,settled,1900 | 2,US,pending,450 | 3,GB,settled,7200 | ...
+
+# column-oriented: one field's values across records are adjacent
+1,2,3,...  |  GB,US,GB,...  |  settled,pending,settled,...  |  1900,450,7200,...</code></pre>
+      </div>
+
+      <p>Storage devices and networks are efficient at contiguous reads and terrible at scattered small ones — that was the central point of <a href="07-storage-foundations.html">chapter 7</a>. So the layout that puts the bytes a query needs next to each other wins, and which layout that is depends entirely on the query.</p>
+
+      <div class="cols">
+        <div>
+          <h4>Row layout wins when</h4>
+          <ul>
+            <li>You want whole records: <code>SELECT * WHERE id = 42</code>.</li>
+            <li>You write one record at a time, which is what a transactional application does.</li>
+            <li>You update in place &mdash; touching one row means touching one contiguous region.</li>
+          </ul>
+        </div>
+        <div>
+          <h4>Column layout wins when</h4>
+          <ul>
+            <li>You want a few fields from many records: <code>SELECT country, sum(amount) GROUP BY country</code>.</li>
+            <li>You write in large batches.</li>
+            <li>You never update, only append and replace.</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>That is the whole OLTP-versus-OLAP distinction expressed physically, and it is why <a href="10-engines.html">chapter 10</a> can treat the two engine families as a consequence of layout rather than as a marketing category.</p>
+
+      <div class="note key">
+        <b>The second, larger effect</b>
+        <p>Skipping unwanted columns is the obvious benefit and it is not the biggest one. A column holds values of <em>one type, from one domain, frequently with heavy repetition</em>. That makes it enormously more compressible than a row, where an integer sits next to a country code sits next to a timestamp. Compression is where most of the win comes from, and the next section measures it.</p>
+      </div>
+    </section>
+
+    <section id="encodings">
+      <p class="kicker">MEASURED, NOT ASSERTED</p>
+      <h2>The encodings, and what they actually save</h2>
+      <p class="sub">Four techniques do nearly all the work. The demo below implements them and runs them on forty thousand generated rows in the page.</p>
+
+      <div class="terms">
+        <dt>Dictionary encoding</dt>
+        <dd>Replace each value with an index into a list of distinct values. A country code stored as two UTF-8 bytes plus a length prefix becomes a 4-bit index when there are only twelve countries. Effective exactly when cardinality is low relative to row count.</dd>
+
+        <dt>Run-length encoding</dt>
+        <dd>Store <em>(value, repeat count)</em> rather than the repeated value. Devastatingly effective on sorted low-cardinality data and useless on unsorted data, which is the whole subject of the sort-order control below.</dd>
+
+        <dt>Delta encoding</dt>
+        <dd>Store the difference from the previous value. A monotonic column &mdash; an id, an ingestion timestamp &mdash; has tiny deltas that pack into a handful of bits each instead of four or eight bytes. This is the encoding that produces the spectacular ratios, and also the one that sorting destroys.</dd>
+
+        <dt>Bit packing</dt>
+        <dd>If the values in a block need only 11 bits, use 11 bits, not 32. Applied underneath the other three rather than instead of them.</dd>
+      </div>
+
+      <p>A real Parquet writer chooses per column and per block, trying candidates and keeping the smallest. The demo does the same, and reports which one won.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Encoding laboratory</b>
+          <span>40,000 generated rows, encoded in the page; every byte figure is measured</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Physical sort order
+              <select id="en-sort">
+                <option value="none" selected>Insertion order</option>
+                <option value="country">country</option>
+                <option value="country,status">country, status</option>
+                <option value="status">status</option>
+                <option value="user_id">user_id</option>
+              </select>
+            </label>
+            <label>Columns kept
+              <select id="en-cols">
+                <option value="all" selected>All seven</option>
+                <option value="nomono">Drop the monotonic ones</option>
+                <option value="lowcard">Low-cardinality only</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="en-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>CSV</i><b id="en-csv">0</b><s>row oriented</s></div>
+            <div class="tile"><i>JSON LINES</i><b id="en-json">0</b><s id="en-json-sub"></s></div>
+            <div class="tile"><i>COLUMNAR, PLAIN</i><b id="en-plain">0</b><s>no encoding</s></div>
+            <div class="tile good"><i>COLUMNAR, ENCODED</i><b id="en-enc">0</b><s id="en-enc-sub"></s></div>
+            <div class="tile hi"><i>VS CSV</i><b id="en-ratio">0</b><s>smaller</s></div>
+          </div>
+
+          <div class="tw">
+            <table>
+              <caption>Per column: what it cost plain, what the encoder chose, and what it saved</caption>
+              <thead>
+                <tr><th>Column</th><th class="num">Distinct</th><th class="num">Runs</th><th class="num">Plain</th><th class="num">Encoded</th><th>Coding chosen</th><th class="num">Ratio</th></tr>
+              </thead>
+              <tbody id="en-rows"></tbody>
+            </table>
+          </div>
+
+          <p class="readout" id="en-note"></p>
+        </div>
+      </div>
+
+      <h3>The measurement, and the correction to chapter 2</h3>
+
+      <p>In insertion order the encoder gets the whole table about <strong>5.1 times</strong> smaller than CSV, not fourfold — so chapter 2's placeholder was conservative for this data. Per column the spread is enormous: a sequential id compresses about thirty-twofold under delta encoding, a four-value status column about forty-fourfold under a dictionary, and a random user id barely twofold because there is no structure to exploit.</p>
+
+      <p>That spread is the real lesson. <strong>"Columnar is four times smaller" is not a property of the format</strong>, it is a property of your data's cardinality and ordering. A table of random values compresses barely at all in any format.</p>
+
+      <div class="note trap">
+        <b>Sorting to improve compression can make it worse</b>
+        <p>Switch the sort order to <code>country, status</code> and watch the total <em>grow by about a third</em>. The mechanism is visible in the per-column table: run-length encoding on the two low-cardinality columns saves around 29 KB, and randomising the previously monotonic <code>event_id</code> and <code>ts_ms</code> columns costs around 146 KB, because their deltas stop being small. Net effect: 33% worse, on byte-for-byte identical data.</p>
+        <p>Now switch the column selection to drop the monotonic columns and re-apply the same sort. It becomes 9% <em>better</em>. Whether sorting helps compression depends on which columns dominate your table, and the answer has to be measured rather than assumed.</p>
+      </div>
+
+      <p>This matters because "sort your data for better compression" is common advice and it is only conditionally true. The good reason to choose a sort order is the next section — pruning — and its compression effect should be measured as a side effect rather than assumed as a benefit.</p>
+    </section>
+
+    <section id="pruning">
+      <p class="kicker">SKIPPING WORK ENTIRELY</p>
+      <h2>Row groups and predicate pushdown</h2>
+      <p class="sub">The largest saving available is not reading data faster. It is proving you never needed to read it.</p>
+
+      <p>A columnar file is not one long column. It is divided into <strong>row groups</strong> — horizontal slices of perhaps a hundred thousand rows — and within each row group, each column is stored as a chunk with its own footer statistics: minimum, maximum, null count, distinct count.</p>
+
+      <p>Those statistics let a reader do something powerful. Given <code>WHERE amount_cents &gt; 400000</code>, it inspects each row group's maximum for that column, and if the maximum is 380,000 the group cannot contain a matching row, so the reader skips it without transferring a byte. This is <strong>predicate pushdown</strong>, and combined with column projection it means a query can touch a tiny fraction of a file.</p>
+
+      <div class="note key">
+        <b>Statistics can only ever prove absence</b>
+        <p>A minimum and maximum can prove no row matches. They can never prove a row does match &mdash; a group whose range overlaps the predicate might contain zero matches and still has to be read. So pushdown is a filter on <em>work</em>, never a substitute for evaluating the predicate. This asymmetry is why pushdown effectiveness depends entirely on how well the data is physically clustered.</p>
+      </div>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Row-group pruning</b>
+          <span>real min/max statistics computed per group, on the same 40,000 rows</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Predicate
+              <select id="pr-pred"></select>
+            </label>
+            <label>Physical sort order
+              <select id="pr-sort">
+                <option value="none" selected>Insertion order</option>
+                <option value="country">country</option>
+                <option value="amount_cents">amount_cents</option>
+                <option value="ts_ms">ts_ms</option>
+              </select>
+            </label>
+            <label>Rows per group
+              <select id="pr-size">
+                <option value="20000">20,000</option>
+                <option value="10000">10,000</option>
+                <option value="4000" selected>4,000</option>
+                <option value="1000">1,000</option>
+                <option value="500">500</option>
+              </select>
+            </label>
+            <label>Columns projected
+              <input type="range" id="pr-proj" min="1" max="7" step="1" value="2">
+              <output id="pr-proj-o">2 of 7</output>
+            </label>
+          </div>
+
+          <div class="canvas" id="pr-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>GROUPS READ</i><b id="pr-groups">0</b><s id="pr-groups-sub"></s></div>
+            <div class="tile"><i>ROWS ACTUALLY MATCHING</i><b id="pr-sel">0%</b><s>true selectivity</s></div>
+            <div class="tile"><i>CSV FULL SCAN</i><b id="pr-csv">0</b><s>bytes read</s></div>
+            <div class="tile good"><i>COLUMNAR + PRUNING</i><b id="pr-col">0</b><s id="pr-col-sub"></s></div>
+            <div class="tile hi"><i>REDUCTION</i><b id="pr-red">0</b><s>less data touched</s></div>
+          </div>
+
+          <p class="readout" id="pr-note"></p>
+        </div>
+      </div>
+
+      <p>Four results from the model that are worth stating explicitly.</p>
+
+      <ol>
+        <li><strong>Unsorted data prunes almost nothing.</strong> With rows in insertion order, every group's <code>amount_cents</code> range spans nearly the whole domain, so all ten groups overlap the predicate and none can be skipped — despite only 7% of rows matching. The statistics are present and correct and completely useless.</li>
+        <li><strong>Clustering on the predicate column is what makes pushdown work.</strong> Sort by <code>amount_cents</code> and the same query reads one group of ten: a 90% reduction in rows touched, from physical layout alone.</li>
+        <li><strong>Clustering helps only the column you clustered on.</strong> Sort by <code>country</code> and the <code>amount_cents</code> predicate is back to reading all ten groups. You get one sort order per table, so it must be chosen for the queries that matter.</li>
+        <li><strong>Ingestion time is clustered for free.</strong> Notice that the timestamp predicate prunes to one group even in insertion order, because rows arrived in time order. This is the real reason partitioning by date is so effective and so ubiquitous — the clustering is a gift from how the data arrives, and costs nothing to maintain.</li>
+      </ol>
+
+      <p>Smaller row groups prune more precisely, and the model shows the benefit flattening: once a group is smaller than the matching region, further subdivision gains nothing while adding footer overhead and more requests. Real writers default to somewhere between 128 MB and 1 GB per row group for exactly this reason, and <a href="07-storage-foundations.html">chapter 7</a>'s request-cost arithmetic is the other half of the argument.</p>
+    </section>
+
+    <section id="formats">
+      <p class="kicker">THE ACTUAL FORMATS</p>
+      <h2>Choosing between them</h2>
+      <p class="sub">Three columnar formats, one row-oriented binary format, and two text formats that will not go away.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Formats by layout and by what they are genuinely good at</caption>
+          <thead>
+            <tr><th>Format</th><th>Layout</th><th>Splittable</th><th>Schema</th><th>Use it for</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>Parquet</strong></td><td>Columnar</td><td>Yes</td><td>Embedded</td><td>The default for analytical storage. Widest engine support of anything here.</td></tr>
+            <tr><td><strong>ORC</strong></td><td>Columnar</td><td>Yes</td><td>Embedded</td><td>Technically comparable, with better built-in indexes. Strongest in the Hive lineage.</td></tr>
+            <tr><td><strong>Avro</strong></td><td>Row</td><td>Yes</td><td>Embedded</td><td>Streaming records and write-heavy landing zones, where whole records arrive one at a time.</td></tr>
+            <tr><td>CSV</td><td>Row</td><td>Yes, awkwardly</td><td>None</td><td>Interchange with humans and spreadsheets. Never a storage layer.</td></tr>
+            <tr><td>JSON lines</td><td>Row</td><td>Yes</td><td>None</td><td>Landing semi-structured data before you know its shape.</td></tr>
+            <tr><td>Arrow</td><td>Columnar</td><td>&mdash;</td><td>Embedded</td><td>In-memory interchange between processes, not a storage format at all.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Two distinctions in that table earn their place.</p>
+
+      <p><strong>Avro is row-oriented, and that is a feature.</strong> Parquet needs a whole row group in memory before it can write anything, so it is a poor fit for a stream of individual records. Avro appends one record at a time cheaply. The common pattern is therefore Avro on the way in, compacted into Parquet for the analytical layer — which is <a href="12-batch-ingestion.html">chapter 12</a>'s landing-zone design.</p>
+
+      <p><strong>Arrow is memory, not storage.</strong> Parquet is optimised for size on disk with heavy encoding; Arrow is optimised for direct CPU access with no decoding step. They are complementary, and the confusion is common enough to be worth naming: you store Parquet and process Arrow.</p>
+
+      <div class="note tip">
+        <b>Compression codec, separately from encoding</b>
+        <p>Everything measured above was <em>encoding</em> &mdash; structural techniques exploiting what the data is. A general-purpose codec is then applied on top, and the choice is a straightforward speed-versus-size trade. <strong>Snappy</strong> is fast and modest, the safe default for data queried often. <strong>Zstd</strong> is now the better default in most engines: meaningfully smaller than Snappy at similar decompression speed, with a tunable level. <strong>Gzip</strong> is smaller still and slow enough to be a poor fit for interactive querying. Choose Zstd unless you have measured a reason not to.</p>
+      </div>
+    </section>
+
+    <section id="pitfalls">
+      <p class="kicker">WHAT GOES WRONG</p>
+      <h2>Five layout mistakes</h2>
+      <p class="sub">All five are common, all five are cheap to avoid at write time and expensive to fix afterwards.</p>
+
+      <div class="terms">
+        <dt>Too many small files</dt>
+        <dd>The dominant failure. Every file costs a request, a footer read and scheduler overhead, and pruning cannot help because a small file is one small row group. Chapter 7 priced this: identical bytes, tens of thousands of pounds apart. Target 128 MB to 1 GB per file and run a compaction job.</dd>
+
+        <dt>Partitioning too finely</dt>
+        <dd>Partitioning by day is usually right; by hour, or by day and country and device, produces thousands of directories holding a few kilobytes each &mdash; the small-files problem arriving through a different door. A partition should hold at least a few hundred megabytes.</dd>
+
+        <dt>Sorting on the wrong column</dt>
+        <dd>You get one physical order. Spending it on a column nothing filters by gives up all the pruning in the previous demo, as the model shows directly.</dd>
+
+        <dt>Assuming pushdown happened</dt>
+        <dd>It silently does not, for predicates the engine cannot translate: a function applied to the column, a cast, an unsupported type, statistics disabled at write time. Always check the query plan for the row-groups-scanned count rather than trusting that it worked.</dd>
+
+        <dt>Wide tables read whole</dt>
+        <dd>Columnar layout only pays if you project. <code>SELECT *</code> on a 300-column Parquet table forfeits the entire benefit and is slower than the row format would have been, because it pays decoding costs for columns it does not use.</dd>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>Row and column layouts are the same data reordered.</b> Rows win for whole-record access and in-place updates; columns win for a few fields across many records.</li>
+          <li><b>Compression is the bigger half of the columnar benefit,</b> because a column holds one type from one domain with heavy repetition.</li>
+          <li><b>Measured on this data, encoded columnar is about 5.1&times; smaller than CSV</b> &mdash; chapter 2's fourfold placeholder was conservative. Per column the range runs from about 1.6&times; to about 44&times;.</li>
+          <li><b>Compression ratio is a property of your data, not of the format.</b> Cardinality and ordering decide it; random values barely compress in anything.</li>
+          <li><b>Sorting to improve compression can make it worse.</b> Sorting by two low-cardinality columns saved 29 KB of run-length coding and cost 146 KB of delta coding &mdash; 33% worse overall. Drop the monotonic columns and the same sort is 9% better.</li>
+          <li><b>Statistics can prove absence, never presence.</b> Pushdown reduces work; it never replaces evaluating the predicate.</li>
+          <li><b>Unsorted data prunes nothing.</b> Every group's range spans the domain, so all groups are read even at 7% selectivity.</li>
+          <li><b>Clustering on the predicate column cut rows touched by 90%,</b> and clustering on a different column gave no benefit at all. One sort order per table, spent deliberately.</li>
+          <li><b>Ingestion time is clustered for free,</b> which is the real reason date partitioning works so well.</li>
+          <li><b>Avro on the way in, Parquet for analytics.</b> Row-oriented for record-at-a-time writes, columnar once compacted. Arrow is memory, not storage.</li>
+          <li><b>Prefer Zstd over Snappy</b> unless measurement says otherwise, and keep files between 128 MB and 1 GB.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="09-modelling.html">Chapter 9 &mdash; Modelling for analytics</a>. Normal forms against dimensional modelling, star against snowflake, choosing a grain, and the six ways to handle a dimension that changes over time.</p>
+          </div>
+          <div class="fi">
+            <i>WHERE THIS GETS USED</i>
+            <p>The pruning result is the foundation for <a href="11-warehouse-lake.html">chapter 11</a>, where table formats add file-level statistics and clustering on top, and for <a href="15-distributed-processing.html">chapter 15</a>, where file size determines task parallelism.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>Take your largest Parquet table and run a typical query with <code>EXPLAIN ANALYZE</code>. Compare row groups scanned against row groups total. If they are equal, your sort order and your query patterns disagree.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   Shared: generate one dataset both demos measure
+   ============================================================ */
+var DE8 = (function () {
+  var N = 40000;
+  var COUNTRIES = ["GB","US","DE","FR","IN","NL","IE","ES","IT","PL","SE","AU"];
+  var STATUSES = ["settled","pending","failed","refunded"];
+
+  function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+
+  var COLS = [
+    { n:"event_id",     t:"int", mono:true,  low:false },
+    { n:"ts_ms",        t:"int", mono:true,  low:false },
+    { n:"user_id",      t:"int", mono:false, low:false },
+    { n:"country",      t:"str", mono:false, low:true  },
+    { n:"status",       t:"str", mono:false, low:true  },
+    { n:"amount_cents", t:"int", mono:false, low:false },
+    { n:"session",      t:"str", mono:false, low:false }
+  ];
+
+  var rows = (function () {
+    var rnd = lcg(99), out = [], ts = 1717200000000;
+    for (var i = 0; i < N; i++) {
+      ts += 1 + Math.floor(rnd() * 500);
+      /* raising a uniform to a power skews the pick toward the first entries */
+      var ci = Math.floor(Math.pow(rnd(), 2.2) * COUNTRIES.length);
+      var si = Math.floor(Math.pow(rnd(), 3.0) * STATUSES.length);
+      out.push({
+        event_id: i + 1,
+        ts_ms: ts,
+        user_id: 1 + Math.floor(rnd() * 50000),
+        country: COUNTRIES[Math.min(ci, COUNTRIES.length - 1)],
+        status: STATUSES[Math.min(si, STATUSES.length - 1)],
+        amount_cents: 1 + Math.floor(Math.pow(rnd(), 3) * 500000),
+        session: Math.floor(rnd() * (N / 8)).toString(16)
+      });
+    }
+    return out;
+  })();
+
+  function utf8(s) { return unescape(encodeURIComponent(String(s))).length; }
+  function bits(n) { return n <= 1 ? 1 : Math.ceil(Math.log(n) / Math.LN2); }
+
+  function plainSize(vals, type) {
+    if (type === "int") {
+      var wide = false;
+      for (var i = 0; i < vals.length; i++) if (vals[i] > 2147483647) { wide = true; break; }
+      return vals.length * (wide ? 8 : 4);
+    }
+    var b = 0;
+    for (var j = 0; j < vals.length; j++) b += 4 + utf8(vals[j]);
+    return b;
+  }
+  function distinctOf(vals) {
+    var seen = {}, d = [];
+    for (var i = 0; i < vals.length; i++) if (seen[vals[i]] === undefined) { seen[vals[i]] = 1; d.push(vals[i]); }
+    return d;
+  }
+  function runsOf(vals) {
+    var r = 1;
+    for (var i = 1; i < vals.length; i++) if (vals[i] !== vals[i - 1]) r++;
+    return r;
+  }
+  function deltaSize(vals) {
+    var maxD = 0, minD = Infinity;
+    for (var i = 1; i < vals.length; i++) {
+      var d = vals[i] - vals[i - 1];
+      if (d > maxD) maxD = d;
+      if (d < minD) minD = d;
+    }
+    if (minD === Infinity) { minD = 0; maxD = 0; }
+    return 16 + Math.ceil((vals.length - 1) * bits(maxD - minD + 1) / 8);
+  }
+
+  function encodeCol(vals, type) {
+    var plain = plainSize(vals, type);
+    var dist = distinctOf(vals), runs = runsOf(vals);
+    var dictBytes = plainSize(dist, type);
+    var idxBits = bits(dist.length);
+    var dict = dictBytes + Math.ceil(vals.length * idxBits / 8);
+    var rle = dictBytes + runs * (Math.ceil(idxBits / 8) + 2);
+    var cands = [{ k: "plain", s: plain }, { k: "dictionary", s: dict }, { k: "RLE", s: rle }];
+    if (type === "int") cands.push({ k: "delta", s: deltaSize(vals) });
+    var best = cands[0];
+    cands.forEach(function (c) { if (c.s < best.s) best = c; });
+    return { plain: plain, best: best.s, coding: best.k, card: dist.length, runs: runs };
+  }
+
+  function encodeAll(rs, cols) {
+    var out = { cols: {}, plain: 0, best: 0 };
+    cols.forEach(function (c) {
+      var vals = rs.map(function (r) { return r[c.n]; });
+      var e = encodeCol(vals, c.t);
+      out.cols[c.n] = e; out.plain += e.plain; out.best += e.best;
+    });
+    return out;
+  }
+
+  function csvBytes(rs, cols) {
+    var b = cols.map(function (c) { return c.n; }).join(",").length + 1;
+    rs.forEach(function (r) {
+      b += utf8(cols.map(function (c) { return r[c.n]; }).join(",")) + 1;
+    });
+    return b;
+  }
+  function jsonBytes(rs, cols) {
+    var b = 0;
+    rs.forEach(function (r) {
+      var parts = cols.map(function (c) {
+        return '"' + c.n + '":' + (c.t === "str" ? '"' + r[c.n] + '"' : r[c.n]);
+      });
+      b += utf8("{" + parts.join(",") + "}") + 1;
+    });
+    return b;
+  }
+
+  function sortBy(rs, keys) {
+    if (!keys.length) return rs;
+    return rs.slice().sort(function (a, b) {
+      for (var i = 0; i < keys.length; i++) {
+        if (a[keys[i]] < b[keys[i]]) return -1;
+        if (a[keys[i]] > b[keys[i]]) return 1;
+      }
+      return 0;
+    });
+  }
+
+  return { N: N, COLS: COLS, rows: rows, encodeAll: encodeAll, encodeCol: encodeCol,
+           csvBytes: csvBytes, jsonBytes: jsonBytes, sortBy: sortBy };
+})();
+
+function kbOf(b) {
+  if (b >= 1048576) return (b / 1048576).toFixed(2) + " MB";
+  if (b >= 1024) return (b / 1024).toFixed(1) + " KB";
+  return b + " B";
+}
+
+/* ============================================================
+   Demo 1 — encoding laboratory
+   ============================================================ */
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var cache = {};
+
+  function colsFor(mode) {
+    if (mode === "nomono") return DE8.COLS.filter(function (c) { return !c.mono; });
+    if (mode === "lowcard") return DE8.COLS.filter(function (c) { return c.low; });
+    return DE8.COLS;
+  }
+
+  function measure(sortKey, colMode) {
+    var key = sortKey + "|" + colMode;
+    if (cache[key]) return cache[key];
+    var keys = sortKey === "none" ? [] : sortKey.split(",");
+    var rs = DE8.sortBy(DE8.rows, keys);
+    var cols = colsFor(colMode);
+    var res = {
+      cols: cols,
+      enc: DE8.encodeAll(rs, cols),
+      csv: DE8.csvBytes(rs, cols),
+      json: DE8.jsonBytes(rs, cols)
+    };
+    cache[key] = res;
+    return res;
+  }
+
+  function chart(res) {
+    var W = 700, H = 92, L = 138;
+    var items = [
+      { n: "JSON lines", v: res.json, c: "#C0453A" },
+      { n: "CSV", v: res.csv, c: "#D9A24A" },
+      { n: "columnar, plain", v: res.enc.plain, c: "#7C8CF8" },
+      { n: "columnar, encoded", v: res.enc.best, c: "#2E8B5F" }
+    ];
+    var max = Math.max.apply(null, items.map(function (i) { return i.v; }));
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Total size by layout and encoding">'];
+    items.forEach(function (it, i) {
+      var y = 6 + i * 21;
+      var w = it.v / max * (W - L - 96);
+      svg.push('<text x="0" y="' + (y + 13) + '" font-size="11" font-weight="600" fill="#16232F">' + it.n + '</text>');
+      svg.push('<rect x="' + L + '" y="' + y + '" width="' + Math.max(2, w).toFixed(1) + '" height="16" rx="2" fill="' + it.c + '"/>');
+      svg.push('<text x="' + (L + w + 7) + '" y="' + (y + 13) + '" font-size="10.5" font-weight="600" fill="#54677A">' + kbOf(it.v) + '</text>');
+    });
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var sortKey = $("en-sort").value, colMode = $("en-cols").value;
+    var res = measure(sortKey, colMode);
+    var base = measure("none", colMode);
+
+    $("en-csv").textContent = kbOf(res.csv);
+    $("en-json").textContent = kbOf(res.json);
+    $("en-json-sub").textContent = (res.json / res.csv).toFixed(1) + "x CSV";
+    $("en-plain").textContent = kbOf(res.enc.plain);
+    $("en-enc").textContent = kbOf(res.enc.best);
+    $("en-enc-sub").textContent = (res.enc.plain / res.enc.best).toFixed(1) + "x vs plain";
+    $("en-ratio").textContent = (res.csv / res.enc.best).toFixed(2) + "x";
+
+    var tb = $("en-rows");
+    tb.innerHTML = "";
+    res.cols.forEach(function (c) {
+      var e = res.enc.cols[c.n];
+      var tr = document.createElement("tr");
+      var cells = ["<code>" + c.n + "</code>", e.card, e.runs, kbOf(e.plain), kbOf(e.best),
+                   e.coding, (e.plain / e.best).toFixed(2) + "x"];
+      cells.forEach(function (v, i) {
+        var td = document.createElement("td");
+        if (i >= 1 && i <= 4 || i === 6) td.className = "num";
+        td.innerHTML = v;
+        tr.appendChild(td);
+      });
+      tb.appendChild(tr);
+    });
+
+    $("en-canvas").innerHTML = chart(res);
+
+    var mono = res.cols.filter(function (c) { return c.mono; }).map(function (c) { return c.n; });
+    var low = res.cols.filter(function (c) { return c.low; }).map(function (c) { return c.n; });
+    var sum = function (r, names) { return names.reduce(function (a, n) { return a + r.enc.cols[n].best; }, 0); };
+
+    var lines = [];
+    lines.push(DE8.N + " rows across " + res.cols.length + " columns. Encoded columnar is " +
+      kbOf(res.enc.best) + " against " + kbOf(res.csv) + " of CSV \u2014 " +
+      (res.csv / res.enc.best).toFixed(2) + " times smaller \u2014 and JSON lines costs " +
+      (res.json / res.csv).toFixed(1) + " times CSV because every row repeats every key.");
+
+    if (sortKey === "none") {
+      lines.push("In insertion order the encoder picks delta for the monotonic columns and a dictionary for the low-cardinality ones. Per-column ratios span " +
+        res.cols.map(function (c) { return (res.enc.cols[c.n].plain / res.enc.cols[c.n].best); })
+          .reduce(function (a, b) { return Math.min(a, b); }, 1e9).toFixed(1) + "x to " +
+        res.cols.map(function (c) { return (res.enc.cols[c.n].plain / res.enc.cols[c.n].best); })
+          .reduce(function (a, b) { return Math.max(a, b); }, 0).toFixed(1) +
+        "x, which is why a single headline compression figure for a format is close to meaningless.");
+    } else if (mono.length && low.length) {
+      var dLow = sum(base, low) - sum(res, low), dMono = sum(res, mono) - sum(base, mono);
+      var net = res.enc.best - base.enc.best;
+      lines.push("Sorting by " + sortKey.replace(",", ", ") + " saved " + kbOf(Math.abs(dLow)) +
+        " on the low-cardinality columns (" + low.join(", ") + ") through run-length coding, and cost " +
+        kbOf(Math.abs(dMono)) + " on the monotonic columns (" + mono.join(", ") +
+        ") because their deltas are no longer small. Net: " + kbOf(base.enc.best) + " to " +
+        kbOf(res.enc.best) + ", " + (net > 0 ? Math.round(net / base.enc.best * 100) + "% WORSE" :
+        Math.round(-net / base.enc.best * 100) + "% better") + " on identical data.");
+      if (net > 0) {
+        lines.push("So the common advice to sort for compression is conditional. Switch the column selection to drop the monotonic columns and re-apply this same sort \u2014 it becomes a clear win. Which way it goes depends on which columns dominate your table, so it has to be measured.");
+      }
+    } else if (!mono.length) {
+      lines.push("With the monotonic columns removed there is no delta encoding left to destroy, so sorting is now unambiguously beneficial: " +
+        kbOf(base.enc.best) + " to " + kbOf(res.enc.best) + ", " +
+        Math.round((1 - res.enc.best / base.enc.best) * 100) +
+        "% smaller. This is the same sort that made the full table worse.");
+    }
+    $("en-note").textContent = lines.join("\n\n");
+  }
+
+  ["en-sort", "en-cols"].forEach(function (id) { $(id).addEventListener("change", render); });
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — row-group pruning
+   ============================================================ */
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+
+  var PREDS = [
+    { id:"gb",  lab:"country = 'GB'",           col:"country",      op:"eq", val:"GB" },
+    { id:"amt", lab:"amount_cents > 400000",    col:"amount_cents", op:"gt", val:400000 },
+    { id:"ts",  lab:"ts_ms > (most recent 10%)",col:"ts_ms",        op:"gt", val:DE8.rows[Math.floor(DE8.N * 0.9)].ts_ms },
+    { id:"uid", lab:"user_id < 5000",           col:"user_id",      op:"lt", val:5000 }
+  ];
+
+  var sel = $("pr-pred");
+  PREDS.forEach(function (p) {
+    var o = document.createElement("option");
+    o.value = p.id; o.textContent = p.lab;
+    sel.appendChild(o);
+  });
+  sel.value = "amt";
+
+  function matches(r, p) {
+    if (p.op === "eq") return r[p.col] === p.val;
+    if (p.op === "gt") return r[p.col] > p.val;
+    return r[p.col] < p.val;
+  }
+  /* statistics can only prove a group has NO match */
+  function mayContain(st, p) {
+    if (p.op === "eq") return p.val >= st[p.col].min && p.val <= st[p.col].max;
+    if (p.op === "gt") return st[p.col].max > p.val;
+    return st[p.col].min < p.val;
+  }
+
+  var cache = {};
+  function grouped(sortKey, size) {
+    var k = sortKey + "|" + size;
+    if (cache[k]) return cache[k];
+    var rs = DE8.sortBy(DE8.rows, sortKey === "none" ? [] : sortKey.split(","));
+    var gs = [];
+    for (var i = 0; i < rs.length; i += size) {
+      var chunk = rs.slice(i, i + size), st = {};
+      DE8.COLS.forEach(function (c) {
+        var mn = chunk[0][c.n], mx = chunk[0][c.n];
+        for (var j = 1; j < chunk.length; j++) {
+          var v = chunk[j][c.n];
+          if (v < mn) mn = v;
+          if (v > mx) mx = v;
+        }
+        st[c.n] = { min: mn, max: mx };
+      });
+      /* bytes per column for this group, measured */
+      var bytes = {};
+      DE8.COLS.forEach(function (c) {
+        bytes[c.n] = DE8.encodeCol(chunk.map(function (r) { return r[c.n]; }), c.t).best;
+      });
+      gs.push({ n: chunk.length, stats: st, bytes: bytes, rows: chunk });
+    }
+    cache[k] = { groups: gs, rows: rs, csv: DE8.csvBytes(rs, DE8.COLS) };
+    return cache[k];
+  }
+
+  function strip(gs, hit, p) {
+    var W = 700, H = 88, L = 8;
+    var n = gs.length, gw = (W - L - 12) / n;
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Row groups, showing which are read and which are skipped">'];
+    svg.push('<text x="' + L + '" y="11" font-size="10" font-weight="700" fill="#7C8B99">ROW GROUPS &middot; SOLID = MUST BE READ, HATCHED = PROVED EMPTY AND SKIPPED</text>');
+    gs.forEach(function (g, i) {
+      var x = L + i * gw, read = hit[i];
+      var real = 0;
+      for (var j = 0; j < g.rows.length; j++) if (matches(g.rows[j], p)) real++;
+      svg.push('<rect x="' + (x + 0.6).toFixed(1) + '" y="20" width="' + Math.max(1, gw - 1.6).toFixed(1) +
+        '" height="30" fill="' + (read ? "#20456A" : "#E4E9ED") + '" stroke="' + (read ? "#20456A" : "#CFD8E0") + '"/>');
+      if (read && real > 0) {
+        var h = Math.max(2, real / g.rows.length * 30);
+        svg.push('<rect x="' + (x + 0.6).toFixed(1) + '" y="' + (50 - h).toFixed(1) + '" width="' +
+          Math.max(1, gw - 1.6).toFixed(1) + '" height="' + h.toFixed(1) + '" fill="#E0699F"/>');
+      }
+      if (n <= 20) {
+        svg.push('<text x="' + (x + gw / 2).toFixed(1) + '" y="63" font-size="9" fill="#7C8B99" text-anchor="middle">' + (i + 1) + '</text>');
+      }
+    });
+    svg.push('<rect x="' + L + '" y="72" width="9" height="9" fill="#E0699F"/>');
+    svg.push('<text x="' + (L + 13) + '" y="81" font-size="10" fill="#54677A">pink height is the share of that group that genuinely matches</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var p = PREDS.filter(function (x) { return x.id === sel.value; })[0];
+    var sortKey = $("pr-sort").value;
+    var size = +$("pr-size").value;
+    var proj = +$("pr-proj").value;
+
+    $("pr-proj-o").textContent = proj + " of 7";
+
+    var g = grouped(sortKey, size);
+    var hit = g.groups.map(function (gr) { return mayContain(gr.stats, p); });
+    var read = hit.filter(Boolean).length;
+
+    /* project the first `proj` columns, always including the predicate column */
+    var names = DE8.COLS.slice(0, proj).map(function (c) { return c.n; });
+    if (names.indexOf(p.col) < 0) names.push(p.col);
+
+    var bytes = 0;
+    g.groups.forEach(function (gr, i) {
+      if (!hit[i]) return;
+      names.forEach(function (n) { bytes += gr.bytes[n]; });
+    });
+
+    var real = 0;
+    for (var i = 0; i < g.rows.length; i++) if (matches(g.rows[i], p)) real++;
+    var rowsRead = g.groups.reduce(function (a, gr, i) { return a + (hit[i] ? gr.n : 0); }, 0);
+
+    $("pr-groups").textContent = read + " / " + g.groups.length;
+    $("pr-groups-sub").textContent = rowsRead.toLocaleString() + " rows touched";
+    $("pr-sel").textContent = (real / DE8.N * 100).toFixed(2) + "%";
+    $("pr-csv").textContent = kbOf(g.csv);
+    $("pr-col").textContent = kbOf(bytes);
+    $("pr-col-sub").textContent = names.length + " columns, " + read + " groups";
+    $("pr-red").textContent = (g.csv / bytes).toFixed(1) + "x";
+
+    $("pr-canvas").innerHTML = strip(g.groups, hit, p);
+
+    var lines = [];
+    lines.push("Predicate " + p.lab + " genuinely matches " + real.toLocaleString() + " of " +
+      DE8.N.toLocaleString() + " rows (" + (real / DE8.N * 100).toFixed(2) + "%). With rows " +
+      (sortKey === "none" ? "in insertion order" : "sorted by " + sortKey) + " and groups of " +
+      size.toLocaleString() + ", statistics rule out " + (g.groups.length - read) + " of " +
+      g.groups.length + " groups, so " + rowsRead.toLocaleString() +
+      " rows are touched and " + kbOf(bytes) + " is read against " + kbOf(g.csv) + " for a CSV full scan.");
+
+    if (read === g.groups.length) {
+      lines.push("Nothing was pruned. Every group's min/max for " + p.col +
+        " spans a range that overlaps the predicate, so no group can be proved empty \u2014 even though " +
+        (100 - real / DE8.N * 100).toFixed(1) + "% of rows do not match. The statistics are present and correct and completely useless, because the data is not clustered on this column. " +
+        (sortKey === "none" ? "Sort by " + p.col + " and watch this collapse." :
+         "You sorted by " + sortKey + ", which helps predicates on " + sortKey + " and nothing else."));
+    } else {
+      lines.push("Pruning cut the work to " + Math.round(rowsRead / DE8.N * 100) +
+        "% of the table. Note the floor: matching rows occupy at least " +
+        (real / DE8.N * 100).toFixed(2) +
+        "% of the data, so no amount of pruning can go below that \u2014 statistics reduce work toward the true selectivity and never past it.");
+      if (sortKey === "none" && p.col === "ts_ms") {
+        lines.push("This pruned well without any explicit sort, because rows arrived in timestamp order and are therefore already clustered on it. That free clustering on ingestion time is the real reason partitioning by date is so effective, and why it is the first partitioning scheme to reach for.");
+      }
+    }
+
+    if (proj < 4) {
+      lines.push("Projecting " + names.length + " of 7 columns contributes the rest of the saving: the columns not named are never fetched from the object store at all. Raise the projection slider to see the benefit erode \u2014 at all seven columns a columnar layout is doing nothing for you but decoding work.");
+    }
+    $("pr-note").textContent = lines.join("\n\n");
+  }
+
+  ["pr-pred", "pr-sort", "pr-size", "pr-proj"].forEach(function (id) {
+    $(id).addEventListener("input", render);
+    $(id).addEventListener("change", render);
+  });
+  render();
+})();
+
+initChapter("08-file-formats.html");
+</script>
+</body>
+</html>

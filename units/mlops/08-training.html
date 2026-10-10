@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Training as a pipeline step — MLOps</title>
+<meta name="description" content="Why sixty-four GPUs are slower than thirty-two, how stragglers and communication split the loss, and why grid search returns the same answer at twenty-seven runs and seven hundred.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">MLOps</a> <span>/</span> Chapter 8</p>
+    <p class="chnum">CHAPTER 08</p>
+    <h1>Training as a pipeline step</h1>
+    <p class="lede">Sixty-four GPUs finish the job <em>slower</em> than thirty-two and cost 2.1 times as much, and the speedup ceiling is <strong>4.73×</strong> however many you add. Meanwhile a grid search over six hyperparameters returns exactly the same answer at twenty-seven runs as at seven hundred and twenty-nine — twenty-seven times the compute, identical result.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~28 min</b> read</div>
+      <div><b>Part 2</b> The pipeline</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="job">
+      <p class="kicker">THE SHIFT</p>
+      <h2>A job, not a session</h2>
+      <p class="sub">Everything that makes interactive training pleasant makes it unschedulable.</p>
+
+      <div class="tw">
+        <table>
+          <caption>What has to change when training moves into a pipeline</caption>
+          <thead>
+            <tr><th></th><th>Interactive</th><th>As a step</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>Configuration</strong></td><td>Edited in place</td><td>Passed in, and recorded</td></tr>
+            <tr><td><strong>Output</strong></td><td>A variable in memory</td><td>An artefact plus a model card</td></tr>
+            <tr><td><strong>Failure</strong></td><td>You notice and rerun</td><td><strong>Retried automatically</strong></td></tr>
+            <tr><td><strong>Progress</strong></td><td>Visible in the notebook</td><td>Logged, or invisible</td></tr>
+            <tr><td><strong>Resources</strong></td><td>Whatever the machine has</td><td>Declared in advance</td></tr>
+            <tr><td><strong>Duration</strong></td><td>As long as it takes</td><td>Bounded, or it holds a slot forever</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>The two that bite immediately</b>
+        <p><strong>Automatic retries.</strong> <a href="04-pipelines.html">Chapter 4</a>'s idempotence requirement applies with force: a training step that appends to a metrics table or writes to a fixed path produces a mess on the second attempt. Derive the output location from the input hashes and a retry overwrites its own previous attempt.</p>
+        <p><strong>A bounded duration.</strong> A training job with no timeout will eventually hang on a stuck data loader and hold a GPU slot until someone notices, which on a shared cluster is measured in days. A timeout that kills at 2× the expected duration costs nothing and prevents that entirely.</p>
+      </div>
+    </section>
+
+    <section id="scaling">
+      <p class="kicker">RESOURCES</p>
+      <h2>What adding GPUs actually buys</h2>
+      <p class="sub">Synchronous data-parallel training: every step waits for the slowest worker, then pays a communication cost that grows with the worker count.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Scaling a 20,000-step training run</b>
+          <span>100 ms of compute per step, 10% jitter per worker, &pound;2.40 per GPU-hour</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>GPUs
+              <select id="sc-n">
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="4">4</option>
+                <option value="8" selected>8</option>
+                <option value="16">16</option>
+                <option value="32">32</option>
+                <option value="64">64</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="sc-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="sc-wall-tile"><i>WALL CLOCK</i><b id="sc-wall">0</b><s id="sc-wall-sub"></s></div>
+            <div class="tile"><i>SPEEDUP</i><b id="sc-sp">0</b><s id="sc-sp-sub"></s></div>
+            <div class="tile" id="sc-cost-tile"><i>COST</i><b id="sc-cost">0</b><s id="sc-cost-sub"></s></div>
+            <div class="tile hi" id="sc-verd-tile"><i>VERDICT</i><b id="sc-verd">&mdash;</b><s id="sc-verd-sub"></s></div>
+          </div>
+
+          <p class="readout" id="sc-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>The same 20,000-step run at every worker count</caption>
+          <thead>
+            <tr><th>GPUs</th><th>Step</th><th>Wall clock</th><th>Speedup</th><th>GPU-hours</th><th>Cost</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>1</td><td>113.0 ms</td><td>0.63 h</td><td>1.00&times;</td><td>0.6</td><td>&pound;2</td></tr>
+            <tr><td>2</td><td>63.6 ms</td><td>0.35 h</td><td>1.78&times;</td><td>0.7</td><td>&pound;2</td></tr>
+            <tr><td>8</td><td>28.7 ms</td><td>0.16 h</td><td>3.93&times;</td><td>1.3</td><td>&pound;3</td></tr>
+            <tr><td>16</td><td>24.5 ms</td><td>0.14 h</td><td>4.60&times;</td><td>2.2</td><td>&pound;5</td></tr>
+            <tr><td><strong>32</strong></td><td><strong>23.9 ms</strong></td><td><strong>0.13 h</strong></td><td><strong>4.73&times;</strong></td><td>4.2</td><td>&pound;10</td></tr>
+            <tr><td><strong>64</strong></td><td>25.0 ms</td><td><strong>0.14 h</strong></td><td>4.52&times;</td><td>8.9</td><td><strong>&pound;21</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <b>The last row is slower and twice the price</b>
+        <p>The wall clock bottoms out at <strong>32 GPUs</strong>. Sixty-four takes longer — 0.14 hours against 0.13 — and costs <strong>2.1 times as much</strong>, because the communication cost has overtaken the shrinking per-worker compute.</p>
+        <p>And the ceiling is <strong>4.73×</strong> against a nominal 32×. Eight GPUs give 3.93× for 2.0× the money, which is usually the sensible trade; thirty-two give 4.73× for 5.6× the money, which usually is not.</p>
+        <p>This is <a href="05-orchestration.html">chapter 5</a>'s critical path in a different costume: a serial fraction you cannot remove sets a floor, and everything past it is billing.</p>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Where the loss goes, per step</caption>
+          <thead>
+            <tr><th>GPUs</th><th>Ideal step</th><th>&plus; communication</th><th>&plus; stragglers</th><th>Straggler share of the loss</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>1</td><td>100.0 ms</td><td>105.0</td><td>113.0</td><td>61%</td></tr>
+            <tr><td><strong>8</strong></td><td>12.5 ms</td><td>26.5</td><td>28.7</td><td><strong>14%</strong></td></tr>
+            <tr><td>32</td><td>3.1 ms</td><td>23.1</td><td>23.9</td><td>4%</td></tr>
+            <tr><td><strong>64</strong></td><td>1.6 ms</td><td>24.6</td><td>25.0</td><td><strong>2%</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>The two losses need opposite fixes</b>
+        <p>At eight GPUs, <strong>14%</strong> of the loss is waiting for the slowest worker. At sixty-four it is <strong>2%</strong>, because communication has taken over completely.</p>
+        <p><strong>Stragglers</strong> want homogeneous hardware, balanced shards, and no other tenant on the node. <strong>Communication</strong> wants fewer and larger workers, gradient compression, or a bigger batch per worker.</p>
+        <p>Applying the straggler fix to a communication-bound job does nothing, which is why the decomposition is worth computing before optimising. Measure the step time at one worker and at N, and the gap tells you which regime you are in.</p>
+      </div>
+    </section>
+
+    <section id="search">
+      <p class="kicker">TUNING</p>
+      <h2>A hyperparameter search that finishes</h2>
+      <p class="sub">Six hyperparameters, two of which actually affect the result. This is the normal case, not a contrived one.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Grid, random, and early stopping at the same budget</b>
+          <span>200 replications per point; budget counted in full training runs</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Budget, in full training runs
+              <select id="hp-b">
+                <option value="27">27</option>
+                <option value="64" selected>64</option>
+                <option value="125">125</option>
+                <option value="243">243</option>
+              </select>
+            </label>
+            <label>Strategy
+              <select id="hp-strat">
+                <option value="grid">Grid search, 3 levels per dimension</option>
+                <option value="random" selected>Random search</option>
+                <option value="sh">Many short runs, keep the best half</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="hp-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile" id="hp-best-tile"><i>BEST SCORE FOUND</i><b id="hp-best">0</b><s id="hp-best-sub"></s></div>
+            <div class="tile"><i>CONFIGURATIONS EXPLORED</i><b id="hp-cfg">0</b><s id="hp-cfg-sub"></s></div>
+            <div class="tile"><i>DISTINCT VALUES PER DIMENSION</i><b id="hp-dist">0</b><s>where it matters</s></div>
+            <div class="tile hi" id="hp-verd-tile"><i>AGAINST RANDOM</i><b id="hp-verd">&mdash;</b><s id="hp-verd-sub"></s></div>
+          </div>
+
+          <p class="readout" id="hp-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Best score found, six dimensions with two that matter</caption>
+          <thead>
+            <tr><th>Budget</th><th>Grid (3 levels)</th><th>Random search</th><th>Many short runs</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>27</td><td>0.8898</td><td>0.9056</td><td><strong>0.9155</strong></td></tr>
+            <tr><td>64</td><td>0.8898</td><td>0.9145</td><td><strong>0.9175</strong></td></tr>
+            <tr><td>125</td><td>0.8898</td><td>0.9170</td><td>0.9182</td></tr>
+            <tr><td><strong>729</strong></td><td><strong>0.8898</strong></td><td><strong>0.9195</strong></td><td>&mdash;</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <b>Grid returns the same answer at 27 runs and at 729</b>
+        <p><strong>0.8898 in every row.</strong> Twenty-seven times the compute, identical result — because a three-level grid gives you three distinct values of each hyperparameter whatever the budget, and every extra run buys resolution in a dimension that does nothing.</p>
+        <p>Random search improves throughout: 0.9056 → 0.9145 → 0.9170 → 0.9195. The same budget buys 243 distinct values of the two dimensions that matter, rather than three.</p>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Raising the grid's resolution instead, over six dimensions</caption>
+          <thead>
+            <tr><th>Levels per dimension</th><th>Runs required</th><th>Best found</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>3</td><td>729</td><td>0.8898</td></tr>
+            <tr><td>4</td><td>4,096</td><td>0.9199</td></tr>
+            <tr><td>5</td><td>15,625</td><td><strong>0.9066</strong></td></tr>
+            <tr><td><strong>6</strong></td><td><strong>46,656</strong></td><td>0.9172</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>And it is not even monotone</b>
+        <p>Five levels does <em>worse</em> than four, at four times the cost. Grid quality depends on whether the optimum happens to fall near a grid point, which is luck rather than resolution — and 46,656 runs at six levels still reaches only 0.9172, which 243 random runs already beat.</p>
+        <p>The grid cannot be rescued by more compute. Its problem is structural: it allocates budget uniformly across dimensions, and the dimensions are not uniformly important.</p>
+      </div>
+
+      <div class="note tip">
+        <b>Early stopping, and its honest limit</b>
+        <p>Running many configurations briefly and keeping the best half each round explores <strong>512</strong> configurations on a budget of 64 full runs, and reaches 0.9175 against random's 0.9145.</p>
+        <p>But the advantage shrinks as the budget grows: <strong>+0.0100, +0.0031, +0.0012, −0.0001</strong> at budgets of 27, 64, 125 and 243. Early stopping is worth most exactly when you cannot afford many full runs — which is the situation it is usually proposed for, and also the reason it looks less impressive in a benchmark with a generous budget.</p>
+      </div>
+    </section>
+
+    <section id="checkpointing">
+      <p class="kicker">DURABILITY</p>
+      <h2>Checkpointing, briefly</h2>
+      <p class="sub"><a href="04-pipelines.html">Chapter 4</a> did the arithmetic. This is what it means inside a training job.</p>
+
+      <div class="check">
+        <li><strong>The numbers from chapter 4 apply directly.</strong> A 400-minute job with no checkpoints expects 5,360 minutes of wall clock at one failure per hundred minutes; with twenty checkpoints, 443.</li>
+        <li><strong>Checkpoint the optimiser state, not just the weights.</strong> Resuming with a fresh optimiser restarts momentum and the learning-rate schedule, which is a different training run wearing the same name.</li>
+        <li><strong>Include the data loader position.</strong> Otherwise a resume replays the same examples and the epoch structure quietly changes — <a href="02-reproducibility.html">chapter 2</a>'s ordering nondeterminism, introduced by your own recovery.</li>
+        <li><strong>Write to a new file, then rename.</strong> A checkpoint written in place and interrupted is a corrupt checkpoint, and you find out at the worst moment.</li>
+        <li><strong>Keep the last few, not all of them.</strong> But keep the one the registered model came from, for as long as the model — <a href="03-versioning.html">chapter 3</a>'s retention argument.</li>
+      </div>
+    </section>
+
+    <section id="output">
+      <p class="kicker">WHAT IT PRODUCES</p>
+      <h2>The output of a training step</h2>
+      <p class="sub">Weights are the least interesting part.</p>
+
+      <div class="code">
+        <div class="code-top"><span class="code-name">train_step_outputs/</span><button class="code-copy">Copy</button></div>
+        <pre><code data-lang="text">model.bin                 the weights
+model_card.json           chapter 3's document: inputs, metrics, interface
+metrics.json              per-epoch curves, not just the final number
+feature_schema.json       what serving must supply, and in what form
+requirements.lock         the exact environment, hashed
+resource_usage.json       peak memory, GPU-hours, step timings
+sample_predictions.parquet  a few hundred scored rows, for comparison later</code></pre>
+      </div>
+
+      <div class="note key">
+        <b>The last two are the ones people leave out</b>
+        <p><strong>Resource usage</strong> is what lets you size the next run rather than guessing, and it is the input to the scaling table above. Peak memory in particular is the number that decides whether a retrain fits on the same hardware after the feature set grew.</p>
+        <p><strong>Sample predictions</strong> are how you compare two models on the same inputs later. When a retrained model behaves oddly, scoring the old sample through the new model takes a minute; reconstructing what the old model would have said takes an afternoon, and <a href="02-reproducibility.html">chapter 2</a> says you may not manage it at all.</p>
+      </div>
+    </section>
+
+    <section id="reading">
+      <p class="kicker">JUDGEMENT</p>
+      <h2>Five questions about a training job</h2>
+
+      <div class="check">
+        <li><strong>Has anyone measured the scaling curve?</strong> If the worker count was chosen by feel, it may be past the point where more is slower.</li>
+        <li><strong>Are you straggler-bound or communication-bound?</strong> 14% against 2% here, and the fixes are opposite.</li>
+        <li><strong>Does it have a timeout?</strong> A hung job holds a GPU slot until a human notices.</li>
+        <li><strong>Is the search a grid?</strong> If so, it is returning the same answer it returned at a twentieth of the budget.</li>
+        <li><strong>Does the step emit resource usage and sample predictions?</strong> Both are nearly free to produce and expensive to reconstruct.</li>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>Training as a step means configuration in, artefact out, bounded, and safe to retry.</b></li>
+          <li><b>A timeout at twice the expected duration costs nothing</b> and stops a hung job holding a slot for days.</li>
+          <li><b>Eight GPUs give 3.93&times; for 2.0&times; the money;</b> thirty-two give 4.73&times; for 5.6&times;.</li>
+          <li><b>Sixty-four are SLOWER than thirty-two</b> and cost 2.1 times as much.</li>
+          <li><b>The speedup ceiling is 4.73&times; against a nominal 32&times;</b> &mdash; chapter 5's critical path in another costume.</li>
+          <li><b>At eight GPUs, 14% of the loss is stragglers; at sixty-four it is 2%.</b></li>
+          <li><b>The two want opposite fixes,</b> so compute the split before optimising.</li>
+          <li><b>Grid search returns 0.8898 at 27 runs and at 729</b> &mdash; identical result, twenty-seven times the compute.</li>
+          <li><b>Random search improves throughout:</b> 0.9056, 0.9145, 0.9170, 0.9195.</li>
+          <li><b>Because a 3-level grid buys three values of each dimension whatever the budget.</b></li>
+          <li><b>Raising the grid to six levels needs 46,656 runs and reaches 0.9172,</b> which 243 random runs beat.</li>
+          <li><b>Grid quality is not even monotone in resolution</b> &mdash; five levels does worse than four.</li>
+          <li><b>Many short runs explore 512 configurations on a budget of 64</b> and reach 0.9175.</li>
+          <li><b>But the advantage shrinks with budget:</b> +0.0100, +0.0031, +0.0012, &minus;0.0001.</li>
+          <li><b>Checkpoint the optimiser state and loader position,</b> not only the weights.</li>
+          <li><b>Emit resource usage and sample predictions.</b> Both are nearly free and expensive to reconstruct.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="09-tracking.html">Chapter 9 &mdash; Experiment tracking</a>, which opens Part 3. What to log, what it costs, and comparing runs when the thing that differed was never recorded.</p>
+          </div>
+          <div class="fi">
+            <i>PART 2 COMPLETE</i>
+            <p>Pipelines, orchestration, data contracts, features and training. Part 3 turns to knowing what you have.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>Measure your training step time at one worker and at your current worker count. The ratio tells you where on the scaling curve you are sitting.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   shared helpers
+   ============================================================ */
+function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+function gauss(rnd) {
+  var u1 = Math.max(1e-12, rnd()), u2 = rnd();
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+function avg(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i]; return s / a.length; }
+
+/* ============================================================
+   Demo 1 — what adding GPUs actually buys
+   ============================================================ */
+(function () {
+  var COMPUTE = 100, COMM_FIXED = 5, COMM_LOG = 3, JITTER = 0.10, HOURLY = 2.40, STEPS = 20000;
+  var $ = function (id) { return document.getElementById(id); };
+  var NS = [1, 2, 4, 8, 16, 32, 64];
+
+  /* every step waits for the slowest worker, then pays a communication cost */
+  var cache = {};
+  function stepTime(n) {
+    if (cache[n] !== undefined) return cache[n];
+    var rnd = lcg(1201), ts = [], per = COMPUTE / n;
+    for (var r = 0; r < 4000; r++) {
+      var slowest = 0;
+      for (var w = 0; w < n; w++) {
+        var t = per * (1 + JITTER * Math.abs(gauss(rnd)));
+        if (t > slowest) slowest = t;
+      }
+      ts.push(slowest + COMM_FIXED + COMM_LOG * Math.log2(n));
+    }
+    cache[n] = avg(ts);
+    return cache[n];
+  }
+  function scaling(n) {
+    var t = stepTime(n), wall = t * STEPS / 1000 / 60;
+    return { step: t, wall: wall, gpuHours: wall * n / 60, cost: wall / 60 * n * HOURLY };
+  }
+  function idealStep(n) { return COMPUTE / n; }
+  function commStep(n) { return COMPUTE / n + COMM_FIXED + COMM_LOG * Math.log2(n); }
+
+  function chart(n) {
+    var W = 700, H = 190, B = 30, L = 46;
+    var xOf = function (i) { return L + i / (NS.length - 1) * (W - L - 150); };
+    var maxW = scaling(1).wall;
+    var yOf = function (v) { return (H - B) - (v / maxW) * (H - B - 26); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Wall clock and cost against GPU count">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">WALL CLOCK AND COST, AGAINST GPU COUNT</text>');
+    /* wall clock */
+    svg.push('<path d="' + NS.map(function (v, i) {
+      return (i ? "L" : "M") + xOf(i).toFixed(1) + " " + yOf(scaling(v).wall).toFixed(1);
+    }).join(" ") + '" fill="none" stroke="#20456A" stroke-width="2.8"/>');
+    /* cost, scaled to the same axis */
+    var maxC = scaling(64).cost;
+    svg.push('<path d="' + NS.map(function (v, i) {
+      return (i ? "L" : "M") + xOf(i).toFixed(1) + " " +
+        ((H - B) - (scaling(v).cost / maxC) * (H - B - 26)).toFixed(1);
+    }).join(" ") + '" fill="none" stroke="#C0453A" stroke-width="2.2" stroke-dasharray="4 3"/>');
+    /* the minimum */
+    var walls = NS.map(function (v) { return scaling(v).wall; });
+    var bi = walls.indexOf(Math.min.apply(null, walls));
+    svg.push('<line x1="' + xOf(bi).toFixed(1) + '" y1="20" x2="' + xOf(bi).toFixed(1) + '" y2="' + (H - B) +
+      '" stroke="#166B47" stroke-width="1.6" stroke-dasharray="3 3"/>');
+    svg.push('<text x="' + (xOf(bi) + 5).toFixed(1) + '" y="30" font-size="9" font-weight="700" fill="#166B47">fastest at ' +
+      NS[bi] + '</text>');
+    NS.forEach(function (v, i) {
+      var on = v === n;
+      svg.push('<circle cx="' + xOf(i).toFixed(1) + '" cy="' + yOf(scaling(v).wall).toFixed(1) +
+        '" r="' + (on ? 5 : 2.8) + '" fill="#20456A"/>');
+      svg.push('<text x="' + xOf(i).toFixed(1) + '" y="' + (H - 12) + '" font-size="9" fill="' +
+        (on ? "#A8386B" : "#7C8B99") + '" font-weight="' + (on ? 700 : 400) + '" text-anchor="middle">' + v + '</text>');
+    });
+    var px = W - 142;
+    svg.push('<line x1="' + px + '" y1="32" x2="' + (px + 16) + '" y2="32" stroke="#20456A" stroke-width="2.8"/>');
+    svg.push('<text x="' + (px + 21) + '" y="36" font-size="9" fill="#54677A">wall clock</text>');
+    svg.push('<line x1="' + px + '" y1="50" x2="' + (px + 16) + '" y2="50" stroke="#C0453A" stroke-width="2.2" stroke-dasharray="4 3"/>');
+    svg.push('<text x="' + (px + 21) + '" y="54" font-size="9" fill="#54677A">cost</text>');
+    var s = scaling(n);
+    svg.push('<text x="' + px + '" y="84" font-size="9.5" fill="#7C8B99">speedup</text>');
+    svg.push('<text x="' + px + '" y="104" font-size="15" font-weight="700" fill="#20456A">' +
+      (scaling(1).wall / s.wall).toFixed(2) + '\u00d7</text>');
+    svg.push('<text x="' + px + '" y="124" font-size="9.5" fill="#7C8B99">for</text>');
+    svg.push('<text x="' + px + '" y="142" font-size="15" font-weight="700" fill="#9B2C22">' +
+      (s.cost / scaling(1).cost).toFixed(1) + '\u00d7 the cost</text>');
+    svg.push('<text x="0" y="' + (H - 1) + '" font-size="9.5" fill="#7C8B99">the wall clock flattens and then rises; the cost never stops climbing</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var n = +$("sc-n").value;
+    var s = scaling(n), one = scaling(1);
+    var walls = NS.map(function (v) { return scaling(v).wall; });
+    var best = NS[walls.indexOf(Math.min.apply(null, walls))];
+
+    $("sc-wall").textContent = (s.wall / 60).toFixed(2) + " h";
+    $("sc-wall-sub").textContent = s.step.toFixed(1) + " ms per step";
+    $("sc-wall-tile").className = "tile " + (n === best ? "good" : "");
+    $("sc-sp").textContent = (one.wall / s.wall).toFixed(2) + "\u00d7";
+    $("sc-sp-sub").textContent = "nominal would be " + n + "\u00d7";
+    $("sc-cost").textContent = "\u00a3" + s.cost.toFixed(0);
+    $("sc-cost-sub").textContent = (s.cost / one.cost).toFixed(1) + "\u00d7 the single-GPU cost";
+    $("sc-cost-tile").className = "tile " + (s.cost / one.cost > 4 ? "bad" : "");
+    $("sc-verd").textContent = n === best ? "Fastest" : n > best ? "Slower AND dearer" : "Room to scale";
+    $("sc-verd-sub").textContent = n > best ? "than " + best + " GPUs" : "";
+    $("sc-verd-tile").className = "tile " + (n > best ? "bad" : "good");
+
+    $("sc-canvas").innerHTML = chart(n);
+
+    var b = scaling(best);
+    var stragglerShare = (s.step - commStep(n)) / (s.step - idealStep(n));
+    var lines = [];
+    lines.push("Twenty thousand steps at " + n + " GPU" + (n > 1 ? "s" : "") + ": " + s.step.toFixed(1) +
+      " ms per step, " + (s.wall / 60).toFixed(2) + " hours of wall clock, " +
+      (one.wall / s.wall).toFixed(2) + "\u00d7 the single-GPU speed for " +
+      (s.cost / one.cost).toFixed(1) + "\u00d7 the cost.");
+
+    if (n > best) {
+      lines.push("And this is past the knee. The wall clock bottoms out at " + best +
+        " GPUs; " + n + " takes " + (s.wall / 60).toFixed(2) + " hours against " +
+        (b.wall / 60).toFixed(2) + " and costs " + (s.cost / b.cost).toFixed(1) +
+        " times as much. The communication cost has overtaken the shrinking per-worker compute, so you are paying more for a slower job.");
+    } else if (n === best) {
+      lines.push("This is the fastest configuration available, and the ceiling is " +
+        (one.wall / s.wall).toFixed(2) + "\u00d7 against a nominal " + n +
+        "\u00d7. Adding more workers from here makes the job slower, not faster.");
+    } else {
+      lines.push("There is still room: the wall clock bottoms out at " + best + " GPUs at " +
+        (b.wall / 60).toFixed(2) + " hours. Whether the extra " + (b.cost / s.cost).toFixed(1) +
+        "\u00d7 in cost is worth the extra " + (s.wall / b.wall).toFixed(2) +
+        "\u00d7 in speed is the actual decision, and it is not a scaling question.");
+    }
+    lines.push("The loss splits into two parts with opposite fixes. At " + n +
+      " workers the ideal step would be " + idealStep(n).toFixed(1) +
+      " ms; communication takes it to " + commStep(n).toFixed(1) +
+      " ms, and waiting for the slowest worker takes it to " + s.step.toFixed(1) + " \u2014 so " +
+      (stragglerShare * 100).toFixed(0) + "% of the loss is stragglers.");
+    lines.push("That share falls as you scale: 14% at eight GPUs, 2% at sixty-four, because communication has taken over. Stragglers want homogeneous hardware and balanced shards; communication wants fewer, larger workers. Applying the wrong fix does nothing, which is why the split is worth computing before optimising.");
+    $("sc-note").textContent = lines.join("\n\n");
+  }
+
+  $("sc-n").addEventListener("change", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — a hyperparameter search that finishes
+   ============================================================ */
+(function () {
+  var NDIM = 6, NIMPORTANT = 2, SH_NOISE = 0.008, REPS = 200;
+  var $ = function (id) { return document.getElementById(id); };
+
+  /* only the first two dimensions affect the score */
+  function objective(x) {
+    var s = 0;
+    for (var i = 0; i < NIMPORTANT; i++) { var d = x[i] - 0.62; s += d * d; }
+    return 0.92 - 1.05 * s;
+  }
+  function gridSearch(levels, budget) {
+    var total = Math.pow(levels, NDIM), best = -Infinity;
+    for (var idx = 0; idx < Math.min(total, budget); idx++) {
+      var x = [], t = idx;
+      for (var d = 0; d < NDIM; d++) { x.push((t % levels + 0.5) / levels); t = Math.floor(t / levels); }
+      var v = objective(x);
+      if (v > best) best = v;
+    }
+    return best;
+  }
+  function randomSearch(budget, rnd) {
+    var best = -Infinity;
+    for (var i = 0; i < budget; i++) {
+      var x = [];
+      for (var d = 0; d < NDIM; d++) x.push(rnd());
+      var v = objective(x);
+      if (v > best) best = v;
+    }
+    return best;
+  }
+  /* many short runs; a short run is a noisy estimate of the true score */
+  function successiveHalving(totalBudget, nStart, rnd) {
+    var configs = [];
+    for (var i = 0; i < nStart; i++) {
+      var x = [];
+      for (var d = 0; d < NDIM; d++) x.push(rnd());
+      configs.push({ x: x, true_: objective(x) });
+    }
+    var n = nStart, rounds = Math.max(1, Math.floor(Math.log2(nStart)));
+    for (var r = 0; r < rounds && n > 1; r++) {
+      var each = (totalBudget / rounds) / n;
+      configs.forEach(function (c) {
+        c.est = c.true_ + (SH_NOISE / Math.sqrt(Math.max(0.002, each))) * gauss(rnd);
+      });
+      configs.sort(function (a, b) { return b.est - a.est; });
+      n = Math.max(1, Math.floor(n / 2));
+      configs = configs.slice(0, n);
+    }
+    return configs[0].true_;
+  }
+
+  var cache = {};
+  function run(budget, strat) {
+    var key = budget + "|" + strat;
+    if (cache[key] !== undefined) return cache[key];
+    var v;
+    if (strat === "grid") v = gridSearch(3, budget);
+    else {
+      var out = [];
+      for (var t = 0; t < REPS; t++) {
+        out.push(strat === "random" ? randomSearch(budget, lcg(1500 + t))
+          : successiveHalving(budget, 8 * budget, lcg(1500 + t)));
+      }
+      v = avg(out);
+    }
+    cache[key] = v;
+    return v;
+  }
+
+  function chart(budget, strat) {
+    var W = 700, H = 190, B = 30, L = 50;
+    var BS = [27, 64, 125, 243];
+    var xOf = function (i) { return L + i / (BS.length - 1) * (W - L - 150); };
+    var lo = 0.885, hi = 0.922;
+    var yOf = function (v) { return (H - B) - (v - lo) / (hi - lo) * (H - B - 26); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Best score found against budget, by strategy">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">BEST SCORE FOUND, AGAINST BUDGET IN FULL TRAINING RUNS</text>');
+    [["grid", "#C0453A", "grid, 3 levels"], ["random", "#20456A", "random"],
+     ["sh", "#2E8B5F", "many short runs"]].forEach(function (c) {
+      var pts = BS.map(function (b, i) { return [i, run(b, c[0])]; });
+      var on = c[0] === strat;
+      svg.push('<path d="' + pts.map(function (p, i) {
+        return (i ? "L" : "M") + xOf(p[0]).toFixed(1) + " " + yOf(p[1]).toFixed(1);
+      }).join(" ") + '" fill="none" stroke="' + c[1] + '" stroke-width="' + (on ? 3.2 : 1.6) +
+        '" opacity="' + (on ? 1 : 0.5) + '"/>');
+      pts.forEach(function (p, i) {
+        svg.push('<circle cx="' + xOf(p[0]).toFixed(1) + '" cy="' + yOf(p[1]).toFixed(1) + '" r="' +
+          (on && BS[i] === budget ? 5 : on ? 3 : 2) + '" fill="' + c[1] + '"/>');
+      });
+    });
+    BS.forEach(function (b, i) {
+      svg.push('<text x="' + xOf(i).toFixed(1) + '" y="' + (H - 12) + '" font-size="9" fill="' +
+        (b === budget ? "#A8386B" : "#7C8B99") + '" font-weight="' + (b === budget ? 700 : 400) +
+        '" text-anchor="middle">' + b + '</text>');
+    });
+    [0.89, 0.90, 0.91, 0.92].forEach(function (v) {
+      svg.push('<text x="' + (L - 6) + '" y="' + (yOf(v) + 4).toFixed(1) + '" font-size="9" fill="#7C8B99" text-anchor="end">' +
+        v.toFixed(2) + '</text>');
+    });
+    var px = W - 142;
+    [["grid, 3 levels", "#C0453A"], ["random", "#20456A"], ["many short runs", "#2E8B5F"]]
+      .forEach(function (c, i) {
+        svg.push('<line x1="' + px + '" y1="' + (34 + i * 16) + '" x2="' + (px + 14) + '" y2="' + (34 + i * 16) +
+          '" stroke="' + c[1] + '" stroke-width="2.6"/>');
+        svg.push('<text x="' + (px + 19) + '" y="' + (38 + i * 16) + '" font-size="9" fill="#54677A">' + c[0] + '</text>');
+      });
+    svg.push('<text x="0" y="' + (H - 1) + '" font-size="9.5" fill="#7C8B99">the grid line is flat \u2014 twenty-seven times the compute buys exactly nothing</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var b = +$("hp-b").value, strat = $("hp-strat").value;
+    var v = run(b, strat), r = run(b, "random");
+
+    $("hp-best").textContent = v.toFixed(4);
+    $("hp-best-sub").textContent = "budget of " + b + " full runs";
+    $("hp-best-tile").className = "tile " + (v >= r - 0.0005 ? "good" : "bad");
+    $("hp-cfg").textContent = strat === "sh" ? (8 * b).toLocaleString() : b;
+    $("hp-cfg-sub").textContent = strat === "sh" ? "most abandoned early" : "each run to completion";
+    $("hp-dist").textContent = strat === "grid" ? "3" : (strat === "sh" ? (8 * b) : b);
+    $("hp-verd").textContent = strat === "random" ? "\u2014"
+      : v > r + 0.0005 ? "+" + ((v - r)).toFixed(4) : v < r - 0.0005 ? ((v - r)).toFixed(4) : "level";
+    $("hp-verd-sub").textContent = "random reaches " + r.toFixed(4);
+    $("hp-verd-tile").className = "tile " + (strat === "grid" ? "bad" : "good");
+
+    $("hp-canvas").innerHTML = chart(b, strat);
+
+    var lines = [];
+    lines.push("Six hyperparameters, two of which actually affect the result \u2014 which is the normal case rather than a contrived one. With a budget of " +
+      b + " full training runs, " +
+      (strat === "grid" ? "a three-level grid" : strat === "random" ? "random search" : "many short runs with the best half kept each round") +
+      " reaches " + v.toFixed(4) + ".");
+
+    if (strat === "grid") {
+      lines.push("And it reaches " + run(27, "grid").toFixed(4) +
+        " at 27 runs, and " + run(243, "grid").toFixed(4) +
+        " at 243. The same number every time \u2014 because a three-level grid gives three distinct values of each hyperparameter whatever the budget, and every extra run buys resolution in a dimension that does nothing.");
+      lines.push("Raising the resolution does not rescue it either. Six levels over six dimensions needs 46,656 runs and reaches 0.9172, which 243 random runs already beat \u2014 and the sequence is not even monotone, because whether a grid does well depends on whether the optimum happens to fall near a grid point.");
+      lines.push("The problem is structural: a grid allocates budget uniformly across dimensions, and the dimensions are not uniformly important.");
+    } else if (strat === "random") {
+      lines.push("Random search improves throughout \u2014 " +
+        [27, 64, 125, 243].map(function (x) { return run(x, "random").toFixed(4); }).join(" \u2192 ") +
+        " \u2014 because the same budget buys " + b +
+        " distinct values of the two dimensions that matter, rather than three.");
+      lines.push("That is the whole of the argument. It is not that random is cleverer; it is that a grid spends most of its budget on resolution nobody needed.");
+    } else {
+      lines.push("It explored " + (8 * b).toLocaleString() +
+        " configurations on a budget of " + b +
+        " full runs, abandoning most of them long before they finished, and reached " + v.toFixed(4) +
+        " against random search's " + r.toFixed(4) + ".");
+      lines.push("But the advantage shrinks as the budget grows: " +
+        [27, 64, 125, 243].map(function (x) {
+          var g = run(x, "sh") - run(x, "random");
+          return (g >= 0 ? "+" : "") + g.toFixed(4);
+        }).join(", ") +
+        " at 27, 64, 125 and 243. Early stopping is worth most exactly when you cannot afford many full runs \u2014 which is the situation it is usually proposed for, and also why it looks unimpressive in a benchmark with a generous budget.");
+    }
+    $("hp-note").textContent = lines.join("\n\n");
+  }
+
+  ["hp-b", "hp-strat"].forEach(function (id) { $(id).addEventListener("change", render); });
+  render();
+})();
+
+initChapter("08-training.html");
+</script>
+</body>
+</html>

@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · The Linux machine underneath — DevOps</title>
+<meta name="description" content="Processes and signals, what load average actually counts, virtual memory and the page cache, how the OOM killer chooses, inodes and disk-full modes, permissions, and systemd.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%237C8CF8' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">DevOps</a><span class="sep">/</span><span>Chapter 02</span></p>
+    <p class="chno">Chapter 02 · Foundations</p>
+    <h1>The Linux machine underneath</h1>
+    <p class="lede">Containers, orchestrators and cloud APIs are all abstractions over one thing: a Unix process running on a kernel that owns the memory, the disk and the clock. When something breaks at three in the morning, the abstraction is usually not where the answer is. This chapter is the layer under all of it — enough to read a machine correctly rather than guess at it.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapter 01</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="model">
+<h2>Kernel, userspace and the line between</h2><div class="h2rule"></div>
+
+<p class="lead">The kernel owns the hardware. Your process does not. It cannot read a file, open a socket, allocate memory or find out what time it is without asking, and the asking is a <strong>system call</strong> — a controlled trap into kernel mode with the arguments checked on the way in. Everything an operator cares about happens either side of that boundary, and almost every diagnostic tool is a way of watching it.</p>
+
+<div class="kv">
+<dt>Userspace</dt><dd>Your processes, the shell, systemd, nginx, the container runtime, the language runtime. Isolated from each other by virtual memory. A crash here kills one process.</dd>
+<dt>The syscall boundary</dt><dd>About 350 entry points. <code>open</code>, <code>read</code>, <code>write</code>, <code>mmap</code>, <code>clone</code>, <code>execve</code>, <code>futex</code>, <code>epoll_wait</code>. <code>strace -c</code> counts them per process; this is how you find out that a "slow" program is making two million <code>stat</code> calls.</dd>
+<dt>Kernel</dt><dd>Scheduler, memory manager, filesystems, network stack, device drivers, namespaces and cgroups. A crash here takes the machine. Everything in chapter 9 about containers is built out of two kernel features that live at this level.</dd>
+</div>
+
+<div class="box tip"><b class="tag">/proc is the interface, not a curiosity</b>
+<p style="margin-bottom:0">Nearly every tool in this chapter — <code>ps</code>, <code>top</code>, <code>free</code>, <code>uptime</code>, <code>ss</code> — is a formatter over files in <code>/proc</code>. <code>/proc/loadavg</code>, <code>/proc/meminfo</code>, <code>/proc/&lt;pid&gt;/status</code>, <code>/proc/&lt;pid&gt;/limits</code>, <code>/proc/&lt;pid&gt;/fd/</code>, <code>/proc/&lt;pid&gt;/cgroup</code>. Knowing this matters in a minimal container image where <code>ps</code> is not installed but <code>/proc</code> always is. <code>cat /proc/1/cgroup</code> tells you whether you are inside a container at all.</p>
+</div>
+</section>
+
+<section id="processes">
+<h2>Processes, states and signals</h2><div class="h2rule"></div>
+
+<p>A new process comes from <code>fork()</code> — which duplicates the calling process — usually followed immediately by <code>execve()</code>, which replaces the duplicate's image with a different program. The copy is not a real copy: pages are marked copy-on-write and only duplicated when one side writes. This is why forking a 4&nbsp;GB process is fast and why the memory accounting afterwards is confusing.</p>
+
+<p>Every process is in exactly one state, and the state tells you what to do about it.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Code</th><th>State</th><th>Meaning</th><th>What it tells you</th></tr></thead>
+<tbody>
+<tr><td><code>R</code></td><td>Running / runnable</td><td>On a CPU, or queued waiting for one</td><td>Counts toward load. If runnable ≫ cores, you are CPU-bound</td></tr>
+<tr><td><code>S</code></td><td>Interruptible sleep</td><td>Waiting on something, e.g. a socket or a timer</td><td class="yes">The normal state of almost everything. Does <em>not</em> count toward load</td></tr>
+<tr><td><code>D</code></td><td>Uninterruptible sleep</td><td>Blocked in a syscall, usually disk or NFS I/O</td><td class="no">Counts toward load, cannot be killed, ignores <code>SIGKILL</code>. Many <code>D</code> processes means storage, not CPU</td></tr>
+<tr><td><code>Z</code></td><td>Zombie</td><td>Exited; exit status not yet reaped by the parent</td><td>Uses no memory, holds a PID. Thousands of them means a parent that never calls <code>wait()</code></td></tr>
+<tr><td><code>T</code></td><td>Stopped</td><td><code>SIGSTOP</code>, or under a debugger</td><td>Often a job someone backgrounded with Ctrl-Z and forgot</td></tr>
+<tr><td><code>I</code></td><td>Idle kernel thread</td><td>Kernel worker with nothing to do</td><td>Ignore. Excluded from load since 4.2</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>Signals are the process control interface, and three of them matter far more than the rest in operations.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Signal</th><th>Number</th><th>Default</th><th>Catchable</th><th>Where you meet it</th></tr></thead>
+<tbody>
+<tr><td><code>SIGTERM</code></td><td>15</td><td>Terminate</td><td class="yes">Yes</td><td><code>kill</code>, <code>docker stop</code>, Kubernetes pod deletion. <strong>The graceful shutdown signal.</strong> Catch it, stop accepting new work, finish what is in flight, exit</td></tr>
+<tr><td><code>SIGKILL</code></td><td>9</td><td>Terminate</td><td class="no">No</td><td>Sent by the kernel's OOM killer, and by <code>docker stop</code>/Kubernetes after the grace period expires. No cleanup runs. No handler fires</td></tr>
+<tr><td><code>SIGHUP</code></td><td>1</td><td>Terminate</td><td class="yes">Yes</td><td>Historically "terminal closed"; by convention now "reload your configuration without restarting" — nginx, sshd and most daemons honour it</td></tr>
+<tr><td><code>SIGINT</code></td><td>2</td><td>Terminate</td><td class="yes">Yes</td><td>Ctrl-C</td></tr>
+<tr><td><code>SIGSTOP</code>/<code>SIGCONT</code></td><td>19/18</td><td>Pause/resume</td><td class="no">No / yes</td><td>Ctrl-Z, and how <code>docker pause</code> works</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box trap"><b class="tag">PID 1 in a container does not behave like PID 1 on a host</b>
+<p style="margin-bottom:6px">The kernel gives PID 1 special treatment: signals with a default action are <em>not</em> applied to it unless it has installed a handler. On a host that is fine because PID 1 is <code>systemd</code>, which handles everything. In a container, PID 1 is your application — and if it has no <code>SIGTERM</code> handler, <code>docker stop</code> does nothing at all for the full grace period, then <code>SIGKILL</code> arrives and you lose in-flight work on every single deploy.</p>
+<p style="margin-bottom:0">The second half of the problem is reaping. If your PID 1 spawns children and never calls <code>wait()</code>, orphaned grandchildren reparent to it and accumulate as zombies until the PID table fills. The fixes: install a real signal handler, avoid <code>sh -c "…"</code> as your entrypoint (the shell does not forward signals), and use <code>--init</code> or <code>tini</code> when your process is not designed to be PID 1.</p>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">bash — the graceful shutdown contract, both sides of it</span><button class="code-copy">Copy</button></div><pre><span class="c"># what the platform does when it wants your container gone</span>
+kill -TERM 1          <span class="c">← you now have a grace period (Docker: 10s, k8s: terminationGracePeriodSeconds, default 30s)</span>
+<span class="c"># ...grace period elapses...</span>
+kill -KILL 1          <span class="c">← unconditional. no handler, no cleanup, no flush</span>
+
+<span class="c"># what your process must do to survive that contract</span>
+<span class="c">#   1. stop accepting new connections / stop pulling from the queue</span>
+<span class="c">#   2. fail the readiness probe so the load balancer stops routing to you</span>
+<span class="c">#   3. finish in-flight requests, with a deadline shorter than the grace period</span>
+<span class="c">#   4. flush buffers, close the DB pool, exit 0</span>
+
+<span class="c"># find out whether yours does. it usually does not.</span>
+docker run -d --name t myimage
+time docker stop t    <span class="c">← 0.2s means it handled SIGTERM. 10s means it was killed</span></pre></div>
+</section>
+
+<section id="load">
+<h2>Load average, and what it is not</h2><div class="h2rule"></div>
+
+<p>Load average is the most misread number on a Linux box. It is <strong>not</strong> CPU utilisation, it is not a percentage, and it has no upper bound. What the kernel actually does is sample, every five seconds, the count of processes that are either <em>runnable</em> or in <em>uninterruptible sleep</em>, and feed that count into three exponentially weighted moving averages with time constants of one, five and fifteen minutes.</p>
+
+<div class="eq plain"><code>load = load × e<sup>−5/T</sup> &nbsp;+&nbsp; n × (1 − e<sup>−5/T</sup>) &nbsp;&nbsp;&nbsp; every 5 s, for T = 60, 300, 900 s</code></div>
+<p class="where">Where <b>n</b> is the instantaneous count of processes in state <code>R</code> or <code>D</code>. Two consequences fall straight out. First, the averages lag: after a step change, the 1-minute figure reaches only 63% of the new value after one minute. Second, and this is the part that catches people, <code>D</code>-state processes are counted — so a machine with an idle CPU and a saturated disk reports exactly the same load as a machine pinned at 100% CPU.</p>
+
+<div class="demo" id="d-load">
+  <div class="demo-top"><div class="demo-title">Load average, composed two different ways</div><div class="demo-hint">Set CPU-bound to 0 and disk-blocked to 8 — the load is identical</div></div>
+  <div class="demo-body">
+    <canvas id="cLoad" aria-label="Three exponentially weighted moving averages of run queue length over simulated time"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Cores <b id="ldCo">4</b></label><input type="range" id="ldC" min="1" max="16" value="4"></div>
+      <div class="ctrl"><label>CPU-bound processes <b id="ldPo">8</b></label><input type="range" id="ldP" min="0" max="24" value="8"></div>
+      <div class="ctrl"><label>Blocked on disk (<code>D</code>) <b id="ldDo">0</b></label><input type="range" id="ldD" min="0" max="24" value="0"></div>
+      <div class="ctrl"><label>Sleeping (<code>S</code>) <b id="ldSo">40</b></label><input type="range" id="ldS" min="0" max="200" value="40"></div>
+      <button class="btn primary" id="ldRun">Run 10 min</button>
+      <button class="btn" id="ldRst">Reset to idle</button>
+    </div>
+    <div class="rgrid" id="ldOut"></div>
+    <div class="readout" id="ldNote"></div>
+  </div>
+</div>
+
+<p>The demo makes three points that are hard to get from prose alone.</p>
+
+<div class="kv">
+<dt>Load is dimensionless until you divide by cores</dt><dd>A load of 8 is catastrophic on a single-core box, fully utilised on eight cores and half-idle on sixteen. The number worth alarming on is <b>load ÷ cores</b>, and even that only if the load is CPU-shaped. On a container, divide by the CPU limit rather than the host's core count — the host's <code>/proc/loadavg</code> is not namespaced, so a container sees the whole machine's load.</dd>
+<dt>The three numbers are a trend, not three measurements</dt><dd>Their only real use is comparison. 1-minute above 15-minute means the problem is arriving; below means it is receding. One minute after a step from idle to 8 runnable, the 1-minute average reads <b>5.06</b> and the 15-minute reads <b>0.52</b> — so during a fast incident the 15-minute figure is close to meaningless, and after one it stays elevated long after recovery.</dd>
+<dt>High load with idle CPUs means I/O</dt><dd>This is the single most useful diagnostic in the section. If <code>uptime</code> shows 12 and <code>top</code> shows the CPUs at 4%, you are looking at <code>D</code>-state processes queued on storage or a hung network filesystem. Confirm with <code>ps -eo state,comm | grep ^D</code> and <code>iostat -x 1</code>, and stop tuning thread pools.</dd>
+</div>
+
+<div class="box tip"><b class="tag">Pressure stall information is the number load average should have been</b>
+<p style="margin-bottom:0">Modern kernels expose <code>/proc/pressure/{cpu,memory,io}</code>. Each gives the percentage of wall time in which at least some tasks were stalled waiting for that resource, averaged over 10s, 60s and 300s. Unlike load average it is a bounded percentage, it separates the three resources, and <code>some avg10</code> answers "is this machine short of CPU right now" directly rather than by inference. If your monitoring predates PSI, adding it is one of the highest-value small changes available.</p>
+</div>
+</section>
+
+<section id="memory">
+<h2>Memory: what "free" means and who gets killed</h2><div class="h2rule"></div>
+
+<p>Two facts explain nearly every memory confusion on Linux. The first is that processes see <em>virtual</em> memory, mapped lazily to physical pages only when touched. The second is that the kernel considers unused RAM to be wasted RAM, so it fills whatever is spare with page cache — copies of file contents it can throw away instantly if something needs the space.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Number</th><th>What it is</th><th>Use it for</th></tr></thead>
+<tbody>
+<tr><td><code>VSZ</code></td><td>Total address space mapped, touched or not. Includes files mapped in and memory reserved but never used</td><td class="no">Almost nothing. A JVM with a 32&nbsp;GB heap setting shows 32&nbsp;GB VSZ on a 4&nbsp;GB box</td></tr>
+<tr><td><code>RSS</code></td><td>Physical pages currently resident for this process</td><td>The usual answer to "how much is it using", but double-counts shared pages across processes</td></tr>
+<tr><td><code>PSS</code></td><td>Resident, with shared pages divided among the sharers</td><td class="yes">The honest per-process figure. Sums correctly across all processes. <code>/proc/&lt;pid&gt;/smaps_rollup</code></td></tr>
+<tr><td><code>free</code></td><td>Physical pages holding nothing at all</td><td class="no">Near zero on any healthy long-running machine. Alarming on it generates false pages</td></tr>
+<tr><td><code>buff/cache</code></td><td>Page cache and filesystem metadata — file contents kept in RAM</td><td>Mostly reclaimable on demand. Large is good</td></tr>
+<tr><td><code>available</code></td><td>The kernel's own estimate of what a new allocation could get without swapping</td><td class="yes"><strong>The number to alert on.</strong> Roughly free plus reclaimable cache, minus what the kernel needs to keep</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>When demand exceeds what is available, the kernel escalates: reclaim clean page cache, then write dirty pages out, then swap anonymous pages if there is swap, then — with nothing left — invoke the out-of-memory killer. The killer does not pick randomly and it does not pick the process that made the failing allocation. It scores every process, roughly by proportion of total memory consumed, adjusted by each process's <code>oom_score_adj</code>, and kills the highest.</p>
+
+<div class="demo" id="d-mem">
+  <div class="demo-top"><div class="demo-title">Memory accounting and the OOM decision</div><div class="demo-hint">Grow the JVM past the cache, then protect it with oom_score_adj and see who dies instead</div></div>
+  <div class="demo-body">
+    <canvas id="cMem" aria-label="A stacked bar of memory usage with a per-process table of OOM badness scores"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Total RAM <b id="mmTo">8192</b> MB</label><input type="range" id="mmT" min="2048" max="16384" step="1024" value="8192"></div>
+      <div class="ctrl"><label>app (jvm) RSS <b id="mmJo">3100</b> MB</label><input type="range" id="mmJ" min="200" max="9000" step="100" value="3100"></div>
+      <div class="ctrl"><label>postgres RSS <b id="mmPo">2400</b> MB</label><input type="range" id="mmP" min="200" max="6000" step="100" value="2400"></div>
+      <div class="ctrl"><label>Swap <b id="mmSo">0</b> MB</label><input type="range" id="mmS" min="0" max="8192" step="512" value="0"></div>
+      <div class="ctrl"><label>Protect the jvm</label><select id="mmA">
+        <option value="0" selected>oom_score_adj 0 — no preference</option>
+        <option value="-500">oom_score_adj −500 — deprioritised</option>
+        <option value="-1000">oom_score_adj −1000 — never chosen</option>
+        <option value="500">oom_score_adj +500 — kill me first</option>
+      </select></div>
+    </div>
+    <div class="rgrid" id="mmOut"></div>
+    <div class="readout" id="mmNote"></div>
+  </div>
+</div>
+
+<div class="box warn"><b class="tag">Three OOM consequences people get wrong</b>
+<p style="margin-bottom:6px"><strong>The victim is not the culprit.</strong> A leaking sidecar can push the machine over and get postgres killed, because postgres is bigger. The kernel is minimising the number of kills, not assigning fault. Read <code>dmesg</code> or the journal for the full scoring table before concluding anything.</p>
+<p style="margin-bottom:6px"><strong>Inside a container, there are two OOM killers.</strong> The cgroup one fires when the container exceeds its own memory limit and kills only inside that cgroup — this is Kubernetes <code>OOMKilled</code>, exit code 137. The system one fires when the host runs out and can kill anything. They look identical from inside and have completely different fixes.</p>
+<p style="margin-bottom:0"><strong>Swap does not prevent OOM, it postpones it and makes the machine unusable first.</strong> A box thrashing on swap has technically not failed, which is worse than failing: latency goes up by three orders of magnitude while every health check still passes. This is why Kubernetes historically refused to run with swap enabled at all.</p>
+</div>
+</section>
+
+<section id="storage">
+<h2>Filesystems, inodes and the two ways a disk fills</h2><div class="h2rule"></div>
+
+<p>A file's name and its contents are separate things. The contents, plus the metadata — size, owner, permissions, timestamps, and pointers to the data blocks — live in an <strong>inode</strong>. A directory entry is just a name paired with an inode number. That indirection explains a family of behaviours that otherwise look arbitrary.</p>
+
+<div class="kv">
+<dt>A hard link is a second name for the same inode</dt><dd>There is no "original". Deleting one name decrements a reference count; the data goes when the count hits zero. Cannot cross filesystems, cannot point at a directory.</dd>
+<dt>A symlink is a small file containing a path</dt><dd>Can cross filesystems, can dangle, resolves at access time. This is why swapping a symlink is an atomic deploy primitive and copying over a directory is not.</dd>
+<dt>Deleting a file that a process still has open frees nothing</dt><dd>The directory entry goes, the inode's link count drops to zero, but the open file descriptor keeps it alive. <code>df</code> shows the space used and <code>du</code> cannot find it, because the file has no name any more. This is the classic "I deleted the 40&nbsp;GB log and nothing happened". Find it with <code>lsof +L1</code>; free it by restarting the holder or truncating through <code>/proc/&lt;pid&gt;/fd/&lt;n&gt;</code>.</dd>
+<dt>You can run out of inodes with the disk half empty</dt><dd>Inodes are allocated when the filesystem is created and their count is fixed. A few million tiny session files, mail-queue entries or cache fragments will exhaust them while <code>df -h</code> reads 45%. Writes fail with <code>ENOSPC</code> — "No space left on device" — which sends everyone to the wrong place. <code>df -i</code> is the check, and it takes two seconds.</dd>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">bash — the disk-full triage sequence, in order</span><button class="code-copy">Copy</button></div><pre>df -h                      <span class="c">← which mount, and is it actually full</span>
+df -i                      <span class="c">← inodes. do this SECOND, not last. costs nothing</span>
+du -xh --max-depth=1 / | sort -h | tail -20
+                           <span class="c">← -x stays on one filesystem, or you will walk /proc all night</span>
+lsof +L1                   <span class="c">← deleted-but-open files. explains df and du disagreeing</span>
+journalctl --disk-usage    <span class="c">← the journal is a very common answer</span>
+docker system df           <span class="c">← so are dangling images and build cache</span>
+
+<span class="c"># the two immediate mitigations</span>
+truncate -s 0 /var/log/huge.log     <span class="c">← keeps the inode, so an open writer keeps working.</span>
+                                    <span class="c">  `rm` would not free the space at all while it is open</span>
+journalctl --vacuum-size=200M</pre></div>
+
+<div class="box trap"><b class="tag">Reserved blocks, and the 5% that is not missing</b>
+<p style="margin-bottom:0">ext4 reserves 5% of the filesystem for root by default. On a 2&nbsp;TB data volume that is 100&nbsp;GB set aside so that root can still log in and clean up when a runaway process fills the disk — sensible on <code>/</code>, pure waste on a dedicated data volume. <code>tune2fs -m 1 /dev/sdb1</code> reclaims it. It also explains why an unprivileged process gets <code>ENOSPC</code> while <code>df</code> still shows free space.</p>
+</div>
+</section>
+
+<section id="permissions">
+<h2>Users, permissions and capabilities</h2><div class="h2rule"></div>
+
+<p>Every file has an owner, a group and nine permission bits — read, write and execute for user, group and other. The octal form is worth being fluent in because it appears in every Dockerfile, Ansible task and Kubernetes volume spec.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Octal</th><th>Symbolic</th><th>Meaning on a file</th><th>Meaning on a directory</th></tr></thead>
+<tbody>
+<tr><td><code>644</code></td><td><code>rw-r--r--</code></td><td>Owner writes, everyone reads</td><td>—</td></tr>
+<tr><td><code>600</code></td><td><code>rw-------</code></td><td class="yes">Owner only. What every secret and private key must be</td><td>—</td></tr>
+<tr><td><code>755</code></td><td><code>rwxr-xr-x</code></td><td>Executable by all</td><td>Everyone can enter and list</td></tr>
+<tr><td><code>700</code></td><td><code>rwx------</code></td><td>Owner-only executable</td><td class="yes">Owner-only directory. <code>~/.ssh</code> must be this or sshd refuses</td></tr>
+<tr><td><code>1777</code></td><td><code>rwxrwxrwt</code></td><td>—</td><td>Sticky bit: anyone writes, only the owner deletes their own. This is <code>/tmp</code></td></tr>
+<tr><td><code>4755</code></td><td><code>rwsr-xr-x</code></td><td class="no">Setuid: runs as the file's owner regardless of who invoked it. A privilege escalation surface</td><td>—</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>On a directory the bits mean something different from what they suggest. <code>x</code> is <em>traverse</em> — permission to reach things inside by name — while <code>r</code> is permission to <em>list</em> the names. A directory with <code>--x</code> lets you open <code>/secret/known-file</code> but not discover what is in <code>/secret</code>. And <code>w</code> on a directory permits deleting files inside it regardless of who owns them, which is why <code>/tmp</code> needs the sticky bit.</p>
+
+<div class="box tip"><b class="tag">Capabilities replaced the root/not-root binary, and containers depend on it</b>
+<p style="margin-bottom:0">Historically a process either had every privilege or none. Linux split root's powers into about forty <strong>capabilities</strong>: <code>CAP_NET_BIND_SERVICE</code> for ports below 1024, <code>CAP_NET_ADMIN</code> for interfaces and firewall rules, <code>CAP_SYS_ADMIN</code> for a grab-bag broad enough to be effectively root. This is what lets a container run nginx on port 80 as a non-root user — grant one capability instead of the whole set. The corresponding hardening step is <code>--cap-drop=ALL</code> and then adding back only what is needed, and it is one of the highest-value lines in a container spec. Chapter 10 returns to it.</p>
+</div>
+</section>
+
+<section id="systemd">
+<h2>systemd: what supervises everything</h2><div class="h2rule"></div>
+
+<p>systemd is PID 1 on essentially every mainstream distribution. It starts services in dependency order, restarts them when they die, captures their output, applies resource limits through cgroups and handles socket activation and timers. You do not need to like it; you do need to be able to read a unit file and diagnose a service that will not start.</p>
+
+<div class="code"><div class="code-top"><span class="code-lang">ini — /etc/systemd/system/api.service, annotated</span><button class="code-copy">Copy</button></div><pre><span class="k">[Unit]</span>
+Description=Order API
+After=network-online.target postgresql.service   <span class="c">← ORDERING only. does not require them</span>
+Wants=postgresql.service                         <span class="c">← try to start it too; do not fail if it fails</span>
+<span class="c"># Requires= would make this unit stop when postgresql stops. usually too strict</span>
+
+<span class="k">[Service]</span>
+Type=notify                <span class="c">← the process tells systemd when it is genuinely ready.</span>
+                           <span class="c">  `simple` means "ready the instant exec returns", which is a lie</span>
+                           <span class="c">  for anything with a warm-up, and breaks ordering downstream</span>
+ExecStart=/usr/bin/api --config /etc/api.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure         <span class="c">← not `always`: `always` restarts after a clean exit 0 too</span>
+RestartSec=2
+User=api
+Group=api
+
+<span class="c"># sandboxing — cheap, and each line removes a class of compromise</span>
+NoNewPrivileges=true       <span class="c">← setuid binaries can no longer escalate from here</span>
+ProtectSystem=strict       <span class="c">← the entire filesystem is read-only except...</span>
+ReadWritePaths=/var/lib/api
+PrivateTmp=true            <span class="c">← its own /tmp, invisible to other services</span>
+ProtectHome=true
+MemoryMax=2G               <span class="c">← a cgroup limit. exceeding it means the cgroup OOM killer,</span>
+                           <span class="c">  which kills only inside this unit rather than the host</span>
+LimitNOFILE=65535          <span class="c">← the file-descriptor ceiling. the default 1024 is the cause</span>
+                           <span class="c">  of most "too many open files" at moderate connection counts</span>
+
+<span class="k">[Install]</span>
+WantedBy=multi-user.target <span class="c">← what `systemctl enable` hooks it into</span></pre></div>
+
+<div class="tw">
+<table>
+<thead><tr><th>Task</th><th>Command</th><th>Note</th></tr></thead>
+<tbody>
+<tr><td>Why did it not start</td><td><code>systemctl status api</code> then <code>journalctl -u api -n 100 --no-pager</code></td><td class="yes">Status truncates at ten lines. The real error is usually below that</td></tr>
+<tr><td>Follow logs live</td><td><code>journalctl -u api -f</code></td><td>Add <code>-p err</code> to filter by priority</td></tr>
+<tr><td>Since last boot</td><td><code>journalctl -u api -b</code></td><td><code>-b -1</code> for the boot before this one</td></tr>
+<tr><td>After editing a unit</td><td><code>systemctl daemon-reload</code></td><td class="no">Forgetting this is why your change had no effect</td></tr>
+<tr><td>Config change, no restart</td><td><code>systemctl reload api</code></td><td>Only works if <code>ExecReload</code> is defined</td></tr>
+<tr><td>What is it consuming</td><td><code>systemd-cgtop</code></td><td>Per-unit CPU, memory and I/O, because every unit is a cgroup</td></tr>
+<tr><td>Why is boot slow</td><td><code>systemd-analyze blame</code></td><td><code>critical-chain</code> shows the dependency path, which is the actual answer</td></tr>
+<tr><td>Failed units</td><td><code>systemctl --failed</code></td><td>First command on any unfamiliar sick machine</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box intu"><b class="tag">Restart=always is how a crash loop becomes invisible</b>
+<p style="margin-bottom:0">A service that crashes on startup and restarts every two seconds looks "active" often enough to fool a coarse health check, while filling the journal and consuming CPU. systemd has a rate limiter for exactly this — <code>StartLimitIntervalSec</code> and <code>StartLimitBurst</code>, five starts in ten seconds by default — after which the unit enters <code>failed</code> and stays there. That is the desired behaviour: a loudly broken service beats a quietly flapping one. Kubernetes reaches the same conclusion with <code>CrashLoopBackOff</code> and exponential backoff.</p>
+</div>
+</section>
+
+<section id="toolkit">
+<h2>The diagnostic set worth memorising</h2><div class="h2rule"></div>
+
+<p>You do not need all of these installed, and on a minimal container image you will have almost none of them. But knowing which question each answers is the difference between a five-minute diagnosis and an hour of guessing.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Question</th><th>Command</th><th>What to look at</th></tr></thead>
+<tbody>
+<tr><td>Overall shape of the problem</td><td><code>uptime</code>, <code>top -H</code>, <code>vmstat 1</code></td><td>vmstat's <code>r</code> (run queue), <code>b</code> (blocked), <code>si/so</code> (swap), <code>wa</code> (I/O wait)</td></tr>
+<tr><td>Which process</td><td><code>ps aux --sort=-%mem \| head</code>, <code>pidstat 1</code></td><td>Sort by the resource you suspect, not by CPU out of habit</td></tr>
+<tr><td>Memory really</td><td><code>free -m</code>, <code>/proc/meminfo</code>, <code>smem</code></td><td><code>available</code>, not <code>free</code>. <code>MemAvailable</code> in meminfo</td></tr>
+<tr><td>Disk saturated</td><td><code>iostat -xz 1</code></td><td><code>%util</code> near 100 with high <code>await</code>. Compare <code>r_await</code> and <code>w_await</code></td></tr>
+<tr><td>Who is writing</td><td><code>iotop -o</code>, <code>pidstat -d 1</code></td><td>Almost always a log, a backup or an unindexed query spilling to disk</td></tr>
+<tr><td>Network connections</td><td><code>ss -tunap</code>, <code>ss -s</code></td><td>Counts by state. Thousands in <code>TIME_WAIT</code> or <code>CLOSE_WAIT</code> each mean something specific — chapter 04</td></tr>
+<tr><td>What is it doing right now</td><td><code>strace -p PID -c</code>, <code>strace -p PID -T -e trace=file</code></td><td>Syscall counts and durations. Slows the target; never on a busy production process without care</td></tr>
+<tr><td>Open files and sockets</td><td><code>lsof -p PID</code>, <code>ls /proc/PID/fd \| wc -l</code></td><td>Compare against <code>/proc/PID/limits</code> before blaming the application</td></tr>
+<tr><td>Where the CPU actually goes</td><td><code>perf top</code>, <code>perf record -g</code></td><td>The only honest answer for a CPU-bound process. Flame graphs come from here</td></tr>
+<tr><td>Am I in a container</td><td><code>cat /proc/1/cgroup</code>, <code>ls /.dockerenv</code></td><td>Changes what every number above means</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box tip"><b class="tag">The USE method gives you an order to run them in</b>
+<p style="margin-bottom:0">For every resource — CPU, memory, disk, network — check <strong>U</strong>tilisation, <strong>S</strong>aturation and <strong>E</strong>rrors, in that order, before moving to the next resource. It is dull and it is systematic, and it beats intuition consistently because it does not let you skip the resource you happen not to be thinking about. Utilisation says how busy, saturation says how much queued work is waiting, errors say what already failed. Chapter 22 formalises this alongside its request-oriented counterpart, RED.</p>
+</div>
+</section>
+
+<section id="close">
+<h2>Check yourself</h2><div class="h2rule"></div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li><code>uptime</code> reports a load average of 14.02 on an 8-core machine, and <code>top</code> shows all CPUs around 6% busy. What is happening, and what do you run next?
+<button class="reveal">Show answer</button><div class="ans">Load counts uninterruptible (<code>D</code>-state) processes as well as runnable ones, so a queue of processes blocked on storage produces a high load with idle CPUs. Something is waiting on a device — a saturated disk, a degraded RAID rebuild, or a hung NFS or network mount. Confirm the state distribution with <code>ps -eo state,comm | grep ^D</code>, then <code>iostat -xz 1</code> for <code>%util</code> and <code>await</code> per device, and check <code>dmesg</code> for I/O errors or mount timeouts. Tuning threads or adding CPU will do nothing.</div></li>
+
+<li>A colleague pages saying a production box is "out of memory" because <code>free -m</code> shows 210&nbsp;MB free out of 16&nbsp;GB. Are they right?
+<button class="reveal">Show answer</button><div class="ans">Almost certainly not. The kernel deliberately fills unused RAM with page cache, so <code>free</code> tends toward zero on any machine that has been up for a while and doing I/O — that is healthy, not a fault. The number that matters is <code>available</code>, which estimates what a new allocation could obtain by reclaiming cache without swapping. If <code>available</code> is several gigabytes there is no problem. If <code>available</code> is also small, then there is, and the next checks are swap in/out rates in <code>vmstat 1</code> and the <code>MemAvailable</code> trend over time rather than its instantaneous value.</div></li>
+
+<li>The OOM killer terminated postgres, but the leak was in a small sidecar. Explain why, and how you would prevent a repeat.
+<button class="reveal">Show answer</button><div class="ans">Badness is scored roughly by the fraction of total memory each process holds, not by who caused the shortage. The sidecar's growth consumed the headroom; postgres, being the largest resident consumer, scored highest and was chosen. The kernel is trying to reclaim the most memory per kill, not to assign blame. Prevention has two halves: bound the culprit, by giving the sidecar its own cgroup memory limit so it hits a local OOM and dies alone, and protect the victim, by setting a negative <code>oom_score_adj</code> on postgres. Under Kubernetes both fall out of setting memory <em>requests equal to limits</em> for the critical container, which places it in the Guaranteed QoS class and makes it the last thing evicted.</div></li>
+
+<li><code>df</code> says the volume is 98% full. <code>du -sh</code> on every directory adds up to about half that. Where is the rest?
+<button class="reveal">Show answer</button><div class="ans">Most likely in files that have been deleted but are still held open by a running process. Unlinking removes the directory entry, so <code>du</code> — which walks names — cannot see the file, but the inode and its blocks survive until the last file descriptor closes, so <code>df</code> still counts them. <code>lsof +L1</code> lists files with a link count of zero and the process holding each. Restart the holder, or reclaim the space in place with <code>: &gt; /proc/&lt;pid&gt;/fd/&lt;n&gt;</code>. Two other candidates worth ruling out: a filesystem mounted over a directory that already contained data, which hides the underlying files from both tools, and ext4's 5% root reservation.</div></li>
+
+<li>Writes are failing with "No space left on device" but <code>df -h</code> shows 55% used. What is the explanation?
+<button class="reveal">Show answer</button><div class="ans">Inode exhaustion. The count of inodes is fixed when the filesystem is created, so a workload producing millions of very small files — session data, mail spool, cache shards — can consume every inode while using little of the capacity. <code>ENOSPC</code> is returned for both conditions, which is what makes it confusing. <code>df -i</code> distinguishes them in two seconds. The fix is to delete the small files or move that workload to a filesystem without a fixed inode count, such as XFS; you cannot add inodes to an existing ext4 filesystem without recreating it.</div></li>
+
+<li>Your container ignores <code>docker stop</code> and takes the full ten seconds every time. Give two causes and their fixes.
+<button class="reveal">Show answer</button><div class="ans">First, the process has no <code>SIGTERM</code> handler. The kernel does not apply default signal actions to PID 1, so a process that would normally die on <code>SIGTERM</code> simply ignores it inside a container and waits for the <code>SIGKILL</code>. Fix: install a handler that drains and exits. Second, the entrypoint is a shell — <code>CMD "npm start"</code> in shell form, or a wrapper script — and the shell receives the signal without forwarding it to the child it is waiting on. Fix: use exec form so your binary is PID 1, or <code>exec</code> the final command in the wrapper, or run with <code>--init</code> so a minimal init handles forwarding and zombie reaping. The cost of not fixing it is in-flight requests dropped on every single deployment.</div></li>
+
+<li>What does <code>Type=notify</code> buy over <code>Type=simple</code>, and when does the difference actually bite?
+<button class="reveal">Show answer</button><div class="ans">With <code>simple</code>, systemd considers the service started the moment <code>execve</code> returns — before any configuration is parsed, any port is bound or any connection pool is warm. With <code>notify</code>, the process signals readiness explicitly over a socket, so "active" means genuinely serving. It bites whenever something is ordered <code>After=</code> this unit: with <code>simple</code>, the dependent starts against a service that is not listening yet, producing connection-refused errors on every boot that disappear on manual retry — the classic "only fails on reboot" bug. It also bites health checking and any deployment that waits for the unit to become active before shifting traffic. The same distinction reappears in Kubernetes as the difference between a container being Running and passing its readiness probe.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin-bottom:0">Chapter 3 is the interface you drive all of this through: streams and exit codes, the quoting rules that cause most shell bugs, the text-processing toolkit, and how to write a script that is safe to run twice.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 02</h2><p>The Linux machine underneath. Part of the DevOps unit — <a href="index.html">all 24 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 09 (namespaces and cgroups), 10 (PID 1 and capabilities in images), 11 (requests, limits and eviction), 22 (the USE method), 23 (triage under pressure).</p></div>
+    <div><h2>Going deeper</h2><p>The Linux unit on this site covers the same ground at greater length. Brendan Gregg's <em>Systems Performance</em> is the reference for the diagnostic half.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: load average ============ */
+(function(){
+  const cv=document.getElementById("cLoad"); if(!cv) return;
+  const cEl=document.getElementById("ldC"), pEl=document.getElementById("ldP"),
+        dEl=document.getElementById("ldD"), sEl=document.getElementById("ldS");
+  const out=document.getElementById("ldOut"), note=document.getElementById("ldNote");
+  const runBtn=document.getElementById("ldRun"), rstBtn=document.getElementById("ldRst");
+  const TICK=5, WIN=900;                       /* 15 minutes of history on screen */
+  const decay=m=>Math.exp(-TICK/(m*60));
+  let l1=0,l5=0,l15=0,t=0,hist=[],timer=null;
+
+  function step(){
+    const n=+pEl.value + +dEl.value;           /* R + D. S-state is excluded */
+    l1 = l1*decay(1)  + n*(1-decay(1));
+    l5 = l5*decay(5)  + n*(1-decay(5));
+    l15= l15*decay(15)+ n*(1-decay(15));
+    t+=TICK; hist.push([t,l1,l5,l15,n]);
+    while(hist.length && hist[0][0] < t-WIN) hist.shift();
+  }
+  function draw(){
+    const cores=+cEl.value, cpu=+pEl.value, dst=+dEl.value, slp=+sEl.value, n=cpu+dst;
+    document.getElementById("ldCo").textContent=cores;
+    document.getElementById("ldPo").textContent=cpu;
+    document.getElementById("ldDo").textContent=dst;
+    document.getElementById("ldSo").textContent=slp;
+
+    const P=Plot(cv,{pad:[16,96,30,40],ratio:0.40});
+    const ymax=Math.max(2, n*1.25, ...hist.map(h=>Math.max(h[1],h[2],h[3])*1.1));
+    P.o.xr=[Math.max(0,t-WIN), Math.max(WIN,t)]; P.o.yr=[0,ymax]; P.clear();
+    const ctx=P.ctx;
+
+    ctx.strokeStyle=PC.grid; ctx.lineWidth=1;
+    for(let g=0;g<=4;g++){ const v=ymax*g/4, y=Math.round(P.Y(v))+0.5;
+      ctx.beginPath(); ctx.moveTo(P.L,y); ctx.lineTo(P.R,y); ctx.stroke();
+      P.px(P.L-6,P.Y(v),v.toFixed(1),PC.text,"right","10.5px Archivo, Arial"); }
+
+    /* the "one per core" reference line — the only meaningful threshold */
+    const yc=P.Y(cores);
+    if(cores<=ymax){ ctx.setLineDash([4,3]); ctx.strokeStyle=PC.warn; ctx.lineWidth=1.3;
+      ctx.beginPath(); ctx.moveTo(P.L,yc); ctx.lineTo(P.R,yc); ctx.stroke(); ctx.setLineDash([]);
+      P.px(P.R-4,yc-9,"load = cores ("+cores+")",PC.warn,"right","600 10px Archivo, Arial"); }
+
+    const series=[[3,PC.purple,"15 min"],[2,PC.info,"5 min"],[1,PC.line,"1 min"]];
+    series.forEach(([i,col,lab])=>{
+      if(hist.length<2) return;
+      ctx.beginPath();
+      hist.forEach((h,k)=>{ const X=P.X(h[0]), Y=P.Y(Math.min(h[i],ymax));
+        k?ctx.lineTo(X,Y):ctx.moveTo(X,Y); });
+      ctx.strokeStyle=col; ctx.lineWidth=i===1?2.4:1.7; ctx.stroke();
+    });
+    let ly=P.T+8;
+    series.slice().reverse().forEach(([i,col,lab])=>{
+      const v=i===1?l1:i===2?l5:l15;
+      ctx.fillStyle=col; ctx.fillRect(P.R+10,ly-4,16,3);
+      P.px(P.R+31,ly-2,lab+"  "+v.toFixed(2),PC.ink,"left","600 10.5px Archivo, Arial");
+      ly+=17;
+    });
+    P.px((P.L+P.R)/2,P.B+18,"simulated time — "+(t/60).toFixed(1)+" min",PC.text,"center","10px Archivo, Arial");
+
+    const perCore=n/cores, cpuUtil=Math.min(1,cpu/cores), runq=Math.max(0,cpu-cores);
+    const verdict = n===0 ? ["idle","#2E9E6B"]
+      : dst>0 && cpu===0 ? ["I/O bound — CPU is idle","#D98324"]
+      : perCore>=1.5 ? ["oversubscribed","#D9534F"]
+      : perCore>=1 ? ["saturated","#D98324"] : ["headroom","#2E9E6B"];
+    out.innerHTML=
+      '<div><span>load 1 / 5 / 15</span><b style="font-size:13px">'+l1.toFixed(2)+' · '+l5.toFixed(2)+' · '+l15.toFixed(2)+'</b></div>'+
+      '<div><span>instantaneous R+D</span><b>'+n+'</b></div>'+
+      '<div><span>load per core</span><b style="color:'+verdict[1]+'">'+perCore.toFixed(2)+'</b></div>'+
+      '<div><span>CPU utilisation</span><b>'+(cpuUtil*100).toFixed(0)+'%</b></div>'+
+      '<div><span>waiting for a CPU</span><b>'+runq+'</b></div>'+
+      '<div><span>verdict</span><b style="font-size:11.5px;color:'+verdict[1]+'">'+verdict[0]+'</b></div>';
+
+    note.innerHTML =
+      'The kernel counts <b>'+cpu+'</b> runnable plus <b>'+dst+'</b> uninterruptible = <b>'+n+
+      '</b>, and ignores the '+slp+' sleeping processes entirely — which is why a box with 400 idle connections shows a load near zero. '+
+      (dst>0 && cpu===0
+        ? 'Right now the CPU is <b>completely idle</b> and the load is <b>'+n+'</b>. Nothing here can be fixed by adding cores.'
+        : dst>0
+          ? '<b>'+dst+'</b> of that load is disk wait, not CPU, so only <b>'+cpu+'</b> of it would respond to more cores.'
+          : 'All of it is CPU-shaped, so '+(runq>0?'<b>'+runq+'</b> process'+(runq>1?'es are':' is')+' queued for a core at any moment.':'every runnable process has a core available.'))+
+      ' Note the lag: the 1-minute average reaches 63% of a step change after 60 s, the 15-minute average after 15 min.';
+  }
+  function run(){
+    if(timer){ clearInterval(timer); timer=null; runBtn.textContent="Run 10 min"; return; }
+    runBtn.textContent="Stop";
+    let ticks=0;
+    timer=setInterval(()=>{ step(); draw(); if(++ticks>=120){ clearInterval(timer); timer=null; runBtn.textContent="Run 10 min"; } },28);
+  }
+  runBtn.addEventListener("click",run);
+  rstBtn.addEventListener("click",()=>{ l1=l5=l15=0; t=0; hist=[]; draw(); });
+  [cEl,pEl,dEl,sEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw);
+  /* pre-settle so the first view is not an empty chart */
+  for(let i=0;i<180;i++) step();
+  draw();
+})();
+
+/* ============ demo 2: memory accounting and the OOM killer ============ */
+(function(){
+  const cv=document.getElementById("cMem"); if(!cv) return;
+  const tEl=document.getElementById("mmT"), jEl=document.getElementById("mmJ"),
+        pEl=document.getElementById("mmP"), sEl=document.getElementById("mmS"), aEl=document.getElementById("mmA");
+  const out=document.getElementById("mmOut"), note=document.getElementById("mmNote");
+  const KERNEL=700, RECLAIM=0.9;
+
+  function model(){
+    const total=+tEl.value, swap=+sEl.value;
+    const procs=[
+      {name:"app (jvm)", rss:+jEl.value, adj:+aEl.value},
+      {name:"postgres",  rss:+pEl.value, adj:-200},
+      {name:"sidecar",   rss:260,        adj:0},
+      {name:"sshd",      rss:12,         adj:-1000}
+    ];
+    const anon=procs.reduce((s,p)=>s+p.rss,0);
+    const room=total-KERNEL-anon;
+    const cache=Math.max(0,room), free=Math.max(0,room-cache);
+    const available=free+cache*RECLAIM;
+    const overflow=Math.max(0,-room);
+    const swapUsed=Math.min(swap,overflow);
+    const oom=overflow>swap;
+    const scored=procs.map(p=>Object.assign({},p,{
+      score:Math.max(0, Math.round(p.rss/total*1000)+p.adj)
+    }));
+    /* who is top of the list right now, whether or not we are out of memory —
+       so that changing oom_score_adj is observable before the crisis */
+    const nextVictim=scored.reduce((m,p)=>p.score>m.score?p:m);
+    const victim=oom?nextVictim:null;
+    return {total,swap,procs:scored,anon,cache,free,available,overflow,swapUsed,oom,victim,nextVictim};
+  }
+
+  function draw(){
+    const m=model();
+    document.getElementById("mmTo").textContent=m.total;
+    document.getElementById("mmJo").textContent=jEl.value;
+    document.getElementById("mmPo").textContent=pEl.value;
+    document.getElementById("mmSo").textContent=sEl.value;
+
+    const w=cv.clientWidth||660, h=52+m.procs.length*24+40, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+
+    /* stacked physical memory bar */
+    const L=14, R=w-14, span=R-L, scale=span/m.total;
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("physical memory — "+m.total+" MB", L, 10);
+    let x=L;
+    const bands=[
+      ["kernel", Math.min(KERNEL,m.total), "#8195A6"],
+      ["anonymous (processes)", Math.min(m.anon, Math.max(0,m.total-KERNEL)), m.oom?PC.bad:PC.line],
+      ["page cache", m.cache, "#C7CEFB"],
+      ["free", m.free, "#EDF1F4"]
+    ];
+    bands.forEach(([lab,mb,col])=>{
+      const bw=mb*scale; if(bw<=0) return;
+      ctx.fillStyle=col; ctx.fillRect(x,18,bw,22);
+      if(bw>58){ ctx.fillStyle=(col==="#EDF1F4"||col==="#C7CEFB")?PC.text:"#fff";
+        ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+        ctx.fillText(lab.length*5.4<bw?lab:lab.split(" ")[0], x+5, 29); }
+      x+=bw;
+    });
+    ctx.strokeStyle="#D5DDE4"; ctx.lineWidth=1; ctx.strokeRect(L+.5,18.5,span,22);
+    /* the available marker — the number that actually matters */
+    const ax=L+(m.total-m.available)*scale;
+    ctx.setLineDash([3,2]); ctx.strokeStyle=PC.ok; ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(ax,15); ctx.lineTo(ax,45); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle=PC.ok; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign=ax>span*0.75?"right":"left";
+    ctx.fillText("available "+m.available.toFixed(0)+" MB →".replace("→",""), ax+(ax>span*0.75?-4:4), 49);
+
+    /* per-process badness table */
+    const maxScore=Math.max(1,...m.procs.map(p=>p.score));
+    m.procs.forEach((p,i)=>{
+      const y=64+i*24, isV=m.victim&&m.victim.name===p.name;
+      const isNext=!m.oom && m.nextVictim.name===p.name && p.score>0;
+      ctx.textAlign="left"; ctx.font=(isV?"700 ":"")+"11px Archivo, Arial";
+      ctx.fillStyle=isV?PC.bad:PC.ink; ctx.fillText(p.name, L, y+9);
+      ctx.font="10px ui-monospace, monospace"; ctx.fillStyle=PC.text; ctx.textAlign="right";
+      ctx.fillText(p.rss+" MB", L+188, y+9);
+      ctx.fillText("adj "+(p.adj>0?"+":"")+p.adj, L+252, y+9);
+      const bx=L+264, bspan=Math.max(40,R-bx-74);
+      ctx.fillStyle="#EDF1F4"; ctx.fillRect(bx,y+2,bspan,14);
+      ctx.fillStyle=isV?PC.bad:"#B9C4CE"; ctx.fillRect(bx,y+2,bspan*(p.score/maxScore),14);
+      ctx.textAlign="left"; ctx.font="600 10px ui-monospace, monospace"; ctx.fillStyle=PC.ink;
+      ctx.fillText("score "+p.score, bx+bspan+6, y+9);
+      if(isV){ ctx.fillStyle=PC.bad; ctx.font="700 9px Archivo, Arial";
+        ctx.fillText("SIGKILL", bx+bspan+6, y+20); }
+      else if(isNext){ ctx.fillStyle=PC.warn; ctx.font="700 9px Archivo, Arial";
+        ctx.fillText("first in line", bx+bspan+6, y+20); }
+    });
+
+    const availCol = m.oom?PC.bad : m.available<m.total*0.1?PC.warn:PC.ok;
+    out.innerHTML=
+      '<div><span>used (anonymous)</span><b>'+m.anon+' MB</b></div>'+
+      '<div><span>buff / cache</span><b>'+m.cache.toFixed(0)+' MB</b></div>'+
+      '<div><span>free</span><b>'+m.free.toFixed(0)+' MB</b></div>'+
+      '<div><span>available</span><b style="color:'+availCol+'">'+m.available.toFixed(0)+' MB</b></div>'+
+      '<div><span>swap in use</span><b>'+m.swapUsed.toFixed(0)+' / '+m.swap+' MB</b></div>'+
+      '<div><span>state</span><b style="font-size:11.5px;color:'+(m.oom?PC.bad:m.swapUsed>0?PC.warn:PC.ok)+'">'+
+        (m.oom?"OOM kill":m.swapUsed>0?"swapping":"healthy")+'</b></div>'+
+      '<div><span>'+(m.oom?"killed":"next to be killed")+'</span><b style="font-size:11.5px;color:'+(m.oom?PC.bad:PC.warn)+'">'+
+        m.nextVictim.name+' ('+m.nextVictim.score+')</b></div>';
+
+    note.innerHTML = m.oom
+      ? 'Demand exceeds RAM by <b>'+m.overflow.toFixed(0)+' MB</b> with only '+m.swap+' MB of swap, so the kernel scores every process and kills the highest. '+
+        'It chose <b>'+m.victim.name+'</b> at score '+m.victim.score+' — note that this is chosen by resident size and <code>oom_score_adj</code>, <b>not</b> by which process asked for the memory that failed. '+
+        'sshd sits at score 0 because <code>oom_score_adj −1000</code> makes it ineligible, which is exactly why you can still log in afterwards.'
+      : 'Free is <b>'+m.free.toFixed(0)+' MB</b> and available is <b>'+m.available.toFixed(0)+' MB</b>. '+
+        (m.cache>0
+          ? 'The gap is page cache: '+m.cache.toFixed(0)+' MB of file contents the kernel is holding because the RAM was otherwise idle, about '+(RECLAIM*100)+'% of which it can hand back instantly. '
+          : 'The page cache has already been fully reclaimed, which means the next allocation has nowhere cheap to come from — this is the state immediately before swapping or an OOM kill. ')+
+        'Alert on <b>available</b>; alerting on <b>free</b> would have paged you long ago for nothing. '+
+        'If the machine ran out right now the kernel would choose <b>'+m.nextVictim.name+'</b> (score '+m.nextVictim.score+
+        ') — change <code>oom_score_adj</code> on the jvm and watch that answer move.';
+  }
+  [tEl,jEl,pEl,sEl,aEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+</script>
+</body>
+</html>

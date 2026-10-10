@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Containers from first principles — DevOps</title>
+<meta name="description" content="Namespaces, cgroups and union filesystems assembled one at a time; what an image really is; CPU quota and the throttling that hits at low average utilisation; containers against virtual machines on measurable terms.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%237C8CF8' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-in">
+    <p class="crumb"><span class="dot"></span><a href="../../index.html">Roadmap Notes</a><span class="sep">/</span><a href="index.html">DevOps</a><span class="sep">/</span><span>Chapter 09</span></p>
+    <p class="chno">Chapter 09 · Containers</p>
+    <h1>Containers from first principles</h1>
+    <p class="lede">There is no such thing as a container. There is a normal Linux process that has entered some namespaces, had some cgroup limits applied, and been given a root filesystem assembled from stacked read-only layers. Once you see it that way the whole model stops being magic and starts being a set of specific, inspectable decisions — including several that quietly leave you with no isolation at all.</p>
+    <p class="meta"><span><b id="mWords">—</b> words</span><span><b id="mTime">—</b> min read</span><span><b>2</b> interactives</span><span>Needs: <b>chapter 02</b></span></p>
+    <div class="strip"><div class="strip-rail" id="strip"></div></div>
+  </div>
+</header>
+
+<div class="shell">
+<nav class="side" id="side" aria-label="Contents"></nav>
+<main>
+
+<section id="problem">
+<h2>What the container was actually invented for</h2><div class="h2rule"></div>
+
+<p class="lead">Two separate problems, and it helps to keep them apart because different tools solve them and people conflate the answers.</p>
+
+<div class="kv">
+<dt>Packaging</dt><dd>"It works on my machine" is a dependency statement: the machine has a particular glibc, a particular Python, a particular set of shared libraries and a particular filesystem layout. An image freezes all of that into one artefact so the thing you tested is the thing that runs. This is by far the larger of the two wins, and it is the reason containers spread through development before they spread through operations.</dd>
+<dt>Density and isolation</dt><dd>A virtual machine duplicates an entire kernel to run one application. A container shares the host kernel and isolates only what the process can <em>see</em>, so it starts in milliseconds instead of tens of seconds and costs megabytes instead of gigabytes. That makes it economical to run one process per unit rather than packing several onto a machine, which is what makes per-service scaling and rolling deployment practical.</dd>
+</div>
+
+<p>The isolation is weaker than a VM's, and being precise about how much weaker is the most useful thing in this chapter — because the difference is not fixed. It depends entirely on which of the mechanisms below you actually turned on.</p>
+</section>
+
+<section id="namespaces">
+<h2>Namespaces: what the process can see</h2><div class="h2rule"></div>
+
+<p>A namespace wraps a global kernel resource so that processes inside it see their own instance of it. There are eight, and each one is independently entered — which is why "containerised" is not a binary state.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>Namespace</th><th>Isolates</th><th>Without it</th></tr></thead>
+<tbody>
+<tr><td><code>pid</code></td><td>The process ID space. Your process is PID 1</td><td class="no"><code>ps</code> shows every host process, and <code>/proc/&lt;pid&gt;/environ</code> can leak other services' environment variables — which is where their credentials live</td></tr>
+<tr><td><code>net</code></td><td>Interfaces, routes, firewall rules, port numbers</td><td class="no">You share the host's stack: can bind host ports, sniff host traffic, and reach services bound to <code>127.0.0.1</code> that believed themselves private</td></tr>
+<tr><td><code>mnt</code></td><td>The mount table and therefore the filesystem view</td><td class="no">Your root filesystem <em>is</em> the host's</td></tr>
+<tr><td><code>uts</code></td><td>Hostname and domain name</td><td>Cosmetic — but <code>hostname</code> inside would change the host's</td></tr>
+<tr><td><code>ipc</code></td><td>System V IPC and POSIX message queues</td><td>Shared memory segments are readable across containers</td></tr>
+<tr><td><code>user</code></td><td>uid and gid mappings</td><td class="no">uid 0 inside is <strong>uid 0 on the host</strong>. Any escape lands as real root</td></tr>
+<tr><td><code>cgroup</code></td><td>The cgroup hierarchy root</td><td>The container can see the host's full cgroup tree</td></tr>
+<tr><td><code>time</code></td><td>Boot and monotonic clocks</td><td>Rarely used; matters for checkpoint and restore</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The user namespace deserves special attention because it is the one that is <em>off by default</em> in Docker and in most Kubernetes installations. Without it, the two senses of "root" are the same root, and every other protection is the only thing standing between a container process and the host.</p>
+
+<div class="demo" id="d-iso">
+  <div class="demo-top"><div class="demo-title">Assemble a container, one mechanism at a time</div><div class="demo-hint">Start from "nothing", then try the Docker defaults, then mount the socket</div></div>
+  <div class="demo-body">
+    <canvas id="cIso" aria-label="Which isolation mechanisms are enabled and what each omission exposes"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>Preset</label><select id="isP">
+        <option value="hard" selected>hardened</option>
+        <option value="docker">docker run, defaults</option>
+        <option value="pidhost">--pid=host (debugging)</option>
+        <option value="nethost">--net=host (performance)</option>
+        <option value="sock">docker.sock mounted (CI runner)</option>
+        <option value="priv">--privileged</option>
+        <option value="none">a plain process — nothing enabled</option>
+      </select></div>
+      <div class="ctrl"><label><input type="checkbox" id="isPid" checked> <code>pid</code> namespace</label></div>
+      <div class="ctrl"><label><input type="checkbox" id="isNet" checked> <code>net</code> namespace</label></div>
+      <div class="ctrl"><label><input type="checkbox" id="isMnt" checked> <code>mnt</code> namespace</label></div>
+      <div class="ctrl"><label><input type="checkbox" id="isUsr" checked> <code>user</code> namespace</label></div>
+      <div class="ctrl"><label><input type="checkbox" id="isCap" checked> capabilities dropped</label></div>
+      <div class="ctrl"><label><input type="checkbox" id="isSock"> mount <code>/var/run/docker.sock</code></label></div>
+      <div class="ctrl"><label><input type="checkbox" id="isPriv"> <code>--privileged</code></label></div>
+    </div>
+    <div class="rgrid" id="isOut"></div>
+    <div class="readout" id="isNote"></div>
+  </div>
+</div>
+
+<div class="box warn"><b class="tag">Mounting the Docker socket is equivalent to root on the host</b>
+<p style="margin-bottom:0">It is extremely common — CI runners that need to build images, monitoring agents, anything doing "Docker in Docker" — and it is a complete escape with no exploit required. A process that can talk to the daemon can ask it to start a new container that is <code>--privileged</code> and bind-mounts <code>/</code>, then write to the host filesystem as root. Every namespace you carefully enabled is irrelevant, because you are not escaping the container, you are politely asking a root-privileged daemon to do the work for you. If a workload needs to build images, use a rootless builder such as Kaniko or Buildah rather than handing it the socket.</p>
+</div>
+</section>
+
+<section id="cgroups">
+<h2>cgroups: what the process can consume</h2><div class="h2rule"></div>
+
+<p>Namespaces control visibility; cgroups control resources. Under cgroup v2 each container is a directory in <code>/sys/fs/cgroup</code> with a handful of files that set limits and report usage.</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>File</th><th>Controls</th><th>What happens at the limit</th></tr></thead>
+<tbody>
+<tr><td><code>cpu.max</code></td><td><code>QUOTA PERIOD</code> in microseconds — e.g. <code>50000 100000</code> is half a CPU</td><td class="no"><strong>Throttled</strong>: the process is descheduled until the next period. Not killed, just stopped</td></tr>
+<tr><td><code>cpu.weight</code></td><td>Relative share under contention</td><td class="yes">Nothing. It only takes effect when the CPU is contended, which is why it is the safer control</td></tr>
+<tr><td><code>memory.max</code></td><td>Hard memory ceiling</td><td class="no">The cgroup OOM killer fires <em>inside this cgroup only</em>. Exit code 137, Kubernetes calls it <code>OOMKilled</code></td></tr>
+<tr><td><code>memory.high</code></td><td>Soft ceiling</td><td class="yes">Reclaim pressure and throttling rather than a kill. Underused, and much kinder</td></tr>
+<tr><td><code>io.max</code></td><td>IOPS and bytes per second per device</td><td>Throttled</td></tr>
+<tr><td><code>pids.max</code></td><td>Process count</td><td class="yes"><code>fork()</code> fails. This is the cheap defence against a fork bomb, and almost nobody sets it</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>The CPU one is worth dwelling on, because it produces a failure that looks impossible: a container throttled hard while its average CPU usage sits comfortably below its limit. The reason is that <code>cpu.max</code> is not an average — it is a hard cap enforced inside every 100&nbsp;ms window, and traffic does not arrive at a constant rate.</p>
+
+<div class="eq plain"><code>periods needed &nbsp;=&nbsp; ⌈ CPU the request needs ÷ quota ⌉ &nbsp;&nbsp;·&nbsp;&nbsp; wall time &nbsp;=&nbsp; (periods − 1) × period &nbsp;+&nbsp; remainder</code></div>
+<p class="where">A request needing 200&nbsp;ms of CPU under a 50&nbsp;ms quota cannot run for 200&nbsp;ms. It runs for 50, stalls for 50, runs for 50, stalls for 50, and so on — finishing after <b>350&nbsp;ms</b> of wall time, of which <b>150&nbsp;ms</b> was spent descheduled doing nothing. The container used 0.2 CPU on average against a 0.5 limit the whole time.</p>
+
+<div class="demo" id="d-cpu">
+  <div class="demo-top"><div class="demo-title">CPU quota, and throttling at low utilisation</div><div class="demo-hint">Note the throttled percentage at ρ 0.40, then double the limit</div></div>
+  <div class="demo-body">
+    <canvas id="cCpu" aria-label="A timeline of CPU periods showing running and throttled intervals, with the resulting request latency"></canvas>
+    <div class="ctrls">
+      <div class="ctrl"><label>CPU limit <b id="cpQo">500</b>m</label><input type="range" id="cpQ" min="50" max="4000" step="50" value="500"></div>
+      <div class="ctrl"><label>Period <b id="cpPo">100</b> ms</label><input type="range" id="cpP" min="10" max="200" step="10" value="100"></div>
+      <div class="ctrl"><label>CPU per request <b id="cpCo">20</b> ms</label><input type="range" id="cpC" min="5" max="400" step="5" value="20"></div>
+      <div class="ctrl"><label>Request rate <b id="cpRo">10</b>/s</label><input type="range" id="cpR" min="1" max="120" value="10"></div>
+      <div class="ctrl"><label>Threads per request <b id="cpTo">1</b></label><input type="range" id="cpT" min="1" max="16" value="1"></div>
+    </div>
+    <div class="rgrid" id="cpOut"></div>
+    <div class="readout" id="cpNote"></div>
+  </div>
+</div>
+
+<div class="box trap"><b class="tag">Three consequences that change how you set limits</b>
+<p style="margin-bottom:6px"><strong>Throttling happens far below the average limit.</strong> At the defaults above the container runs at 40% of its CPU limit and still exhausts its quota in <b>8.0%</b> of periods, because two requests fit in one quota and arrivals bunch. Every one of those periods adds up to 50&nbsp;ms of pure stall to whatever was running, which lands squarely in your p99.</p>
+<p style="margin-bottom:6px"><strong>Raising the limit helps superlinearly.</strong> Doubling it from 0.5 to 1.0 CPU halves the utilisation but cuts throttled periods from 8.0% to <b>0.06%</b> — a 135-fold reduction, not a twofold one. This is why "the CPU graph looks fine, why is p99 bad" is answered by <code>container_cpu_cfs_throttled_periods_total</code> rather than by the usage metric.</p>
+<p style="margin-bottom:0"><strong>Parallelism drains the quota faster, it does not raise it.</strong> Splitting the same 200&nbsp;ms of work across four threads should take 50&nbsp;ms; under a 0.5 CPU limit it takes <b>313&nbsp;ms</b>, a 6.3× stretch against 1.8× for the single-threaded version. The four threads burn the quota four times faster and then all stall together. This is the mechanism behind the classic JVM problem, where a runtime that sized its thread pools from the host's core count spawns dozens of GC threads inside a half-CPU container.</p>
+</div>
+
+<div class="box tip"><b class="tag">The practical position on CPU limits</b>
+<p style="margin-bottom:0">Set CPU <em>requests</em>, which reserve a share and drive scheduling. Be far more cautious with CPU <em>limits</em>, which throttle. Many experienced teams set requests and omit limits entirely, on the grounds that <code>cpu.weight</code> already prevents a noisy neighbour from starving anyone under contention, while a limit actively wastes idle capacity that nobody else wants. The counter-argument is that limits make performance predictable and stop a runaway from consuming a whole node. If you do set them, set them well above the peak rather than near the average, and alert on throttled periods. Memory is the opposite case: <code>memory.max</code> genuinely is necessary, because memory is not compressible and there is no equivalent of "throttling" — the alternative to a limit is the host OOM killer choosing a victim, which chapter 2 showed is not the process you would have chosen.</p>
+</div>
+</section>
+
+<section id="images">
+<h2>Union filesystems, and what an image really is</h2><div class="h2rule"></div>
+
+<p>The third mechanism is the one that makes images cheap. OverlayFS presents a stack of read-only directories plus one writable directory as a single filesystem. Each image layer is a directory of files; the container gets them stacked with a thin writable layer on top.</p>
+
+<div class="kv">
+<dt>An image is an ordered list of layer digests plus a config blob</dt><dd>Nothing more. The manifest names the layers by content hash and the config records the entrypoint, environment, exposed ports and so on. A tag is a mutable pointer to a manifest digest — which is why <code>myapp:latest</code> is not a version, and why deploying by digest is what makes a deployment reproducible.</dd>
+<dt>Layers are shared across images by content</dt><dd>Ten images built on the same base share exactly one copy of it on disk and one pull over the network. This is why a 900&nbsp;MB image is not necessarily 900&nbsp;MB of new traffic, and why standardising on a small number of base images matters more than shrinking any individual image.</dd>
+<dt>Writes go to the top layer, copying the whole file first</dt><dd>Modifying one byte of a 2&nbsp;GB file in a lower layer copies the entire 2&nbsp;GB into the writable layer. This copy-up cost is why databases in containers want a volume rather than the container filesystem, and why heavy write workloads on overlay storage are slow in a way that looks inexplicable.</dd>
+<dt>Deleting a file from a lower layer does not remove it</dt><dd>It writes a <em>whiteout</em> entry that hides it. The bytes are still in the image and still transferred on every pull. This single fact is the most consequential thing in chapter 10.</dd>
+<dt>The container's writable layer dies with the container</dt><dd>Which is the whole point — but it means anything you need to keep must be on a volume, and it means a container that writes logs to its own filesystem is filling the host's disk in a place nobody thinks to look.</dd>
+</div>
+
+<div class="code"><div class="code-top"><span class="code-lang">bash — proving to yourself that a container is just a process</span><button class="code-copy">Copy</button></div><pre>docker run -d --name demo nginx
+
+<span class="c"># from the HOST: the "containerised" nginx is a normal process in ps</span>
+ps -ef | grep nginx                     <span class="c">← there it is, with a host PID</span>
+pid=$(docker inspect -f '{{.State.Pid}}' demo)
+
+<span class="c"># the namespaces it entered — each is an inode number. same number = same namespace</span>
+sudo ls -l /proc/$pid/ns/               <span class="c">← pid, net, mnt, uts, ipc, user, cgroup</span>
+sudo ls -l /proc/1/ns/                  <span class="c">← compare with the host's. `user` usually MATCHES,</span>
+                                        <span class="c">  which is the missing user namespace</span>
+
+<span class="c"># the cgroup limits actually in force</span>
+cat /sys/fs/cgroup/$(cat /proc/$pid/cgroup | cut -d: -f3)/cpu.max
+cat /sys/fs/cgroup/$(cat /proc/$pid/cgroup | cut -d: -f3)/memory.max
+cat /sys/fs/cgroup/$(cat /proc/$pid/cgroup | cut -d: -f3)/cpu.stat
+                                        <span class="c">← nr_throttled and throttled_usec. this is the</span>
+                                        <span class="c">  number the demo above is about</span>
+
+<span class="c"># enter its namespaces without any container tooling at all</span>
+sudo nsenter -t $pid -m -u -i -n -p /bin/sh
+                                        <span class="c">← you are now "inside the container". nsenter is not</span>
+                                        <span class="c">  a docker command; it is just setns(2)</span></pre></div>
+</section>
+
+<section id="vsvms">
+<h2>Containers against virtual machines, honestly</h2><div class="h2rule"></div>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th>Container</th><th>Virtual machine</th><th>microVM (Firecracker, Kata)</th></tr></thead>
+<tbody>
+<tr><td>Kernel</td><td class="no">Shared with the host</td><td class="yes">Its own</td><td class="yes">Its own, minimal</td></tr>
+<tr><td>Start time</td><td class="yes">Tens of milliseconds</td><td>Tens of seconds</td><td>~125 ms</td></tr>
+<tr><td>Memory overhead</td><td class="yes">Essentially none</td><td>Hundreds of MB per guest</td><td>A few MB</td></tr>
+<tr><td>Isolation boundary</td><td>The syscall interface — a large attack surface</td><td class="yes">The hypervisor — small and well studied</td><td class="yes">The hypervisor</td></tr>
+<tr><td>A kernel vulnerability</td><td class="no">Affects every container on the host</td><td class="yes">Contained to one guest</td><td class="yes">Contained</td></tr>
+<tr><td>Different kernel versions</td><td class="no">Impossible</td><td class="yes">Trivial</td><td class="yes">Trivial</td></tr>
+<tr><td>Density per host</td><td class="yes">Hundreds</td><td>Tens</td><td>Hundreds</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="box intu"><b class="tag">The rule that follows from the second-to-last row</b>
+<p style="margin-bottom:0">Containers isolate <em>your</em> workloads from each other well enough. They are not a sufficient boundary between <em>mutually untrusted</em> workloads, because the shared kernel means one local privilege escalation compromises every container on the host. That is why cloud providers running untrusted customer code use microVMs underneath what they present as containers — AWS Lambda and Fargate run on Firecracker — and why running arbitrary user-supplied code in a plain container on a shared node is a decision that needs a deliberate argument rather than a default. gVisor takes the other approach, intercepting syscalls in userspace to shrink the surface, at a performance cost.</p>
+</div>
+</section>
+
+<section id="close">
+<h2>Check yourself</h2><div class="h2rule"></div>
+
+<div class="check">
+<h4>Self-check</h4>
+<ol>
+<li>A CI runner mounts <code>/var/run/docker.sock</code> so it can build images. Someone points out that the container is otherwise well hardened — all namespaces, capabilities dropped, non-root user. How much does the hardening buy?
+<button class="reveal">Show answer</button><div class="ans">Essentially nothing. A process that can reach the Docker socket can instruct the daemon — which runs as root on the host — to start a new container that is <code>--privileged</code> and bind-mounts <code>/</code>, then write to the host filesystem as root. There is no exploit and no escape; it is the daemon's documented API being used as designed. Every namespace and dropped capability applies to the CI container, not to the container it asks the daemon to create. Treat socket access as equivalent to granting root on the host, and if a workload needs to build images use a rootless builder such as Kaniko or Buildah, or a remote build service, so that no process holding untrusted input ever has the socket.</div></li>
+
+<li>Your service is limited to 500m CPU. The usage graph never exceeds 250m, yet p99 latency is five times the median. Where do you look?
+<button class="reveal">Show answer</button><div class="ans">At CFS throttling — <code>container_cpu_cfs_throttled_periods_total</code>, or <code>nr_throttled</code> in the cgroup's <code>cpu.stat</code>. The limit is not an average, it is a hard cap inside every 100&nbsp;ms window, and traffic does not arrive at a constant rate. In the model above, a container at 40% of its limit still exhausts its quota in about 8% of periods simply because arrivals bunch, and each of those adds up to 50&nbsp;ms of pure stall to whatever was running. Averaged over a minute the usage graph shows 250m and looks healthy; the requests unlucky enough to be running during a throttled period are the p99. The remedy is to raise the limit — which helps superlinearly, cutting throttled periods from 8% to 0.06% when doubled — or to remove the limit and rely on requests and <code>cpu.weight</code> for fairness.</div></li>
+
+<li>Splitting a 200&nbsp;ms unit of work across four threads makes it slower inside a 0.5 CPU container. Explain.
+<button class="reveal">Show answer</button><div class="ans">The quota is CPU-time per period, not CPUs. Four threads consume it four times faster in wall-clock terms: the container gets 50&nbsp;ms of CPU per 100&nbsp;ms period, which four parallel threads exhaust in 12.5&nbsp;ms, and then all four stall for the remaining 87.5&nbsp;ms. The total CPU needed is unchanged, so the number of periods needed is unchanged, but the useful fraction of each period has shrunk. The ideal wall time falls from 200&nbsp;ms to 50&nbsp;ms while the actual rises to about 313&nbsp;ms — a 6.3× stretch against 1.8× for the single-threaded version. This is the mechanism behind the JVM case: a runtime that sizes GC threads and pools from the host's core count spawns dozens of threads inside a half-CPU container, and they all become runnable during a collection. The fixes are to make the runtime container-aware, cap its thread pools explicitly, or raise the limit so the quota is not the constraint.</div></li>
+
+<li>Why does modifying one byte of a large file inside a container sometimes take seconds?
+<button class="reveal">Show answer</button><div class="ans">Copy-up. OverlayFS presents read-only image layers with one writable layer on top, and it cannot modify a file in a lower layer in place — so the first write to any such file copies the <em>entire</em> file into the writable layer first. One byte of a 2&nbsp;GB file means a 2&nbsp;GB copy before the write proceeds. It happens once per file per container lifetime, which makes it confusing: the first write is very slow and every subsequent one is normal. This is why databases and any write-heavy workload should use a volume, which bypasses the union filesystem entirely, and why an image containing large mutable files is a poor design even when its size looks acceptable.</div></li>
+
+<li><code>docker run --user 1000</code> is often described as making a container non-root. What does it and does it not achieve?
+<button class="reveal">Show answer</button><div class="ans">It does achieve real defence in depth: the process starts as uid 1000, so it cannot write to root-owned paths, cannot bind ports below 1024 without <code>CAP_NET_BIND_SERVICE</code>, and a compromise starts from an unprivileged position. That is worth having and should be the default. What it does not achieve is a mapping between container identity and host identity. Without a user namespace, uid 1000 inside is uid 1000 on the host, and uid 0 inside would be real root on the host — so the protection depends entirely on the process never becoming root, rather than on root inside being harmless. A user namespace is what supplies the second property: it maps container uid 0 to some unprivileged host uid, so even a full escape from a root-in-container process lands as nobody. It is off by default in Docker and in most Kubernetes installations, which is why the demo flags it as an exposure in the default configuration.</div></li>
+
+<li>A container is killed with exit code 137. Give the two possible causes and how you would tell them apart.
+<button class="reveal">Show answer</button><div class="ans">137 is 128 + 9, so the process received <code>SIGKILL</code>. Either the cgroup OOM killer fired because the container exceeded <code>memory.max</code> — the platform records this as <code>OOMKilled</code> in the termination reason, and the kernel log shows the cgroup and the chosen victim — or the runtime sent <code>SIGTERM</code> for a normal shutdown, the process ignored it for the entire grace period, and the runtime escalated. Timing separates them cleanly: an OOM kill happens at an arbitrary moment under load, while a grace-period escalation happens at exactly the configured grace period after a stop was requested. The fixes are unrelated: raise the limit or reduce usage in the first case, and install a working <code>SIGTERM</code> handler in the second, which is the PID 1 problem from chapter 2. Note also that a memory limit produces an immediate kill rather than throttling, because memory is not compressible — this asymmetry with CPU is why the advice on the two limits is opposite.</div></li>
+
+<li>Your platform team proposes running customer-supplied code in containers on shared nodes. What is the objection, and what would you propose instead?
+<button class="reveal">Show answer</button><div class="ans">Containers share the host kernel, so the isolation boundary is the syscall interface — hundreds of entry points, historically a steady source of local privilege escalations. One such vulnerability compromises every container on the node, not just the one that exploited it. That is acceptable between workloads that already trust each other, since they share a blast radius anyway, and it is not acceptable between mutually untrusted tenants, because the failure mode is a cross-customer breach. The established answer is a hypervisor boundary under whatever you present as a container: microVMs such as Firecracker give a per-workload kernel with roughly 125&nbsp;ms start-up and a few megabytes of overhead, which is why AWS Lambda and Fargate use them. gVisor is the alternative, intercepting syscalls in userspace to shrink the surface at some performance cost. If neither is possible, the fallback is one node per tenant — which is a real cost, and the point is to price it honestly rather than to assume the container was sufficient.</div></li>
+</ol>
+</div>
+
+<div class="box tip"><b class="tag">Next</b>
+<p style="margin-bottom:0">Chapter 10 is about building the images: why instruction order decides whether a one-line change costs 36 seconds or 131, why deleting files in a later layer saves nothing at all, and what multi-stage builds are actually doing.</p>
+</div>
+</section>
+
+<div class="pagenav" id="pagenav"></div>
+</main>
+</div>
+
+<footer class="unit">
+  <div class="fi">
+    <div><h2>Chapter 09</h2><p>Containers from first principles. Part of the DevOps unit — <a href="index.html">all 24 chapters</a>.</p></div>
+    <div><h2>Used later by</h2><p>Chapter 10 (layers in practice), 11 (requests, limits and eviction), 16 (microVMs and cold starts), 20 (image digests and provenance).</p></div>
+    <div><h2>Going deeper</h2><p>The Docker unit on this site covers the tooling in full. Liz Rice's <em>Container Security</em> is the reference for the isolation half of this chapter.</p></div>
+  </div>
+</footer>
+
+<button class="top" id="toTop" aria-label="Back to top">↑</button>
+<script src="assets/unit.js"></script>
+<script>
+/* ============ demo 1: isolation matrix ============ */
+(function(){
+  const cv=document.getElementById("cIso"); if(!cv) return;
+  const pEl=document.getElementById("isP");
+  const T={pid:document.getElementById("isPid"), net:document.getElementById("isNet"),
+           mnt:document.getElementById("isMnt"), user:document.getElementById("isUsr"),
+           caps:document.getElementById("isCap"), sock:document.getElementById("isSock"),
+           priv:document.getElementById("isPriv")};
+  const out=document.getElementById("isOut"), note=document.getElementById("isNote");
+  const PRESETS={
+    hard:    {pid:1,net:1,mnt:1,user:1,caps:1,sock:0,priv:0},
+    docker:  {pid:1,net:1,mnt:1,user:0,caps:0,sock:0,priv:0},
+    pidhost: {pid:0,net:1,mnt:1,user:0,caps:0,sock:0,priv:0},
+    nethost: {pid:1,net:0,mnt:1,user:0,caps:0,sock:0,priv:0},
+    sock:    {pid:1,net:1,mnt:1,user:1,caps:1,sock:1,priv:0},
+    priv:    {pid:1,net:1,mnt:1,user:0,caps:0,sock:0,priv:1},
+    none:    {pid:0,net:0,mnt:0,user:0,caps:0,sock:0,priv:0}
+  };
+  const SEV={critical:["#D9534F",3],high:["#E07B39",2],medium:["#D9A441",1],low:["#8195A6",0]};
+
+  function state(){ const s={}; for(const k in T) s[k]=T[k].checked?1:0; return s; }
+  function analyse(s){
+    const ex=[];
+    if(s.priv) ex.push(["critical","--privileged: every capability, every host device",
+      "/dev is shared, so the container can mount the host disk directly. Equivalent to root on the host."]);
+    if(s.sock) ex.push(["critical","/var/run/docker.sock is mounted",
+      "It can ask the daemon — which is root — to start a privileged container bind-mounting /. No exploit needed."]);
+    if(!s.mnt) ex.push(["critical","no mnt namespace: the host filesystem IS the root filesystem",
+      "There is no isolation of any kind here; this is a plain process."]);
+    if(!s.pid) ex.push(["high","no pid namespace: the host process table is visible",
+      "ps lists every host process, and /proc/&lt;pid&gt;/environ leaks other services' environment variables — where credentials live."]);
+    if(!s.net) ex.push(["high","no net namespace: the host network stack is shared",
+      "Can bind host ports, capture host traffic, and reach services bound to 127.0.0.1 that believed themselves unreachable."]);
+    if(!s.user && !s.priv) ex.push(["high","no user namespace: uid 0 inside is uid 0 on the host",
+      "Any escape lands as real root. A user namespace would map it to an unprivileged host uid instead."]);
+    if(!s.caps && !s.priv) ex.push(["high","full capability set retained",
+      "CAP_SYS_ADMIN alone permits mount(2); CAP_SYS_PTRACE permits inspecting other processes. --cap-drop=ALL then add back what you need."]);
+    let worst="none";
+    for(const k of ["critical","high","medium","low"]) if(ex.some(e=>e[0]===k)){ worst=k; break; }
+    const on=["pid","net","mnt","user","caps"].filter(k=>s[k]).length;
+    return {ex,worst,on};
+  }
+
+  function draw(){
+    const s=state(), m=analyse(s);
+    const rows=[["pid",s.pid],["net",s.net],["mnt",s.mnt],["user",s.user],["caps dropped",s.caps],
+                ["docker.sock",!s.sock],["unprivileged",!s.priv]];
+    const w=cv.clientWidth||660, h=42+Math.max(1,m.ex.length)*26+6, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+
+    /* the mechanism strip */
+    let x=14;
+    rows.forEach(([lab,on])=>{
+      const bw=Math.max(46,Math.min(96,(w-28)/rows.length-6));
+      ctx.fillStyle= on?"#EFF1FE":"#FBE9E8";
+      ctx.strokeStyle= on?PC.line:PC.bad; ctx.lineWidth=1.2;
+      ctx.fillRect(x,10,bw,20); ctx.strokeRect(x+.5,10.5,bw,20);
+      ctx.fillStyle= on?PC.line:PC.bad; ctx.font="700 9px Archivo, Arial"; ctx.textAlign="center";
+      const t=lab.length*4.6>bw?lab.slice(0,Math.floor(bw/4.6)):lab;
+      ctx.fillText(t, x+bw/2, 20);
+      x+=bw+6;
+    });
+
+    if(!m.ex.length){
+      ctx.textAlign="left"; ctx.font="700 11px Archivo, Arial"; ctx.fillStyle=PC.ok;
+      ctx.fillText("No exposures. The process sees only its own namespaces and holds no capabilities it does not need.", 14, 52);
+    } else {
+      m.ex.forEach((e,i)=>{
+        const y=44+i*26, col=SEV[e[0]][0];
+        ctx.fillStyle=col; ctx.fillRect(14,y,4,20);
+        ctx.textAlign="left"; ctx.font="700 8.5px Archivo, Arial"; ctx.fillStyle=col;
+        ctx.fillText(e[0].toUpperCase(), 24, y+6);
+        ctx.font="10.5px Archivo, Arial"; ctx.fillStyle=PC.ink;
+        const room=Math.floor((w-100)/5.4);
+        ctx.fillText(e[1].length>room?e[1].slice(0,room-1)+"…":e[1], 24, y+16);
+      });
+    }
+
+    const col = m.worst==="none"?PC.ok : m.worst==="critical"?PC.bad : PC.warn;
+    out.innerHTML=
+      '<div><span>mechanisms on</span><b>'+m.on+' / 5</b></div>'+
+      '<div><span>exposures</span><b style="color:'+col+'">'+m.ex.length+'</b></div>'+
+      '<div><span>worst</span><b style="font-size:11.5px;color:'+col+'">'+m.worst+'</b></div>'+
+      '<div><span>host escape</span><b style="font-size:11.5px;color:'+(m.worst==="critical"?PC.bad:PC.ok)+'">'+
+        (m.worst==="critical"?"yes":"not directly")+'</b></div>'+
+      '<div><span>root inside = root outside</span><b style="font-size:11.5px;color:'+((!s.user||s.priv)?PC.bad:PC.ok)+'">'+
+        ((!s.user||s.priv)?"yes":"no")+'</b></div>'+
+      '<div><span>verdict</span><b style="font-size:11px;color:'+col+'">'+
+        (m.ex.length===0?"hardened":m.worst==="critical"?"equivalent to host root":"isolated but weakened")+'</b></div>';
+
+    note.innerHTML = m.ex.length===0
+      ? 'All five mechanisms are in force. The process has its own process table, network stack, filesystem view and uid mapping, and holds no capability it was not explicitly granted. '+
+        'This is achievable with ordinary flags — <code>--cap-drop=ALL</code>, <code>--security-opt=no-new-privileges</code>, a non-root user and a userns-remapped daemon — and it is not the default.'
+      : '<b>'+m.ex[0][1]+'</b> — '+m.ex[0][2]+
+        (m.ex.length>1 ? ' <br>Plus '+(m.ex.length-1)+' further exposure'+(m.ex.length>2?'s':'')+' listed above.' : '')+
+        (m.worst==="critical" ? ' <b style="color:#D9534F">At this point the other mechanisms are decoration</b>: the container can reach host root without exploiting anything.' : '');
+  }
+  pEl.addEventListener("input",()=>{ const p=PRESETS[pEl.value];
+    for(const k in T) T[k].checked = (k==="sock"||k==="priv") ? !!p[k] : !!p[k];
+    draw(); });
+  Object.values(T).forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+
+/* ============ demo 2: cgroup CPU throttling ============ */
+(function(){
+  const cv=document.getElementById("cCpu"); if(!cv) return;
+  const qEl=document.getElementById("cpQ"), pEl=document.getElementById("cpP"), cEl=document.getElementById("cpC"),
+        rEl=document.getElementById("cpR"), tEl=document.getElementById("cpT");
+  const out=document.getElementById("cpOut"), note=document.getElementById("cpNote");
+  const CORES=8;
+
+  function model(){
+    const milli=Math.round(+qEl.value), period=Math.round(+pEl.value);
+    const cpuReq=Math.round(+cEl.value), rate=Math.round(+rEl.value);
+    const threads=Math.max(1,Math.round(+tEl.value));
+    const parallel=Math.min(threads,CORES);
+    const limitCores=milli/1000;
+    const quota=period*limitCores;              /* ms of CPU per period */
+
+    /* a request needing `cpuReq` ms of CPU can obtain at most `quota` per period */
+    const n=Math.max(1,Math.ceil(cpuReq/quota));
+    const remainder=cpuReq-(n-1)*quota;
+    const soloWall=(n-1)*period+remainder/parallel;
+    const idealWall=cpuReq/parallel;
+    const inflation=soloWall/idealWall;
+    const stall=soloWall-idealWall;
+
+    /* throttling follows burstiness: arrivals in a period are Poisson, and the
+       quota is exhausted whenever enough land together to exceed it */
+    const lam=rate*period/1000;
+    const kMax=Math.floor(quota/cpuReq);
+    let pFit=0, term=Math.exp(-lam);
+    for(let k=0;k<=kMax;k++){ pFit+=term; term*=lam/(k+1); }
+    const throttled=Math.min(1,Math.max(0,1-pFit));
+
+    const demand=rate*cpuReq/1000;
+    return {milli,period,cpuReq,rate,threads,parallel,limitCores,quota,n,remainder,
+            soloWall,idealWall,inflation,stall,throttled,kMax,lam,
+            demand, rho:demand/limitCores, maxRate:limitCores*1000/cpuReq};
+  }
+
+  function draw(){
+    const m=model();
+    document.getElementById("cpQo").textContent=m.milli;
+    document.getElementById("cpPo").textContent=m.period;
+    document.getElementById("cpCo").textContent=m.cpuReq;
+    document.getElementById("cpRo").textContent=m.rate;
+    document.getElementById("cpTo").textContent=m.threads;
+
+    const w=cv.clientWidth||660, h=106, dpr=Math.min(devicePixelRatio||1,2);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+"px";
+    const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle="#FBFCFD"; ctx.fillRect(0,0,w,h); ctx.textBaseline="middle";
+
+    /* timeline of one request across periods */
+    const shown=Math.min(m.n,8);
+    const span=w-28, total=Math.max(m.soloWall, m.period);
+    const scale=span/Math.max(total, shown*m.period);
+    ctx.fillStyle=PC.text; ctx.font="600 9.5px Archivo, Arial"; ctx.textAlign="left";
+    ctx.fillText("one request needing "+m.cpuReq+" ms of CPU, across "+m.n+" period"+(m.n>1?"s":""), 14, 12);
+
+    let x=14;
+    for(let i=0;i<shown;i++){
+      const isLast=i===m.n-1;
+      const cpuThis=isLast?m.remainder:m.quota;
+      const runWall=cpuThis/m.parallel;
+      const stallWall=isLast?0:(m.period-runWall);
+      const rw=Math.max(1.5,runWall*scale), sw=Math.max(0,stallWall*scale);
+      ctx.fillStyle=PC.line; ctx.fillRect(x,24,rw,22);
+      if(sw>0){ ctx.fillStyle="#F4CFCB"; ctx.fillRect(x+rw,24,sw,22);
+        if(sw>34){ ctx.fillStyle=PC.bad; ctx.font="700 8.5px Archivo, Arial"; ctx.textAlign="center";
+          ctx.fillText("stalled", x+rw+sw/2, 35); } }
+      ctx.strokeStyle="#D5DDE4"; ctx.lineWidth=1; ctx.strokeRect(x+.5,24.5,rw+sw,22);
+      x+=rw+sw;
+      if(x>w-20) break;
+    }
+    if(m.n>shown){ ctx.textAlign="left"; ctx.font="9.5px Archivo, Arial"; ctx.fillStyle=PC.text;
+      ctx.fillText("… "+(m.n-shown)+" more period"+(m.n-shown>1?"s":""), Math.min(x+6,w-90), 35); }
+
+    ctx.textAlign="left"; ctx.font="9.5px Archivo, Arial"; ctx.fillStyle=PC.text;
+    ctx.fillText("running", 14, 56);
+    ctx.fillStyle=PC.line; ctx.fillRect(56,52,13,7);
+    ctx.fillStyle=PC.text; ctx.fillText("throttled", 78, 56);
+    ctx.fillStyle="#F4CFCB"; ctx.fillRect(126,52,13,7);
+    ctx.textAlign="right"; ctx.fillStyle=PC.ink; ctx.font="600 10px Archivo, Arial";
+    ctx.fillText(m.cpuReq+" ms CPU → "+m.soloWall.toFixed(0)+" ms wall ("+m.inflation.toFixed(1)+"×)", w-14, 56);
+
+    /* throttled-period gauge */
+    ctx.textAlign="left"; ctx.font="600 9.5px Archivo, Arial"; ctx.fillStyle=PC.text;
+    ctx.fillText("periods in which the quota is exhausted", 14, 74);
+    const gx=14, gs=Math.max(80,w-28-160);
+    ctx.fillStyle="#EDF1F4"; ctx.fillRect(gx,84,gs,13);
+    const tc = m.throttled>0.05?PC.bad : m.throttled>0.005?PC.warn : PC.ok;
+    ctx.fillStyle=tc; ctx.fillRect(gx,84,gs*Math.min(1,m.throttled),13);
+    ctx.textAlign="left"; ctx.font="700 10.5px ui-monospace, monospace"; ctx.fillStyle=tc;
+    ctx.fillText((m.throttled*100).toFixed(m.throttled<0.01?2:1)+"%", gx+gs+8, 91);
+    ctx.font="9.5px Archivo, Arial"; ctx.fillStyle=PC.text;
+    ctx.fillText("at ρ "+m.rho.toFixed(2), gx+gs+64, 91);
+
+    out.innerHTML=
+      '<div><span>limit</span><b>'+m.limitCores.toFixed(2)+' CPU</b></div>'+
+      '<div><span>average demand</span><b>'+m.demand.toFixed(2)+' CPU (ρ '+m.rho.toFixed(2)+')</b></div>'+
+      '<div><span>request wall time</span><b style="color:'+(m.inflation>1.2?PC.bad:PC.ink)+'">'+m.soloWall.toFixed(0)+' ms</b></div>'+
+      '<div><span>stretched by</span><b style="color:'+(m.inflation>1.2?PC.bad:PC.ok)+'">'+m.inflation.toFixed(2)+'×</b></div>'+
+      '<div><span>periods throttled</span><b style="color:'+tc+'">'+(m.throttled*100).toFixed(m.throttled<0.01?2:1)+'%</b></div>'+
+      '<div><span>throughput ceiling</span><b>'+m.maxRate.toFixed(0)+'/s</b></div>';
+
+    let msg='The quota is <b>'+m.quota.toFixed(0)+' ms of CPU per '+m.period+' ms period</b>. ';
+    if(m.n>1)
+      msg+='A request needing '+m.cpuReq+' ms cannot get it in one period, so it is stretched across <b>'+m.n+
+           '</b> of them: '+m.stall.toFixed(0)+' ms of the '+m.soloWall.toFixed(0)+
+           ' ms wall time is spent descheduled, doing nothing. ';
+    else
+      msg+='A request needing '+m.cpuReq+' ms fits inside one quota, so it is never stretched. ';
+    msg+='Separately, <b>'+m.kMax+'</b> request'+(m.kMax===1?'':'s')+' fit in a single quota, and at '+m.rate+
+         '/s about '+m.lam.toFixed(2)+' arrive per period — so the quota is exhausted in <b>'+
+         (m.throttled*100).toFixed(m.throttled<0.01?2:1)+'%</b> of periods';
+    if(m.rho<0.6 && m.throttled>0.02)
+      msg+=', <b style="color:#D9534F">even though average usage is only '+(m.rho*100).toFixed(0)+
+           '% of the limit</b>. Throttling follows burstiness, not averages — which is why the CPU graph looks healthy while p99 does not.';
+    else msg+='.';
+    if(m.parallel>1)
+      msg+=' With '+m.threads+' threads the quota drains '+m.parallel+
+           '× faster: ideal wall time would be '+m.idealWall.toFixed(0)+' ms but the actual is '+m.soloWall.toFixed(0)+
+           ' ms. <b>Parallelism drains the quota, it does not raise it.</b>';
+    note.innerHTML=msg;
+  }
+  [qEl,pEl,cEl,rEl,tEl].forEach(e=>e.addEventListener("input",draw));
+  debounceResize(draw); draw();
+})();
+</script>
+</body>
+</html>

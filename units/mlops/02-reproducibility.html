@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Reproducibility — MLOps</title>
+<meta name="description" content="Why a stable metric hides unstable decisions, where nondeterminism actually enters training, and why hashing inputs beats eliminating them.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230C1D30'/%3E%3Cpath d='M6 16h20' stroke='%23E0699F' stroke-width='4' stroke-linecap='round'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%230C1D30' stroke='%23fff' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..700&family=Newsreader:opsz,wght@6..72,300..500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/unit.css">
+</head>
+<body>
+
+<div id="prog"></div>
+
+<header class="band">
+  <div class="band-inner">
+    <p class="crumb"><a href="../../index.html">Roadmap Notes</a> <span>/</span> <a href="index.html">MLOps</a> <span>/</span> Chapter 2</p>
+    <p class="chnum">CHAPTER 02</p>
+    <h1>Reproducibility</h1>
+    <p class="lede">Retrain the same converged model with the examples in a different order and the test AUC moves by <strong>0.00158</strong> — nothing. Meanwhile <strong>5.90%</strong> of individual decisions flip, and among borderline cases it is <strong>41.1%</strong>. The metric says the model is unchanged; the people it decides about would disagree.</p>
+    <div class="meta">
+      <div><b>7</b> sections</div>
+      <div><b>2</b> demos</div>
+      <div><b>~27 min</b> read</div>
+      <div><b>Part 1</b> Foundations</div>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <nav class="side">
+    <h2>ON THIS PAGE</h2>
+    <ol></ol>
+    <a class="back" href="index.html">&#8592; All chapters</a>
+  </nav>
+
+  <main>
+
+    <section id="levels">
+      <p class="kicker">DEFINITIONS</p>
+      <h2>Three different things called reproducible</h2>
+      <p class="sub">They cost wildly different amounts, and most arguments about reproducibility are people wanting different ones.</p>
+
+      <div class="terms">
+        <dt>Bit-identical</dt>
+        <dd>The same weights, byte for byte. Achievable, and the demo below shows what it takes: a fixed seed and no source of ordering nondeterminism. Expensive on a GPU, and often not the thing you actually need.</dd>
+
+        <dt>Statistically equivalent</dt>
+        <dd>A different model whose aggregate behaviour is indistinguishable. Cheap, and what most teams mean. The first demo is about why this is a weaker guarantee than it sounds.</dd>
+
+        <dt>Reconstructible</dt>
+        <dd>You can identify every input that produced the artefact, whether or not rerunning gives the same answer. This is the one that matters for audit, debugging and rollback, and it is the cheapest of the three &mdash; it is bookkeeping rather than determinism.</dd>
+      </div>
+
+      <div class="note key">
+        <b>The order to want them in</b>
+        <p><strong>Reconstructible first</strong>, always. It is a few lines of metadata and it answers "what produced this", which is the question you will actually be asked.</p>
+        <p><strong>Bit-identical where it is cheap</strong> &mdash; which is most CPU training and most classical models. Do not spend a fortnight forcing determinism onto a distributed GPU job.</p>
+        <p><strong>Statistically equivalent as the fallback</strong>, but knowing what the second demo shows: aggregate equivalence permits a lot of per-case disagreement.</p>
+      </div>
+    </section>
+
+    <section id="stability">
+      <p class="kicker">THE MEASUREMENT</p>
+      <h2>What actually moves when you retrain</h2>
+      <p class="sub">A logistic model trained by stochastic gradient descent, retrained eight times, and compared two ways.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>Aggregate stability against per-case stability</b>
+          <span>3,000 training rows, 4,000 test rows, 8 rebuilds compared pairwise</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>What differs between rebuilds
+              <select id="st-case">
+                <option value="0">Nothing &mdash; fixed seed, no shuffling</option>
+                <option value="1" selected>The order of the examples</option>
+                <option value="2">Order, plus float reduction order</option>
+                <option value="3">The same, stopped early</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="st-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile good" id="st-auc-tile"><i>SPREAD IN TEST AUC</i><b id="st-auc">0</b><s id="st-auc-sub"></s></div>
+            <div class="tile" id="st-flip-tile"><i>DECISIONS THAT FLIP</i><b id="st-flip">0%</b><s>between two rebuilds</s></div>
+            <div class="tile" id="st-near-tile"><i>OF BORDERLINE CASES</i><b id="st-near">0%</b><s>within 0.05 of the threshold</s></div>
+            <div class="tile hi" id="st-verd-tile"><i>VERDICT</i><b id="st-verd">&mdash;</b><s id="st-verd-sub"></s></div>
+          </div>
+
+          <p class="readout" id="st-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>The same training data and the same hyperparameters throughout</caption>
+          <thead>
+            <tr><th>What differs</th><th>Mean test AUC</th><th>AUC spread</th><th>Decisions that flip</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Nothing &mdash; fixed seed, no shuffle</td><td>0.8320</td><td><strong>0.00000</strong></td><td><strong>0.00%</strong></td></tr>
+            <tr><td><strong>The order of the examples</strong></td><td>0.8293</td><td><strong>0.00158</strong></td><td><strong>5.90%</strong></td></tr>
+            <tr><td>Order, plus float reduction</td><td>0.8274</td><td>0.00224</td><td>6.50%</td></tr>
+            <tr><td>The same, stopped early</td><td>0.8208</td><td>0.00457</td><td><strong>12.20%</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note trap">
+        <b>The metric is stable and the decisions are not</b>
+        <p>Shuffling the examples moves the test AUC by <strong>0.00158</strong> — a range of 0.00516 across eight rebuilds, which no report would flag and no acceptance test would fail. The model is, by any aggregate measure, the same model.</p>
+        <p>And <strong>5.90%</strong> of individual test cases receive a different decision. On a hundred thousand applications that is roughly six thousand people whose outcome depended on which run of the training job happened to be the one deployed.</p>
+        <p>The flips concentrate near the boundary — <strong>41.1%</strong> of cases within 0.05 of the threshold flip, against <strong>2.88%</strong> of confident ones. That is reassuring for an average and not at all reassuring for the borderline applicant, who is precisely the person a review process will ask about.</p>
+      </div>
+
+      <div class="note key">
+        <b>Two things follow</b>
+        <p><strong>"The metrics match" is not evidence that a rebuild reproduced.</strong> It is evidence that the aggregate behaviour is similar, which is a much weaker claim and one that a comparison of AUCs cannot distinguish from a genuinely identical model.</p>
+        <p><strong>Convergence is a reproducibility property.</strong> The undertrained row flips <strong>12.20%</strong> of decisions and has three times the AUC spread. A model stopped early is not just less accurate, it is less <em>stable</em>, and the two are usually discussed separately.</p>
+        <p>If per-case consistency matters — credit, moderation, medical triage, anything a person can appeal — then the thing to test is not the metric. It is the fraction of decisions that change, which takes one line and almost nobody computes.</p>
+      </div>
+    </section>
+
+    <section id="sources">
+      <p class="kicker">MECHANISM</p>
+      <h2>Where nondeterminism enters</h2>
+      <p class="sub">In rough order of how often it is the culprit.</p>
+
+      <div class="tw">
+        <table>
+          <caption>Sources, and what each one costs to remove</caption>
+          <thead>
+            <tr><th>Source</th><th>Why it happens</th><th>Cost to pin</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>Data ordering</strong></td><td>Shuffling, and parallel readers finishing out of order</td><td>Low &mdash; seed the shuffle, sort the shards</td></tr>
+            <tr><td><strong>Unseeded initialisation</strong></td><td>Weight init, dropout, augmentation, sampling</td><td>Low &mdash; one global seed, set early</td></tr>
+            <tr><td>Concurrency</td><td>Thread count changes the reduction order of a sum</td><td>Medium &mdash; fix threads, lose some speed</td></tr>
+            <tr><td>GPU kernels</td><td>Atomics accumulate in nondeterministic order</td><td><strong>High</strong> &mdash; deterministic kernels are slower and not always available</td></tr>
+            <tr><td>Library versions</td><td>A default changed, or an algorithm was replaced</td><td>Low &mdash; a lockfile</td></tr>
+            <tr><td><strong>The data itself</strong></td><td>A late-arriving row, a backfill, a mutable table</td><td>Medium &mdash; snapshot or content-address it</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note warn">
+        <b>The last row is the one that catches people</b>
+        <p>Everything above it is a property of your code. "The data itself" is a property of a system you probably do not control, and a query against a live table returns different rows depending on when you ran it.</p>
+        <p><a href="01-why.html">Chapter 1</a> measured what that does: with a silently-refreshing data source, <strong>35.5%</strong> of days ran a combination nobody had tested. Pinning the training data is usually the highest-value single change, and it is <a href="03-versioning.html">chapter 3</a>'s subject.</p>
+      </div>
+
+      <div class="note tip">
+        <b>A seed is not one seed</b>
+        <p>Python's <code>random</code>, NumPy's global state, the framework's own generator, the data loader's workers, and the CUDA generator are separate. Setting one and assuming the rest followed is the most common way a "seeded" run turns out not to be.</p>
+        <p>Frameworks provide a single call that sets all of them, and a determinism flag that raises an error when a nondeterministic operation is used. That flag is worth turning on once even if you then turn it off &mdash; the list of things it complains about is the list of things making your training irreproducible.</p>
+      </div>
+    </section>
+
+    <section id="detect">
+      <p class="kicker">THE BETTER GOAL</p>
+      <h2>Do not eliminate divergence — detect it</h2>
+      <p class="sub">Hashing the inputs does not make a rebuild match. It changes who finds out that it did not.</p>
+
+      <div class="demo">
+        <div class="demo-top">
+          <b>What hashing actually buys</b>
+          <span>the same six components as chapter 1, with the same odds of matching</span>
+        </div>
+        <div class="demo-body">
+          <div class="ctrl">
+            <label>Which inputs you hash and compare
+              <select id="hs-set">
+                <option value="none">Nothing</option>
+                <option value="two">Code and data</option>
+                <option value="cheap" selected>Code, data, libraries and seed</option>
+                <option value="expensive">Only hardware and upstream logic</option>
+                <option value="all">Everything</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="canvas" id="hs-canvas"></div>
+
+          <div class="rgrid">
+            <div class="tile"><i>REBUILD IS IDENTICAL</i><b id="hs-id">0%</b><s>unchanged by hashing</s></div>
+            <div class="tile good" id="hs-loud-tile"><i>DIVERGENCE CAUGHT LOUDLY</i><b id="hs-loud">0%</b><s>the job fails, you know</s></div>
+            <div class="tile bad" id="hs-sil-tile"><i>SILENT DIVERGENCE</i><b id="hs-sil">0%</b><s>a different model, no warning</s></div>
+            <div class="tile hi" id="hs-verd-tile"><i>VERDICT</i><b id="hs-verd">&mdash;</b><s id="hs-verd-sub"></s></div>
+          </div>
+
+          <p class="readout" id="hs-note"></p>
+        </div>
+      </div>
+
+      <div class="tw">
+        <table>
+          <caption>Hashing does not change whether the rebuild matches, only whether you find out</caption>
+          <thead>
+            <tr><th>Hashed</th><th>Rebuild identical</th><th>Caught loudly</th><th>Silent divergence</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Nothing</td><td>7.1%</td><td>0.0%</td><td><strong>92.9%</strong></td></tr>
+            <tr><td>Code and data</td><td>7.1%</td><td>53.3%</td><td>39.7%</td></tr>
+            <tr><td><strong>&plus; libraries and seed</strong></td><td>7.1%</td><td>85.3%</td><td><strong>7.7%</strong></td></tr>
+            <tr><td>Everything</td><td>7.1%</td><td>92.9%</td><td><strong>0.0%</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note key">
+        <b>The first column never moves</b>
+        <p><strong>7.1% throughout.</strong> Hashing does not improve reproducibility at all — the rebuild is exactly as likely to differ as it was before.</p>
+        <p>What changes is the third column: silent divergence falls from <strong>92.9% to 0.0%</strong>. The failure mode goes from "a different model is now in production and nobody knows" to "the job stopped and printed which input moved". Those are not the same incident.</p>
+        <p>And the third row is the practical one. Hashing the four <em>cheap</em> inputs — code, data, libraries, seed — gets silent divergence to <strong>7.7%</strong> without touching hardware or upstream feature logic, which are the expensive things to pin. Doing it the other way round, hashing only hardware and upstream logic, leaves <strong>40.9%</strong> silent: <strong>5.3 times worse, for considerably more effort.</strong></p>
+      </div>
+
+      <div class="note tip">
+        <b>What a hash of each input looks like in practice</b>
+        <p><strong>Code:</strong> the git commit, plus a flag for a dirty working tree. <strong>Data:</strong> a content hash of the snapshot, or the table version if the store provides one. <strong>Libraries:</strong> a hash of the lockfile, not of the requirements file. <strong>Seed:</strong> the value itself. <strong>Environment:</strong> the container image digest, which is already a hash.</p>
+        <p>Store all five with the model. A rebuild recomputes them and refuses to proceed on a mismatch unless overridden explicitly. That is perhaps thirty lines, and it converts the most confusing class of ML incident into a failed job with a clear message.</p>
+      </div>
+    </section>
+
+    <section id="practice">
+      <p class="kicker">DOING IT</p>
+      <h2>The checklist that gets you most of the way</h2>
+      <p class="sub">In the order that pays.</p>
+
+      <div class="check">
+        <li><strong>Snapshot or content-address the training data.</strong> The highest-value single change, and the one that stops a rerun quietly training on a different week.</li>
+        <li><strong>Lockfile, not a requirements list.</strong> Exact versions of everything including transitive dependencies, and hash the lockfile rather than the top-level file.</li>
+        <li><strong>One seed, set once, covering every generator.</strong> Use the framework's combined helper rather than setting them individually.</li>
+        <li><strong>Run in a container, and record the image digest.</strong> The digest is a hash you already have.</li>
+        <li><strong>Record all of it with the model artefact.</strong> Not in a wiki page &mdash; alongside the weights, where a rollback can read it.</li>
+        <li><strong>Test the rebuild on a schedule.</strong> A monthly job that retrains last month's model and compares. This is the only thing that tells you whether any of the above is actually working.</li>
+      </div>
+
+      <div class="note warn">
+        <b>Where to stop</b>
+        <p>Forcing bit-identical results out of distributed GPU training is expensive, sometimes slower by a large factor, and occasionally impossible with the kernels available. It is rarely worth it.</p>
+        <p>What <em>is</em> worth it is knowing you did not get it. A recorded set of input hashes plus an accepted tolerance on the metric gives you a defensible position: this model was built from these exact inputs, and rebuilding produces a model within this stated tolerance. That is an honest claim, and unlike "it is reproducible" it is one you can check.</p>
+      </div>
+    </section>
+
+    <section id="reading">
+      <p class="kicker">JUDGEMENT</p>
+      <h2>Five questions about a training pipeline</h2>
+
+      <div class="check">
+        <li><strong>Which of the three meanings are you claiming?</strong> Bit-identical, statistically equivalent, or reconstructible. Most disagreements dissolve here.</li>
+        <li><strong>If you reran it now, would it use the same rows?</strong> A query against a live table says no.</li>
+        <li><strong>What fraction of decisions would change?</strong> Not the metric &mdash; the decisions. 5.90% here with a metric that moved 0.00158.</li>
+        <li><strong>Would a mismatch be loud or silent?</strong> Silent is the 92.9% default.</li>
+        <li><strong>When did a rebuild last actually run?</strong> An untested rebuild procedure is a hypothesis, and this is the cheapest possible test of everything above.</li>
+      </div>
+    </section>
+
+    <section id="recap">
+      <h2>Recap</h2>
+
+      <div class="recap">
+        <h3>What to take from this chapter</h3>
+        <ol>
+          <li><b>Three meanings:</b> bit-identical, statistically equivalent, reconstructible &mdash; and the cheapest one matters most.</li>
+          <li><b>Want reconstructible first,</b> bit-identical where cheap, statistical equivalence as a fallback.</li>
+          <li><b>A fixed seed with no shuffling gives a bit-identical rebuild</b> and zero flipped decisions.</li>
+          <li><b>Shuffling the examples moves the AUC by 0.00158</b> &mdash; a range of 0.00516 across eight rebuilds.</li>
+          <li><b>And flips 5.90% of individual decisions.</b> The metric says the model is unchanged.</li>
+          <li><b>Among borderline cases it is 41.1%,</b> against 2.88% of confident ones.</li>
+          <li><b>So &quot;the metrics match&quot; is not evidence a rebuild reproduced.</b></li>
+          <li><b>Convergence is a reproducibility property:</b> stopped early, 12.20% of decisions flip.</li>
+          <li><b>If per-case consistency matters, measure decision flips, not the metric.</b></li>
+          <li><b>Data ordering and unseeded initialisation are the usual culprits,</b> and both are cheap to fix.</li>
+          <li><b>The data itself is the expensive one,</b> because it belongs to a system you do not control.</li>
+          <li><b>A seed is not one seed</b> &mdash; several generators, and the determinism flag lists what is breaking.</li>
+          <li><b>Hashing does not change the 7.1%.</b> It changes who finds out.</li>
+          <li><b>Silent divergence falls from 92.9% to 0.0%</b> as you hash more inputs.</li>
+          <li><b>The four cheap inputs get it to 7.7%;</b> hashing only the expensive ones leaves 40.9%.</li>
+          <li><b>Test the rebuild on a schedule.</b> It is the only check that the rest of this is working.</li>
+        </ol>
+      </div>
+
+      <div class="foot">
+        <div class="fi-grid">
+          <div class="fi">
+            <i>NEXT</i>
+            <p><a href="03-versioning.html">Chapter 3 &mdash; Versioning code, data and models</a>. Three artefacts with different lifecycles, content addressing, and the identifier that ties a prediction back to its origin.</p>
+          </div>
+          <div class="fi">
+            <i>PICKED UP FROM</i>
+            <p><a href="01-why.html">Chapter 1</a>'s conjunction: six components each mostly fine multiplying to 7.1%.</p>
+          </div>
+          <div class="fi">
+            <i>ONE THING TO TRY</i>
+            <p>Retrain your current model twice with different seeds and count the fraction of predictions that cross the decision threshold. Compare that with the change in your headline metric.</p>
+          </div>
+        </div>
+        <div class="pager"></div>
+      </div>
+
+    </section>
+
+  </main>
+</div>
+
+<button class="top" aria-label="Back to top">&#8593;</button>
+
+<script src="assets/unit.js"></script>
+<script>
+/* ============================================================
+   shared helpers
+   ============================================================ */
+function lcg(seed) { var s = seed >>> 0; return function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+function gauss(rnd) {
+  var u1 = Math.max(1e-12, rnd()), u2 = rnd();
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+function avg(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i]; return s / a.length; }
+function sd(a) {
+  var m = avg(a), s = 0;
+  for (var i = 0; i < a.length; i++) s += (a[i] - m) * (a[i] - m);
+  return Math.sqrt(s / a.length);
+}
+function sigm(z) { return 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z)))); }
+function auc(sc, lb) {
+  var idx = sc.map(function (s, i) { return i; }).sort(function (a, b) { return sc[a] - sc[b]; });
+  var rk = new Array(sc.length), i = 0;
+  while (i < idx.length) {
+    var j = i;
+    while (j + 1 < idx.length && sc[idx[j + 1]] === sc[idx[i]]) j++;
+    var r = (i + j) / 2 + 1;
+    for (var k = i; k <= j; k++) rk[idx[k]] = r;
+    i = j + 1;
+  }
+  var np = 0, nn = 0, sp = 0;
+  for (var t = 0; t < lb.length; t++) { if (lb[t]) { np++; sp += rk[t]; } else nn++; }
+  return (np && nn) ? (sp - np * (np + 1) / 2) / (np * nn) : 0.5;
+}
+
+/* ============================================================
+   Demo 1 — aggregate stability against per-case stability
+   ============================================================ */
+(function () {
+  var NF = 6, TRUE_W = [1.1, -0.8, 0.6, 0.4, -0.3, 0.2], RUNS = 8;
+  var $ = function (id) { return document.getElementById(id); };
+  var CASES = [
+    { label: "nothing \u2014 fixed seed, no shuffling", epochs: 50, lr: 0.08, shuffle: false, floatJitter: 0, sameSeed: true },
+    { label: "the order of the examples", epochs: 50, lr: 0.08, shuffle: true, floatJitter: 0, sameSeed: false },
+    { label: "order, plus float reduction order", epochs: 50, lr: 0.08, shuffle: true, floatJitter: 0.02, sameSeed: false },
+    { label: "the same, stopped early", epochs: 6, lr: 0.08, shuffle: true, floatJitter: 0, sameSeed: false }
+  ];
+
+  function makeData(n, rnd) {
+    var X = [], y = [];
+    for (var i = 0; i < n; i++) {
+      var x = [];
+      for (var j = 0; j < NF; j++) x.push(gauss(rnd));
+      var z = -0.3;
+      for (var j2 = 0; j2 < NF; j2++) z += TRUE_W[j2] * x[j2];
+      X.push(x); y.push(rnd() < sigm(z) ? 1 : 0);
+    }
+    return { X: X, y: y };
+  }
+  /* SGD: the order of examples is a real source of nondeterminism */
+  function trainSGD(X, y, seed, opts) {
+    var rnd = lcg(seed), w = new Array(NF + 1).fill(0), n = y.length;
+    var order = [];
+    for (var i = 0; i < n; i++) order.push(i);
+    var lr = opts.lr;
+    for (var e = 0; e < opts.epochs; e++) {
+      if (opts.shuffle) {
+        for (var k = order.length - 1; k > 0; k--) {
+          var j = Math.floor(rnd() * (k + 1)), t = order[k];
+          order[k] = order[j]; order[j] = t;
+        }
+      }
+      for (var q = 0; q < n; q++) {
+        var idx = order[q], xi = X[idx], z = w[0];
+        for (var f = 0; f < NF; f++) z += w[f + 1] * xi[f];
+        var g = sigm(z) - y[idx];
+        /* a tiny perturbation stands in for float reduction order on a GPU */
+        if (opts.floatJitter) g += (rnd() - 0.5) * opts.floatJitter;
+        w[0] -= lr * g;
+        for (var f2 = 0; f2 < NF; f2++) w[f2 + 1] -= lr * g * xi[f2];
+      }
+      lr *= 0.98;
+    }
+    return w;
+  }
+  function scoreAll(w, X) {
+    return X.map(function (x) {
+      var z = w[0];
+      for (var f = 0; f < NF; f++) z += w[f + 1] * x[f];
+      return sigm(z);
+    });
+  }
+
+  var cache = {};
+  function run(ci) {
+    if (cache[ci]) return cache[ci];
+    var opts = CASES[ci], rnd = lcg(501);
+    var tr = makeData(3000, rnd), te = makeData(4000, rnd);
+    var aucs = [], preds = [];
+    for (var r = 0; r < RUNS; r++) {
+      var w = trainSGD(tr.X, tr.y, opts.sameSeed ? 7 : 100 + r, opts);
+      aucs.push(auc(scoreAll(w, te.X), te.y));
+      preds.push(scoreAll(w, te.X));
+    }
+    /* how often two independent rebuilds disagree on an individual case */
+    var flips = 0, pairs = 0;
+    for (var a = 0; a < preds.length; a++) {
+      for (var b = a + 1; b < preds.length; b++) {
+        pairs++;
+        var f = 0;
+        for (var i = 0; i < preds[a].length; i++) {
+          if ((preds[a][i] > 0.5 ? 1 : 0) !== (preds[b][i] > 0.5 ? 1 : 0)) f++;
+        }
+        flips += f / preds[a].length;
+      }
+    }
+    /* and whether they concentrate near the decision boundary */
+    var nearFlip = 0, nearN = 0, farFlip = 0, farN = 0;
+    for (var i2 = 0; i2 < preds[0].length; i2++) {
+      var near = Math.abs(preds[0][i2] - 0.5) < 0.05;
+      var dis = (preds[0][i2] > 0.5 ? 1 : 0) !== (preds[1][i2] > 0.5 ? 1 : 0);
+      if (near) { nearN++; if (dis) nearFlip++; } else { farN++; if (dis) farFlip++; }
+    }
+    cache[ci] = {
+      aucMean: avg(aucs), aucSD: sd(aucs),
+      aucRange: Math.max.apply(null, aucs) - Math.min.apply(null, aucs),
+      flip: flips / pairs, nearRate: nearN ? nearFlip / nearN : 0,
+      farRate: farN ? farFlip / farN : 0, preds: preds
+    };
+    return cache[ci];
+  }
+
+  function chart(ci) {
+    var W = 700, H = 190, B = 28, L = 42;
+    var d = run(ci);
+    /* where the two rebuilds disagree, plotted against the first run's score */
+    var bins = 40, tot = new Array(bins).fill(0), dis = new Array(bins).fill(0);
+    for (var i = 0; i < d.preds[0].length; i++) {
+      var b = Math.min(bins - 1, Math.floor(d.preds[0][i] * bins));
+      tot[b]++;
+      if ((d.preds[0][i] > 0.5 ? 1 : 0) !== (d.preds[1][i] > 0.5 ? 1 : 0)) dis[b]++;
+    }
+    var xOf = function (v) { return L + v * (W - L - 140); };
+    var yOf = function (v) { return (H - B) - v * (H - B - 26); };
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Where two rebuilds disagree, by predicted score">'];
+    svg.push('<text x="0" y="11" font-size="10" font-weight="700" fill="#7C8B99">SHARE OF CASES WHERE TWO REBUILDS DISAGREE, BY PREDICTED SCORE</text>');
+    svg.push('<line x1="' + xOf(0.5).toFixed(1) + '" y1="20" x2="' + xOf(0.5).toFixed(1) + '" y2="' + (H - B) +
+      '" stroke="#0C1D30" stroke-width="1.6" stroke-dasharray="4 3"/>');
+    svg.push('<text x="' + (xOf(0.5) + 5).toFixed(1) + '" y="29" font-size="9" fill="#0C1D30">threshold</text>');
+    for (var k = 0; k < bins; k++) {
+      if (!tot[k]) continue;
+      var rate = dis[k] / tot[k];
+      var x = xOf((k + 0.5) / bins);
+      svg.push('<rect x="' + (x - 6).toFixed(1) + '" y="' + yOf(rate).toFixed(1) + '" width="12" height="' +
+        Math.max(0.6, (H - B) - yOf(rate)).toFixed(1) + '" fill="' +
+        (Math.abs((k + 0.5) / bins - 0.5) < 0.05 ? "#C0453A" : "#8FA0AF") + '" opacity="0.85"/>');
+    }
+    [0, 0.25, 0.5, 0.75, 1].forEach(function (v) {
+      svg.push('<text x="' + xOf(v).toFixed(1) + '" y="' + (H - 12) + '" font-size="9" fill="#7C8B99" text-anchor="middle">' +
+        v.toFixed(2) + '</text>');
+    });
+    [0, 0.25, 0.5].forEach(function (v) {
+      svg.push('<text x="' + (L - 6) + '" y="' + (yOf(v) + 4).toFixed(1) + '" font-size="9" fill="#7C8B99" text-anchor="end">' +
+        (v * 100).toFixed(0) + '%</text>');
+    });
+    var px = W - 132;
+    svg.push('<text x="' + px + '" y="34" font-size="9.5" fill="#7C8B99">AUC spread</text>');
+    svg.push('<text x="' + px + '" y="52" font-size="14" font-weight="700" fill="#166B47">' + d.aucSD.toFixed(5) + '</text>');
+    svg.push('<text x="' + px + '" y="76" font-size="9.5" fill="#7C8B99">decisions flipped</text>');
+    svg.push('<text x="' + px + '" y="94" font-size="17" font-weight="700" fill="' +
+      (d.flip > 0.01 ? "#9B2C22" : "#166B47") + '">' + (d.flip * 100).toFixed(2) + '%</text>');
+    svg.push('<text x="0" y="' + (H - 1) + '" font-size="9.5" fill="#7C8B99">red bars are cases within 0.05 of the threshold \u2014 the ones a review process asks about</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var ci = +$("st-case").value;
+    var d = run(ci), base = run(0);
+
+    $("st-auc").textContent = d.aucSD.toFixed(5);
+    $("st-auc-sub").textContent = "range " + d.aucRange.toFixed(5) + " over " + RUNS + " rebuilds";
+    $("st-auc-tile").className = "tile " + (d.aucSD < 0.005 ? "good" : "");
+    $("st-flip").textContent = (d.flip * 100).toFixed(2) + "%";
+    $("st-flip-tile").className = "tile " + (d.flip > 0.01 ? "bad" : "good");
+    $("st-near").textContent = (d.nearRate * 100).toFixed(1) + "%";
+    $("st-near-tile").className = "tile " + (d.nearRate > 0.1 ? "bad" : "good");
+    $("st-verd").textContent = d.flip === 0 ? "Bit-identical" : d.aucSD < 0.005 ? "Metric says fine" : "Unstable throughout";
+    $("st-verd-sub").textContent = d.flip === 0 ? "nothing to detect"
+      : "decisions disagree anyway";
+    $("st-verd-tile").className = "tile " + (d.flip === 0 ? "good" : "bad");
+
+    $("st-canvas").innerHTML = chart(ci);
+
+    var lines = [];
+    lines.push("The same training data, the same hyperparameters, " + RUNS +
+      " rebuilds. What differs between them is " + CASES[ci].label + ".");
+
+    if (ci === 0) {
+      lines.push("With the seed fixed and no shuffling, the rebuild is bit-identical: an AUC spread of " +
+        d.aucSD.toExponential(1) + " and zero decisions flipped. This is achievable, it is what most classical CPU training can do, and it is the control for everything below.");
+      lines.push("Now allow the examples to arrive in a different order \u2014 which is what a shuffle, or two parallel readers finishing out of turn, actually does.");
+    } else {
+      lines.push("The test AUC moves by " + d.aucSD.toFixed(5) + " \u2014 a range of " +
+        d.aucRange.toFixed(5) + " across all " + RUNS +
+        " rebuilds. No report would flag that and no acceptance test would fail on it. By any aggregate measure this is the same model.");
+      lines.push("And " + (d.flip * 100).toFixed(2) +
+        "% of individual test cases receive a DIFFERENT decision. On a hundred thousand applications that is roughly " +
+        Math.round(d.flip * 100000).toLocaleString() +
+        " people whose outcome depended on which run of the training job happened to be the one deployed.");
+      lines.push("The disagreement concentrates near the threshold: " + (d.nearRate * 100).toFixed(1) +
+        "% of cases within 0.05 of the boundary flip, against " + (d.farRate * 100).toFixed(2) +
+        "% of confident ones. Reassuring for an average, and not at all reassuring for the borderline applicant \u2014 who is exactly the person an appeal process will ask about.");
+      if (ci === 3) {
+        lines.push("This row also shows that convergence is a REPRODUCIBILITY property, not only an accuracy one. Stopped early, the model flips " +
+          (d.flip * 100).toFixed(2) + "% of decisions against the converged " + (run(1).flip * 100).toFixed(2) +
+          "%, and its AUC spread is " + (d.aucSD / run(1).aucSD).toFixed(1) +
+          " times larger. A model that has not settled is unstable in both senses, and the two are usually discussed separately.");
+      } else {
+        lines.push("Which means \u201cthe metrics match\u201d is not evidence that a rebuild reproduced. It is evidence that the aggregate behaviour is similar \u2014 a much weaker claim, and one a comparison of AUCs cannot distinguish from a genuinely identical model. If per-case consistency matters, the thing to measure is the flip rate, and it takes one line.");
+      }
+    }
+    $("st-note").textContent = lines.join("\n\n");
+  }
+
+  $("st-case").addEventListener("change", render);
+  render();
+})();
+
+/* ============================================================
+   Demo 2 — hashing converts silent divergence into loud failure
+   ============================================================ */
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  /* the same six components as chapter 1, with the same odds of matching */
+  var COMPONENTS = [
+    { name: "the training code", match: 0.85, cheap: true },
+    { name: "the training data", match: 0.55, cheap: true },
+    { name: "library versions", match: 0.70, cheap: true },
+    { name: "the random seed", match: 0.45, cheap: true },
+    { name: "hardware and thread count", match: 0.80, cheap: false },
+    { name: "upstream feature logic", match: 0.60, cheap: false }
+  ];
+  var SETS = {
+    none: [false, false, false, false, false, false],
+    two: [true, true, false, false, false, false],
+    cheap: [true, true, true, true, false, false],
+    expensive: [false, false, false, false, true, true],
+    all: [true, true, true, true, true, true]
+  };
+  var SLBL = {
+    none: "nothing", two: "code and data",
+    cheap: "code, data, libraries and the seed",
+    expensive: "only hardware and upstream logic", all: "everything"
+  };
+
+  function detect(flags) {
+    var allMatch = 1, unhashedMatch = 1, hashedMatch = 1;
+    COMPONENTS.forEach(function (c, i) {
+      allMatch *= c.match;
+      if (flags[i]) hashedMatch *= c.match; else unhashedMatch *= c.match;
+    });
+    return {
+      identical: allMatch,
+      loud: 1 - hashedMatch,                    /* at least one hashed input differs */
+      silent: hashedMatch * (1 - unhashedMatch) /* all hashed matched, something else did not */
+    };
+  }
+
+  function chart(key) {
+    var W = 700, H = 190, L = 8;
+    var flags = SETS[key], d = detect(flags);
+    var svg = ['<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" aria-label="Which inputs are hashed, and what happens when one differs">'];
+    svg.push('<text x="' + L + '" y="11" font-size="10" font-weight="700" fill="#7C8B99">WHICH INPUTS ARE CHECKED, AND WHAT HAPPENS WHEN ONE MOVES</text>');
+    COMPONENTS.forEach(function (c, i) {
+      var y = 22 + i * 20, on = flags[i];
+      svg.push('<rect x="' + L + '" y="' + y + '" width="11" height="11" rx="2" fill="' +
+        (on ? "#2E8B5F" : "#fff") + '" stroke="' + (on ? "#2E8B5F" : "#CFD8E0") + '" stroke-width="1.5"/>');
+      if (on) svg.push('<path d="M' + (L + 2.5) + ' ' + (y + 5.5) + 'l2.5 2.5 4-5" stroke="#fff" stroke-width="1.6" fill="none"/>');
+      svg.push('<text x="' + (L + 19) + '" y="' + (y + 10) + '" font-size="9.5" fill="' +
+        (on ? "#16232F" : "#8FA0AF") + '">' + c.name + '</text>');
+      svg.push('<text x="' + (L + 186) + '" y="' + (y + 10) + '" font-size="9" fill="#8FA0AF">matches ' +
+        (c.match * 100).toFixed(0) + '%</text>');
+      svg.push('<text x="' + (L + 262) + '" y="' + (y + 10) + '" font-size="9" font-weight="' + (on ? 600 : 400) +
+        '" fill="' + (on ? "#166B47" : "#9B2C22") + '">' +
+        (on ? "a mismatch stops the job" : "a mismatch goes unnoticed") + '</text>');
+      if (!c.cheap) {
+        svg.push('<text x="' + (L + 400) + '" y="' + (y + 10) + '" font-size="9" fill="#C6A15B">expensive to hash</text>');
+      }
+    });
+    var px = W - 152, bars = [["caught loudly", d.loud, "#2E8B5F"], ["silent divergence", d.silent, "#C0453A"]];
+    bars.forEach(function (b, i) {
+      var y = 40 + i * 46;
+      svg.push('<text x="' + px + '" y="' + y + '" font-size="9.5" fill="#7C8B99">' + b[0] + '</text>');
+      svg.push('<rect x="' + px + '" y="' + (y + 6) + '" width="130" height="12" rx="2" fill="#ECEFF2"/>');
+      svg.push('<rect x="' + px + '" y="' + (y + 6) + '" width="' + Math.max(1, 130 * b[1]).toFixed(1) +
+        '" height="12" rx="2" fill="' + b[2] + '"/>');
+      svg.push('<text x="' + px + '" y="' + (y + 32) + '" font-size="14" font-weight="700" fill="' + b[2] + '">' +
+        (b[1] * 100).toFixed(1) + '%</text>');
+    });
+    svg.push('<text x="' + L + '" y="' + (H - 4) + '" font-size="9.5" fill="#7C8B99">the odds of an identical rebuild are ' +
+      (d.identical * 100).toFixed(1) + '% in every setting \u2014 hashing changes only who finds out</text>');
+    svg.push("</svg>");
+    return svg.join("");
+  }
+
+  function render() {
+    var key = $("hs-set").value;
+    var d = detect(SETS[key]), cheap = detect(SETS.cheap), exp = detect(SETS.expensive), none = detect(SETS.none);
+
+    $("hs-id").textContent = (d.identical * 100).toFixed(1) + "%";
+    $("hs-loud").textContent = (d.loud * 100).toFixed(1) + "%";
+    $("hs-loud-tile").className = "tile " + (d.loud > 0.8 ? "good" : "");
+    $("hs-sil").textContent = (d.silent * 100).toFixed(1) + "%";
+    $("hs-sil-tile").className = "tile " + (d.silent > 0.15 ? "bad" : "good");
+    $("hs-verd").textContent = d.silent < 0.1 ? "Failures are loud" : d.silent < 0.5 ? "Partly covered" : "Flying blind";
+    $("hs-verd-sub").textContent = key === "cheap" ? "and it cost four cheap hashes"
+      : key === "expensive" ? "for the most effort of any option" : "";
+    $("hs-verd-tile").className = "tile " + (d.silent < 0.1 ? "good" : "bad");
+
+    $("hs-canvas").innerHTML = chart(key);
+
+    var lines = [];
+    lines.push("Six inputs, each with its own chance of matching on a rebuild. Hashing " + SLBL[key] +
+      " and refusing to proceed on a mismatch gives " + (d.loud * 100).toFixed(1) +
+      "% of divergences caught loudly and " + (d.silent * 100).toFixed(1) + "% still silent.");
+    lines.push("Note the first tile: the chance of an identical rebuild is " +
+      (d.identical * 100).toFixed(1) +
+      "% in EVERY setting of this demo. Hashing does not improve reproducibility at all \u2014 the rebuild is exactly as likely to differ as it was before. What changes is whether the failure mode is \u201ca different model is now in production and nobody knows\u201d or \u201cthe job stopped and printed which input moved\u201d.");
+
+    if (key === "none") {
+      lines.push("With nothing checked, " + (none.silent * 100).toFixed(1) +
+        "% of rebuilds silently produce a different model. That is the default state of most training pipelines, and it is why the confusing class of ML incident \u2014 \u201cit worked last month\u201d \u2014 is so common.");
+    } else if (key === "cheap") {
+      lines.push("This is the practical setting. The four CHEAP inputs \u2014 a git commit, a content hash, a lockfile hash, a seed value \u2014 take silent divergence to " +
+        (d.silent * 100).toFixed(1) +
+        "% without touching hardware or upstream feature logic, which are the expensive things to pin.");
+      lines.push("Compare it with hashing only the expensive ones, which leaves " + (exp.silent * 100).toFixed(1) +
+        "% silent \u2014 " + (exp.silent / cheap.silent).toFixed(1) +
+        " times worse, for considerably more effort. Effort here follows how cheap the check is, not how likely the component is to move.");
+    } else if (key === "expensive") {
+      lines.push("Hashing only hardware and upstream logic leaves " + (d.silent * 100).toFixed(1) +
+        "% silent, against " + (cheap.silent * 100).toFixed(1) +
+        "% for the four cheap inputs \u2014 " + (d.silent / cheap.silent).toFixed(1) +
+        " times worse, and considerably more work. The four cheap hashes are a git commit, a content hash, a lockfile hash and an integer.");
+    } else if (key === "all") {
+      lines.push("Everything hashed: no divergence is silent. Every mismatch stops the job with a message naming the input that moved. The rebuild still only matches " +
+        (d.identical * 100).toFixed(1) + "% of the time \u2014 that has not changed and cannot be fixed by checking.");
+      lines.push("Which is the honest position to aim for: this model was built from these exact inputs, and a rebuild either reproduces it or tells you precisely why not. That is a claim you can check, unlike \u201cit is reproducible\u201d.");
+    } else {
+      lines.push("Two inputs checked, and silent divergence is already down from " +
+        (none.silent * 100).toFixed(1) + "% to " + (d.silent * 100).toFixed(1) +
+        "%. Add the libraries and the seed \u2014 both trivial to hash \u2014 and watch it fall again.");
+    }
+    $("hs-note").textContent = lines.join("\n\n");
+  }
+
+  $("hs-set").addEventListener("change", render);
+  render();
+})();
+
+initChapter("02-reproducibility.html");
+</script>
+</body>
+</html>
